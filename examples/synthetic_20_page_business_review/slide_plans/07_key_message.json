@@ -1,0 +1,10 @@
+{
+  "index": 7,
+  "layout": "key_message",
+  "title": "Top Result",
+  "blocks": [
+    { "id": "title",           "kind": "text",    "content": "Top Result" },
+    { "id": "message",         "kind": "callout", "content": "Synthetic Team met its qualitative goals for the quarter." },
+    { "id": "supporting_text", "kind": "text",    "content": "Detail is intentionally qualitative; no financial figures." }
+  ]
+}

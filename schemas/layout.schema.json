@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "layout.schema.json",
+  "title": "Layout Skeleton",
+  "description": "Skeleton definition for one layout under a template. Lists the named slots the layout exposes and their kinds. Slot bounds, typography roles, and SVG mapping are TODO.",
+  "type": "object",
+  "required": ["name", "slots"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Layout id. Must match the filename and an entry in the template's layouts list."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["skeleton", "draft", "stable"]
+    },
+    "purpose": {
+      "type": "string"
+    },
+    "slots": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "required"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["text", "list", "callout", "kpi", "table", "image_ref", "chart_ref"]
+          },
+          "required": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "todo": {
+      "type": "string"
+    }
+  }
+}

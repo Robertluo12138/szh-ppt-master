@@ -1,0 +1,21 @@
+{
+  "index": 2,
+  "layout": "agenda",
+  "title": "Agenda",
+  "blocks": [
+    { "id": "title", "kind": "text", "content": "Agenda" },
+    {
+      "id": "agenda_items",
+      "kind": "list",
+      "content": [
+        "Market Context",
+        "Performance",
+        "Operations",
+        "Risks",
+        "Outlook",
+        "Asks"
+      ]
+    }
+  ],
+  "notes": "Six sections mirror the source outline."
+}

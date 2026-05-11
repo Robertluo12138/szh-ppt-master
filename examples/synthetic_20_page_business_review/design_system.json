@@ -1,7 +1,4 @@
 {
-  "name": "business_review_default",
-  "version": "0.1.0",
-  "status": "scaffold",
   "palette": {
     "primary":    "#1F3A5F",
     "secondary":  "#4A6FA5",
@@ -17,9 +14,5 @@
     "width_px": 1920,
     "height_px": 1080,
     "margin_px": 64
-  },
-  "todo": [
-    "Confirm palette meets the contrast minimum chosen in references/style-guide.md.",
-    "Decide whether accent doubles as a chart-highlight color."
-  ]
+  }
 }

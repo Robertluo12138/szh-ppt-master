@@ -48,7 +48,7 @@ Neutral, business-professional.
 ## Key messages (synthetic)
 
 - Synthetic Team met its qualitative goals for the quarter.
-- Two placeholder risks require a decision this cycle.
+- Three placeholder risks require a decision this cycle.
 - Next quarter requires resourcing for one placeholder initiative.
 
 ## Constraints

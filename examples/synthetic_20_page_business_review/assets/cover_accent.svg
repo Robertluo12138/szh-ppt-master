@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic placeholder accent. Not derived from any real source. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480" width="480" height="480">
+  <rect x="0" y="0" width="480" height="480" fill="#1F3A5F"/>
+  <circle cx="240" cy="240" r="160" fill="#F2B33D" fill-opacity="0.85"/>
+  <rect x="120" y="120" width="240" height="240" fill="none" stroke="#FFFFFF" stroke-width="6" stroke-opacity="0.6"/>
+</svg>

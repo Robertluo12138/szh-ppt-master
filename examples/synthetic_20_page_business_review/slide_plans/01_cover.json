@@ -1,0 +1,15 @@
+{
+  "index": 1,
+  "layout": "cover",
+  "title": "Synthetic Quarterly Business Review",
+  "subtitle": "Quarter placeholder",
+  "blocks": [
+    { "id": "title",     "kind": "text",      "content": "Synthetic Quarterly Business Review" },
+    { "id": "subtitle",  "kind": "text",      "content": "Quarter placeholder" },
+    { "id": "presenter", "kind": "text",      "content": "Synthetic Team Lead" },
+    { "id": "date",      "kind": "text",      "content": "<date-placeholder>" },
+    { "id": "accent",    "kind": "image_ref", "content": "cover_accent" }
+  ],
+  "image_refs": ["cover_accent"],
+  "notes": "All values are synthetic placeholders."
+}

@@ -17,8 +17,9 @@ Defines design tokens and visual conventions consumed by `design_system.json` an
 
 ## Fonts
 
-- Fonts must be embeddable or available on the target platform. Web-only fonts are not allowed until a fallback chain is defined.
-- The fallback chain for a font is **TODO**; until defined, font choices in themes must be widely available (e.g. system fonts).
+- `font_family` is a CSS-style fallback chain, ordered preferred → fallback (e.g. `"Calibri, Helvetica Neue, Arial, sans-serif"`). At least one entry must be a font that is broadly available on Windows and macOS so PPTX export can resolve it without embedding.
+- The last entry should be a generic family (`sans-serif`, `serif`, or `monospace`) for the SVG layer.
+- Web-only fonts (e.g. fonts that ship from a CDN only) may only appear as the *preferred* entry, never as the last entry. Fonts that require remote loading at render time are forbidden by `svg-design-rules.md`.
 
 ## Density
 
@@ -28,5 +29,4 @@ Defines design tokens and visual conventions consumed by `design_system.json` an
 
 - Confirm minimum readable body size (pt).
 - Confirm minimum contrast ratio.
-- Define fallback font chains.
 - Decide whether dark-mode themes are in scope.

@@ -1,0 +1,22 @@
+{
+  "images": [
+    {
+      "id": "cover_accent",
+      "local_path": "assets/cover_accent.svg",
+      "source": "synthetic",
+      "alt_text": "Synthetic geometric accent shape.",
+      "intended_use": "spot illustration",
+      "width_px": 480,
+      "height_px": 480
+    },
+    {
+      "id": "section_icon_risks",
+      "local_path": "assets/icons/section_risks.svg",
+      "source": "local_asset",
+      "alt_text": "Placeholder icon used on the Risks section divider.",
+      "intended_use": "icon",
+      "width_px": 128,
+      "height_px": 128
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "index": 9,
+  "layout": "two_column",
+  "title": "Wins vs. Misses",
+  "blocks": [
+    { "id": "title",         "kind": "text", "content": "Wins vs. Misses" },
+    { "id": "left_heading",  "kind": "text", "content": "Wins" },
+    {
+      "id": "left_content",
+      "kind": "list",
+      "content": [
+        "Placeholder win one",
+        "Placeholder win two",
+        "Placeholder win three"
+      ]
+    },
+    { "id": "right_heading", "kind": "text", "content": "Misses" },
+    {
+      "id": "right_content",
+      "kind": "list",
+      "content": [
+        "Placeholder miss one",
+        "Placeholder miss two"
+      ]
+    }
+  ]
+}

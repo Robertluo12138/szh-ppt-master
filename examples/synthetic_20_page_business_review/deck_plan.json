@@ -1,0 +1,25 @@
+{
+  "template": "business_review",
+  "slides": [
+    { "index":  1, "layout": "cover",            "title": "Synthetic Quarterly Business Review", "summary": "Title and presenter." },
+    { "index":  2, "layout": "agenda",           "title": "Agenda" },
+    { "index":  3, "layout": "section_divider", "title": "Market Context" },
+    { "index":  4, "layout": "executive_summary","title": "Market Context Summary" },
+    { "index":  5, "layout": "section_divider", "title": "Performance" },
+    { "index":  6, "layout": "executive_summary","title": "Quarter Performance Summary" },
+    { "index":  7, "layout": "key_message",     "title": "Top Result" },
+    { "index":  8, "layout": "kpi_dashboard",   "title": "Quarter KPIs" },
+    { "index":  9, "layout": "two_column",      "title": "Wins vs. Misses" },
+    { "index": 10, "layout": "section_divider", "title": "Operations" },
+    { "index": 11, "layout": "comparison_table","title": "Current Quarter vs. Prior Quarter" },
+    { "index": 12, "layout": "timeline",        "title": "Quarter Timeline" },
+    { "index": 13, "layout": "section_divider", "title": "Risks" },
+    { "index": 14, "layout": "key_message",     "title": "Top Risk" },
+    { "index": 15, "layout": "two_column",      "title": "Risk vs. Mitigation" },
+    { "index": 16, "layout": "section_divider", "title": "Outlook" },
+    { "index": 17, "layout": "executive_summary","title": "Next-Quarter Plan" },
+    { "index": 18, "layout": "kpi_dashboard",   "title": "Projected KPIs" },
+    { "index": 19, "layout": "section_divider", "title": "Asks" },
+    { "index": 20, "layout": "conclusion",      "title": "Decisions Requested" }
+  ]
+}

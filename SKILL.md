@@ -36,10 +36,11 @@ Hard invariants (must remain true as the skill grows):
 
 - Root docs: `SKILL.md`, `README.md`, `SECURITY.md`, `.gitignore`.
 - `references/` — policy and contract documents.
-- `schemas/` — minimal JSON Schemas for the five core artifacts.
-- `templates/layouts/business_review/` — template + theme + 10 layout skeletons.
-- `examples/synthetic_20_page_business_review/` — synthetic input and a schema-valid `deck_brief.json` fixture.
+- `schemas/` — JSON Schemas for the five core artifacts (`deck_brief`, `deck_plan`, `design_system`, `slide_plan`, `image_manifest`) plus the template-side schemas (`template`, `theme`, `layout`).
+- `templates/layouts/business_review/` — template + theme + 10 layout skeletons. Theme `font_family` is a CSS-style fallback chain.
+- `examples/synthetic_20_page_business_review/` — synthetic input, schema-valid fixtures for `deck_brief`, `deck_plan`, `design_system`, `image_manifest`, a representative set of `slide_plans/`, and the synthetic SVG assets referenced by the manifest under `assets/`.
 - `scripts/validate_artifacts.py` — stdlib-only structural validator (subset of JSON Schema; full validation is TODO).
+- `scripts/validate_scaffold.py` — stdlib-only scaffold runner that exercises positive fixtures, negative cases, path-safety on `image_manifest.local_path` **and** `template.theme_ref` (rejecting **any URI-like scheme prefix** matching `^[A-Za-z][A-Za-z0-9+.\-]*:` — `http://`, `https://`, `file://`, `s3://`, `ftp://`, `data:`, `mailto:`, `javascript:`, etc., including Windows drive prefixes like `C:\...` / `D:/...` which match the same shape — plus POSIX-absolute, leading-backslash, protocol-relative `//host/...`, `..` segments, and the empty string), **media resolution (every `local_path` must exist; every `slide_plan.image_refs` id must be declared)**, layout-aware slide-plan coverage, the template/theme/layout cross-check (including `template.name` matching its directory, and `theme_ref` not escaping the template dir). The theme load is **gated** on the `theme_ref` guards in two stages: a string-only `local_path_is_safe` check runs first and short-circuits before any filesystem call, then the within-template-dir resolve check runs, and only then can the theme file be opened. An unsafe `theme_ref` never reaches `Path.resolve()` or any file read.
 
 ## What is NOT implemented yet
 
@@ -59,12 +60,17 @@ Project workspaces are user-provided. Scripts must accept arbitrary paths. Do no
 
 ## Verification available today
 
-Only the structural validator runs:
+Two stdlib-only commands run:
 
 ```
+# Single-artifact structural check (subset of JSON Schema).
 python3 scripts/validate_artifacts.py \
   --schema schemas/deck_brief.schema.json \
   examples/synthetic_20_page_business_review/deck_brief.json
+
+# Full scaffold check: schemas, negative cases, image_manifest path-safety,
+# layout-aware slide_plan coverage, and template/theme/layout cross-check.
+python3 scripts/validate_scaffold.py
 ```
 
-All other verification commands are TODO until their scripts exist.
+`validate_scaffold.py` exits non-zero if any check disagrees, including its built-in negative cases (e.g. unsafe `http://` paths must be rejected, dropping a required layout slot must be detected). All other verification commands — SVG, PPTX, security scan, visual regression — are TODO until their scripts exist.

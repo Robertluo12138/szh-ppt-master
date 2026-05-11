@@ -1,0 +1,19 @@
+{
+  "index": 8,
+  "layout": "kpi_dashboard",
+  "title": "Quarter KPIs",
+  "blocks": [
+    { "id": "title", "kind": "text", "content": "Quarter KPIs" },
+    {
+      "id": "kpis",
+      "kind": "kpi",
+      "content": [
+        { "label": "metric_a", "value": "<value>", "delta": "<delta>" },
+        { "label": "metric_b", "value": "<value>", "delta": "<delta>" },
+        { "label": "metric_c", "value": "<value>", "delta": "<delta>" },
+        { "label": "metric_d", "value": "<value>", "delta": "<delta>" }
+      ]
+    }
+  ],
+  "notes": "All KPI values are placeholders."
+}

@@ -1,13 +1,13 @@
 {
   "title": "Synthetic Quarterly Business Review",
   "audience": "Internal review committee (synthetic)",
-  "objective": "Communicate the prior quarter's qualitative performance, surface placeholder risks, and request decisions on two synthetic initiatives.",
+  "objective": "Communicate the prior quarter's qualitative performance, surface the top three placeholder risks, and request decisions on two synthetic initiatives.",
   "tone": "neutral-professional",
   "language": "en",
   "approximate_slide_count": 20,
   "key_messages": [
     "Synthetic Team met its qualitative goals for the quarter.",
-    "Two placeholder risks require a decision this cycle.",
+    "Three placeholder risks require a decision this cycle.",
     "Next quarter requires resourcing for one placeholder initiative."
   ],
   "constraints": {
