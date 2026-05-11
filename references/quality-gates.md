@@ -15,6 +15,11 @@ The gates a deck must pass before the skill reports success. Each gate maps to a
 | `plan.template` — `deck_plan.template` resolves to a real template under the template-root | Plan | workspace (`scripts/validate_workspace.py`) |
 | `plan.layouts` — every `deck_plan` slide layout is declared by the chosen template | Plan | workspace (`scripts/validate_workspace.py`) |
 | `plan.coverage` — every `deck_plan` slide has a matching `slide_plan` file (and every `slide_plan` matches its deck_plan entry on index/layout/title) | Per-slide plan | workspace (`scripts/validate_workspace.py`) |
+| `brief.source_refs` — `deck_brief.source_refs` is present and non-empty | Brief | scaffold + workspace |
+| `plan.count` — `deck_plan.planning.planned_slide_count` equals `len(deck_plan.slides)` | Plan | scaffold + workspace |
+| `plan.sections` — `deck_plan.sections[].slide_indices` partition the set of `slides[].index` (no duplicates across sections, no missing deck indices, no orphan section indices) | Plan | scaffold + workspace |
+| `plan.section_id` — every `deck_plan.slides[].section_id` resolves to an existing section, and the slide's index is listed in that section's `slide_indices` | Plan | scaffold + workspace |
+| `plan.slide_source_refs` — every `deck_plan.slides[].source_refs` value is declared in `deck_brief.source_refs` | Plan | scaffold + workspace |
 | `slide.slots` — every required layout slot is covered by a matching slide_plan block id+kind | Per-slide plan | scaffold + workspace |
 | `svg.bounds` — no element exits the canvas viewBox | SVG validate | TODO |
 | `svg.refs` — same fail-closed rule as `images.path-safety` (any URI scheme, absolute, leading-backslash, protocol-relative, `..`) | SVG validate | TODO |

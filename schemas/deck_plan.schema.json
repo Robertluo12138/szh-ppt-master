@@ -2,9 +2,9 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "deck_plan.schema.json",
   "title": "Deck Plan",
-  "description": "Deck-level outline produced from the brief. Lists slides in order with their layout, title, and a short summary. Per-slide detail lives in slide_plan.json files.",
+  "description": "Deck-level outline produced from the brief. Adaptive in length and structure: the planner chooses how many slides, what sections, which layouts, and per-slide density. Per-slide detail lives in slide_plan.json files. Schema enforces source traceability and the section/slide cross-references; it does NOT impose a maximum slide count or a required layout sequence.",
   "type": "object",
-  "required": ["template", "slides"],
+  "required": ["template", "planning", "sections", "slides"],
   "additionalProperties": false,
   "properties": {
     "template": {
@@ -16,12 +16,73 @@
       "type": "object",
       "description": "TODO: enumerate overridable theme tokens once the design system stabilizes."
     },
+    "planning": {
+      "type": "object",
+      "required": ["planned_slide_count", "rationale"],
+      "additionalProperties": false,
+      "description": "Adaptive planning record. Validators cross-check planned_slide_count against len(slides).",
+      "properties": {
+        "planned_slide_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Integer the planner committed to. Validators require this to equal len(slides)."
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Short explanation of why this length and section structure suits the brief. No raw sensitive source text."
+        }
+      }
+    },
+    "sections": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Ordered section list. Validators require sections[].slide_indices to cover every deck_plan slide exactly once, with no duplicates, missing, or orphan indices.",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "summary", "slide_indices"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable section identifier referenced by slides[].section_id."
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Short qualitative description of what the section covers."
+          },
+          "slide_indices": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "1-based slide indices contained by this section. Validators require these to match the slides[].index values that carry the matching section_id."
+          }
+        }
+      }
+    },
     "slides": {
       "type": "array",
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["index", "layout", "title"],
+        "required": [
+          "index",
+          "layout",
+          "title",
+          "section_id",
+          "summary",
+          "density",
+          "source_refs"
+        ],
         "additionalProperties": false,
         "properties": {
           "index": {
@@ -37,8 +98,26 @@
             "type": "string",
             "minLength": 1
           },
+          "section_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "References sections[].id. Validators require this id to exist and the slide's index to be listed in that section's slide_indices."
+          },
           "summary": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1,
+            "description": "Short qualitative description of this slide. No raw sensitive source text."
+          },
+          "density": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Planner's density hint for this slide. Small enum on purpose; tighten only when the design system needs more granularity."
+          },
+          "source_refs": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 },
+            "description": "Opaque source identifiers this slide draws from. Validators require every value to be declared in deck_brief.source_refs."
           },
           "key_points": {
             "type": "array",

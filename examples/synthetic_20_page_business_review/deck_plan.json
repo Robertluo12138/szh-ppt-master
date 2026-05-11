@@ -1,25 +1,233 @@
 {
   "template": "business_review",
+  "planning": {
+    "planned_slide_count": 20,
+    "rationale": "Synthetic upper-range fixture: seven sections (intro, market context, performance, operations, risks, outlook, asks) cover a 20-slide quarterly review. The shape is illustrative, not canonical."
+  },
+  "sections": [
+    {
+      "id": "intro",
+      "title": "Intro",
+      "summary": "Cover and agenda.",
+      "slide_indices": [1, 2]
+    },
+    {
+      "id": "market_context",
+      "title": "Market Context",
+      "summary": "Frame the quarter's external context.",
+      "slide_indices": [3, 4]
+    },
+    {
+      "id": "performance",
+      "title": "Performance",
+      "summary": "Top result, KPIs, and wins vs. misses for the quarter.",
+      "slide_indices": [5, 6, 7, 8, 9]
+    },
+    {
+      "id": "operations",
+      "title": "Operations",
+      "summary": "Quarter-over-quarter comparison and timeline.",
+      "slide_indices": [10, 11, 12]
+    },
+    {
+      "id": "risks",
+      "title": "Risks",
+      "summary": "Top risk plus risk vs. mitigation breakdown.",
+      "slide_indices": [13, 14, 15]
+    },
+    {
+      "id": "outlook",
+      "title": "Outlook",
+      "summary": "Next-quarter plan and projected KPIs.",
+      "slide_indices": [16, 17, 18]
+    },
+    {
+      "id": "asks",
+      "title": "Asks",
+      "summary": "Decisions requested from the review committee.",
+      "slide_indices": [19, 20]
+    }
+  ],
   "slides": [
-    { "index":  1, "layout": "cover",            "title": "Synthetic Quarterly Business Review", "summary": "Title and presenter." },
-    { "index":  2, "layout": "agenda",           "title": "Agenda" },
-    { "index":  3, "layout": "section_divider", "title": "Market Context" },
-    { "index":  4, "layout": "executive_summary","title": "Market Context Summary" },
-    { "index":  5, "layout": "section_divider", "title": "Performance" },
-    { "index":  6, "layout": "executive_summary","title": "Quarter Performance Summary" },
-    { "index":  7, "layout": "key_message",     "title": "Top Result" },
-    { "index":  8, "layout": "kpi_dashboard",   "title": "Quarter KPIs" },
-    { "index":  9, "layout": "two_column",      "title": "Wins vs. Misses" },
-    { "index": 10, "layout": "section_divider", "title": "Operations" },
-    { "index": 11, "layout": "comparison_table","title": "Current Quarter vs. Prior Quarter" },
-    { "index": 12, "layout": "timeline",        "title": "Quarter Timeline" },
-    { "index": 13, "layout": "section_divider", "title": "Risks" },
-    { "index": 14, "layout": "key_message",     "title": "Top Risk" },
-    { "index": 15, "layout": "two_column",      "title": "Risk vs. Mitigation" },
-    { "index": 16, "layout": "section_divider", "title": "Outlook" },
-    { "index": 17, "layout": "executive_summary","title": "Next-Quarter Plan" },
-    { "index": 18, "layout": "kpi_dashboard",   "title": "Projected KPIs" },
-    { "index": 19, "layout": "section_divider", "title": "Asks" },
-    { "index": 20, "layout": "conclusion",      "title": "Decisions Requested" }
+    {
+      "index": 1,
+      "layout": "cover",
+      "title": "Synthetic Quarterly Business Review",
+      "section_id": "intro",
+      "summary": "Title slide with presenter and placeholder date.",
+      "density": "low",
+      "source_refs": ["synthetic_source_a"]
+    },
+    {
+      "index": 2,
+      "layout": "agenda",
+      "title": "Agenda",
+      "section_id": "intro",
+      "summary": "Six-item agenda mirroring the source outline.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_a"]
+    },
+    {
+      "index": 3,
+      "layout": "section_divider",
+      "title": "Market Context",
+      "section_id": "market_context",
+      "summary": "Section divider into market context.",
+      "density": "low",
+      "source_refs": ["synthetic_source_a"]
+    },
+    {
+      "index": 4,
+      "layout": "executive_summary",
+      "title": "Market Context Summary",
+      "section_id": "market_context",
+      "summary": "Qualitative summary of the external context for the quarter.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_a", "synthetic_source_b"]
+    },
+    {
+      "index": 5,
+      "layout": "section_divider",
+      "title": "Performance",
+      "section_id": "performance",
+      "summary": "Section divider into performance.",
+      "density": "low",
+      "source_refs": ["synthetic_source_a"]
+    },
+    {
+      "index": 6,
+      "layout": "executive_summary",
+      "title": "Quarter Performance Summary",
+      "section_id": "performance",
+      "summary": "Qualitative summary of quarter performance.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_b"]
+    },
+    {
+      "index": 7,
+      "layout": "key_message",
+      "title": "Top Result",
+      "section_id": "performance",
+      "summary": "Single placeholder top result for the quarter.",
+      "density": "low",
+      "source_refs": ["synthetic_source_b"]
+    },
+    {
+      "index": 8,
+      "layout": "kpi_dashboard",
+      "title": "Quarter KPIs",
+      "section_id": "performance",
+      "summary": "Four placeholder KPIs for the quarter.",
+      "density": "high",
+      "source_refs": ["synthetic_source_b"]
+    },
+    {
+      "index": 9,
+      "layout": "two_column",
+      "title": "Wins vs. Misses",
+      "section_id": "performance",
+      "summary": "Wins on the left, misses on the right.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_a", "synthetic_source_b"]
+    },
+    {
+      "index": 10,
+      "layout": "section_divider",
+      "title": "Operations",
+      "section_id": "operations",
+      "summary": "Section divider into operations.",
+      "density": "low",
+      "source_refs": ["synthetic_source_a"]
+    },
+    {
+      "index": 11,
+      "layout": "comparison_table",
+      "title": "Current Quarter vs. Prior Quarter",
+      "section_id": "operations",
+      "summary": "Side-by-side placeholder operational metrics.",
+      "density": "high",
+      "source_refs": ["synthetic_source_b"]
+    },
+    {
+      "index": 12,
+      "layout": "timeline",
+      "title": "Quarter Timeline",
+      "section_id": "operations",
+      "summary": "Placeholder timeline of operational milestones.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_a"]
+    },
+    {
+      "index": 13,
+      "layout": "section_divider",
+      "title": "Risks",
+      "section_id": "risks",
+      "summary": "Section divider into risks.",
+      "density": "low",
+      "source_refs": ["synthetic_source_a"]
+    },
+    {
+      "index": 14,
+      "layout": "key_message",
+      "title": "Top Risk",
+      "section_id": "risks",
+      "summary": "Single placeholder top risk.",
+      "density": "low",
+      "source_refs": ["synthetic_source_b"]
+    },
+    {
+      "index": 15,
+      "layout": "two_column",
+      "title": "Risk vs. Mitigation",
+      "section_id": "risks",
+      "summary": "Risks on the left, placeholder mitigations on the right.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_a", "synthetic_source_b"]
+    },
+    {
+      "index": 16,
+      "layout": "section_divider",
+      "title": "Outlook",
+      "section_id": "outlook",
+      "summary": "Section divider into outlook.",
+      "density": "low",
+      "source_refs": ["synthetic_source_a"]
+    },
+    {
+      "index": 17,
+      "layout": "executive_summary",
+      "title": "Next-Quarter Plan",
+      "section_id": "outlook",
+      "summary": "Qualitative plan for the upcoming quarter.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_a"]
+    },
+    {
+      "index": 18,
+      "layout": "kpi_dashboard",
+      "title": "Projected KPIs",
+      "section_id": "outlook",
+      "summary": "Projected placeholder KPIs for the upcoming quarter.",
+      "density": "high",
+      "source_refs": ["synthetic_source_b"]
+    },
+    {
+      "index": 19,
+      "layout": "section_divider",
+      "title": "Asks",
+      "section_id": "asks",
+      "summary": "Section divider into asks.",
+      "density": "low",
+      "source_refs": ["synthetic_source_a"]
+    },
+    {
+      "index": 20,
+      "layout": "conclusion",
+      "title": "Decisions Requested",
+      "section_id": "asks",
+      "summary": "Two synthetic decision requests for the committee.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_a", "synthetic_source_b"]
+    }
   ]
 }

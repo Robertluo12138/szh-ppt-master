@@ -591,6 +591,221 @@ def check_slide_plan_coverage(workspace: Path, template_root: Path) -> list[Chec
     return out
 
 
+def check_planner_semantics(workspace: Path) -> list[CheckResult]:
+    """Cross-artifact planner semantics, beyond what JSON Schema can express:
+
+      - deck_plan.planning.planned_slide_count equals len(deck_plan.slides);
+      - deck_plan.sections[].slide_indices cover exactly the deck_plan
+        slide indices (no duplicates across sections, no missing
+        deck_plan indices, no section_indices the deck_plan does not
+        declare);
+      - every deck_plan.slides[].section_id resolves to an existing
+        section and the slide's index appears in that section's
+        slide_indices;
+      - every deck_plan.slides[].source_refs value is declared in
+        deck_brief.source_refs.
+
+    Workspace-path agnostic: reads brief/plan from the caller-supplied
+    workspace only. Fail-closed: a missing or malformed brief / plan
+    short-circuits with a [FAIL] line."""
+    out: list[CheckResult] = []
+    brief_raw, err = _try_load(workspace / "deck_brief.json")
+    if brief_raw is None:
+        out.append(CheckResult("planner semantics skipped: deck_brief.json loadable", False, err))
+        return out
+    brief = _as_dict(brief_raw)
+    if brief is None:
+        out.append(CheckResult(
+            "planner semantics skipped: deck_brief.json root is an object",
+            False, f"got {type(brief_raw).__name__}",
+        ))
+        return out
+    deck_raw, err = _try_load(workspace / "deck_plan.json")
+    if deck_raw is None:
+        out.append(CheckResult("planner semantics skipped: deck_plan.json loadable", False, err))
+        return out
+    deck = _as_dict(deck_raw)
+    if deck is None:
+        out.append(CheckResult(
+            "planner semantics skipped: deck_plan.json root is an object",
+            False, f"got {type(deck_raw).__name__}",
+        ))
+        return out
+
+    brief_refs_raw = brief.get("source_refs")
+    brief_refs_list = _as_list(brief_refs_raw)
+    if brief_refs_list is None:
+        out.append(CheckResult(
+            "deck_brief.source_refs is a list",
+            False, f"got {type(brief_refs_raw).__name__}",
+        ))
+        return out
+    brief_refs = {r for r in brief_refs_list if isinstance(r, str)}
+
+    slides_raw = deck.get("slides")
+    slides = _as_list(slides_raw)
+    if slides is None:
+        out.append(CheckResult(
+            "deck_plan.slides is a list (planner semantics)",
+            False, f"got {type(slides_raw).__name__}",
+        ))
+        return out
+    dict_slides: list[dict] = []
+    for i, s in enumerate(slides):
+        s_d = _as_dict(s)
+        if s_d is None:
+            out.append(CheckResult(
+                f"deck_plan.slides[{i}] is an object (planner semantics)",
+                False, f"got {type(s).__name__}",
+            ))
+            continue
+        dict_slides.append(s_d)
+
+    planning_raw = deck.get("planning")
+    planning = _as_dict(planning_raw)
+    if planning is None:
+        out.append(CheckResult(
+            "deck_plan.planning is an object",
+            False, f"got {type(planning_raw).__name__}",
+        ))
+    else:
+        planned = planning.get("planned_slide_count")
+        if not isinstance(planned, int) or isinstance(planned, bool):
+            out.append(CheckResult(
+                "deck_plan.planning.planned_slide_count is an integer",
+                False, f"got {type(planned).__name__}",
+            ))
+        else:
+            out.append(CheckResult(
+                f"planning.planned_slide_count ({planned}) equals len(slides) ({len(dict_slides)})",
+                planned == len(dict_slides),
+                f"planned={planned}, actual={len(dict_slides)}",
+            ))
+
+    sections_raw = deck.get("sections")
+    sections = _as_list(sections_raw)
+    if sections is None:
+        out.append(CheckResult(
+            "deck_plan.sections is a list",
+            False, f"got {type(sections_raw).__name__}",
+        ))
+        return out
+    dict_sections: list[dict] = []
+    for i, sec in enumerate(sections):
+        sec_d = _as_dict(sec)
+        if sec_d is None:
+            out.append(CheckResult(
+                f"deck_plan.sections[{i}] is an object (planner semantics)",
+                False, f"got {type(sec).__name__}",
+            ))
+            continue
+        dict_sections.append(sec_d)
+
+    section_by_id: dict[str, dict] = {}
+    duplicate_section_ids: list[str] = []
+    for sec in dict_sections:
+        sid = sec.get("id")
+        if isinstance(sid, str):
+            if sid in section_by_id:
+                duplicate_section_ids.append(sid)
+            else:
+                section_by_id[sid] = sec
+    out.append(CheckResult(
+        f"section ids are unique ({len(section_by_id)} sections)",
+        not duplicate_section_ids,
+        f"duplicated: {sorted(set(duplicate_section_ids))}",
+    ))
+
+    slide_indices_list: list[int] = []
+    for s in dict_slides:
+        idx = s.get("index")
+        if isinstance(idx, int) and not isinstance(idx, bool):
+            slide_indices_list.append(idx)
+    slide_index_set = set(slide_indices_list)
+
+    seen_overall: dict[int, str] = {}
+    duplicate_across_sections: list[tuple[int, str, str]] = []
+    section_problems: list[str] = []
+    for sec in dict_sections:
+        sid = sec.get("id")
+        if not isinstance(sid, str):
+            continue
+        s_indices_raw = sec.get("slide_indices")
+        s_indices = _as_list(s_indices_raw)
+        if s_indices is None:
+            section_problems.append(f"section {sid!r}: slide_indices is not a list")
+            continue
+        int_indices = [i for i in s_indices if isinstance(i, int) and not isinstance(i, bool)]
+        if len(int_indices) != len(s_indices):
+            section_problems.append(f"section {sid!r}: slide_indices has non-integer entries")
+        if len(set(int_indices)) != len(int_indices):
+            section_problems.append(f"section {sid!r}: slide_indices has duplicates within section")
+        for i in int_indices:
+            if i in seen_overall and seen_overall[i] != sid:
+                duplicate_across_sections.append((i, seen_overall[i], sid))
+            else:
+                seen_overall.setdefault(i, sid)
+    out.append(CheckResult(
+        "per-section slide_indices are well-formed (list of unique integers)",
+        not section_problems,
+        "; ".join(section_problems),
+    ))
+    out.append(CheckResult(
+        "no slide index appears in more than one section",
+        not duplicate_across_sections,
+        f"shared indices: {duplicate_across_sections}",
+    ))
+
+    section_indices_union = set(seen_overall)
+    missing_from_sections = sorted(slide_index_set - section_indices_union)
+    orphan_section_indices = sorted(section_indices_union - slide_index_set)
+    out.append(CheckResult(
+        f"sections cover every deck_plan slide index "
+        f"({len(slide_index_set)} slides, {len(section_indices_union)} indices listed by sections)",
+        not missing_from_sections,
+        f"slides missing from sections: {missing_from_sections}",
+    ))
+    out.append(CheckResult(
+        "sections list no slide indices the deck_plan does not declare",
+        not orphan_section_indices,
+        f"orphan section slide_indices: {orphan_section_indices}",
+    ))
+
+    for s in dict_slides:
+        idx = s.get("index")
+        sid = s.get("section_id")
+        if not isinstance(sid, str) or sid not in section_by_id:
+            out.append(CheckResult(
+                f"slide index {idx}: section_id {sid!r} exists in sections",
+                False,
+                f"known section ids: {sorted(section_by_id)}",
+            ))
+        else:
+            section_indices_raw = section_by_id[sid].get("slide_indices")
+            section_indices_list = _as_list(section_indices_raw) or []
+            out.append(CheckResult(
+                f"slide index {idx}: listed in section {sid!r}.slide_indices",
+                isinstance(idx, int) and idx in section_indices_list,
+                f"section_indices={section_indices_list}",
+            ))
+        srcs_raw = s.get("source_refs")
+        srcs = _as_list(srcs_raw)
+        if srcs is None:
+            out.append(CheckResult(
+                f"slide index {idx}: source_refs is a list",
+                False, f"got {type(srcs_raw).__name__}",
+            ))
+            continue
+        for ref in srcs:
+            if not isinstance(ref, str) or ref not in brief_refs:
+                out.append(CheckResult(
+                    f"slide index {idx}: source_ref {ref!r} declared in deck_brief.source_refs",
+                    False,
+                    f"brief source_refs: {sorted(brief_refs)}",
+                ))
+    return out
+
+
 def check_image_manifest(workspace: Path) -> list[CheckResult]:
     out: list[CheckResult] = []
     manifest_raw, err = _try_load(workspace / "image_manifest.json")
@@ -1215,6 +1430,194 @@ def negative_tempfixture_checks() -> list[CheckResult]:
     return out
 
 
+def _write_minimal_planner_workspace(ws: Path) -> None:
+    """Build a workspace whose deck_brief.json + deck_plan.json pass
+    check_planner_semantics. Used as the clean baseline that each
+    planner-semantics tempfixture mutates by exactly one rule violation."""
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "deck_brief.json").write_text(json.dumps({
+        "title": "T", "audience": "A", "objective": "O",
+        "source_refs": ["src_a", "src_b"],
+    }))
+    (ws / "deck_plan.json").write_text(json.dumps({
+        "template": "tpl",
+        "planning": {"planned_slide_count": 2, "rationale": "synthetic"},
+        "sections": [
+            {"id": "s1", "title": "S1", "summary": "x", "slide_indices": [1]},
+            {"id": "s2", "title": "S2", "summary": "x", "slide_indices": [2]},
+        ],
+        "slides": [
+            {"index": 1, "layout": "L", "title": "T1",
+             "section_id": "s1", "summary": "x", "density": "low",
+             "source_refs": ["src_a"]},
+            {"index": 2, "layout": "L", "title": "T2",
+             "section_id": "s2", "summary": "x", "density": "medium",
+             "source_refs": ["src_b"]},
+        ],
+    }))
+
+
+def negative_planner_semantics_tempfixture_checks() -> list[CheckResult]:
+    """Negative tempfixtures proving check_planner_semantics fails closed
+    on each cross-artifact invariant: planned_slide_count mismatch,
+    section coverage gaps (missing / duplicate-across-sections / orphan
+    indices), slide section_id pointing at an unknown section, slide
+    index not listed in its section, and slide source_ref not declared
+    in deck_brief. Each case builds a clean baseline workspace, applies
+    exactly one mutation, and asserts the targeted check failed."""
+    import tempfile
+    out: list[CheckResult] = []
+
+    # Sanity: the minimal baseline itself is clean. Catches regressions
+    # in either the baseline writer or check_planner_semantics.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        _write_minimal_planner_workspace(ws)
+        results = check_planner_semantics(ws)
+        out.append(CheckResult(
+            "tempfixture: minimal planner-semantics baseline passes check_planner_semantics",
+            all(r.ok for r in results),
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # A. planned_slide_count != len(slides).
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        _write_minimal_planner_workspace(ws)
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        deck["planning"]["planned_slide_count"] = 99
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        results = check_planner_semantics(ws)
+        detected = any(
+            "planning.planned_slide_count" in r.name
+            and "equals len(slides)" in r.name
+            and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: planned_slide_count mismatch is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # B. Section coverage is missing a slide index that deck_plan declares.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        _write_minimal_planner_workspace(ws)
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        for sec in deck["sections"]:
+            if sec["id"] == "s2":
+                sec["slide_indices"] = []
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        results = check_planner_semantics(ws)
+        detected = any(
+            "sections cover every deck_plan slide index" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: missing section coverage of a deck_plan slide is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # C. Duplicate index across two sections.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        _write_minimal_planner_workspace(ws)
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        for sec in deck["sections"]:
+            if sec["id"] == "s1":
+                sec["slide_indices"] = [1, 2]
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        results = check_planner_semantics(ws)
+        detected = any(
+            "no slide index appears in more than one section" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: duplicate slide index across sections is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # D. Orphan section index that the deck_plan does not declare.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        _write_minimal_planner_workspace(ws)
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        for sec in deck["sections"]:
+            if sec["id"] == "s2":
+                sec["slide_indices"] = [2, 99]
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        results = check_planner_semantics(ws)
+        detected = any(
+            "sections list no slide indices the deck_plan does not declare" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: orphan section slide_index is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # E. Slide.section_id is unknown.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        _write_minimal_planner_workspace(ws)
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        deck["slides"][0]["section_id"] = "__no_such_section__"
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        results = check_planner_semantics(ws)
+        detected = any(
+            "section_id '__no_such_section__' exists in sections" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: slide.section_id pointing at unknown section is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # F. Slide claims a section that does not list this index.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        _write_minimal_planner_workspace(ws)
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        deck["slides"][0]["section_id"] = "s2"
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        results = check_planner_semantics(ws)
+        detected = any(
+            "listed in section 's2'.slide_indices" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: slide.section_id that does not list this slide index is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # G. Slide.source_refs value not declared in deck_brief.source_refs.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        _write_minimal_planner_workspace(ws)
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        deck["slides"][0]["source_refs"] = ["__no_such_src__"]
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        results = check_planner_semantics(ws)
+        detected = any(
+            "source_ref '__no_such_src__' declared in deck_brief.source_refs" in r.name
+            and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: slide.source_ref not declared in deck_brief is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    return out
+
+
 def _print(section: str, results: list[CheckResult]) -> int:
     print(f"\n== {section} ==")
     fails = 0
@@ -1252,6 +1655,9 @@ def main(argv: list[str]) -> int:
          check_template_files_for_workspace(args.workspace, args.template_root)),
         ("slide_plan coverage: 1:1 with deck_plan + required slots",
          check_slide_plan_coverage(args.workspace, args.template_root)),
+        ("planner semantics: planned_slide_count, section coverage, "
+         "slide.section_id, slide.source_refs vs. deck_brief.source_refs",
+         check_planner_semantics(args.workspace)),
         ("image_manifest: path-safety + media resolution + image_refs",
          check_image_manifest(args.workspace)),
         ("negative: unsafe scheme, absolute, traversal, missing media, "
@@ -1262,6 +1668,10 @@ def main(argv: list[str]) -> int:
          "slide_plan index, missing deck_plan.json without traceback, "
          "malformed-but-loadable artifacts without traceback",
          negative_tempfixture_checks()),
+        ("negative tempfixtures (planner semantics): planned_slide_count "
+         "mismatch, missing / duplicate / orphan section indices, "
+         "unknown / mis-listed slide.section_id, undeclared slide.source_refs",
+         negative_planner_semantics_tempfixture_checks()),
     ]
     fails = 0
     for title, results in sections:

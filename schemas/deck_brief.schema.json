@@ -4,7 +4,7 @@
   "title": "Deck Brief",
   "description": "First structured artifact in the pipeline. Captures what the deck is for and the high-level constraints. No raw sensitive source text belongs here.",
   "type": "object",
-  "required": ["title", "audience", "objective"],
+  "required": ["title", "audience", "objective", "source_refs"],
   "additionalProperties": false,
   "properties": {
     "title": {
@@ -54,8 +54,9 @@
     },
     "source_refs": {
       "type": "array",
-      "description": "Opaque identifiers of source documents. Do not put raw sensitive content here.",
-      "items": { "type": "string" }
+      "minItems": 1,
+      "description": "Opaque identifiers of source documents. Required and non-empty so every slide can reference the source bundle it came from. Do not put raw sensitive content here.",
+      "items": { "type": "string", "minLength": 1 }
     }
   }
 }

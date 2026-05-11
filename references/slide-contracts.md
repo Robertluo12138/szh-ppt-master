@@ -12,6 +12,16 @@ The shape rules here apply to **any** deck the planner produces — short or lon
 - `deck_plan.slides[]` is an ordered array with `minItems: 1` only. There is no universal upper bound and no required mix of layouts.
 - A `deck_plan` is allowed to include or omit any layout the chosen template family declares (agenda, section dividers, KPI dashboards, timelines, conclusion, etc.); none is mandatory.
 
+## Planner contract (machine-enforced)
+
+The planner contract is enforced by schema **and** by cross-artifact checks in `scripts/validate_workspace.py` / `scripts/validate_scaffold.py`. Neither check fixes a maximum slide count or a required layout sequence:
+
+- `deck_brief.source_refs` is **required and non-empty** — every brief lists the opaque source identifiers the deck draws from. Raw sensitive text never goes here.
+- `deck_plan.planning.planned_slide_count` is required and must equal `len(deck_plan.slides)`. The validator catches drift between the planner's declared length and the actual slide list.
+- `deck_plan.planning.rationale` is a required short string. It records *why* the planner chose this length and section structure for this brief.
+- `deck_plan.sections[]` is required and non-empty. Each section carries `id`, `title`, `summary`, and `slide_indices`. The union of all `slide_indices` must equal the set of `deck_plan.slides[].index` values, with no duplicates across sections, no missing deck indices, and no orphan section indices.
+- Every `deck_plan.slides[]` entry carries `section_id`, `summary`, `density` (enum `low` / `medium` / `high`), and a non-empty `source_refs`. The validator requires `section_id` to resolve to an existing section, the slide's `index` to be listed in that section's `slide_indices`, and every `source_refs` value to be declared in `deck_brief.source_refs`.
+
 ## Artifacts
 
 | Artifact | Schema | Produced by | Required to start |

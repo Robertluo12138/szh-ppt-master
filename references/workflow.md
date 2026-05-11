@@ -19,10 +19,21 @@ The skill is a single linear pipeline. Stages are append-only; do not skip or re
 
 The Brief and Plan stages are **adaptive**, not template-driven:
 
-- The Brief stage derives `deck_brief.json` from the user's request and the normalized source. It captures intent, audience, objective, and any explicit constraints (including `approximate_slide_count` if the caller supplied one).
+- The Brief stage derives `deck_brief.json` from the user's request and the normalized source. It captures intent, audience, objective, and any explicit constraints (including `approximate_slide_count` if the caller supplied one). `source_refs` is required and non-empty: every brief lists the opaque source identifiers the deck draws from.
 - The Plan stage chooses, for that specific brief: **target slide count**, **section structure**, **which layouts each slide uses**, and **per-slide density**. There is no universal sequence — agenda, section dividers, KPI dashboards, timelines, and conclusion slides are tools the planner *may* use, not slots it *must* fill.
 - Expected capacity range is **12–25 slides** as guidance; a real run may produce 6, 8, 10, 15, 20, 25, or another reasonable count. The number depends on the brief, not on the template.
 - Different scenarios produce different shapes — e.g. executive summary, product proposal, technical solution, project review, research report, training deck, strategy memo. Template families exist to provide the layout vocabulary; they do not dictate slide count or order.
+
+### Planner contract (machine-enforced)
+
+`deck_plan.json` carries a stricter planner contract that the validators cross-check, while still imposing **no** maximum slide count or required layout sequence:
+
+- `deck_plan.planning.planned_slide_count` must equal `len(deck_plan.slides)`.
+- `deck_plan.planning.rationale` is a required short string explaining the planner's length / structure choice.
+- `deck_plan.sections[]` (`id`, `title`, `summary`, `slide_indices`) partitions the deck: the union of every section's `slide_indices` must equal the set of `slides[].index` values — no duplicates across sections, no missing deck indices, no orphan section indices.
+- Each `slides[]` entry carries `section_id` (must exist; the slide's index must be listed by that section), `summary`, `density` (`low` / `medium` / `high`), and a non-empty `source_refs` whose values must all be declared in `deck_brief.source_refs`.
+
+See `references/slide-contracts.md` and the schemas under `schemas/` for the authoritative shape; `references/quality-gates.md` lists the matching gates.
 
 ## Invariants
 

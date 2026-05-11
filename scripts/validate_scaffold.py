@@ -650,6 +650,11 @@ def main() -> int:
         ("path-safety predicate (workspace-agnostic)", path_safety_checker_checks()),
     ]
 
+    # Lazy import to avoid the circular dependency: validate_workspace
+    # already imports local_path_is_safe / _resolves_within /
+    # _slide_plan_against_layout from this module at module load time.
+    from validate_workspace import check_planner_semantics
+
     # Per-workspace positive + per-workspace negatives. The label embeds the
     # workspace path so failures point at a specific example.
     for ws in workspaces:
@@ -665,6 +670,8 @@ def main() -> int:
              media_resolution_checks(ws)),
             (f"layout-aware slide_plan coverage ({label})",
              layout_aware_slide_plan_checks(DEFAULT_TEMPLATE, ws)),
+            (f"planner semantics ({label})",
+             check_planner_semantics(ws)),
         ])
 
     # Layout-aware negative-mutation tests pick fixtures dynamically so we

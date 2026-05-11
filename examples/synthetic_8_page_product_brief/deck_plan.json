@@ -1,13 +1,119 @@
 {
   "template": "business_review",
+  "planning": {
+    "planned_slide_count": 8,
+    "rationale": "Synthetic lower-range fixture: six short sections (overview, proposition, proposal, rollout, risks, close) cover an 8-slide product brief that reuses the business_review layout vocabulary."
+  },
+  "sections": [
+    {
+      "id": "overview",
+      "title": "Overview",
+      "summary": "Cover and product overview.",
+      "slide_indices": [1, 2]
+    },
+    {
+      "id": "proposition",
+      "title": "Proposition",
+      "summary": "Single-statement core proposition.",
+      "slide_indices": [3]
+    },
+    {
+      "id": "proposal",
+      "title": "Proposal",
+      "summary": "Problem and solution plus target metrics.",
+      "slide_indices": [4, 5]
+    },
+    {
+      "id": "rollout",
+      "title": "Rollout",
+      "summary": "Placeholder rollout milestones.",
+      "slide_indices": [6]
+    },
+    {
+      "id": "risks",
+      "title": "Risks",
+      "summary": "Risks and placeholder mitigations.",
+      "slide_indices": [7]
+    },
+    {
+      "id": "close",
+      "title": "Close",
+      "summary": "Next steps and approval asks.",
+      "slide_indices": [8]
+    }
+  ],
   "slides": [
-    { "index": 1, "layout": "cover",             "title": "Synthetic Product Brief: Project Placeholder", "summary": "Title, presenter, and placeholder date." },
-    { "index": 2, "layout": "executive_summary", "title": "Product Overview" },
-    { "index": 3, "layout": "key_message",       "title": "Core Proposition" },
-    { "index": 4, "layout": "two_column",        "title": "Problem and Solution" },
-    { "index": 5, "layout": "kpi_dashboard",     "title": "Target Metrics" },
-    { "index": 6, "layout": "timeline",          "title": "Rollout Plan" },
-    { "index": 7, "layout": "two_column",        "title": "Risks and Mitigations" },
-    { "index": 8, "layout": "conclusion",        "title": "Next Steps" }
+    {
+      "index": 1,
+      "layout": "cover",
+      "title": "Synthetic Product Brief: Project Placeholder",
+      "section_id": "overview",
+      "summary": "Title, presenter, and placeholder date.",
+      "density": "low",
+      "source_refs": ["synthetic_source_p"]
+    },
+    {
+      "index": 2,
+      "layout": "executive_summary",
+      "title": "Product Overview",
+      "section_id": "overview",
+      "summary": "Qualitative description of the proposed product.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_p", "synthetic_source_q"]
+    },
+    {
+      "index": 3,
+      "layout": "key_message",
+      "title": "Core Proposition",
+      "section_id": "proposition",
+      "summary": "Single placeholder core proposition statement.",
+      "density": "low",
+      "source_refs": ["synthetic_source_p"]
+    },
+    {
+      "index": 4,
+      "layout": "two_column",
+      "title": "Problem and Solution",
+      "section_id": "proposal",
+      "summary": "Problem on the left, proposed solution on the right.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_p", "synthetic_source_q"]
+    },
+    {
+      "index": 5,
+      "layout": "kpi_dashboard",
+      "title": "Target Metrics",
+      "section_id": "proposal",
+      "summary": "Three placeholder target metrics.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_q"]
+    },
+    {
+      "index": 6,
+      "layout": "timeline",
+      "title": "Rollout Plan",
+      "section_id": "rollout",
+      "summary": "Placeholder rollout milestones.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_p"]
+    },
+    {
+      "index": 7,
+      "layout": "two_column",
+      "title": "Risks and Mitigations",
+      "section_id": "risks",
+      "summary": "Risks on the left, placeholder mitigations on the right.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_p", "synthetic_source_q"]
+    },
+    {
+      "index": 8,
+      "layout": "conclusion",
+      "title": "Next Steps",
+      "section_id": "close",
+      "summary": "Two synthetic approval requests for the proposal.",
+      "density": "medium",
+      "source_refs": ["synthetic_source_p", "synthetic_source_q"]
+    }
   ]
 }
