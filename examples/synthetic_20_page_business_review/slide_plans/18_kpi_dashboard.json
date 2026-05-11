@@ -1,0 +1,19 @@
+{
+  "index": 18,
+  "layout": "kpi_dashboard",
+  "title": "Projected KPIs",
+  "blocks": [
+    { "id": "title", "kind": "text", "content": "Projected KPIs" },
+    {
+      "id": "kpis",
+      "kind": "kpi",
+      "content": [
+        { "label": "metric_a", "value": "<projected_value>", "delta": "<projected_delta>" },
+        { "label": "metric_b", "value": "<projected_value>", "delta": "<projected_delta>" },
+        { "label": "metric_c", "value": "<projected_value>", "delta": "<projected_delta>" },
+        { "label": "metric_d", "value": "<projected_value>", "delta": "<projected_delta>" }
+      ]
+    }
+  ],
+  "notes": "All projected KPI values are placeholders."
+}

@@ -1,0 +1,17 @@
+{
+  "index": 20,
+  "layout": "conclusion",
+  "title": "Decisions Requested",
+  "blocks": [
+    { "id": "title",   "kind": "text", "content": "Decisions Requested" },
+    { "id": "summary", "kind": "text", "content": "Two synthetic decision requests close the deck." },
+    {
+      "id": "call_to_action",
+      "kind": "list",
+      "content": [
+        "Approve placeholder initiative one",
+        "Approve placeholder initiative two"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "index": 5,
+  "layout": "kpi_dashboard",
+  "title": "Target Metrics",
+  "blocks": [
+    { "id": "title", "kind": "text", "content": "Target Metrics" },
+    {
+      "id": "kpis",
+      "kind": "kpi",
+      "content": [
+        { "label": "metric_x", "value": "<value>", "delta": "<delta>" },
+        { "label": "metric_y", "value": "<value>", "delta": "<delta>" },
+        { "label": "metric_z", "value": "<value>", "delta": "<delta>" }
+      ]
+    }
+  ],
+  "notes": "All KPI values are placeholders."
+}

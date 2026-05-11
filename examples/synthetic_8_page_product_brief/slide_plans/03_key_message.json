@@ -1,0 +1,10 @@
+{
+  "index": 3,
+  "layout": "key_message",
+  "title": "Core Proposition",
+  "blocks": [
+    { "id": "title",           "kind": "text",    "content": "Core Proposition" },
+    { "id": "message",         "kind": "callout", "content": "Synthetic placeholder proposition statement." },
+    { "id": "supporting_text", "kind": "text",    "content": "Qualitative placeholder supporting context; no financial figures." }
+  ]
+}

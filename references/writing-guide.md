@@ -2,6 +2,10 @@
 
 Rules for the natural-language content of slides (titles, key points, summaries, notes).
 
+## Adaptive content shape
+
+The Brief stage and the Plan stage decide what the deck looks like for that specific request — its length, section structure, and per-slide density all come from the brief, not from a fixed template. The writing rules below apply to whatever slides the planner chose; they do not assume a particular sequence (agenda → sections → KPIs → conclusion) and they do not assume a slide count. A 6-page strategy memo and a 25-page research report use the same writing rules but populate very different layouts.
+
 ## Source fidelity
 
 - Slide content must trace back to the source bundle. The skill must not fabricate statistics, dates, names, or quotations.

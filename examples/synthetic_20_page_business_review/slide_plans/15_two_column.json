@@ -1,0 +1,28 @@
+{
+  "index": 15,
+  "layout": "two_column",
+  "title": "Risk vs. Mitigation",
+  "blocks": [
+    { "id": "title",         "kind": "text", "content": "Risk vs. Mitigation" },
+    { "id": "left_heading",  "kind": "text", "content": "Risk" },
+    {
+      "id": "left_content",
+      "kind": "list",
+      "content": [
+        "Placeholder risk one",
+        "Placeholder risk two",
+        "Placeholder risk three"
+      ]
+    },
+    { "id": "right_heading", "kind": "text", "content": "Mitigation" },
+    {
+      "id": "right_content",
+      "kind": "list",
+      "content": [
+        "Placeholder mitigation one",
+        "Placeholder mitigation two",
+        "Placeholder mitigation three"
+      ]
+    }
+  ]
+}

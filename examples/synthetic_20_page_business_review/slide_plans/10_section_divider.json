@@ -1,0 +1,9 @@
+{
+  "index": 10,
+  "layout": "section_divider",
+  "title": "Operations",
+  "blocks": [
+    { "id": "section_number", "kind": "text", "content": "03" },
+    { "id": "section_title",  "kind": "text", "content": "Operations" }
+  ]
+}

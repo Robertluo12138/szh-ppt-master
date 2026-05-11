@@ -1,0 +1,10 @@
+{
+  "index": 13,
+  "layout": "section_divider",
+  "title": "Risks",
+  "blocks": [
+    { "id": "section_number", "kind": "text",      "content": "04" },
+    { "id": "section_title",  "kind": "text",      "content": "Risks" }
+  ],
+  "image_refs": ["section_icon_risks"]
+}

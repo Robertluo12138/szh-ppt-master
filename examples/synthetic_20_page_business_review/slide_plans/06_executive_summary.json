@@ -1,0 +1,18 @@
+{
+  "index": 6,
+  "layout": "executive_summary",
+  "title": "Quarter Performance Summary",
+  "blocks": [
+    { "id": "title",   "kind": "text", "content": "Quarter Performance Summary" },
+    { "id": "summary", "kind": "text", "content": "Qualitative placeholder summary of the quarter's performance." },
+    {
+      "id": "key_points",
+      "kind": "list",
+      "content": [
+        "Placeholder achievement one",
+        "Placeholder achievement two",
+        "Placeholder achievement three"
+      ]
+    }
+  ]
+}

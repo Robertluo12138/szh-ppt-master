@@ -1,0 +1,9 @@
+{
+  "index": 3,
+  "layout": "section_divider",
+  "title": "Market Context",
+  "blocks": [
+    { "id": "section_number", "kind": "text", "content": "01" },
+    { "id": "section_title",  "kind": "text", "content": "Market Context" }
+  ]
+}

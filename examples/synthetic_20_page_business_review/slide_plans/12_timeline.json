@@ -1,0 +1,18 @@
+{
+  "index": 12,
+  "layout": "timeline",
+  "title": "Quarter Timeline",
+  "blocks": [
+    { "id": "title", "kind": "text", "content": "Quarter Timeline" },
+    {
+      "id": "timeline_items",
+      "kind": "list",
+      "content": [
+        "Placeholder milestone one",
+        "Placeholder milestone two",
+        "Placeholder milestone three",
+        "Placeholder milestone four"
+      ]
+    }
+  ]
+}

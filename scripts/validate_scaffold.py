@@ -2,14 +2,25 @@
 """validate_scaffold.py
 
 Stdlib-only scaffold check. Runs:
-  - positive: every synthetic fixture validates against its schema
+  - positive: every synthetic fixture under every example workspace
+    in examples/ validates against its schema
   - negative: removing a required field makes validation fail
-  - image_manifest path-safety: rejects http://, https://, file://,
-    absolute paths, and '..' segments
+  - image_manifest path-safety: rejects ANY URI-like scheme prefix
+    (http, https, file, s3, ftp, data, mailto, javascript, ...),
+    POSIX-absolute paths, leading backslash, protocol-relative
+    '//host/...', Windows drive prefixes, '..' segments, and empty
+    strings — same rule as scripts/validate_workspace.py
   - layout-aware slide_plan: every required layout slot is covered by
     a matching block id and kind (and dropping one is caught)
   - template / theme / layout cross-check: schemas validate, the
-    template's declared layout list matches the files on disk.
+    template's declared layout list matches the files on disk; the
+    theme load is gated in two stages and is fail-closed.
+
+Example workspaces are discovered dynamically: any subdirectory of
+examples/ that contains deck_plan.json and slide_plans/ is treated as
+a workspace. No example name (and no fixed slide count) is hardcoded.
+The shipped fixtures span a range of deck lengths to demonstrate that
+the pipeline does not assume one universal deck shape.
 
 Exit 0 if every check (including negatives) behaved as expected.
 Exit 1 otherwise. Scope is intentionally narrow: SVG, PPTX, charts,
@@ -32,8 +43,7 @@ from validate_artifacts import _validate  # noqa: E402
 SCHEMAS = REPO_ROOT / "schemas"
 EXAMPLES = REPO_ROOT / "examples"
 TEMPLATES = REPO_ROOT / "templates" / "layouts"
-EXAMPLE_DIR = EXAMPLES / "synthetic_20_page_business_review"
-SLIDE_PLANS_DIR = EXAMPLE_DIR / "slide_plans"
+DEFAULT_TEMPLATE = TEMPLATES / "business_review"
 
 
 @dataclass
@@ -53,14 +63,29 @@ def _schema_validate(artifact: dict, schema_path: Path) -> list[str]:
     return errors
 
 
-def positive_checks() -> list[CheckResult]:
+def discover_workspaces() -> list[Path]:
+    """Return every example workspace under examples/ that has the
+    expected pipeline artifacts on disk. The runner uses this list to
+    iterate positive / per-workspace checks — no example name (and no
+    fixed slide count) is hardcoded."""
+    out: list[Path] = []
+    if not EXAMPLES.is_dir():
+        return out
+    for example_dir in sorted(p for p in EXAMPLES.iterdir() if p.is_dir()):
+        if (example_dir / "deck_plan.json").is_file() and (example_dir / "slide_plans").is_dir():
+            out.append(example_dir)
+    return out
+
+
+def positive_checks(workspace: Path) -> list[CheckResult]:
+    plans_dir = workspace / "slide_plans"
     cases: list[tuple[str, Path]] = [
-        ("deck_brief.schema.json", EXAMPLE_DIR / "deck_brief.json"),
-        ("deck_plan.schema.json", EXAMPLE_DIR / "deck_plan.json"),
-        ("design_system.schema.json", EXAMPLE_DIR / "design_system.json"),
-        ("image_manifest.schema.json", EXAMPLE_DIR / "image_manifest.json"),
+        ("deck_brief.schema.json",     workspace / "deck_brief.json"),
+        ("deck_plan.schema.json",      workspace / "deck_plan.json"),
+        ("design_system.schema.json",  workspace / "design_system.json"),
+        ("image_manifest.schema.json", workspace / "image_manifest.json"),
     ]
-    for sp in sorted(SLIDE_PLANS_DIR.glob("*.json")):
+    for sp in sorted(plans_dir.glob("*.json")):
         cases.append(("slide_plan.schema.json", sp))
     out: list[CheckResult] = []
     for schema_name, fixture in cases:
@@ -73,14 +98,18 @@ def positive_checks() -> list[CheckResult]:
     return out
 
 
-def negative_required_field_checks() -> list[CheckResult]:
-    cases = [
-        ("deck_brief.schema.json", EXAMPLE_DIR / "deck_brief.json", "title"),
-        ("deck_plan.schema.json", EXAMPLE_DIR / "deck_plan.json", "template"),
-        ("design_system.schema.json", EXAMPLE_DIR / "design_system.json", "palette"),
-        ("slide_plan.schema.json", SLIDE_PLANS_DIR / "01_cover.json", "layout"),
-        ("image_manifest.schema.json", EXAMPLE_DIR / "image_manifest.json", "images"),
+def negative_required_field_checks(workspace: Path) -> list[CheckResult]:
+    plans_dir = workspace / "slide_plans"
+    plan_files = sorted(plans_dir.glob("*.json"))
+    sample_plan = plan_files[0] if plan_files else None
+    cases: list[tuple[str, Path, str]] = [
+        ("deck_brief.schema.json",     workspace / "deck_brief.json",     "title"),
+        ("deck_plan.schema.json",      workspace / "deck_plan.json",      "template"),
+        ("design_system.schema.json",  workspace / "design_system.json",  "palette"),
+        ("image_manifest.schema.json", workspace / "image_manifest.json", "images"),
     ]
+    if sample_plan is not None:
+        cases.append(("slide_plan.schema.json", sample_plan, "layout"))
     out: list[CheckResult] = []
     for schema_name, fixture, field in cases:
         artifact = _load(fixture)
@@ -88,7 +117,7 @@ def negative_required_field_checks() -> list[CheckResult]:
         errors = _schema_validate(artifact, SCHEMAS / schema_name)
         triggered = any(f"missing required property '{field}'" in e for e in errors)
         out.append(CheckResult(
-            f"removing '{field}' from {fixture.name} must fail",
+            f"removing '{field}' from {fixture.relative_to(REPO_ROOT)} must fail",
             triggered,
             "" if triggered else "validation unexpectedly passed",
         ))
@@ -224,7 +253,9 @@ def _theme_load_results(template_dir: Path, template: dict) -> list[CheckResult]
     return out
 
 
-def image_manifest_path_safety_checks() -> list[CheckResult]:
+def path_safety_checker_checks() -> list[CheckResult]:
+    """Workspace-agnostic path-safety predicate tests. Runs the same
+    unsafe / safe input vectors regardless of which examples exist."""
     out: list[CheckResult] = []
     for unsafe in UNSAFE_IMAGE_PATHS:
         out.append(CheckResult(
@@ -236,13 +267,20 @@ def image_manifest_path_safety_checks() -> list[CheckResult]:
             f"path-safety accepts safe path {safe!r}",
             local_path_is_safe(safe),
         ))
-    manifest = _load(EXAMPLE_DIR / "image_manifest.json")
+    return out
+
+
+def image_manifest_path_safety_checks(workspace: Path) -> list[CheckResult]:
+    out: list[CheckResult] = []
+    manifest = _load(workspace / "image_manifest.json")
     unsafe_entries = [
         img for img in manifest["images"]
         if not local_path_is_safe(img["local_path"])
     ]
     out.append(CheckResult(
-        "shipped image_manifest fixture contains only safe local_paths",
+        f"shipped image_manifest in {workspace.relative_to(REPO_ROOT)} "
+        f"contains only safe local_paths "
+        f"({len(manifest['images'])} image entries)",
         not unsafe_entries,
         ", ".join(img["local_path"] for img in unsafe_entries),
     ))
@@ -256,30 +294,32 @@ def media_resolution_checks(workspace: Path) -> list[CheckResult]:
     out: list[CheckResult] = []
     manifest = _load(workspace / "image_manifest.json")
     declared_ids = {img["id"] for img in manifest["images"]}
+    label = workspace.relative_to(REPO_ROOT)
     for img in manifest["images"]:
         asset = workspace / img["local_path"]
         out.append(CheckResult(
-            f"manifest entry '{img['id']}' resolves to {img['local_path']}",
+            f"{label}: manifest entry '{img['id']}' resolves to {img['local_path']}",
             asset.is_file(),
             f"missing file at {asset}",
         ))
-    for plan_file in sorted(SLIDE_PLANS_DIR.glob("*.json")):
+    plans_dir = workspace / "slide_plans"
+    for plan_file in sorted(plans_dir.glob("*.json")):
         plan = _load(plan_file)
         for ref in plan.get("image_refs", []):
             out.append(CheckResult(
-                f"slide_plan {plan_file.name} image_ref '{ref}' declared in manifest",
+                f"{label}: slide_plan {plan_file.name} image_ref '{ref}' declared in manifest",
                 ref in declared_ids,
                 f"unknown image id '{ref}'",
             ))
     # Negative: a fabricated missing path must be flagged.
-    fake = workspace / "assets" / "does_not_exist.svg"
+    fake = workspace / "assets" / "does_not_exist_synthetic_xyz.svg"
     out.append(CheckResult(
-        "fabricated missing media path is detected as missing",
+        f"{label}: fabricated missing media path is detected as missing",
         not fake.is_file(),
     ))
     # Negative: an undeclared image_ref id must be flagged.
     out.append(CheckResult(
-        "fabricated undeclared image_ref is detected as unknown",
+        f"{label}: fabricated undeclared image_ref is detected as unknown",
         "no_such_id_xyz" not in declared_ids,
     ))
     return out
@@ -293,62 +333,134 @@ def _load_layouts(template_dir: Path) -> dict[str, dict]:
 
 
 def _slide_plan_against_layout(plan: dict, layout: dict) -> list[str]:
-    blocks_by_id = {b.get("id"): b for b in plan.get("blocks", []) if b.get("id")}
+    """Return human-readable problems describing where slide_plan
+    blocks do not cover the layout's required slots. Defensive against
+    malformed-but-loadable plan/layout JSON: a missing 'slots' key,
+    non-dict slot entries, missing 'required'/'id'/'type' on a slot,
+    or a non-dict block all surface as a clear problem string rather
+    than tracebacking the validator."""
+    plan_blocks = plan.get("blocks", []) if isinstance(plan, dict) else []
+    if not isinstance(plan_blocks, list):
+        plan_blocks = []
+    blocks_by_id: dict[str, dict] = {}
+    for b in plan_blocks:
+        if isinstance(b, dict) and isinstance(b.get("id"), str):
+            blocks_by_id[b["id"]] = b
+    if not isinstance(layout, dict):
+        return [f"layout is not an object: got {type(layout).__name__}"]
+    slots = layout.get("slots")
+    if not isinstance(slots, list):
+        return [f"layout.slots is not a list: got {type(slots).__name__}"]
     problems: list[str] = []
-    for slot in layout["slots"]:
-        if not slot["required"]:
+    for i, slot in enumerate(slots):
+        if not isinstance(slot, dict):
+            problems.append(f"slots[{i}] is not an object: got {type(slot).__name__}")
             continue
-        block = blocks_by_id.get(slot["id"])
+        if not slot.get("required"):
+            continue
+        slot_id = slot.get("id")
+        slot_type = slot.get("type")
+        if not isinstance(slot_id, str) or not isinstance(slot_type, str):
+            problems.append(f"slots[{i}] missing string 'id'/'type'")
+            continue
+        block = blocks_by_id.get(slot_id)
         if block is None:
-            problems.append(f"missing required slot '{slot['id']}'")
+            problems.append(f"missing required slot '{slot_id}'")
             continue
-        if block["kind"] != slot["type"]:
+        if block.get("kind") != slot_type:
             problems.append(
-                f"slot '{slot['id']}' expected kind '{slot['type']}', "
-                f"got '{block['kind']}'"
+                f"slot '{slot_id}' expected kind '{slot_type}', "
+                f"got '{block.get('kind')}'"
             )
     return problems
 
 
-def layout_aware_slide_plan_checks(template_dir: Path) -> list[CheckResult]:
+def _find_plan_by_layout(workspaces: list[Path], layout: str) -> Path | None:
+    """Return the first slide_plan in any provided workspace whose
+    layout matches. None if no example uses that layout. Used by the
+    negative-mutation checks so they don't depend on a specific
+    fixture path."""
+    for ws in workspaces:
+        plans_dir = ws / "slide_plans"
+        if not plans_dir.is_dir():
+            continue
+        for plan_file in sorted(plans_dir.glob("*.json")):
+            plan = _load(plan_file)
+            if plan.get("layout") == layout:
+                return plan_file
+    return None
+
+
+def layout_aware_slide_plan_checks(template_dir: Path, workspace: Path) -> list[CheckResult]:
     layouts = _load_layouts(template_dir)
     out: list[CheckResult] = []
-    plan_files = sorted(SLIDE_PLANS_DIR.glob("*.json"))
+    plan_files = sorted((workspace / "slide_plans").glob("*.json"))
+    label = workspace.relative_to(REPO_ROOT)
     for plan_file in plan_files:
         plan = _load(plan_file)
         layout_name = plan["layout"]
         if layout_name not in layouts:
             out.append(CheckResult(
-                f"layout-aware: {plan_file.name} references unknown layout {layout_name!r}",
+                f"{label}: {plan_file.name} references unknown layout {layout_name!r}",
                 False,
             ))
             continue
         problems = _slide_plan_against_layout(plan, layouts[layout_name])
         out.append(CheckResult(
-            f"layout-aware: {plan_file.name} covers required slots of {layout_name}",
+            f"{label}: {plan_file.name} covers required slots of {layout_name}",
             not problems,
             "; ".join(problems),
         ))
-    # Negative: remove a required block and confirm the check catches it.
-    cover_plan = _load(SLIDE_PLANS_DIR / "01_cover.json")
-    cover_plan["blocks"] = [b for b in cover_plan["blocks"] if b.get("id") != "title"]
-    problems = _slide_plan_against_layout(cover_plan, layouts["cover"])
-    out.append(CheckResult(
-        "layout-aware: dropping cover.title from slide_plan must be detected",
-        any("missing required slot 'title'" in p for p in problems),
-        "" if problems else "no problems reported",
-    ))
-    # Negative: wrong block kind for a required slot.
-    bad_kpi_plan = _load(SLIDE_PLANS_DIR / "08_kpi_dashboard.json")
-    for b in bad_kpi_plan["blocks"]:
-        if b.get("id") == "kpis":
-            b["kind"] = "text"
-    problems = _slide_plan_against_layout(bad_kpi_plan, layouts["kpi_dashboard"])
-    out.append(CheckResult(
-        "layout-aware: wrong kind on kpi_dashboard.kpis must be detected",
-        any("expected kind 'kpi'" in p for p in problems),
-        "" if problems else "no problems reported",
-    ))
+    return out
+
+
+def layout_aware_negative_mutation_checks(
+    template_dir: Path, workspaces: list[Path],
+) -> list[CheckResult]:
+    """Negative-mutation checks against whichever example provides a
+    slide_plan using the targeted layout. The mutations themselves
+    are layout-specific (drop a required slot, change a required slot's
+    block kind), but the source fixture is discovered, not hardcoded."""
+    layouts = _load_layouts(template_dir)
+    out: list[CheckResult] = []
+
+    cover_plan_path = _find_plan_by_layout(workspaces, "cover")
+    if cover_plan_path is None:
+        out.append(CheckResult(
+            "layout-aware negative: a 'cover' fixture is available in examples/",
+            False,
+            "no example slide_plan uses the 'cover' layout",
+        ))
+    else:
+        cover_plan = _load(cover_plan_path)
+        cover_plan["blocks"] = [b for b in cover_plan["blocks"] if b.get("id") != "title"]
+        problems = _slide_plan_against_layout(cover_plan, layouts["cover"])
+        out.append(CheckResult(
+            f"layout-aware: dropping cover.title from "
+            f"{cover_plan_path.relative_to(REPO_ROOT)} must be detected",
+            any("missing required slot 'title'" in p for p in problems),
+            "" if problems else "no problems reported",
+        ))
+
+    kpi_plan_path = _find_plan_by_layout(workspaces, "kpi_dashboard")
+    if kpi_plan_path is None:
+        out.append(CheckResult(
+            "layout-aware negative: a 'kpi_dashboard' fixture is available in examples/",
+            False,
+            "no example slide_plan uses the 'kpi_dashboard' layout",
+        ))
+    else:
+        bad_kpi_plan = _load(kpi_plan_path)
+        for b in bad_kpi_plan["blocks"]:
+            if b.get("id") == "kpis":
+                b["kind"] = "text"
+        problems = _slide_plan_against_layout(bad_kpi_plan, layouts["kpi_dashboard"])
+        out.append(CheckResult(
+            f"layout-aware: wrong kind on kpi_dashboard.kpis in "
+            f"{kpi_plan_path.relative_to(REPO_ROOT)} must be detected",
+            any("expected kind 'kpi'" in p for p in problems),
+            "" if problems else "no problems reported",
+        ))
     return out
 
 
@@ -523,18 +635,51 @@ def _print(section: str, results: list[CheckResult]) -> int:
 
 
 def main() -> int:
+    workspaces = discover_workspaces()
+    if not workspaces:
+        print(
+            "error: no example workspaces found under examples/. "
+            "Each workspace must contain deck_plan.json and slide_plans/.",
+            file=sys.stderr,
+        )
+        return 1
+
     sections: list[tuple[str, list[CheckResult]]] = [
-        ("positive: synthetic fixtures validate", positive_checks()),
-        ("negative: missing required fields must fail", negative_required_field_checks()),
-        ("image_manifest path-safety", image_manifest_path_safety_checks()),
-        ("image_manifest media resolution", media_resolution_checks(EXAMPLE_DIR)),
-        (
-            "layout-aware slide_plan coverage",
-            layout_aware_slide_plan_checks(TEMPLATES / "business_review"),
-        ),
+        # Workspace-agnostic predicate tests first so a regression in
+        # local_path_is_safe surfaces independently of any example.
+        ("path-safety predicate (workspace-agnostic)", path_safety_checker_checks()),
+    ]
+
+    # Per-workspace positive + per-workspace negatives. The label embeds the
+    # workspace path so failures point at a specific example.
+    for ws in workspaces:
+        label = ws.relative_to(REPO_ROOT)
+        sections.extend([
+            (f"positive: synthetic fixtures validate ({label})",
+             positive_checks(ws)),
+            (f"negative: missing required fields must fail ({label})",
+             negative_required_field_checks(ws)),
+            (f"image_manifest path-safety: shipped manifest ({label})",
+             image_manifest_path_safety_checks(ws)),
+            (f"image_manifest media resolution ({label})",
+             media_resolution_checks(ws)),
+            (f"layout-aware slide_plan coverage ({label})",
+             layout_aware_slide_plan_checks(DEFAULT_TEMPLATE, ws)),
+        ])
+
+    # Layout-aware negative-mutation tests pick fixtures dynamically so we
+    # don't depend on any single example's slide list.
+    sections.append((
+        "layout-aware negatives: mutations against discovered fixtures",
+        layout_aware_negative_mutation_checks(DEFAULT_TEMPLATE, workspaces),
+    ))
+
+    # Template / theme / layout cross-checks are workspace-independent.
+    sections.extend([
         ("template / theme / layout cross-check", template_consistency_checks()),
         ("negative: template guards reject bad inputs", template_negative_checks()),
-    ]
+    ])
+
     fails = 0
     for title, results in sections:
         fails += _print(title, results)
@@ -542,7 +687,11 @@ def main() -> int:
     if fails:
         print(f"FAIL: {fails} check(s) did not pass.")
         return 1
-    print("OK: all scaffold checks passed.")
+    print(
+        f"OK: all scaffold checks passed across "
+        f"{len(workspaces)} example workspace(s): "
+        f"{[str(ws.relative_to(REPO_ROOT)) for ws in workspaces]}"
+    )
     return 0
 
 

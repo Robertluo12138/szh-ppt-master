@@ -1,0 +1,13 @@
+{
+  "template": "business_review",
+  "slides": [
+    { "index": 1, "layout": "cover",             "title": "Synthetic Product Brief: Project Placeholder", "summary": "Title, presenter, and placeholder date." },
+    { "index": 2, "layout": "executive_summary", "title": "Product Overview" },
+    { "index": 3, "layout": "key_message",       "title": "Core Proposition" },
+    { "index": 4, "layout": "two_column",        "title": "Problem and Solution" },
+    { "index": 5, "layout": "kpi_dashboard",     "title": "Target Metrics" },
+    { "index": 6, "layout": "timeline",          "title": "Rollout Plan" },
+    { "index": 7, "layout": "two_column",        "title": "Risks and Mitigations" },
+    { "index": 8, "layout": "conclusion",        "title": "Next Steps" }
+  ]
+}

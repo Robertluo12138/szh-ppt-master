@@ -1,0 +1,9 @@
+{
+  "index": 5,
+  "layout": "section_divider",
+  "title": "Performance",
+  "blocks": [
+    { "id": "section_number", "kind": "text", "content": "02" },
+    { "id": "section_title",  "kind": "text", "content": "Performance" }
+  ]
+}

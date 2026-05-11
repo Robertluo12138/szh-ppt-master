@@ -1,0 +1,20 @@
+{
+  "index": 11,
+  "layout": "comparison_table",
+  "title": "Current Quarter vs. Prior Quarter",
+  "blocks": [
+    { "id": "title", "kind": "text", "content": "Current Quarter vs. Prior Quarter" },
+    {
+      "id": "table",
+      "kind": "table",
+      "content": {
+        "headers": ["metric", "prior_quarter", "current_quarter"],
+        "rows": [
+          ["placeholder_metric_a", "<value>", "<value>"],
+          ["placeholder_metric_b", "<value>", "<value>"],
+          ["placeholder_metric_c", "<value>", "<value>"]
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "index": 8,
+  "layout": "conclusion",
+  "title": "Next Steps",
+  "blocks": [
+    { "id": "title",   "kind": "text", "content": "Next Steps" },
+    { "id": "summary", "kind": "text", "content": "Two synthetic asks close the brief." },
+    {
+      "id": "call_to_action",
+      "kind": "list",
+      "content": [
+        "Approve placeholder scope",
+        "Approve placeholder timeline"
+      ]
+    }
+  ]
+}

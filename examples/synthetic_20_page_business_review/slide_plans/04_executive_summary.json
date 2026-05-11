@@ -1,0 +1,9 @@
+{
+  "index": 4,
+  "layout": "executive_summary",
+  "title": "Market Context Summary",
+  "blocks": [
+    { "id": "title",   "kind": "text", "content": "Market Context Summary" },
+    { "id": "summary", "kind": "text", "content": "Qualitative placeholder summary of the market context." }
+  ]
+}

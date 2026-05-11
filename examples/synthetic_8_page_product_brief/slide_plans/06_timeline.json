@@ -1,0 +1,17 @@
+{
+  "index": 6,
+  "layout": "timeline",
+  "title": "Rollout Plan",
+  "blocks": [
+    { "id": "title", "kind": "text", "content": "Rollout Plan" },
+    {
+      "id": "timeline_items",
+      "kind": "list",
+      "content": [
+        "Milestone A — placeholder",
+        "Milestone B — placeholder",
+        "Milestone C — placeholder"
+      ]
+    }
+  ]
+}

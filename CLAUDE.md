@@ -4,66 +4,111 @@
 
 `AGENTS.md` is intended for Codex only. Claude Code should not read, import, depend on, summarize, or edit `AGENTS.md` unless the user explicitly asks. Use this `CLAUDE.md` file as the implementation source of truth.
 
-## Project Role
+## Project Overview
 
-This repo is for an internal clean-room skill that turns prompts, reports, or Markdown into editable PowerPoint decks through controlled planning, SVG rendering, validation, and PPTX export.
+This repo is an internal clean-room skill for turning prompts, reports, or Markdown into editable PowerPoint decks through a controlled local pipeline.
 
-Implement only the work requested in the user's current prompt. Do not treat this file as a task list or roadmap.
+The project should meet the same business need as a PPT-generation workflow, but it must not copy implementation, wording, templates, examples, or assets from the parent `ppt-master` project. Treat that project as out of scope unless the user explicitly asks for a comparative review.
+
+Claude Code's job is to implement the user's current prompt narrowly, preserve the local-only and clean-room constraints, and keep the repo verifiable.
+
+## Current Capability Surface
+
+The repo currently contains scaffold docs, JSON schemas, template skeletons, synthetic examples, and stdlib-only validators. It does not yet implement real SVG generation, PPTX export, D-One integration, chart rendering, visual regression, or Qoder CLI integration.
+
+Do not document unimplemented stages as working behavior.
+
+## Architecture Notes
+
+Preferred pipeline:
+
+`input -> deck_brief -> adaptive deck_plan -> slide_plans -> layout model -> SVG preview -> native editable PPTX -> validation reports`
+
+Stable architecture direction:
+
+- `deck_brief`, `deck_plan`, `slide_plan`, template layouts, and the design system are the source of truth.
+- Deck length and structure are adaptive. Do not assume 20 slides, business-review sequencing, or mandatory agenda/KPI/timeline/conclusion pages.
+- Use a controlled rendering primitive model: text, shapes, lines, image slots, tables, KPI blocks, and simple charts.
+- SVG is the visual preview and inspection layer, but this repo should not become a broad arbitrary-SVG-to-PPTX converter.
+- Editable PPTX should be generated from the controlled model as native PowerPoint objects whenever possible.
+- D-One or similar image generation may only create local image assets. It must not generate full-slide screenshots or receive raw sensitive source text.
 
 ## Repo Conventions
 
-Expected stable layout, once created:
+- `SKILL.md`: skill-facing workflow status, invariants, and available commands.
+- `README.md`: maintainer usage and verification surface.
+- `SECURITY.md`: privacy and security policy.
+- `references/`: durable product/process contracts.
+- `schemas/`: JSON schemas for artifacts and template files.
+- `templates/`: layout and theme families.
+- `scripts/`: deterministic local tooling.
+- `examples/`: synthetic or redacted fixtures only.
+- `projects/`: generated local workspaces if needed; do not hardcode this path.
 
-- `SKILL.md` for skill behavior.
-- `README.md` for maintainer usage.
-- `SECURITY.md` for privacy and security policy.
-- `references/` for detailed workflow, design, writing, SVG, conversion, D-One, and quality-gate rules.
-- `schemas/` for JSON schemas.
-- `templates/` for internal layout and chart templates.
-- `scripts/` for local deterministic tooling.
-- `projects/` for generated local workspaces, without hardcoded project names.
-- `examples/` for synthetic or redacted examples only.
-
-Detailed product/process rules should live in `references/` after those files exist. Until then, mark missing sources as `TODO / not created yet` rather than expanding this file into a PRD.
-
-Do not document commands, dependencies, package formats, or validation results as real until the corresponding files exist.
+Use zero-padded slide artifact names when creating slide files, such as `01_cover.json` and `01_cover.svg`.
 
 ## Engineering Rules
 
 - If the `karpathy-guidelines` skill is available, use it for coding, review, and refactor work: keep changes simple, surgical, assumption-aware, and verifiable.
-- Keep changes narrow. Do not implement later phases or broad architecture rewrites unless explicitly asked.
-- Prefer structured schemas, templates, and deterministic validators over ad hoc conventions.
-- Preserve these pipeline invariants: `deck_plan` before SVG, per-slide plans before SVG, SVG as the intermediate layer, and editable PPTX as the main output.
-- D-One or similar image generation may only produce local image assets, never full-slide screenshots.
-- Qoder CLI and project handling must accept arbitrary paths; do not hardcode `projects/<name>`.
-- Mark missing decisions as TODOs or blockers instead of inventing policy, dependencies, or product behavior.
+- Keep changes narrow to the user's prompt. Do not implement later roadmap phases unless explicitly asked.
+- Prefer structured schemas, templates, and deterministic validators over prose-only conventions.
+- Preserve pipeline ordering: `deck_plan` before slide artwork, and per-slide plans before SVG.
+- Do not add a generic arbitrary-SVG parser/converter unless the user explicitly accepts that scope.
+- Do not add public-network behavior, telemetry, real-data examples, broad template markets, voiceover, video export, or complex animation without explicit user approval.
+- Mark missing product or technical decisions as TODOs or blockers instead of inventing behavior.
+- When changing schemas, update matching examples, validators, and docs in the same change.
+- When changing templates, update validators or examples that prove template/runtime alignment.
 
 ## Privacy Rules
 
 - Default to no public network access.
-- Do not add public scraping, public image search, telemetry, or undeclared remote calls without explicit user approval.
-- Do not commit real examples, credentials, endpoints, account IDs, customer names, or sensitive report text.
+- Do not add public scraping, public image search, telemetry, or undeclared remote calls.
+- Do not commit real company data, credentials, endpoints, account IDs, customer names, internal screenshots, or sensitive report text.
 - Do not send raw source documents or sensitive text to image-generation prompts.
-- Security checks should fail closed for external URLs, `file://`, absolute paths, unsafe PPTX relationships, missing media, or uncertain safety.
+- Outputs and manifests must not contain external URLs, `file://` links, absolute paths, undeclared remote media, or unsafe PPTX relationships.
+- Examples and tests must be synthetic or clearly redacted.
 
-## Verification Expectations
+## Verification Commands
 
-Run the narrowest real checks that cover the changed surface. When available, prefer:
+Use the narrowest real checks that cover the changed surface. Existing stdlib-only checks include:
 
-- schema validation for structured artifacts;
-- SVG validation for bounds, references, colors, fonts, and density;
-- PPTX inspection for editability, media, and relationship safety;
-- security scan output;
-- synthetic demo generation;
-- package/archive inspection.
+```bash
+python3 scripts/validate_scaffold.py
 
-If no verification command exists yet, say that clearly and describe the static checks performed.
+python3 scripts/validate_workspace.py \
+  --workspace examples/synthetic_20_page_business_review \
+  --template-root templates/layouts
+
+python3 scripts/validate_workspace.py \
+  --workspace examples/synthetic_8_page_product_brief \
+  --template-root templates/layouts
+```
+
+For single-artifact checks:
+
+```bash
+python3 scripts/validate_artifacts.py \
+  --schema schemas/deck_brief.schema.json \
+  examples/synthetic_20_page_business_review/deck_brief.json
+```
+
+If a relevant check does not exist yet, say that clearly and describe the static inspection performed.
 
 ## Reporting Expectations
 
 When finished, report:
 
 - files changed;
-- verification run;
+- verification run and exact result;
 - scope completed;
-- blockers, TODOs, or the next recommended step.
+- blockers, TODOs, or the recommended next step.
+
+## Roadmap Reference
+
+Background only. The current task must come from the user's prompt.
+
+- Planner contract: adaptive deck planning with sections, density, source references, and no fixed slide count.
+- Minimal vertical slice: a small controlled primitive set rendered to SVG preview and editable PPTX.
+- Quality gates: deterministic artifact, SVG, PPTX, editability, media, and security checks.
+- Internal image assets: D-One integration only after the local pipeline is stable.
+- Runtime packaging: Qoder/skill integration only after local generation and validation work end to end.

@@ -1,0 +1,27 @@
+{
+  "title": "Synthetic Product Brief",
+  "audience": "Internal product review (synthetic)",
+  "objective": "Communicate a synthetic product proposal in a short deck and request approval of two placeholder next steps.",
+  "tone": "neutral-professional",
+  "language": "en",
+  "approximate_slide_count": 8,
+  "key_messages": [
+    "Synthetic Product Team can deliver the proposal within the proposed scope.",
+    "Two placeholder asks require approval to start.",
+    "Three placeholder risks have placeholder mitigations."
+  ],
+  "constraints": {
+    "must_include": [
+      "Three placeholder target metrics",
+      "Two synthetic approval requests"
+    ],
+    "must_avoid": [
+      "Speculative financial guidance",
+      "Any real customer or product reference"
+    ]
+  },
+  "source_refs": [
+    "synthetic_source_p",
+    "synthetic_source_q"
+  ]
+}

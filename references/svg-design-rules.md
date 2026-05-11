@@ -13,7 +13,7 @@ SVG rendering is not implemented yet; this file is the contract the renderer mus
 ## References
 
 - Images are referenced by `id` from the slide's `image_manifest.json`, resolved to a relative `local_path` at render time.
-- External URLs (`http://`, `https://`, `//`, `file://`) and absolute paths are **forbidden** inside SVG. The validator must reject them.
+- Any URI-like scheme inside an SVG reference is **forbidden**. The validator must reject any string matching `^[A-Za-z][A-Za-z0-9+.\-]*:` (covers `http://`, `https://`, `file://`, `s3://`, `ftp://`, `data:`, `mailto:`, `javascript:`, and Windows drive prefixes like `C:`, `D:/`). POSIX-absolute paths (`/...`), leading-backslash, protocol-relative (`//host/...`), and any `..` segment are also forbidden — same fail-closed rule as `scripts/validate_workspace.py` and `scripts/validate_scaffold.py`'s `local_path_is_safe`.
 - Fonts must be referenced by family name only. No `@font-face` rules pointing to remote URLs.
 
 ## Color

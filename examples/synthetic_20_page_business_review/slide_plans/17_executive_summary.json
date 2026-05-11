@@ -1,0 +1,18 @@
+{
+  "index": 17,
+  "layout": "executive_summary",
+  "title": "Next-Quarter Plan",
+  "blocks": [
+    { "id": "title",   "kind": "text", "content": "Next-Quarter Plan" },
+    { "id": "summary", "kind": "text", "content": "Qualitative placeholder plan for the next quarter." },
+    {
+      "id": "key_points",
+      "kind": "list",
+      "content": [
+        "Resource one placeholder initiative",
+        "Track two placeholder risks",
+        "Re-baseline placeholder metric a"
+      ]
+    }
+  ]
+}

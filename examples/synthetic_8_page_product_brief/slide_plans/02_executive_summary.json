@@ -1,0 +1,18 @@
+{
+  "index": 2,
+  "layout": "executive_summary",
+  "title": "Product Overview",
+  "blocks": [
+    { "id": "title",   "kind": "text", "content": "Product Overview" },
+    { "id": "summary", "kind": "text", "content": "Qualitative placeholder description of the synthetic product proposal." },
+    {
+      "id": "key_points",
+      "kind": "list",
+      "content": [
+        "Placeholder goal one",
+        "Placeholder goal two",
+        "Placeholder goal three"
+      ]
+    }
+  ]
+}

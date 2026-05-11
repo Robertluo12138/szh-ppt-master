@@ -1,0 +1,13 @@
+{
+  "index": 1,
+  "layout": "cover",
+  "title": "Synthetic Product Brief: Project Placeholder",
+  "subtitle": "Internal product review",
+  "blocks": [
+    { "id": "title",     "kind": "text", "content": "Synthetic Product Brief: Project Placeholder" },
+    { "id": "subtitle",  "kind": "text", "content": "Internal product review" },
+    { "id": "presenter", "kind": "text", "content": "Synthetic Product Lead" },
+    { "id": "date",      "kind": "text", "content": "<date-placeholder>" }
+  ],
+  "notes": "All values are synthetic placeholders."
+}

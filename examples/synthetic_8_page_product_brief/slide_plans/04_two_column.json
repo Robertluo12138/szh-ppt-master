@@ -1,0 +1,26 @@
+{
+  "index": 4,
+  "layout": "two_column",
+  "title": "Problem and Solution",
+  "blocks": [
+    { "id": "title",         "kind": "text", "content": "Problem and Solution" },
+    { "id": "left_heading",  "kind": "text", "content": "Problem" },
+    {
+      "id": "left_content",
+      "kind": "list",
+      "content": [
+        "Placeholder problem one",
+        "Placeholder problem two"
+      ]
+    },
+    { "id": "right_heading", "kind": "text", "content": "Solution" },
+    {
+      "id": "right_content",
+      "kind": "list",
+      "content": [
+        "Placeholder solution one",
+        "Placeholder solution two"
+      ]
+    }
+  ]
+}
