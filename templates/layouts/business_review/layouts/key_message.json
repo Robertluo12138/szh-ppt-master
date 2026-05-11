@@ -1,0 +1,11 @@
+{
+  "name": "key_message",
+  "status": "skeleton",
+  "purpose": "Emphasizes a single statement, optionally with supporting context.",
+  "slots": [
+    { "id": "title",          "type": "text",    "required": false },
+    { "id": "message",        "type": "callout", "required": true },
+    { "id": "supporting_text","type": "text",    "required": false }
+  ],
+  "todo": "Define callout shape / accent treatment in the SVG layer."
+}

@@ -1,0 +1,26 @@
+{
+  "name": "business_review_default",
+  "version": "0.1.0",
+  "status": "scaffold",
+  "palette": {
+    "primary":    "#1F3A5F",
+    "secondary":  "#4A6FA5",
+    "accent":     "#F2B33D",
+    "background": "#FFFFFF",
+    "text":       "#1A1A1A"
+  },
+  "typography": {
+    "heading": { "font_family": "Inter", "size_pt": 28 },
+    "body":    { "font_family": "Inter", "size_pt": 14 }
+  },
+  "grid": {
+    "width_px": 1920,
+    "height_px": 1080,
+    "margin_px": 64
+  },
+  "todo": [
+    "Confirm font availability for PPTX export and define a fallback chain.",
+    "Confirm palette meets the contrast minimum chosen in references/style-guide.md.",
+    "Decide whether accent doubles as a chart-highlight color."
+  ]
+}

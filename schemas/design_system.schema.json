@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "design_system.schema.json",
+  "title": "Design System",
+  "description": "Concrete design tokens (palette, typography, grid) used by SVG render and PPTX export. Derived from the chosen template's theme plus deck-plan overrides.",
+  "type": "object",
+  "required": ["palette", "typography", "grid"],
+  "additionalProperties": false,
+  "properties": {
+    "palette": {
+      "type": "object",
+      "required": ["primary", "background", "text"],
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^#[0-9A-Fa-f]{6}$"
+      },
+      "properties": {
+        "primary":    { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "secondary":  { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "accent":     { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "background": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "text":       { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" }
+      }
+    },
+    "typography": {
+      "type": "object",
+      "required": ["heading", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "heading": {
+          "type": "object",
+          "required": ["font_family", "size_pt"],
+          "additionalProperties": false,
+          "properties": {
+            "font_family": { "type": "string", "minLength": 1 },
+            "size_pt": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        },
+        "body": {
+          "type": "object",
+          "required": ["font_family", "size_pt"],
+          "additionalProperties": false,
+          "properties": {
+            "font_family": { "type": "string", "minLength": 1 },
+            "size_pt": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        }
+      }
+    },
+    "grid": {
+      "type": "object",
+      "required": ["width_px", "height_px", "margin_px"],
+      "additionalProperties": false,
+      "properties": {
+        "width_px":  { "type": "integer", "exclusiveMinimum": 0 },
+        "height_px": { "type": "integer", "exclusiveMinimum": 0 },
+        "margin_px": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

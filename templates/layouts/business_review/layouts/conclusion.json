@@ -1,0 +1,11 @@
+{
+  "name": "conclusion",
+  "status": "skeleton",
+  "purpose": "Closing slide. Restates the main message and any explicit next steps.",
+  "slots": [
+    { "id": "title",          "type": "text", "required": true },
+    { "id": "summary",        "type": "text", "required": false },
+    { "id": "call_to_action", "type": "list", "required": false }
+  ],
+  "todo": "Decide whether a contact / Q&A slot is required by default."
+}

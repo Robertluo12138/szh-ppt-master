@@ -1,0 +1,10 @@
+{
+  "name": "agenda",
+  "status": "skeleton",
+  "purpose": "Lists the sections / topics the deck will cover.",
+  "slots": [
+    { "id": "title",        "type": "text", "required": true },
+    { "id": "agenda_items", "type": "list", "required": true }
+  ],
+  "todo": "Decide minimum / maximum item count and ordering rule."
+}

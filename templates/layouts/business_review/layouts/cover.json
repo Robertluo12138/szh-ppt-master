@@ -1,0 +1,13 @@
+{
+  "name": "cover",
+  "status": "skeleton",
+  "purpose": "Opening slide. Establishes the deck topic, presenter, and date.",
+  "slots": [
+    { "id": "title",     "type": "text",      "required": true },
+    { "id": "subtitle",  "type": "text",      "required": false },
+    { "id": "presenter", "type": "text",      "required": false },
+    { "id": "date",      "type": "text",      "required": false },
+    { "id": "accent",    "type": "image_ref", "required": false }
+  ],
+  "todo": "Define bounds, typography roles per slot, and SVG mapping."
+}

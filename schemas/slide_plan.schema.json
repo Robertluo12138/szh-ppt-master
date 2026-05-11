@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "slide_plan.schema.json",
+  "title": "Slide Plan",
+  "description": "Per-slide plan: layout, title, ordered content blocks, image references. Produced before any SVG for that slide. Block content is intentionally loose in the scaffold and will be tightened per-kind.",
+  "type": "object",
+  "required": ["index", "layout", "title", "blocks"],
+  "additionalProperties": false,
+  "properties": {
+    "index": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "layout": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "subtitle": {
+      "type": "string"
+    },
+    "blocks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["text", "list", "kpi", "table", "image_ref", "chart_ref", "callout"]
+          },
+          "id": {
+            "type": "string",
+            "description": "Optional slot id used to match this block to a layout slot."
+          },
+          "content": {
+            "description": "Free-form in the scaffold. TODO: tighten per kind."
+          }
+        }
+      }
+    },
+    "image_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Image manifest entry ids referenced by this slide."
+      }
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "deck_plan.schema.json",
+  "title": "Deck Plan",
+  "description": "Deck-level outline produced from the brief. Lists slides in order with their layout, title, and a short summary. Per-slide detail lives in slide_plan.json files.",
+  "type": "object",
+  "required": ["template", "slides"],
+  "additionalProperties": false,
+  "properties": {
+    "template": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Name of the template under templates/layouts/, e.g. 'business_review'."
+    },
+    "theme_overrides": {
+      "type": "object",
+      "description": "TODO: enumerate overridable theme tokens once the design system stabilizes."
+    },
+    "slides": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["index", "layout", "title"],
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "layout": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Must match a layout name in the chosen template."
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "summary": {
+            "type": "string"
+          },
+          "key_points": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}

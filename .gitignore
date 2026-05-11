@@ -1,0 +1,55 @@
+# Generated workspaces and outputs
+projects/
+out/
+output/
+dist/
+build/
+previews/
+renders/
+exports/
+
+# PPTX and related real artifacts (synthetic fixtures should be JSON/MD, not binary)
+*.pptx
+*.potx
+*.ppsx
+*.ppt
+*.pot
+*.pps
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+env/
+
+# Node caches (in case of future tooling)
+node_modules/
+.npm/
+.pnpm-store/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs and temp
+*.log
+*.tmp
+tmp/

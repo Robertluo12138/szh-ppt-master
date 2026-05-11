@@ -1,0 +1,10 @@
+{
+  "name": "timeline",
+  "status": "skeleton",
+  "purpose": "Sequence of items along a horizontal or vertical axis.",
+  "slots": [
+    { "id": "title",          "type": "text", "required": true },
+    { "id": "timeline_items", "type": "list", "required": true }
+  ],
+  "todo": "Decide whether axis is horizontal by default and how to render items in SVG."
+}

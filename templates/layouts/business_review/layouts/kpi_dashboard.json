@@ -1,0 +1,10 @@
+{
+  "name": "kpi_dashboard",
+  "status": "skeleton",
+  "purpose": "Grid of KPI tiles, each with a label, value, and optional delta.",
+  "slots": [
+    { "id": "title", "type": "text", "required": true },
+    { "id": "kpis",  "type": "kpi",  "required": true }
+  ],
+  "todo": "Define KPI tile count (e.g. 3 / 4 / 6), bounds, and delta formatting rules."
+}

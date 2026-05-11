@@ -1,0 +1,11 @@
+{
+  "name": "section_divider",
+  "status": "skeleton",
+  "purpose": "Marks the boundary between major sections.",
+  "slots": [
+    { "id": "section_number", "type": "text", "required": false },
+    { "id": "section_title",  "type": "text", "required": true },
+    { "id": "subtitle",       "type": "text", "required": false }
+  ],
+  "todo": "Define typography scale (large title, muted background) and SVG mapping."
+}

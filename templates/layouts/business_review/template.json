@@ -1,0 +1,24 @@
+{
+  "name": "business_review",
+  "version": "0.1.0",
+  "status": "scaffold",
+  "description": "Business-review template skeleton. Defines the set of layouts available for a typical review deck. Layout internals are placeholders.",
+  "theme_ref": "theme.json",
+  "layouts": [
+    "cover",
+    "agenda",
+    "section_divider",
+    "executive_summary",
+    "key_message",
+    "two_column",
+    "kpi_dashboard",
+    "comparison_table",
+    "timeline",
+    "conclusion"
+  ],
+  "todo": [
+    "Define per-layout bounds, slot positions, and SVG mapping.",
+    "Decide whether layouts may declare optional chart slots once charting is in scope.",
+    "Map each layout to a PPTX slide layout for export."
+  ]
+}

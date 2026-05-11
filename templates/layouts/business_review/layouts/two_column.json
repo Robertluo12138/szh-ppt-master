@@ -1,0 +1,13 @@
+{
+  "name": "two_column",
+  "status": "skeleton",
+  "purpose": "Generic two-column comparison or pairing of content.",
+  "slots": [
+    { "id": "title",         "type": "text", "required": true },
+    { "id": "left_heading",  "type": "text", "required": false },
+    { "id": "left_content",  "type": "list", "required": true },
+    { "id": "right_heading", "type": "text", "required": false },
+    { "id": "right_content", "type": "list", "required": true }
+  ],
+  "todo": "Decide whether left/right may be image_ref or chart_ref in addition to text/list."
+}

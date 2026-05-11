@@ -1,0 +1,11 @@
+{
+  "name": "executive_summary",
+  "status": "skeleton",
+  "purpose": "Single-slide summary of the deck's main message and supporting points.",
+  "slots": [
+    { "id": "title",      "type": "text", "required": true },
+    { "id": "summary",    "type": "text", "required": true },
+    { "id": "key_points", "type": "list", "required": false }
+  ],
+  "todo": "Define density limit and how summary text is split when too long."
+}

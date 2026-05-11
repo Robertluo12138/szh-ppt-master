@@ -1,0 +1,10 @@
+{
+  "name": "comparison_table",
+  "status": "skeleton",
+  "purpose": "Tabular comparison across rows / columns. Renders to a real PPTX table at export time.",
+  "slots": [
+    { "id": "title", "type": "text",  "required": true },
+    { "id": "table", "type": "table", "required": true }
+  ],
+  "todo": "Define maximum rows / columns and table styling (header row, zebra striping)."
+}

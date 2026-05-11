@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "deck_brief.schema.json",
+  "title": "Deck Brief",
+  "description": "First structured artifact in the pipeline. Captures what the deck is for and the high-level constraints. No raw sensitive source text belongs here.",
+  "type": "object",
+  "required": ["title", "audience", "objective"],
+  "additionalProperties": false,
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "audience": {
+      "type": "string",
+      "minLength": 1
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tone": {
+      "type": "string",
+      "description": "TODO: enumerate allowed tones once the writing guide settles."
+    },
+    "language": {
+      "type": "string",
+      "description": "BCP-47 language tag, e.g. 'en' or 'en-US'. TODO: enumerate supported languages."
+    },
+    "approximate_slide_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "key_messages": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "must_include": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "must_avoid": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "source_refs": {
+      "type": "array",
+      "description": "Opaque identifiers of source documents. Do not put raw sensitive content here.",
+      "items": { "type": "string" }
+    }
+  }
+}
