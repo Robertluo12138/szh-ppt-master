@@ -3728,8 +3728,10 @@ def _build_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
     actually run against. `kind` selects the mutation applied:
 
       'happy'         — clean baseline: slide 1 is cover, slide 2 is
-                        executive_summary (an unsupported layout). The
-                        generator should generate 1 file and skip 1 slide.
+                        comparison_table (an unsupported layout because
+                        the table primitive_kind is not implemented by
+                        the generator today). Generator should generate
+                        1 file and skip 1 slide.
       'bad_image_ref' — cover slide_plan references an image id not in
                         the image_manifest. Generator must FAIL closed.
       'malformed_kpi' — kpi_dashboard slide_plan content is not a list.
@@ -3766,8 +3768,8 @@ def _build_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
              "title": "Synthetic Cover", "section_id": "only",
              "summary": "x", "density": "low",
              "source_refs": ["synthetic_src_g"]},
-            {"index": 2, "layout": "executive_summary",
-             "title": "Synthetic Summary", "section_id": "only",
+            {"index": 2, "layout": "comparison_table",
+             "title": "Synthetic Comparison", "section_id": "only",
              "summary": "x", "density": "medium",
              "source_refs": ["synthetic_src_g"]},
         ],
@@ -3796,9 +3798,10 @@ def _build_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
         {"id": "title", "kind": "text", "content": "Synthetic Cover"},
         {"id": "accent", "kind": "image_ref", "content": "generator_accent"},
     ]
-    base_summary_blocks = [
-        {"id": "title", "kind": "text", "content": "Synthetic Summary"},
-        {"id": "summary", "kind": "text", "content": "Synthetic summary body."},
+    base_slide2_blocks = [
+        {"id": "title", "kind": "text", "content": "Synthetic Comparison"},
+        {"id": "table", "kind": "table",
+         "content": {"columns": ["A", "B"], "rows": [["1", "2"]]}},
     ]
     if kind == "bad_image_ref":
         base_cover_blocks = [
@@ -3813,7 +3816,7 @@ def _build_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
             "summary": "x", "density": "high",
             "source_refs": ["synthetic_src_g"],
         }
-        base_summary_blocks = [
+        base_slide2_blocks = [
             {"id": "title", "kind": "text", "content": "Bad KPI"},
             {"id": "kpis", "kind": "kpi", "content": "not a list"},
         ]
@@ -3851,7 +3854,7 @@ def _build_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
     (plans / "02.json").write_text(json.dumps({
         "index": 2, "layout": slide2["layout"],
         "title": slide2["title"],
-        "blocks": base_summary_blocks,
+        "blocks": base_slide2_blocks,
     }))
 
 
@@ -3859,8 +3862,10 @@ def _build_generator_template(template_root: Path) -> None:
     """Build a minimal template tree that the synthetic generator workspace
     references. Includes cover and kpi_dashboard layouts (with bounds and
     primitive_kind on the required slots, matching the real business_review
-    template's shape) plus an unsupported executive_summary layout so the
-    skip-not-success path can be exercised."""
+    template's shape) plus an unsupported comparison_table layout so the
+    skip-not-success path can be exercised. comparison_table maps to the
+    `table` primitive_kind, which the controlled render-model generator
+    does not implement today and remains a TODO per CLAUDE.md."""
     layout_files = {
         "cover": {
             "name": "cover",
@@ -3889,11 +3894,11 @@ def _build_generator_template(template_root: Path) -> None:
                  "bounds": {"x": 64, "y": 280, "w": 1792, "h": 600}},
             ],
         },
-        "executive_summary": {
-            "name": "executive_summary",
+        "comparison_table": {
+            "name": "comparison_table",
             "slots": [
                 {"id": "title", "type": "text", "required": True},
-                {"id": "summary", "type": "text", "required": True},
+                {"id": "table", "type": "table", "required": True},
             ],
         },
     }
@@ -4001,16 +4006,16 @@ def negative_generator_tempfixture_checks() -> list[CheckResult]:
         _build_generator_workspace(ws, kind="happy")
         ret, sout, serr = run(ws, tr)
         cover_emitted = (ws / "render_models" / "01_cover.json").is_file()
-        summary_emitted = (ws / "render_models" / "02_executive_summary.json").is_file()
-        skip_reported = "[SKIP] slide  2: layout 'executive_summary' not implemented" in sout
+        unsupported_emitted = (ws / "render_models" / "02_comparison_table.json").is_file()
+        skip_reported = "[SKIP] slide  2: layout 'comparison_table' not implemented" in sout
         out.append(CheckResult(
             "tempfixture generator: happy path exits 0, "
             "emits supported cover, skips unsupported layout "
             "(reports as not implemented, NOT as success)",
-            ret == 0 and cover_emitted and not summary_emitted and skip_reported,
+            ret == 0 and cover_emitted and not unsupported_emitted and skip_reported,
             f"ret={ret}, cover_emitted={cover_emitted}, "
-            f"summary_emitted={summary_emitted}, skip_reported={skip_reported}, "
-            f"stderr={serr!r}",
+            f"unsupported_emitted={unsupported_emitted}, "
+            f"skip_reported={skip_reported}, stderr={serr!r}",
         ))
 
     # B. Bad image_ref in cover.accent.
@@ -4198,7 +4203,7 @@ def negative_generator_tempfixture_checks() -> list[CheckResult]:
     #    on the next run even though the generator does not write a
     #    replacement (the slide is now skipped). Without this, the
     #    workspace would carry a stale cover render_model for a slide
-    #    the deck_plan now describes as executive_summary.
+    #    the deck_plan now describes as comparison_table.
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         tr = root / "templates"
@@ -4206,20 +4211,21 @@ def negative_generator_tempfixture_checks() -> list[CheckResult]:
         _build_generator_template(tr)
         ws = root / "ws"
         _build_generator_workspace(ws, kind="happy")
-        # Mutate deck_plan slide 1 from cover -> executive_summary
+        # Mutate deck_plan slide 1 from cover -> comparison_table
         # (unsupported), and align the slide_plan + section_id so the
         # workspace stays schema-valid and the generator's per-slide
         # alignment guard does not short-circuit first.
         deck = json.loads((ws / "deck_plan.json").read_text())
-        deck["slides"][0]["layout"] = "executive_summary"
+        deck["slides"][0]["layout"] = "comparison_table"
         deck["slides"][0]["title"] = "Now Unsupported"
         (ws / "deck_plan.json").write_text(json.dumps(deck))
         plan1 = json.loads((ws / "slide_plans" / "01.json").read_text())
-        plan1["layout"] = "executive_summary"
+        plan1["layout"] = "comparison_table"
         plan1["title"] = "Now Unsupported"
         plan1["blocks"] = [
             {"id": "title", "kind": "text", "content": "Now Unsupported"},
-            {"id": "summary", "kind": "text", "content": "Body."},
+            {"id": "table", "kind": "table",
+             "content": {"columns": ["A", "B"], "rows": [["1", "2"]]}},
         ]
         (ws / "slide_plans" / "01.json").write_text(json.dumps(plan1))
         # Plant a stale render_model from "before the layout change".
@@ -4246,7 +4252,7 @@ def negative_generator_tempfixture_checks() -> list[CheckResult]:
         ret, sout, serr = run(ws, tr)
         still_exists = prior.is_file()
         skipped_logged = (
-            "[SKIP] slide  1: layout 'executive_summary' not implemented"
+            "[SKIP] slide  1: layout 'comparison_table' not implemented"
             in sout
         )
         cleaned_logged = "[CLEAN] render_models/01_cover.json" in sout

@@ -6,12 +6,22 @@ Reads a workspace's existing pipeline outputs and emits
 `<workspace>/render_models/<idx>_<layout>.json` for the supported layouts.
 
 SUPPORTED LAYOUTS
-    cover            text + line + (optional) image_slot
-    kpi_dashboard    text + shape (decorative band) + kpi tiles
+    cover              text + line + (optional) image_slot
+    section_divider    text + line (structural divider rule)
+    executive_summary  text + bulleted text list (key_points)
+    key_message        text + decorative rounded shape + callout text
+    two_column         text + paired bulleted text lists per column
+    kpi_dashboard      text + shape (decorative band) + kpi tiles
+    timeline           text + bulleted text list (timeline_items)
+    conclusion         text + bulleted text list (call_to_action)
 
-Slides with any other layout are SKIPPED and reported as not implemented;
-they are NOT counted as success. A successful run therefore says exactly
-how many render models were generated AND how many slides were skipped.
+All supported layouts emit only the controlled primitive kinds the
+downstream renderers cover today: text, line, shape, image_slot, kpi.
+Slides with any other layout (e.g. comparison_table → table primitive,
+or any chart_placeholder layout) are SKIPPED and reported as not
+implemented; they are NOT counted as success. A successful run therefore
+says exactly how many render models were generated AND how many slides
+were skipped.
 
 INPUTS (all workspace-relative)
     deck_brief.json
@@ -25,12 +35,17 @@ under --template-root, resolved through the two-stage path-safety gate
 imported from validate_workspace.
 
 DETERMINISM
-    The generator never invents source content. Strings come from
-    `slide_plan.blocks[].content`. KPI rows come from
-    `slide_plan.blocks[id="kpis"].content`. Image refs come from
-    `slide_plan.blocks[id="accent"].content` and must be declared in
-    `image_manifest`. Bounds use the layout slot's `bounds` when set,
-    otherwise the deterministic fallback table at the top of this file.
+    The generator never invents source content. Text and callout
+    strings come from `slide_plan.blocks[].content`. List entries
+    (key_points, left_content, right_content, call_to_action,
+    timeline_items) are read from the matching slide_plan list
+    block's content array and each entry becomes its own bulleted
+    text primitive distributed inside the slot's bounds. KPI rows
+    come from `slide_plan.blocks[id="kpis"].content`. Image refs
+    come from `slide_plan.blocks[id="accent"].content` and must be
+    declared in `image_manifest`. Bounds use the layout slot's
+    `bounds` when set, otherwise the deterministic fallback table
+    at the top of this file (LAYOUT_FALLBACK_BOUNDS).
 
 PREFLIGHT GATES (run BEFORE render_models/ cleanup)
     Cleanup deletes every *.json under render_models/, so any check that
@@ -87,7 +102,8 @@ FAIL-CLOSED GATES (every gate exits non-zero on failure)
     - stale / mismatched slide_plan: matched by JSON index, but its
       `layout` or `title` disagrees with the deck_plan slide;
     - slide_plan content shape that the supported layout does not expect
-      (missing required block, wrong block kind, malformed kpi entries);
+      (missing required block, wrong block kind, malformed kpi entries,
+      empty list content, list-slot too short for the requested items);
     - cover slot 'accent' content referencing an image_ref that
       image_manifest does not declare;
     - design_system missing required palette keys (primary/background/text)
@@ -99,8 +115,10 @@ FAIL-CLOSED GATES (every gate exits non-zero on failure)
 
 OUT OF SCOPE
     SVG rendering, PPTX export, D-One, Qoder integration, network
-    behavior, charts, layouts other than cover and kpi_dashboard, and any
-    new fixtures beyond the workspaces the caller already ships.
+    behavior, charts, table-bearing layouts (comparison_table and
+    anything else mapped to the `table` primitive_kind), chart-bearing
+    layouts (any slot mapped to chart_placeholder), and any new fixtures
+    beyond the workspaces the caller already ships.
 """
 
 from __future__ import annotations
@@ -126,7 +144,16 @@ from validate_workspace import (  # noqa: E402
 )
 
 SCHEMAS = REPO_ROOT / "schemas"
-SUPPORTED_LAYOUTS = ("cover", "kpi_dashboard")
+SUPPORTED_LAYOUTS = (
+    "cover",
+    "section_divider",
+    "executive_summary",
+    "key_message",
+    "two_column",
+    "kpi_dashboard",
+    "timeline",
+    "conclusion",
+)
 
 # Deterministic fallback bounds for cover slots that don't carry their own
 # bounds. Used only when the layout slot omits `bounds`. The cover layout in
@@ -153,6 +180,59 @@ KPI_FALLBACK_BOUNDS = {
 KPI_TILE_GAP = 12
 KPI_INSET_X = 32  # horizontal padding inside the kpis slot
 KPI_INSET_Y = 30  # vertical padding inside the kpis slot
+
+# Deterministic fallback bounds for the non-cover / non-kpi_dashboard layouts.
+# Used only when the layout slot omits `bounds`. The owned business_review
+# layouts (executive_summary, key_message, two_column, conclusion,
+# section_divider) declare bounds explicitly; these fallbacks let the
+# generator still produce a valid render_model against a bounds-less layout
+# (notably timeline.json, whose layout JSON is outside this script's
+# ownership and remains unbounded today).
+LAYOUT_FALLBACK_BOUNDS = {
+    "executive_summary": {
+        "title":      (64, 80, 1792, 100),
+        "summary":    (64, 210, 1792, 180),
+        "key_points": (64, 420, 1792, 580),
+    },
+    "key_message": {
+        "title":           (64, 80, 1792, 100),
+        "message":         (160, 260, 1600, 360),
+        "supporting_text": (160, 700, 1600, 280),
+    },
+    "two_column": {
+        "title":         (64, 80, 1792, 100),
+        "left_heading":  (96, 220, 832, 80),
+        "left_content":  (96, 320, 832, 680),
+        "right_heading": (992, 220, 832, 80),
+        "right_content": (992, 320, 832, 680),
+    },
+    "conclusion": {
+        "title":          (64, 80, 1792, 100),
+        "summary":        (64, 210, 1792, 160),
+        "call_to_action": (64, 400, 1792, 600),
+    },
+    "section_divider": {
+        "section_number": (64, 360, 400, 80),
+        "section_title":  (64, 460, 1792, 220),
+        "subtitle":       (64, 720, 1792, 140),
+    },
+    "timeline": {
+        "title":          (64, 80, 1792, 100),
+        "timeline_items": (64, 260, 1792, 700),
+    },
+}
+
+# Decorative line drawn between section_title and subtitle on the
+# section_divider layout. Structural: no slot binding.
+SECTION_DIVIDER_RULE_BOUNDS = (64, 700, 1792, 4)
+
+# Minimum vertical pixels per list item before the generator refuses to
+# distribute. Body text is ~19px tall at 14pt; 28px gives modest leading.
+LIST_ITEM_MIN_H = 28
+# Bullet prefix prepended to each list item's text content. Renderers
+# treat text.content as a literal display string; the prefix gives the
+# preview a recognisable bullet without requiring rich-text support.
+LIST_ITEM_BULLET_PREFIX = "• "
 
 
 class GenerationError(RuntimeError):
@@ -219,6 +299,123 @@ def _check_slot_present(slots_by_id: dict, slot_id: str, layout_name: str) -> di
             f"layout {layout_name!r} has no slot id {slot_id!r}"
         )
     return slot
+
+
+def _list_block_content(blocks_by_id: dict, slot_id: str) -> list[str]:
+    """Validate a `kind=list` slide_plan block and return its items as a
+    list of non-empty strings. Raises GenerationError on any drift from
+    the controlled contract (wrong kind, non-list content, empty list,
+    non-string entry)."""
+    block = blocks_by_id.get(slot_id)
+    if not isinstance(block, dict):
+        raise GenerationError(
+            f"missing slide_plan block for slot id {slot_id!r}"
+        )
+    if block.get("kind") != "list":
+        raise GenerationError(
+            f"slot {slot_id!r} expects a list block; "
+            f"got kind={block.get('kind')!r}"
+        )
+    content = block.get("content")
+    if not isinstance(content, list) or not content:
+        raise GenerationError(
+            f"slot {slot_id!r} list block content must be a non-empty list of strings"
+        )
+    items: list[str] = []
+    for i, item in enumerate(content):
+        if not isinstance(item, str) or not item:
+            raise GenerationError(
+                f"slot {slot_id!r} list block content[{i}] is not a non-empty string"
+            )
+        items.append(item)
+    return items
+
+
+def _callout_block_content(blocks_by_id: dict, slot_id: str) -> str:
+    """Validate a `kind=callout` slide_plan block and return its string
+    content. Mirrors _text_block_content but for the callout kind so the
+    key_message generator can keep callouts distinct from plain text."""
+    block = blocks_by_id.get(slot_id)
+    if not isinstance(block, dict):
+        raise GenerationError(
+            f"missing slide_plan block for slot id {slot_id!r}"
+        )
+    if block.get("kind") != "callout":
+        raise GenerationError(
+            f"slot {slot_id!r} expects a callout block; "
+            f"got kind={block.get('kind')!r}"
+        )
+    content = block.get("content")
+    if not isinstance(content, str) or not content:
+        raise GenerationError(
+            f"slot {slot_id!r} callout block has no non-empty string content"
+        )
+    return content
+
+
+def _list_item_bounds(slot_bounds: dict, count: int, index: int) -> dict:
+    """Distribute `count` list items vertically inside slot_bounds and
+    return the bounds for the item at `index`. Integer-only arithmetic
+    so output is byte-stable. The trailing remainder (slot.h % count)
+    is left as whitespace at the bottom of the slot rather than
+    silently extending the last item — keeping every item the same
+    height makes the preview legible at any count."""
+    if count <= 0 or index < 0 or index >= count:
+        raise GenerationError(
+            f"invalid list item request: count={count}, index={index}"
+        )
+    sx = slot_bounds["x"]
+    sy = slot_bounds["y"]
+    sw = slot_bounds["w"]
+    sh = slot_bounds["h"]
+    item_h = sh // count
+    if item_h < LIST_ITEM_MIN_H:
+        raise GenerationError(
+            f"list slot too short for {count} items "
+            f"(item_h={item_h} < {LIST_ITEM_MIN_H})"
+        )
+    return {"x": sx, "y": sy + index * item_h, "w": sw, "h": item_h}
+
+
+def _fallback_for(layout_name: str, slot_id: str) -> tuple[int, int, int, int]:
+    """Return the fallback bounds tuple registered for (layout_name, slot_id).
+    Raises GenerationError if the generator forgot to register a fallback —
+    every supported layout slot the generator touches must have one so a
+    bounds-less layout still produces a deterministic render_model."""
+    by_slot = LAYOUT_FALLBACK_BOUNDS.get(layout_name)
+    if not isinstance(by_slot, dict) or slot_id not in by_slot:
+        raise GenerationError(
+            f"internal: no fallback bounds registered for "
+            f"layout={layout_name!r}, slot={slot_id!r}"
+        )
+    return by_slot[slot_id]
+
+
+def _make_text_primitive(
+    prim_id: str,
+    slot_id: str | None,
+    bounds: dict,
+    content: str,
+    *,
+    role: str,
+    typography_token: str,
+) -> dict:
+    """Build a controlled text primitive. `slot_id=None` means structural
+    text not bound to a layout slot — currently unused but kept symmetric
+    with `_make_text_primitive` for shape and line helpers below."""
+    prim: dict = {
+        "id": prim_id,
+        "kind": "text",
+        "bounds": bounds,
+        "style": {
+            "color_token": "palette.text",
+            "typography_token": typography_token,
+        },
+        "text": {"content": content, "role": role},
+    }
+    if slot_id is not None:
+        prim["slot_id"] = slot_id
+    return prim
 
 
 def _generate_cover(
@@ -489,16 +686,435 @@ def _generate_kpi_dashboard(
     }
 
 
+def _bounds_for(slots_by_id: dict, layout_name: str, slot_id: str) -> dict:
+    """Resolve the canonical bounds for `slot_id` on `layout_name`: prefer
+    the layout slot's declared bounds, else the fallback table. Raises
+    GenerationError if the slot is missing from the layout (the caller
+    must check the slot is required or that the slide_plan asks for it
+    before calling this)."""
+    slot = _check_slot_present(slots_by_id, slot_id, layout_name)
+    return _bounds_or_fallback(slot, _fallback_for(layout_name, slot_id))
+
+
+def _generate_executive_summary(
+    slide_plan: dict,
+    deck_slide: dict,
+    layout: dict,
+    design_system: dict,
+    manifest_ids: set[str],
+    manifest_alt_by_id: dict,
+) -> dict:
+    """executive_summary: title + summary (both required) + optional
+    bulleted key_points list. Every primitive emits a text kind."""
+    grid = design_system["grid"]
+    canvas = {"width_px": grid["width_px"], "height_px": grid["height_px"]}
+    slots_by_id = {
+        s["id"]: s for s in (_as_list(layout.get("slots")) or [])
+        if isinstance(s, dict) and isinstance(s.get("id"), str)
+    }
+    blocks_by_id = {
+        b["id"]: b for b in (_as_list(slide_plan.get("blocks")) or [])
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    }
+
+    primitives: list[dict] = []
+
+    # Required: title.
+    primitives.append(_make_text_primitive(
+        "title", "title",
+        _bounds_for(slots_by_id, "executive_summary", "title"),
+        _text_block_content(blocks_by_id, "title"),
+        role="heading",
+        typography_token="typography.heading",
+    ))
+
+    # Required: summary.
+    primitives.append(_make_text_primitive(
+        "summary", "summary",
+        _bounds_for(slots_by_id, "executive_summary", "summary"),
+        _text_block_content(blocks_by_id, "summary"),
+        role="body",
+        typography_token="typography.body",
+    ))
+
+    # Optional: key_points (list). Only fired when the slide_plan declares
+    # the optional block; the layout slot still has to exist for the
+    # primitives to bind to it.
+    if "key_points" in blocks_by_id:
+        kp_bounds = _bounds_for(slots_by_id, "executive_summary", "key_points")
+        items = _list_block_content(blocks_by_id, "key_points")
+        for i, item in enumerate(items):
+            primitives.append(_make_text_primitive(
+                f"key_point_{i + 1:02d}", "key_points",
+                _list_item_bounds(kp_bounds, len(items), i),
+                LIST_ITEM_BULLET_PREFIX + item,
+                role="body",
+                typography_token="typography.body",
+            ))
+
+    return {
+        "index": deck_slide["index"],
+        "layout": "executive_summary",
+        "canvas": canvas,
+        "source_refs": list(deck_slide.get("source_refs") or []),
+        "primitives": primitives,
+    }
+
+
+def _generate_key_message(
+    slide_plan: dict,
+    deck_slide: dict,
+    layout: dict,
+    design_system: dict,
+    manifest_ids: set[str],
+    manifest_alt_by_id: dict,
+) -> dict:
+    """key_message: optional title, required callout message rendered as a
+    rounded-rectangle background plus a text primitive on top, and
+    optional supporting_text. The decorative shape is structural (no
+    slot_id) so the layout slot.primitive_kind=text constraint binds the
+    overlayed text only."""
+    grid = design_system["grid"]
+    canvas = {"width_px": grid["width_px"], "height_px": grid["height_px"]}
+    slots_by_id = {
+        s["id"]: s for s in (_as_list(layout.get("slots")) or [])
+        if isinstance(s, dict) and isinstance(s.get("id"), str)
+    }
+    blocks_by_id = {
+        b["id"]: b for b in (_as_list(slide_plan.get("blocks")) or [])
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    }
+
+    primitives: list[dict] = []
+
+    if "title" in blocks_by_id:
+        primitives.append(_make_text_primitive(
+            "title", "title",
+            _bounds_for(slots_by_id, "key_message", "title"),
+            _text_block_content(blocks_by_id, "title"),
+            role="heading",
+            typography_token="typography.heading",
+        ))
+
+    # Required: message. Decorative band first, then the text on top —
+    # the shape carries no slot_id so the slot.primitive_kind check on
+    # the 'message' slot still only binds the text primitive below.
+    msg_bounds = _bounds_for(slots_by_id, "key_message", "message")
+    primitives.append({
+        "id": "message_callout_bg",
+        "kind": "shape",
+        "bounds": dict(msg_bounds),
+        "style": {
+            "fill_token": "palette.background",
+            "stroke_token": "palette.primary",
+            "stroke_width_px": 2,
+        },
+        "shape": {
+            "shape_kind": "rounded_rectangle",
+            "corner_radius_px": 16,
+        },
+    })
+    primitives.append(_make_text_primitive(
+        "message", "message",
+        dict(msg_bounds),
+        _callout_block_content(blocks_by_id, "message"),
+        role="callout",
+        typography_token="typography.heading",
+    ))
+
+    if "supporting_text" in blocks_by_id:
+        primitives.append(_make_text_primitive(
+            "supporting_text", "supporting_text",
+            _bounds_for(slots_by_id, "key_message", "supporting_text"),
+            _text_block_content(blocks_by_id, "supporting_text"),
+            role="body",
+            typography_token="typography.body",
+        ))
+
+    return {
+        "index": deck_slide["index"],
+        "layout": "key_message",
+        "canvas": canvas,
+        "source_refs": list(deck_slide.get("source_refs") or []),
+        "primitives": primitives,
+    }
+
+
+def _generate_two_column(
+    slide_plan: dict,
+    deck_slide: dict,
+    layout: dict,
+    design_system: dict,
+    manifest_ids: set[str],
+    manifest_alt_by_id: dict,
+) -> dict:
+    """two_column: title + two parallel columns of optional heading and
+    required content list. Each column's heading is a text primitive,
+    each list item is its own text primitive distributed inside the
+    column's content slot."""
+    grid = design_system["grid"]
+    canvas = {"width_px": grid["width_px"], "height_px": grid["height_px"]}
+    slots_by_id = {
+        s["id"]: s for s in (_as_list(layout.get("slots")) or [])
+        if isinstance(s, dict) and isinstance(s.get("id"), str)
+    }
+    blocks_by_id = {
+        b["id"]: b for b in (_as_list(slide_plan.get("blocks")) or [])
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    }
+
+    primitives: list[dict] = []
+
+    # Required: title.
+    primitives.append(_make_text_primitive(
+        "title", "title",
+        _bounds_for(slots_by_id, "two_column", "title"),
+        _text_block_content(blocks_by_id, "title"),
+        role="heading",
+        typography_token="typography.heading",
+    ))
+
+    # Per-side: optional heading + required content list. The render order
+    # (left heading, left items, right heading, right items) is deterministic
+    # and mirrors the slide_plan's visual reading order.
+    for side, prefix in (("left", "left"), ("right", "right")):
+        heading_slot_id = f"{side}_heading"
+        content_slot_id = f"{side}_content"
+        if heading_slot_id in blocks_by_id:
+            primitives.append(_make_text_primitive(
+                heading_slot_id, heading_slot_id,
+                _bounds_for(slots_by_id, "two_column", heading_slot_id),
+                _text_block_content(blocks_by_id, heading_slot_id),
+                role="subheading",
+                typography_token="typography.heading",
+            ))
+        content_bounds = _bounds_for(slots_by_id, "two_column", content_slot_id)
+        items = _list_block_content(blocks_by_id, content_slot_id)
+        for i, item in enumerate(items):
+            primitives.append(_make_text_primitive(
+                f"{prefix}_item_{i + 1:02d}", content_slot_id,
+                _list_item_bounds(content_bounds, len(items), i),
+                LIST_ITEM_BULLET_PREFIX + item,
+                role="body",
+                typography_token="typography.body",
+            ))
+
+    return {
+        "index": deck_slide["index"],
+        "layout": "two_column",
+        "canvas": canvas,
+        "source_refs": list(deck_slide.get("source_refs") or []),
+        "primitives": primitives,
+    }
+
+
+def _generate_conclusion(
+    slide_plan: dict,
+    deck_slide: dict,
+    layout: dict,
+    design_system: dict,
+    manifest_ids: set[str],
+    manifest_alt_by_id: dict,
+) -> dict:
+    """conclusion: required title + optional summary text + optional
+    call_to_action bulleted list. Mirrors executive_summary's text-only
+    shape but with a different slot vocabulary."""
+    grid = design_system["grid"]
+    canvas = {"width_px": grid["width_px"], "height_px": grid["height_px"]}
+    slots_by_id = {
+        s["id"]: s for s in (_as_list(layout.get("slots")) or [])
+        if isinstance(s, dict) and isinstance(s.get("id"), str)
+    }
+    blocks_by_id = {
+        b["id"]: b for b in (_as_list(slide_plan.get("blocks")) or [])
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    }
+
+    primitives: list[dict] = []
+
+    primitives.append(_make_text_primitive(
+        "title", "title",
+        _bounds_for(slots_by_id, "conclusion", "title"),
+        _text_block_content(blocks_by_id, "title"),
+        role="heading",
+        typography_token="typography.heading",
+    ))
+
+    if "summary" in blocks_by_id:
+        primitives.append(_make_text_primitive(
+            "summary", "summary",
+            _bounds_for(slots_by_id, "conclusion", "summary"),
+            _text_block_content(blocks_by_id, "summary"),
+            role="body",
+            typography_token="typography.body",
+        ))
+
+    if "call_to_action" in blocks_by_id:
+        cta_bounds = _bounds_for(slots_by_id, "conclusion", "call_to_action")
+        items = _list_block_content(blocks_by_id, "call_to_action")
+        for i, item in enumerate(items):
+            primitives.append(_make_text_primitive(
+                f"call_to_action_{i + 1:02d}", "call_to_action",
+                _list_item_bounds(cta_bounds, len(items), i),
+                LIST_ITEM_BULLET_PREFIX + item,
+                role="body",
+                typography_token="typography.body",
+            ))
+
+    return {
+        "index": deck_slide["index"],
+        "layout": "conclusion",
+        "canvas": canvas,
+        "source_refs": list(deck_slide.get("source_refs") or []),
+        "primitives": primitives,
+    }
+
+
+def _generate_section_divider(
+    slide_plan: dict,
+    deck_slide: dict,
+    layout: dict,
+    design_system: dict,
+    manifest_ids: set[str],
+    manifest_alt_by_id: dict,
+) -> dict:
+    """section_divider: optional section_number, required section_title,
+    a structural horizontal rule below the title, and optional subtitle.
+    The rule is decorative (no slot_id)."""
+    grid = design_system["grid"]
+    canvas = {"width_px": grid["width_px"], "height_px": grid["height_px"]}
+    slots_by_id = {
+        s["id"]: s for s in (_as_list(layout.get("slots")) or [])
+        if isinstance(s, dict) and isinstance(s.get("id"), str)
+    }
+    blocks_by_id = {
+        b["id"]: b for b in (_as_list(slide_plan.get("blocks")) or [])
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    }
+
+    primitives: list[dict] = []
+
+    if "section_number" in blocks_by_id:
+        primitives.append(_make_text_primitive(
+            "section_number", "section_number",
+            _bounds_for(slots_by_id, "section_divider", "section_number"),
+            _text_block_content(blocks_by_id, "section_number"),
+            role="subheading",
+            typography_token="typography.body",
+        ))
+
+    primitives.append(_make_text_primitive(
+        "section_title", "section_title",
+        _bounds_for(slots_by_id, "section_divider", "section_title"),
+        _text_block_content(blocks_by_id, "section_title"),
+        role="heading",
+        typography_token="typography.heading",
+    ))
+
+    primitives.append({
+        "id": "section_rule",
+        "kind": "line",
+        "bounds": dict(zip(("x", "y", "w", "h"), SECTION_DIVIDER_RULE_BOUNDS)),
+        "style": {
+            "stroke_token": "palette.primary",
+            "stroke_width_px": 4,
+        },
+        "line": {"stroke_style": "solid"},
+    })
+
+    if "subtitle" in blocks_by_id:
+        primitives.append(_make_text_primitive(
+            "subtitle", "subtitle",
+            _bounds_for(slots_by_id, "section_divider", "subtitle"),
+            _text_block_content(blocks_by_id, "subtitle"),
+            role="subheading",
+            typography_token="typography.body",
+        ))
+
+    return {
+        "index": deck_slide["index"],
+        "layout": "section_divider",
+        "canvas": canvas,
+        "source_refs": list(deck_slide.get("source_refs") or []),
+        "primitives": primitives,
+    }
+
+
+def _generate_timeline(
+    slide_plan: dict,
+    deck_slide: dict,
+    layout: dict,
+    design_system: dict,
+    manifest_ids: set[str],
+    manifest_alt_by_id: dict,
+) -> dict:
+    """timeline: required title + required timeline_items list. Items are
+    rendered as a vertically stacked bulleted list inside the
+    timeline_items slot. The timeline.json layout (outside this script's
+    ownership) does not declare bounds today; both slots fall back to the
+    table in LAYOUT_FALLBACK_BOUNDS."""
+    grid = design_system["grid"]
+    canvas = {"width_px": grid["width_px"], "height_px": grid["height_px"]}
+    slots_by_id = {
+        s["id"]: s for s in (_as_list(layout.get("slots")) or [])
+        if isinstance(s, dict) and isinstance(s.get("id"), str)
+    }
+    blocks_by_id = {
+        b["id"]: b for b in (_as_list(slide_plan.get("blocks")) or [])
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    }
+
+    primitives: list[dict] = []
+
+    primitives.append(_make_text_primitive(
+        "title", "title",
+        _bounds_for(slots_by_id, "timeline", "title"),
+        _text_block_content(blocks_by_id, "title"),
+        role="heading",
+        typography_token="typography.heading",
+    ))
+
+    items_bounds = _bounds_for(slots_by_id, "timeline", "timeline_items")
+    items = _list_block_content(blocks_by_id, "timeline_items")
+    for i, item in enumerate(items):
+        primitives.append(_make_text_primitive(
+            f"timeline_item_{i + 1:02d}", "timeline_items",
+            _list_item_bounds(items_bounds, len(items), i),
+            LIST_ITEM_BULLET_PREFIX + item,
+            role="body",
+            typography_token="typography.body",
+        ))
+
+    return {
+        "index": deck_slide["index"],
+        "layout": "timeline",
+        "canvas": canvas,
+        "source_refs": list(deck_slide.get("source_refs") or []),
+        "primitives": primitives,
+    }
+
+
 GENERATORS = {
     "cover": _generate_cover,
+    "executive_summary": _generate_executive_summary,
+    "key_message": _generate_key_message,
+    "two_column": _generate_two_column,
     "kpi_dashboard": _generate_kpi_dashboard,
+    "timeline": _generate_timeline,
+    "conclusion": _generate_conclusion,
+    "section_divider": _generate_section_divider,
 }
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        description="Deterministic render_model generator for "
-                    "cover and kpi_dashboard layouts only.",
+        description="Deterministic render_model generator for the "
+                    "controlled primitive set (text / line / shape / "
+                    "image_slot / kpi). Supported layouts: cover, "
+                    "section_divider, executive_summary, key_message, "
+                    "two_column, kpi_dashboard, timeline, conclusion. "
+                    "Layouts mapped to the table or chart_placeholder "
+                    "primitive kinds are skipped as not implemented.",
     )
     parser.add_argument("--workspace", required=True, type=Path,
                         help="Caller-supplied workspace directory.")
@@ -846,7 +1462,7 @@ def main(argv: list[str]) -> int:
         print(f"  [GEN]  slide {idx:>2} ({layout_name}) -> {p.relative_to(ws)}")
     if skipped:
         print(f"Skipped {len(skipped)} slide(s) with layouts not yet supported "
-              f"by the generator (cover and kpi_dashboard only):")
+              f"by the generator (supported: {', '.join(SUPPORTED_LAYOUTS)}):")
         for idx, layout_name in skipped:
             print(f"  [SKIP] slide {idx:>2}: layout {layout_name!r} "
                   f"not implemented")

@@ -3,9 +3,27 @@
   "status": "skeleton",
   "purpose": "Emphasizes a single statement, optionally with supporting context.",
   "slots": [
-    { "id": "title",          "type": "text",    "required": false },
-    { "id": "message",        "type": "callout", "required": true },
-    { "id": "supporting_text","type": "text",    "required": false }
+    {
+      "id": "title",
+      "type": "text",
+      "required": false,
+      "primitive_kind": "text",
+      "bounds": { "x": 64, "y": 80, "w": 1792, "h": 100 }
+    },
+    {
+      "id": "message",
+      "type": "callout",
+      "required": true,
+      "primitive_kind": "text",
+      "bounds": { "x": 160, "y": 260, "w": 1600, "h": 360 }
+    },
+    {
+      "id": "supporting_text",
+      "type": "text",
+      "required": false,
+      "primitive_kind": "text",
+      "bounds": { "x": 160, "y": 700, "w": 1600, "h": 280 }
+    }
   ],
   "todo": "Define callout shape / accent treatment in the SVG layer."
 }

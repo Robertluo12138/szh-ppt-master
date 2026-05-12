@@ -8,7 +8,7 @@ status: scaffold
 
 ## Status
 
-Scaffold + minimal vertical slice. The pipeline is defined, the on-disk contracts are sketched, the render-model stage produces output for two layouts (`cover`, `kpi_dashboard`), an SVG preview stage renders those render-models into per-slide `*.svg` files under `svg_previews/`, and a **minimal native editable PPTX export stage** (`scripts/export_pptx.py`) now produces a `.pptx` for the same supported subset (cover / kpi_dashboard; primitives `text` / `line` / `shape` / `image_slot` / `kpi`; `image_slot` is rendered as a native placeholder shape — media embedding is intentionally TODO). Charting, visual regression, image generation, full editability inventory, theme palette mapping, and CLI integration are not implemented yet. See per-file TODOs and `references/`.
+Scaffold + minimal vertical slice. The pipeline is defined, the on-disk contracts are sketched, the render-model stage now produces output for the controlled text / line / shape / image_slot / kpi primitive set across `cover`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `kpi_dashboard`, `timeline`, and `conclusion`; an SVG preview stage renders those render-models into per-slide `*.svg` files under `svg_previews/`; and a **minimal native editable PPTX export stage** (`scripts/export_pptx.py`) still covers only the narrower subset (cover / kpi_dashboard; primitives `text` / `line` / `shape` / `image_slot` / `kpi`; `image_slot` is rendered as a native placeholder shape — media embedding is intentionally TODO). Layouts that map to the `table` or `chart_placeholder` primitive kinds (e.g. `comparison_table`) remain unimplemented and are reported as `[SKIP] ... not implemented` by the render-model generator. Charting, visual regression, image generation, full editability inventory, theme palette mapping, and CLI integration are not implemented yet. See per-file TODOs and `references/`.
 
 ## Adaptive deck shape
 
@@ -125,10 +125,15 @@ python3 scripts/validate_workspace.py \
   --workspace examples/synthetic_8_page_product_brief \
   --template-root templates/layouts
 
-# Render-model generation (supports cover and kpi_dashboard only;
-# every other layout is listed as [SKIP] ... not implemented and is
-# NOT counted as success). Re-runs the same render_model cross-check
-# the workspace validator uses, so output drift fails immediately.
+# Render-model generation. Supported layouts today: cover,
+# section_divider, executive_summary, key_message, two_column,
+# kpi_dashboard, timeline, conclusion (every emit uses only the
+# controlled text / line / shape / image_slot / kpi primitives).
+# Layouts mapped to the table or chart_placeholder primitive kinds
+# (e.g. comparison_table, anything chart-bearing) are listed as
+# [SKIP] ... not implemented and are NOT counted as success.
+# Re-runs the same render_model cross-check the workspace validator
+# uses, so output drift fails immediately.
 python3 scripts/generate_render_models.py \
   --workspace examples/synthetic_20_page_business_review \
   --template-root templates/layouts

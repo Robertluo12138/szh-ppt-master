@@ -3,9 +3,27 @@
   "status": "skeleton",
   "purpose": "Closing slide. Restates the main message and any explicit next steps.",
   "slots": [
-    { "id": "title",          "type": "text", "required": true },
-    { "id": "summary",        "type": "text", "required": false },
-    { "id": "call_to_action", "type": "list", "required": false }
+    {
+      "id": "title",
+      "type": "text",
+      "required": true,
+      "primitive_kind": "text",
+      "bounds": { "x": 64, "y": 80, "w": 1792, "h": 100 }
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "required": false,
+      "primitive_kind": "text",
+      "bounds": { "x": 64, "y": 210, "w": 1792, "h": 160 }
+    },
+    {
+      "id": "call_to_action",
+      "type": "list",
+      "required": false,
+      "primitive_kind": "text",
+      "bounds": { "x": 64, "y": 400, "w": 1792, "h": 600 }
+    }
   ],
   "todo": "Decide whether a contact / Q&A slot is required by default."
 }

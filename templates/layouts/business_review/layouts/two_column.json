@@ -3,11 +3,41 @@
   "status": "skeleton",
   "purpose": "Generic two-column comparison or pairing of content.",
   "slots": [
-    { "id": "title",         "type": "text", "required": true },
-    { "id": "left_heading",  "type": "text", "required": false },
-    { "id": "left_content",  "type": "list", "required": true },
-    { "id": "right_heading", "type": "text", "required": false },
-    { "id": "right_content", "type": "list", "required": true }
+    {
+      "id": "title",
+      "type": "text",
+      "required": true,
+      "primitive_kind": "text",
+      "bounds": { "x": 64, "y": 80, "w": 1792, "h": 100 }
+    },
+    {
+      "id": "left_heading",
+      "type": "text",
+      "required": false,
+      "primitive_kind": "text",
+      "bounds": { "x": 96, "y": 220, "w": 832, "h": 80 }
+    },
+    {
+      "id": "left_content",
+      "type": "list",
+      "required": true,
+      "primitive_kind": "text",
+      "bounds": { "x": 96, "y": 320, "w": 832, "h": 680 }
+    },
+    {
+      "id": "right_heading",
+      "type": "text",
+      "required": false,
+      "primitive_kind": "text",
+      "bounds": { "x": 992, "y": 220, "w": 832, "h": 80 }
+    },
+    {
+      "id": "right_content",
+      "type": "list",
+      "required": true,
+      "primitive_kind": "text",
+      "bounds": { "x": 992, "y": 320, "w": 832, "h": 680 }
+    }
   ],
   "todo": "Decide whether left/right may be image_ref or chart_ref in addition to text/list."
 }

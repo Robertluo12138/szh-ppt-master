@@ -1,0 +1,89 @@
+{
+  "index": 3,
+  "layout": "key_message",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_p"
+  ],
+  "primitives": [
+    {
+      "id": "title",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 80,
+        "w": 1792,
+        "h": 100
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Core Proposition",
+        "role": "heading"
+      },
+      "slot_id": "title"
+    },
+    {
+      "id": "message_callout_bg",
+      "kind": "shape",
+      "bounds": {
+        "x": 160,
+        "y": 260,
+        "w": 1600,
+        "h": 360
+      },
+      "style": {
+        "fill_token": "palette.background",
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 2
+      },
+      "shape": {
+        "shape_kind": "rounded_rectangle",
+        "corner_radius_px": 16
+      }
+    },
+    {
+      "id": "message",
+      "kind": "text",
+      "bounds": {
+        "x": 160,
+        "y": 260,
+        "w": 1600,
+        "h": 360
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Synthetic placeholder proposition statement.",
+        "role": "callout"
+      },
+      "slot_id": "message"
+    },
+    {
+      "id": "supporting_text",
+      "kind": "text",
+      "bounds": {
+        "x": 160,
+        "y": 700,
+        "w": 1600,
+        "h": 280
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "Qualitative placeholder supporting context; no financial figures.",
+        "role": "body"
+      },
+      "slot_id": "supporting_text"
+    }
+  ]
+}

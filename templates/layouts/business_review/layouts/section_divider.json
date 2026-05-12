@@ -3,9 +3,27 @@
   "status": "skeleton",
   "purpose": "Marks the boundary between major sections.",
   "slots": [
-    { "id": "section_number", "type": "text", "required": false },
-    { "id": "section_title",  "type": "text", "required": true },
-    { "id": "subtitle",       "type": "text", "required": false }
+    {
+      "id": "section_number",
+      "type": "text",
+      "required": false,
+      "primitive_kind": "text",
+      "bounds": { "x": 64, "y": 360, "w": 400, "h": 80 }
+    },
+    {
+      "id": "section_title",
+      "type": "text",
+      "required": true,
+      "primitive_kind": "text",
+      "bounds": { "x": 64, "y": 460, "w": 1792, "h": 220 }
+    },
+    {
+      "id": "subtitle",
+      "type": "text",
+      "required": false,
+      "primitive_kind": "text",
+      "bounds": { "x": 64, "y": 720, "w": 1792, "h": 140 }
+    }
   ],
   "todo": "Define typography scale (large title, muted background) and SVG mapping."
 }
