@@ -1,0 +1,52 @@
+{
+  "index": 4,
+  "layout": "executive_summary",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_a",
+    "synthetic_source_b"
+  ],
+  "primitives": [
+    {
+      "id": "title",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 80,
+        "w": 1792,
+        "h": 100
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Market Context Summary",
+        "role": "heading"
+      },
+      "slot_id": "title"
+    },
+    {
+      "id": "summary",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 210,
+        "w": 1792,
+        "h": 180
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "Qualitative placeholder summary of the market context.",
+        "role": "body"
+      },
+      "slot_id": "summary"
+    }
+  ]
+}

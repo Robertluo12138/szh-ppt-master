@@ -1,0 +1,108 @@
+{
+  "index": 17,
+  "layout": "executive_summary",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_a"
+  ],
+  "primitives": [
+    {
+      "id": "title",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 80,
+        "w": 1792,
+        "h": 100
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Next-Quarter Plan",
+        "role": "heading"
+      },
+      "slot_id": "title"
+    },
+    {
+      "id": "summary",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 210,
+        "w": 1792,
+        "h": 180
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "Qualitative placeholder plan for the next quarter.",
+        "role": "body"
+      },
+      "slot_id": "summary"
+    },
+    {
+      "id": "key_point_01",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 420,
+        "w": 1792,
+        "h": 193
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Resource one placeholder initiative",
+        "role": "body"
+      },
+      "slot_id": "key_points"
+    },
+    {
+      "id": "key_point_02",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 613,
+        "w": 1792,
+        "h": 193
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Track two placeholder risks",
+        "role": "body"
+      },
+      "slot_id": "key_points"
+    },
+    {
+      "id": "key_point_03",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 806,
+        "w": 1792,
+        "h": 193
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Re-baseline placeholder metric a",
+        "role": "body"
+      },
+      "slot_id": "key_points"
+    }
+  ]
+}

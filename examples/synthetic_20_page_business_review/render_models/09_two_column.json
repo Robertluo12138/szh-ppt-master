@@ -1,0 +1,166 @@
+{
+  "index": 9,
+  "layout": "two_column",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_a",
+    "synthetic_source_b"
+  ],
+  "primitives": [
+    {
+      "id": "title",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 80,
+        "w": 1792,
+        "h": 100
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Wins vs. Misses",
+        "role": "heading"
+      },
+      "slot_id": "title"
+    },
+    {
+      "id": "left_heading",
+      "kind": "text",
+      "bounds": {
+        "x": 96,
+        "y": 220,
+        "w": 832,
+        "h": 80
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Wins",
+        "role": "subheading"
+      },
+      "slot_id": "left_heading"
+    },
+    {
+      "id": "left_item_01",
+      "kind": "text",
+      "bounds": {
+        "x": 96,
+        "y": 320,
+        "w": 832,
+        "h": 226
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder win one",
+        "role": "body"
+      },
+      "slot_id": "left_content"
+    },
+    {
+      "id": "left_item_02",
+      "kind": "text",
+      "bounds": {
+        "x": 96,
+        "y": 546,
+        "w": 832,
+        "h": 226
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder win two",
+        "role": "body"
+      },
+      "slot_id": "left_content"
+    },
+    {
+      "id": "left_item_03",
+      "kind": "text",
+      "bounds": {
+        "x": 96,
+        "y": 772,
+        "w": 832,
+        "h": 226
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder win three",
+        "role": "body"
+      },
+      "slot_id": "left_content"
+    },
+    {
+      "id": "right_heading",
+      "kind": "text",
+      "bounds": {
+        "x": 992,
+        "y": 220,
+        "w": 832,
+        "h": 80
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Misses",
+        "role": "subheading"
+      },
+      "slot_id": "right_heading"
+    },
+    {
+      "id": "right_item_01",
+      "kind": "text",
+      "bounds": {
+        "x": 992,
+        "y": 320,
+        "w": 832,
+        "h": 340
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder miss one",
+        "role": "body"
+      },
+      "slot_id": "right_content"
+    },
+    {
+      "id": "right_item_02",
+      "kind": "text",
+      "bounds": {
+        "x": 992,
+        "y": 660,
+        "w": 832,
+        "h": 340
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder miss two",
+        "role": "body"
+      },
+      "slot_id": "right_content"
+    }
+  ]
+}

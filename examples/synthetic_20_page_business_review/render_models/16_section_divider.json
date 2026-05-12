@@ -1,0 +1,68 @@
+{
+  "index": 16,
+  "layout": "section_divider",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_a"
+  ],
+  "primitives": [
+    {
+      "id": "section_number",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 360,
+        "w": 400,
+        "h": 80
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "05",
+        "role": "subheading"
+      },
+      "slot_id": "section_number"
+    },
+    {
+      "id": "section_title",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 460,
+        "w": 1792,
+        "h": 220
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Outlook",
+        "role": "heading"
+      },
+      "slot_id": "section_title"
+    },
+    {
+      "id": "section_rule",
+      "kind": "line",
+      "bounds": {
+        "x": 64,
+        "y": 700,
+        "w": 1792,
+        "h": 4
+      },
+      "style": {
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 4
+      },
+      "line": {
+        "stroke_style": "solid"
+      }
+    }
+  ]
+}

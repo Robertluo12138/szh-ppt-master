@@ -1,0 +1,146 @@
+{
+  "index": 2,
+  "layout": "agenda",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_a"
+  ],
+  "primitives": [
+    {
+      "id": "title",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 80,
+        "w": 1792,
+        "h": 100
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Agenda",
+        "role": "heading"
+      },
+      "slot_id": "title"
+    },
+    {
+      "id": "agenda_item_01",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 260,
+        "w": 1792,
+        "h": 116
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Market Context",
+        "role": "body"
+      },
+      "slot_id": "agenda_items"
+    },
+    {
+      "id": "agenda_item_02",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 376,
+        "w": 1792,
+        "h": 116
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Performance",
+        "role": "body"
+      },
+      "slot_id": "agenda_items"
+    },
+    {
+      "id": "agenda_item_03",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 492,
+        "w": 1792,
+        "h": 116
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Operations",
+        "role": "body"
+      },
+      "slot_id": "agenda_items"
+    },
+    {
+      "id": "agenda_item_04",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 608,
+        "w": 1792,
+        "h": 116
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Risks",
+        "role": "body"
+      },
+      "slot_id": "agenda_items"
+    },
+    {
+      "id": "agenda_item_05",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 724,
+        "w": 1792,
+        "h": 116
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Outlook",
+        "role": "body"
+      },
+      "slot_id": "agenda_items"
+    },
+    {
+      "id": "agenda_item_06",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 840,
+        "w": 1792,
+        "h": 116
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Asks",
+        "role": "body"
+      },
+      "slot_id": "agenda_items"
+    }
+  ]
+}

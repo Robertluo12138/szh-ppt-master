@@ -1,0 +1,108 @@
+{
+  "index": 6,
+  "layout": "executive_summary",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_b"
+  ],
+  "primitives": [
+    {
+      "id": "title",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 80,
+        "w": 1792,
+        "h": 100
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Quarter Performance Summary",
+        "role": "heading"
+      },
+      "slot_id": "title"
+    },
+    {
+      "id": "summary",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 210,
+        "w": 1792,
+        "h": 180
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "Qualitative placeholder summary of the quarter's performance.",
+        "role": "body"
+      },
+      "slot_id": "summary"
+    },
+    {
+      "id": "key_point_01",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 420,
+        "w": 1792,
+        "h": 193
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder achievement one",
+        "role": "body"
+      },
+      "slot_id": "key_points"
+    },
+    {
+      "id": "key_point_02",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 613,
+        "w": 1792,
+        "h": 193
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder achievement two",
+        "role": "body"
+      },
+      "slot_id": "key_points"
+    },
+    {
+      "id": "key_point_03",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 806,
+        "w": 1792,
+        "h": 193
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder achievement three",
+        "role": "body"
+      },
+      "slot_id": "key_points"
+    }
+  ]
+}

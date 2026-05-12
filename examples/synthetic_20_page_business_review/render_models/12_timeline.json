@@ -1,0 +1,108 @@
+{
+  "index": 12,
+  "layout": "timeline",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_a"
+  ],
+  "primitives": [
+    {
+      "id": "title",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 80,
+        "w": 1792,
+        "h": 100
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Quarter Timeline",
+        "role": "heading"
+      },
+      "slot_id": "title"
+    },
+    {
+      "id": "timeline_item_01",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 260,
+        "w": 1792,
+        "h": 175
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder milestone one",
+        "role": "body"
+      },
+      "slot_id": "timeline_items"
+    },
+    {
+      "id": "timeline_item_02",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 435,
+        "w": 1792,
+        "h": 175
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder milestone two",
+        "role": "body"
+      },
+      "slot_id": "timeline_items"
+    },
+    {
+      "id": "timeline_item_03",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 610,
+        "w": 1792,
+        "h": 175
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder milestone three",
+        "role": "body"
+      },
+      "slot_id": "timeline_items"
+    },
+    {
+      "id": "timeline_item_04",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 785,
+        "w": 1792,
+        "h": 175
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "\u2022 Placeholder milestone four",
+        "role": "body"
+      },
+      "slot_id": "timeline_items"
+    }
+  ]
+}
