@@ -5,15 +5,16 @@ Stdlib-only **contract / skeleton** validator for the editable-ppt
 pipeline's PPTX output stage. The PPTX exporter (`scripts/export_pptx.py`)
 now produces an expanded native editable subset — the `cover`,
 `kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`,
-`key_message`, `two_column`, `timeline`, and `conclusion` layouts;
-primitives `text` / `line` / `shape` / `image_slot` / `kpi` — and this
-validator gates that output with both the original container checks
-and a set of MINIMAL-EVIDENCE checks (see below), including a
-relationship `Type` allow-list. `comparison_table`, the `table` and
-`chart_placeholder` primitives, media embedding, full editability
-inventory, theme palette mapping, determinism, and layout/primitive-
-scope inspection of the produced PPTX all remain TODO and are
-explicitly named that way in every run.
+`key_message`, `two_column`, `timeline`, `conclusion`, and
+`comparison_table` layouts; primitives `text` / `line` / `shape` /
+`image_slot` / `kpi` / `table` (the `table` primitive emits a native
+`<p:graphicFrame>` wrapping `<a:tbl>` with editable `<a:tc>` cells) —
+and this validator gates that output with both the original container
+checks and a set of MINIMAL-EVIDENCE checks (see below), including a
+relationship `Type` allow-list. The `chart_placeholder` primitive,
+media embedding, full editability inventory, theme palette mapping,
+determinism, and layout/primitive-scope inspection of the produced
+PPTX all remain TODO and are explicitly named that way in every run.
 
 USAGE
     # Skeleton mode (no .pptx supplied). Reports the contract /
@@ -135,9 +136,10 @@ TODO (explicitly NOT implemented; reported as TODO every run)
         SUPPORTED_LAYOUTS allow-list in scripts/export_pptx.py (the
         exporter enforces this today; this validator does not yet
         read the layout slot back out of the PPTX).
-    primitives.scope — initial export covers only the supported five
-        primitive kinds (the exporter enforces this today; this
-        validator does not yet inspect every shape's mapped primitive).
+    primitives.scope — exported shapes map only to the supported six
+        primitive kinds (text, line, shape, image_slot, kpi, table; the
+        exporter enforces this today; this validator does not yet
+        inspect every shape's mapped primitive).
 
 OUT OF SCOPE FOR THIS SCRIPT
     Generating PPTX (that is `scripts/export_pptx.py`). Full
@@ -247,9 +249,10 @@ TODO_CHECKS: tuple[tuple[str, str], ...] = (
      "exporter enforces this; the validator does not yet read layout "
      "slot info back out of the PPTX)"),
     ("primitives.scope",
-     "validate that exported shapes map only to the supported five "
-     "primitive kinds (the exporter enforces this; the validator does "
-     "not yet inspect every shape's primitive mapping)"),
+     "validate that exported shapes map only to the supported six "
+     "primitive kinds — text, line, shape, image_slot, kpi, table "
+     "(the exporter enforces this; the validator does not yet inspect "
+     "every shape's primitive mapping)"),
 )
 
 
@@ -1110,19 +1113,20 @@ def main(argv: list[str]) -> int:
             "(scripts/export_pptx.py) produces a native editable "
             "subset — the cover / kpi_dashboard / agenda / "
             "section_divider / executive_summary / key_message / "
-            "two_column / timeline / conclusion layouts; "
-            "text / line / shape / image_slot / kpi primitives — and "
-            "this validator gates that output. With --pptx, runs the "
-            "basic OOXML container checks AND the minimal-evidence "
-            "safety/editability checks (slide count, no external rels, "
-            "no file:// rels, relationship Type allow-list, no macros / "
-            "OLE / ActiveX parts, at least one editable text run, no "
-            "all-image slide, no blank slide, every slide carries at "
-            "least one <p:sp> or <p:cxnSp>). Without --pptx, runs in "
-            "skeleton mode and only reports the contract / TODO "
-            "surface. --self-test runs the in-script tempfixture "
-            "negatives + positives. The TODO surface is reported in "
-            "every run and is also listed below in --help."
+            "two_column / timeline / conclusion / comparison_table "
+            "layouts; text / line / shape / image_slot / kpi / table "
+            "primitives — and this validator gates that output. With "
+            "--pptx, runs the basic OOXML container checks AND the "
+            "minimal-evidence safety/editability checks (slide count, "
+            "no external rels, no file:// rels, relationship Type "
+            "allow-list, no macros / OLE / ActiveX parts, at least one "
+            "editable text run, no all-image slide, no blank slide, "
+            "every slide carries at least one <p:sp> or <p:cxnSp>). "
+            "Without --pptx, runs in skeleton mode and only reports "
+            "the contract / TODO surface. --self-test runs the "
+            "in-script tempfixture negatives + positives. The TODO "
+            "surface is reported in every run and is also listed below "
+            "in --help."
         ),
         epilog=_todo_epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,

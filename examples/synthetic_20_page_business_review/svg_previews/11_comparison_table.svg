@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080">
+  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>
+  <text x="72" y="117.333" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="37.333px" fill="#1A1A1A" font-weight="700">Current Quarter vs. Prior Quarter</text>
+  <g>
+    <rect x="64" y="240" width="1791" height="190" fill="#FFFFFF" stroke="#1F3A5F" stroke-width="2"/>
+    <rect x="64" y="430" width="1791" height="570" fill="none" stroke="#1F3A5F" stroke-width="2"/>
+    <line x1="661" y1="240" x2="661" y2="1000" stroke="#1F3A5F" stroke-width="1"/>
+    <line x1="1258" y1="240" x2="1258" y2="1000" stroke="#1F3A5F" stroke-width="1"/>
+    <line x1="64" y1="430" x2="1855" y2="430" stroke="#1F3A5F" stroke-width="1"/>
+    <line x1="64" y1="620" x2="1855" y2="620" stroke="#1F3A5F" stroke-width="1"/>
+    <line x1="64" y1="810" x2="1855" y2="810" stroke="#1F3A5F" stroke-width="1"/>
+    <text x="72" y="344" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A" font-weight="700">metric</text>
+    <text x="669" y="344" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A" font-weight="700">prior_quarter</text>
+    <text x="1266" y="344" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A" font-weight="700">current_quarter</text>
+    <text x="72" y="534" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">placeholder_metric_a</text>
+    <text x="669" y="534" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">&lt;value&gt;</text>
+    <text x="1266" y="534" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">&lt;value&gt;</text>
+    <text x="72" y="724" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">placeholder_metric_b</text>
+    <text x="669" y="724" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">&lt;value&gt;</text>
+    <text x="1266" y="724" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">&lt;value&gt;</text>
+    <text x="72" y="914" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">placeholder_metric_c</text>
+    <text x="669" y="914" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">&lt;value&gt;</text>
+    <text x="1266" y="914" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">&lt;value&gt;</text>
+  </g>
+</svg>

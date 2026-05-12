@@ -1,0 +1,70 @@
+{
+  "index": 11,
+  "layout": "comparison_table",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_b"
+  ],
+  "primitives": [
+    {
+      "id": "title",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 80,
+        "w": 1792,
+        "h": 100
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Current Quarter vs. Prior Quarter",
+        "role": "heading"
+      },
+      "slot_id": "title"
+    },
+    {
+      "id": "comparison_table",
+      "slot_id": "table",
+      "kind": "table",
+      "bounds": {
+        "x": 64,
+        "y": 240,
+        "w": 1792,
+        "h": 760
+      },
+      "style": {
+        "color_token": "palette.text"
+      },
+      "table": {
+        "columns": [
+          "metric",
+          "prior_quarter",
+          "current_quarter"
+        ],
+        "rows": [
+          [
+            "placeholder_metric_a",
+            "<value>",
+            "<value>"
+          ],
+          [
+            "placeholder_metric_b",
+            "<value>",
+            "<value>"
+          ],
+          [
+            "placeholder_metric_c",
+            "<value>",
+            "<value>"
+          ]
+        ]
+      }
+    }
+  ]
+}

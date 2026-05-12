@@ -5,21 +5,20 @@ The terminal output of the pipeline is an **editable** PPTX. An **expanded nativ
 ## Implementation status
 
 - An **expanded vertical slice** of PPTX export is implemented (`scripts/export_pptx.py`):
-  - layouts: `cover`, `kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `timeline`, `conclusion`. The slide-body emitter is layout-agnostic — it iterates the render_model's `primitives` list and emits one native PPTX object per primitive — so adding a layout to this allow-list does not change how any single shape is rendered;
-  - primitive kinds: `text`, `line`, `shape`, `image_slot`, `kpi`;
+  - layouts: `cover`, `kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `timeline`, `conclusion`, `comparison_table`. The slide-body emitter is layout-agnostic — it iterates the render_model's `primitives` list and emits one native PPTX object per primitive — so adding a layout to this allow-list does not change how any single shape is rendered;
+  - primitive kinds: `text`, `line`, `shape`, `image_slot`, `kpi`, `table` (the `table` primitive emits a native `<p:graphicFrame>` wrapping `<a:tbl>` with one `<a:gridCol>` per column, a bold header row, and an editable `<a:txBody>` per `<a:tc>` cell);
   - the exporter consumes `render_model.json` directly — it does **not** parse `svg_previews/*.svg`, does **not** screenshot a slide, and does **not** rasterize a whole slide into a single picture;
   - the package contains only stdlib-written XML parts (`[Content_Types].xml`, `_rels/.rels`, `ppt/presentation.xml`, `ppt/_rels/presentation.xml.rels`, one `ppt/slides/slide{N}.xml` + `_rels/` per exported slide, `ppt/slideLayouts/slideLayout1.xml` + `_rels/`, `ppt/slideMasters/slideMaster1.xml` + `_rels/`, and `ppt/theme/theme1.xml`); there are no embedded media parts, no remote relationships, no macros, no OLE, and no ActiveX parts.
 - The slice intentionally fails closed on everything outside that surface:
-  - `table` primitive — fail-closed (no native PPTX-table emission yet);
   - `chart_placeholder` primitive — fail-closed (no native chart-frame emission yet);
-  - layouts outside the allow-list above — per-slide fail-closed with a `[FAIL]` line; the whole run aborts and no `.pptx` is written. `comparison_table` is the one template-declared layout intentionally left outside the allow-list because its primary content is a `table` primitive. The exporter contract is intentionally all-or-nothing: it refuses to drop coverage for slides whose layout is not yet implemented.
+  - layouts outside the allow-list above — per-slide fail-closed with a `[FAIL]` line; the whole run aborts and no `.pptx` is written. Every layout declared by the business_review template skeleton is currently in scope; new layouts must add a paired generator branch before they may appear here. The exporter contract is intentionally all-or-nothing: it refuses to drop coverage for slides whose layout is not yet implemented.
 - Media embedding is **not** implemented. `image_slot` primitives are exported as **native placeholder rectangle shapes** carrying the `image_manifest` alt_text (or the image_ref id when no alt_text is declared). PNG / JPG / SVG bytes are NOT copied into `ppt/media/`. The exporter still validates the `image_ref` against `image_manifest` and re-runs `local_path_is_safe` on the resolved path, so an unsafe / missing reference fails closed at preflight.
 
 ## Editability requirements
 
 - Every body of text is a real text frame. No outlined-to-path text.
 - Every shape is a native PPTX shape, not a rasterized image of a shape.
-- Tables (when implemented) are real PPTX tables.
+- Tables are real PPTX tables (`<a:tbl>` inside `<p:graphicFrame>`), not images or text-frame impostors.
 - Images appear only as picture shapes referencing media stored inside the PPTX package.
 - A slide that is "one big PNG" is not editable and is not a valid output.
 
@@ -90,8 +89,7 @@ A passing run of this validator therefore proves the container shape, the absenc
 ## TODOs
 
 - Define palette → theme slot mapping.
-- Cover the remaining `render_model` primitive → native PPTX object mapping: `table` → native PPTX table, `chart_placeholder` → blank chart frame. Today the exporter maps `text` → text frame, `shape` → native PPTX shape, `line` → native line / connector, `image_slot` → placeholder rectangle (alt_text only, no embedded media), `kpi` → composite text frame with stacked paragraphs; `table` and `chart_placeholder` fail closed.
-- Add `comparison_table` to the exporter's `SUPPORTED_LAYOUTS` once `table` lands.
+- Cover the remaining `render_model` primitive → native PPTX object mapping: `chart_placeholder` → blank chart frame. Today the exporter maps `text` → text frame, `shape` → native PPTX shape, `line` → native line / connector, `image_slot` → placeholder rectangle (alt_text only, no embedded media), `kpi` → composite text frame with stacked paragraphs, `table` → native `<p:graphicFrame>` / `<a:tbl>` with editable cells; `chart_placeholder` fails closed.
 - Implement native-object / full-inventory editability / media / determinism / layouts.scope / primitives.scope checks inside `scripts/validate_pptx_contract.py`. Today these are explicitly TODO. (`relationships.allow_list` is now implemented.)
 - Decide whether speaker notes round-trip.
 - Decide whether and how to embed PNG / JPG / SVG media into `ppt/media/` (PowerPoint requires a PNG fallback for SVG, plus a media relationship per slide picture). When this lands, widen `_ALLOWED_RELATIONSHIP_TYPES` to include the `image` URL.

@@ -2,7 +2,7 @@
 
 The SVG layer is the per-slide **preview / inspection artifact** and the deterministic visual-validation gate. It is rendered from `render_model.json` (see `schemas/render_model.schema.json` and `references/slide-contracts.md`), the same controlled source the editable PPTX exporter will read. SVG is **not** an intermediate stage on the way to PPTX: the PPTX exporter will not parse SVG. Both stages produce their output from the same render model, so the visual preview and the editable deck agree by construction.
 
-SVG rendering is **partially implemented**: `scripts/generate_svg_previews.py` reads `<workspace>/render_models/*.json` and writes `<workspace>/svg_previews/<stem>.svg` for the primitive kinds the render-model generator emits today (`text`, `line`, `shape`, `image_slot`, `kpi`). Every other kind (`table`, `chart_placeholder`, or any future kind) fails closed on that slide. PPTX export is **not implemented**.
+SVG rendering is **partially implemented**: `scripts/generate_svg_previews.py` reads `<workspace>/render_models/*.json` and writes `<workspace>/svg_previews/<stem>.svg` for the primitive kinds the render-model generator emits today (`text`, `line`, `shape`, `image_slot`, `kpi`, `table`). Every other kind (`chart_placeholder` or any future kind) fails closed on that slide. PPTX export is implemented for the same primitive set — see `references/pptx-conversion-rules.md`.
 
 ## Source of truth
 
@@ -45,7 +45,7 @@ SVG editability matters because the SVG is the per-slide preview / inspection ar
 
 - Every text run must be a real `<text>` (or `<tspan>`) node. Outlined / pathified text is not allowed; it breaks the preview's editability contract and hides what the renderer was given.
 - Every SVG element must visually lower a controlled `render_model` primitive (`text`, `shape`, `line`, `image_slot`, `table`, `kpi`, `chart_placeholder`). The SVG layer adds no shapes the render_model did not declare; it is a faithful preview of the same primitive set the PPTX exporter consumes. PPTX editability is delivered by the PPTX exporter constructing native PowerPoint objects from the render_model directly — not by re-parsing this SVG.
-- Each controlled render_model primitive must therefore remain expressible both as a native PPTX object (text frame, native shape, native connector / line, picture, native table, composite text frame for `kpi`, blank chart frame for `chart_placeholder`) and as a corresponding SVG element in the preview. The exact list of SVG element types used to lower each primitive is **TODO**; until it exists, prefer the obvious primitives (`rect`, `circle`, `ellipse`, `line`, `polygon`, `path` with straight + cubic segments, `text`, `g`).
+- Each controlled render_model primitive must therefore remain expressible both as a native PPTX object (text frame, native shape, native connector / line, picture, native `<a:tbl>` for `table`, composite text frame for `kpi`, blank chart frame for `chart_placeholder`) and as a corresponding SVG element in the preview. Today the renderer uses: `text` → `<text>`; `line` → `<line>`; `shape` → `<rect>` / `<rect rx>` / `<ellipse>`; `image_slot` → `<image>`; `kpi` → composite `<g>` with stacked `<text>` runs; `table` → composite `<g>` with grid `<rect>` outline plus one `<text>` per cell. `chart_placeholder` rendering remains TODO.
 
 ## Validation / repair
 

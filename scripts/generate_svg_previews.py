@@ -19,10 +19,15 @@ SUPPORTED PRIMITIVE KINDS
                  declared by image_manifest — no URLs, no '..', no
                  absolute paths
     kpi          composite <g> with <text> runs for label, value, delta
+    table        composite <g> with grid <rect> outline, bold header row
+                 (filled with palette.background, stroked in
+                 palette.primary), and one <text> per cell sized from
+                 typography.body; intended as a preview of the native
+                 PPTX table the exporter emits
 
-    Any other kind (`table`, `chart_placeholder`, or any future kind)
-    fails closed on that slide. These are absent from current generator
-    output; adding renderer support requires a paired scaffold update.
+    Any other kind (`chart_placeholder` or any future kind) fails closed
+    on that slide. Adding renderer support requires a paired scaffold
+    update.
 
 TOKEN RESOLUTION
     palette.X is resolved against design_system.palette.X (raw hex) and
@@ -116,7 +121,7 @@ from validate_workspace import (  # noqa: E402
 )
 
 SCHEMAS = REPO_ROOT / "schemas"
-SUPPORTED_PRIMITIVE_KINDS = ("text", "line", "shape", "image_slot", "kpi")
+SUPPORTED_PRIMITIVE_KINDS = ("text", "line", "shape", "image_slot", "kpi", "table")
 
 # pt -> px ratio at 96 dpi. SVG accepts mixed units; pt is fine on its
 # own, but our canvas is in px, so we keep one consistent unit (px) for
@@ -447,6 +452,119 @@ def _render_kpi(prim: dict, design: dict) -> str:
     return "\n".join(parts)
 
 
+def _render_table(prim: dict, design: dict) -> str:
+    """Render a controlled `table` primitive into a composite <g>.
+
+    Cells are laid out on a deterministic uniform grid: every column has
+    the same width and every body row has the same height. The header
+    row uses the body typography size scaled to the same row height; the
+    rendering is a preview, not a typographically precise table — the
+    native PPTX table emitter is the source of truth for export.
+
+    Integer arithmetic only so the output is byte-stable. Failure to
+    distribute (zero-width column, zero-height row) is a per-slide
+    RenderError so the issue surfaces in the run rather than producing
+    a degenerate SVG."""
+    x, y, w, h = _bounds_tuple(prim["bounds"])
+    style = _as_dict(prim.get("style")) or {}
+    color_token = style.get("color_token")
+    if not isinstance(color_token, str):
+        raise RenderError("table primitive missing style.color_token")
+    text_color = _resolve_palette(design, color_token)
+    grid_color = _resolve_palette(design, "palette.primary")
+    header_fill = _resolve_palette(design, "palette.background")
+    body_family, body_pt = _resolve_typography(design, "typography.body")
+    body_size_px = body_pt * PT_TO_PX
+    payload = _as_dict(prim.get("table")) or {}
+    columns = payload.get("columns")
+    rows = payload.get("rows")
+    if not isinstance(columns, list) or not columns:
+        raise RenderError("table primitive missing non-empty columns")
+    if not isinstance(rows, list) or not rows:
+        raise RenderError("table primitive missing non-empty rows")
+    col_count = len(columns)
+    row_count = len(rows) + 1  # header + body rows
+    col_w = w // col_count
+    row_h = h // row_count
+    if col_w <= 0 or row_h <= 0:
+        raise RenderError(
+            f"table primitive bounds {w}x{h} too small for "
+            f"{col_count} cols x {row_count} rows"
+        )
+    parts: list[str] = ["  <g>"]
+    # Header background.
+    header_bg_attrs = {
+        "x": x, "y": y, "width": col_count * col_w, "height": row_h,
+        "fill": header_fill,
+        "stroke": grid_color, "stroke-width": 2,
+    }
+    parts.append(f"    <rect {_attrs(header_bg_attrs)}/>")
+    # Outer body outline. Header rect already drew the top edge; the
+    # body outline adds the remaining grid box.
+    body_outline_attrs = {
+        "x": x, "y": y + row_h,
+        "width": col_count * col_w, "height": (row_count - 1) * row_h,
+        "fill": "none",
+        "stroke": grid_color, "stroke-width": 2,
+    }
+    parts.append(f"    <rect {_attrs(body_outline_attrs)}/>")
+    # Interior column dividers (skip the outer left/right).
+    for c in range(1, col_count):
+        div_attrs = {
+            "x1": x + c * col_w, "y1": y,
+            "x2": x + c * col_w, "y2": y + row_count * row_h,
+            "stroke": grid_color, "stroke-width": 1,
+        }
+        parts.append(f"    <line {_attrs(div_attrs)}/>")
+    # Interior row dividers (skip the outer top/bottom).
+    for r in range(1, row_count):
+        div_attrs = {
+            "x1": x, "y1": y + r * row_h,
+            "x2": x + col_count * col_w, "y2": y + r * row_h,
+            "stroke": grid_color, "stroke-width": 1,
+        }
+        parts.append(f"    <line {_attrs(div_attrs)}/>")
+    # Cell text. Baseline anchored near the row's vertical midline so
+    # the preview stays inside its row regardless of body font size.
+    def _cell_text(col_idx: int, row_idx: int, content: str, *, bold: bool) -> str:
+        tx = x + col_idx * col_w + TEXT_INSET_X
+        ty = y + row_idx * row_h + (row_h + int(body_size_px)) // 2
+        cell_attrs = {
+            "x": tx,
+            "y": ty,
+            "font-family": body_family,
+            "font-size": _px(body_size_px),
+            "fill": text_color,
+        }
+        if bold:
+            cell_attrs["font-weight"] = "700"
+        return (
+            f"    <text {_attrs(cell_attrs)}>{xml_escape(content)}</text>"
+        )
+
+    for c_i, header in enumerate(columns):
+        if not isinstance(header, str) or not header:
+            raise RenderError(
+                f"table primitive columns[{c_i}] is not a non-empty string"
+            )
+        parts.append(_cell_text(c_i, 0, header, bold=True))
+    for r_i, row in enumerate(rows):
+        if not isinstance(row, list) or len(row) != col_count:
+            raise RenderError(
+                f"table primitive rows[{r_i}] has the wrong cell count "
+                f"(expected {col_count})"
+            )
+        for c_i, cell in enumerate(row):
+            if not isinstance(cell, str) or not cell:
+                raise RenderError(
+                    f"table primitive rows[{r_i}][{c_i}] is not a "
+                    f"non-empty string"
+                )
+            parts.append(_cell_text(c_i, r_i + 1, cell, bold=False))
+    parts.append("  </g>")
+    return "\n".join(parts)
+
+
 def _render_primitive(
     prim: dict,
     design: dict,
@@ -464,8 +582,10 @@ def _render_primitive(
         return _render_image_slot(prim, manifest_paths, manifest_alts)
     if kind == "kpi":
         return _render_kpi(prim, design)
-    # Fail closed for table / chart_placeholder / anything else — these
-    # are absent from current generator output and have no renderer.
+    if kind == "table":
+        return _render_table(prim, design)
+    # Fail closed for chart_placeholder / anything else — these are
+    # absent from current generator output and have no renderer.
     raise RenderError(
         f"primitive kind {kind!r} is not supported by the SVG renderer "
         f"today (supported: {SUPPORTED_PRIMITIVE_KINDS})"

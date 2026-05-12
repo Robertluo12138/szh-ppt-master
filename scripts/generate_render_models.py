@@ -15,11 +15,12 @@ SUPPORTED LAYOUTS
     timeline           text + bulleted text list (timeline_items)
     agenda             text + bulleted text list (agenda_items)
     conclusion         text + bulleted text list (call_to_action)
+    comparison_table   text + native table primitive (columns + rows)
 
-All supported layouts emit only the controlled primitive kinds the
-downstream renderers cover today: text, line, shape, image_slot, kpi.
-Slides with any other layout (e.g. comparison_table → table primitive,
-or any chart_placeholder layout) are SKIPPED and reported as not
+Supported layouts emit only the controlled primitive kinds the
+downstream renderers cover today: text, line, shape, image_slot, kpi,
+and (for comparison_table only) table. Slides with any other layout
+(e.g. a chart_placeholder layout) are SKIPPED and reported as not
 implemented; they are NOT counted as success. A successful run therefore
 says exactly how many render models were generated AND how many slides
 were skipped.
@@ -116,10 +117,9 @@ FAIL-CLOSED GATES (every gate exits non-zero on failure)
 
 OUT OF SCOPE
     SVG rendering, PPTX export, D-One, Qoder integration, network
-    behavior, charts, table-bearing layouts (comparison_table and
-    anything else mapped to the `table` primitive_kind), chart-bearing
-    layouts (any slot mapped to chart_placeholder), and any new fixtures
-    beyond the workspaces the caller already ships.
+    behavior, charts, chart-bearing layouts (any slot mapped to
+    chart_placeholder), and any new fixtures beyond the workspaces the
+    caller already ships.
 """
 
 from __future__ import annotations
@@ -155,6 +155,7 @@ SUPPORTED_LAYOUTS = (
     "timeline",
     "agenda",
     "conclusion",
+    "comparison_table",
 )
 
 # Deterministic fallback bounds for cover slots that don't carry their own
@@ -225,6 +226,10 @@ LAYOUT_FALLBACK_BOUNDS = {
     "agenda": {
         "title":         (64, 80, 1792, 100),
         "agenda_items":  (64, 260, 1792, 700),
+    },
+    "comparison_table": {
+        "title": (64, 80, 1792, 100),
+        "table": (64, 240, 1792, 760),
     },
 }
 
@@ -1154,6 +1159,118 @@ def _generate_agenda(
     }
 
 
+def _generate_comparison_table(
+    slide_plan: dict,
+    deck_slide: dict,
+    layout: dict,
+    design_system: dict,
+    manifest_ids: set[str],
+    manifest_alt_by_id: dict,
+) -> dict:
+    """comparison_table: required title text + required table primitive.
+
+    The slide_plan's `table` block carries the cell content as a
+    `{headers: [...], rows: [[...], ...]}` dict; the render_model's
+    `table` primitive renames `headers` to `columns` (to match
+    render_model.schema.json's payload field) and requires every row to
+    have the same column count as `headers`. Every cell value must be a
+    non-empty string — the controlled primitive contract does not yet
+    accept numeric or rich-text cell payloads."""
+    grid = design_system["grid"]
+    canvas = {"width_px": grid["width_px"], "height_px": grid["height_px"]}
+    slots_by_id = {
+        s["id"]: s for s in (_as_list(layout.get("slots")) or [])
+        if isinstance(s, dict) and isinstance(s.get("id"), str)
+    }
+    blocks_by_id = {
+        b["id"]: b for b in (_as_list(slide_plan.get("blocks")) or [])
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    }
+
+    primitives: list[dict] = []
+
+    primitives.append(_make_text_primitive(
+        "title", "title",
+        _bounds_for(slots_by_id, "comparison_table", "title"),
+        _text_block_content(blocks_by_id, "title"),
+        role="heading",
+        typography_token="typography.heading",
+    ))
+
+    table_block = blocks_by_id.get("table")
+    if not isinstance(table_block, dict):
+        raise GenerationError(
+            "comparison_table slide_plan missing block id='table'"
+        )
+    if table_block.get("kind") != "table":
+        raise GenerationError(
+            f"slot 'table' expects a table block; "
+            f"got kind={table_block.get('kind')!r}"
+        )
+    content = _as_dict(table_block.get("content"))
+    if content is None:
+        raise GenerationError(
+            "slot 'table' block content must be an object with "
+            "'headers' (non-empty list of strings) and 'rows' "
+            "(non-empty list of equal-length row arrays)"
+        )
+    headers = content.get("headers")
+    rows_raw = content.get("rows")
+    if not isinstance(headers, list) or not headers:
+        raise GenerationError(
+            "slot 'table' content.headers must be a non-empty list of strings"
+        )
+    columns: list[str] = []
+    for i, h in enumerate(headers):
+        if not isinstance(h, str) or not h:
+            raise GenerationError(
+                f"slot 'table' content.headers[{i}] is not a non-empty string"
+            )
+        columns.append(h)
+    if not isinstance(rows_raw, list) or not rows_raw:
+        raise GenerationError(
+            "slot 'table' content.rows must be a non-empty list of row arrays"
+        )
+    rows: list[list[str]] = []
+    for r_i, row in enumerate(rows_raw):
+        if not isinstance(row, list) or not row:
+            raise GenerationError(
+                f"slot 'table' content.rows[{r_i}] must be a non-empty list"
+            )
+        if len(row) != len(columns):
+            raise GenerationError(
+                f"slot 'table' content.rows[{r_i}] has {len(row)} cells but "
+                f"there are {len(columns)} column(s); every row must match "
+                f"the column count"
+            )
+        cells: list[str] = []
+        for c_i, cell in enumerate(row):
+            if not isinstance(cell, str) or not cell:
+                raise GenerationError(
+                    f"slot 'table' content.rows[{r_i}][{c_i}] is not a "
+                    f"non-empty string"
+                )
+            cells.append(cell)
+        rows.append(cells)
+
+    primitives.append({
+        "id": "comparison_table",
+        "slot_id": "table",
+        "kind": "table",
+        "bounds": _bounds_for(slots_by_id, "comparison_table", "table"),
+        "style": {"color_token": "palette.text"},
+        "table": {"columns": columns, "rows": rows},
+    })
+
+    return {
+        "index": deck_slide["index"],
+        "layout": "comparison_table",
+        "canvas": canvas,
+        "source_refs": list(deck_slide.get("source_refs") or []),
+        "primitives": primitives,
+    }
+
+
 GENERATORS = {
     "cover": _generate_cover,
     "executive_summary": _generate_executive_summary,
@@ -1164,6 +1281,7 @@ GENERATORS = {
     "agenda": _generate_agenda,
     "conclusion": _generate_conclusion,
     "section_divider": _generate_section_divider,
+    "comparison_table": _generate_comparison_table,
 }
 
 
@@ -1171,12 +1289,12 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description="Deterministic render_model generator for the "
                     "controlled primitive set (text / line / shape / "
-                    "image_slot / kpi). Supported layouts: cover, "
+                    "image_slot / kpi / table). Supported layouts: cover, "
                     "section_divider, executive_summary, key_message, "
                     "two_column, kpi_dashboard, timeline, agenda, "
-                    "conclusion. Layouts mapped to the table or "
-                    "chart_placeholder primitive kinds are skipped as "
-                    "not implemented.",
+                    "conclusion, comparison_table. Layouts mapped to the "
+                    "chart_placeholder primitive kind are skipped as not "
+                    "implemented.",
     )
     parser.add_argument("--workspace", required=True, type=Path,
                         help="Caller-supplied workspace directory.")

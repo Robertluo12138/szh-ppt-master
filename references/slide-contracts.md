@@ -58,7 +58,7 @@ A `slide_plan` is valid against a layout when every `required` slot has a matchi
 
 ## Controlled render model (per slide)
 
-The `render_model` is the per-slide intermediate that the SVG preview renderer (implemented today for a subset of kinds; see below) and the expanded editable PPTX exporter (`scripts/export_pptx.py`, **consumes** render_models for layouts `cover`, `kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `timeline`, `conclusion` with primitive kinds `text` / `line` / `shape` / `image_slot` / `kpi`; everything else fails closed) both consume. SVG is preview / inspection only — the PPTX exporter does not parse SVG, it builds native OOXML from the render_model directly. See `references/pptx-conversion-rules.md` for the PPTX exporter contract.
+The `render_model` is the per-slide intermediate that the SVG preview renderer (implemented today for a subset of kinds; see below) and the expanded editable PPTX exporter (`scripts/export_pptx.py`, **consumes** render_models for layouts `cover`, `kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `timeline`, `conclusion`, `comparison_table` with primitive kinds `text` / `line` / `shape` / `image_slot` / `kpi` / `table`; everything else fails closed) both consume. SVG is preview / inspection only — the PPTX exporter does not parse SVG, it builds native OOXML from the render_model directly. See `references/pptx-conversion-rules.md` for the PPTX exporter contract.
 
 Authoritative shape lives in `schemas/render_model.schema.json`. Key invariants:
 
@@ -73,7 +73,7 @@ The render_model is **not** itself a render of a slide — it carries no SVG pat
 
 ### Generator scope
 
-Today `scripts/generate_render_models.py` produces render models for every layout reachable from the controlled `text` / `line` / `shape` / `image_slot` / `kpi` primitive set: `cover`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `kpi_dashboard`, `timeline`, `agenda`, `conclusion`. The generator is deterministic and stdlib-only. Keep two phrasings distinct: which layouts this stage **can produce end-to-end** from a slide_plan (above) and which layouts the **PPTX exporter can consume** (see `references/pptx-conversion-rules.md`) — today both sets are the same.
+Today `scripts/generate_render_models.py` produces render models for every layout reachable from the controlled `text` / `line` / `shape` / `image_slot` / `kpi` / `table` primitive set: `cover`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `kpi_dashboard`, `timeline`, `agenda`, `conclusion`, `comparison_table`. The generator is deterministic and stdlib-only. Keep two phrasings distinct: which layouts this stage **can produce end-to-end** from a slide_plan (above) and which layouts the **PPTX exporter can consume** (see `references/pptx-conversion-rules.md`) — today both sets are the same.
 
 - `cover`: emits a structural `line` (title divider, no slot), then `text` primitives for the required `title` and any present optional `subtitle` / `presenter` / `date`, then an `image_slot` for `accent` if the slide_plan has an `accent` block whose `image_ref` is declared in `image_manifest`. Bounds come from the layout slot when set; otherwise from the deterministic fallback table in the script.
 - `section_divider`: optional `text` for `section_number`, required `text` for `section_title`, a structural `line` (no slot) below the title, and an optional `text` for `subtitle`.
@@ -84,8 +84,9 @@ Today `scripts/generate_render_models.py` produces render models for every layou
 - `timeline`: required `text` for `title`, then one bulleted `text` per entry in the required `timeline_items` list, distributed vertically inside the slot's fallback bounds (the `timeline.json` layout does not declare bounds today; the generator's `LAYOUT_FALLBACK_BOUNDS` covers the gap).
 - `agenda`: required `text` for `title`, then one bulleted `text` per entry in the required `agenda_items` list, distributed vertically inside the slot's fallback bounds. The `agenda.json` layout does not declare bounds today; the generator's `LAYOUT_FALLBACK_BOUNDS` covers the gap — same shape as `timeline`.
 - `conclusion`: required `text` for `title`, optional `text` for `summary`, then one bulleted `text` per entry in the optional `call_to_action` list, distributed vertically inside the slot bounds.
+- `comparison_table`: required `text` for `title` plus one `table` primitive from the `slide_plan` `table` block's `{headers, rows}` content (renamed to `columns` + `rows` to match the render_model schema). Every row must have exactly `len(headers)` cells, and every cell must be a non-empty string; an inconsistent row count or an empty cell fails closed.
 
-Layouts mapped to the `table` or `chart_placeholder` primitive kinds — `comparison_table` and anything chart-bearing — are **not** generated. The script lists those slides as `[SKIP] … not implemented`. A run is `OK` when generation succeeds for every supported slide; skipped slides are surfaced in the output but never counted as success.
+Layouts mapped to the `chart_placeholder` primitive kind — anything chart-bearing — are **not** generated. The script lists those slides as `[SKIP] … not implemented`. A run is `OK` when generation succeeds for every supported slide; skipped slides are surfaced in the output but never counted as success.
 
 The generator never invents source content. All text and KPI rows come from `slide_plan.blocks[].content`. The generator is fail-closed on missing / malformed inputs, unsafe `deck_plan.template`, unknown `image_ref`, malformed kpi entries, a missing required slide_plan block, **a stale / mismatched slide_plan** (matched by JSON index but whose `layout` or `title` disagrees with the deck_plan slide), schema-invalid output, or workspace cross-check failure — and re-runs the same `check_render_models` gate the workspace validator uses, so output drift fails immediately rather than after the next CI run.
 
@@ -95,7 +96,7 @@ Before generating, the script **removes every** `render_models/*.json` file. The
 
 `scripts/generate_svg_previews.py` is the stage-8 implementation. It reads `<workspace>/render_models/*.json` and writes `<workspace>/svg_previews/<stem>.svg` for each. The renderer consumes `render_model.json` only — it does NOT read `slide_plan.json`, so the controlled primitive contract cannot be bypassed.
 
-- Supported primitive kinds today: `text`, `line`, `shape`, `image_slot`, `kpi`. Every other kind (`table`, `chart_placeholder`, or any future kind) fails closed on that slide.
+- Supported primitive kinds today: `text`, `line`, `shape`, `image_slot`, `kpi`, `table`. Every other kind (`chart_placeholder` or any future kind) fails closed on that slide. The `table` primitive is rendered as a composite `<g>` with a bold header row, grid `<rect>` outline, and one `<text>` per cell — a visual preview of the native PPTX table the exporter emits.
 - Tokens: `palette.*` resolves to a raw hex via `design_system.palette.X`; `typography.heading|body` resolves to a `(font_family, size_pt)` pair via `design_system.typography.X`. An unresolved token fails closed.
 - Image references: resolve through `image_manifest.images[].id → local_path`. The resolved `local_path` must pass the same path-safety rule the workspace validator enforces; an undeclared or unsafe `image_ref` fails closed.
 - Output naming: `<idx>_<layout>.svg`, matching the render_model file stem.
@@ -128,4 +129,4 @@ Per-kind content shape is **TODO**; the scaffold schema accepts `content` as fre
 
 - Tighten `slide_plan.blocks[].content` shape per `kind` (today the schema accepts free-form content; the `render_model` primitives tighten this for renderable artifacts).
 - Decide canonical workspace path layout (including per-slide directory vs flat `slide_plans/` and `render_models/`).
-- Extend `render_model` once SVG / PPTX export is in scope: stroke styles, gradients, dashed-pattern enumeration, multi-paragraph text runs, table cell styling, and a controlled chart spec to replace `chart_placeholder`. None of these are in scope today.
+- Extend `render_model` further: stroke styles, gradients, dashed-pattern enumeration, multi-paragraph text runs, richer table cell styling (zebra striping, per-cell typography), and a controlled chart spec to replace `chart_placeholder`. None of these are in scope today; the current `table` primitive carries cell strings only and the native PPTX `<a:tbl>` inherits the default table style.

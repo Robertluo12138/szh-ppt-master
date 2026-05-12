@@ -1347,9 +1347,12 @@ def check_generator_render_model_coverage(
         render_model on disk. Missing files are FAILs that name the
         slide index and layout so the maintainer can run the
         generator (or correct the deck_plan).
-      - Slides whose layout is NOT in the supported set (today only
-        `comparison_table`) are allowed to have no render_model and
-        are not flagged here.
+      - Slides whose layout is NOT in the supported set are allowed to
+        have no render_model and are not flagged here. Every layout
+        declared by the business_review template skeleton is currently
+        in the generator's SUPPORTED_LAYOUTS, so this branch only fires
+        for non-business_review templates that declare a layout the
+        generator has not been taught about yet.
 
     This stops a fixture from committing e.g. only `01_cover.json`
     while the deck_plan declares twenty slides — the workspace would
@@ -2896,11 +2899,13 @@ def negative_render_model_tempfixture_checks() -> list[CheckResult]:
 
 def _build_coverage_template(template_root: Path) -> None:
     """Build a self-contained template that declares one generator-
-    supported layout (`cover`) and one unsupported one (`comparison_table`).
+    supported layout (`cover`) and one unsupported one (`org_chart`).
     The cover layout's `title` slot mirrors the real business_review
-    cover slot so the test render_model can target it. The
-    comparison_table layout is deliberately included so the coverage
-    check can prove unsupported layouts are NOT flagged."""
+    cover slot so the test render_model can target it. The `org_chart`
+    layout is a synthetic placeholder for a layout the generator does
+    not implement (its `chart` slot maps to the still-unsupported
+    chart_placeholder primitive_kind), so the coverage check can prove
+    unsupported layouts are NOT flagged."""
     _make_template_dir(
         template_root,
         "coverage_tmpl",
@@ -2915,17 +2920,17 @@ def _build_coverage_template(template_root: Path) -> None:
                     },
                 ],
             },
-            "comparison_table": {
-                "name": "comparison_table",
+            "org_chart": {
+                "name": "org_chart",
                 "slots": [
                     {
-                        "id": "table", "type": "table", "required": True,
-                        "primitive_kind": "table",
+                        "id": "chart", "type": "chart_ref", "required": True,
+                        "primitive_kind": "chart_placeholder",
                     },
                 ],
             },
         },
-        declared_layouts=["cover", "comparison_table"],
+        declared_layouts=["cover", "org_chart"],
     )
 
 
@@ -3103,7 +3108,7 @@ def negative_render_model_coverage_tempfixture_checks() -> list[CheckResult]:
             ws,
             deck_slides=[
                 {"index": 1, "layout": "cover", "title": "First"},
-                {"index": 2, "layout": "comparison_table", "title": "Compare"},
+                {"index": 2, "layout": "org_chart", "title": "Org"},
             ],
             render_model_indices=[1],
         )
@@ -3627,15 +3632,18 @@ def _build_svg_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
         "text": {"content": "Synthetic headline", "role": "heading"},
     }
     if kind == "unsupported":
-        # Schema-valid table primitive (the SVG renderer fails closed on it
-        # since current generated fixtures never emit a table).
+        # Schema-valid chart_placeholder primitive (the SVG renderer
+        # fails closed on it — chart rendering is intentionally TODO).
+        # The previous fixture used `table`, but `table` is now part of
+        # SUPPORTED_PRIMITIVE_KINDS, so a still-unsupported kind is
+        # needed here to keep this fail-closed gate exercised.
         primitive = {
-            "id": "tbl",
-            "kind": "table",
+            "id": "chart",
+            "kind": "chart_placeholder",
             "bounds": {"x": 100, "y": 100, "w": 800, "h": 400},
-            "table": {
-                "columns": ["A", "B"],
-                "rows": [["1", "2"]],
+            "chart_placeholder": {
+                "caption": "placeholder",
+                "chart_kind": "bar",
             },
         }
     if kind == "bad_token":
@@ -3683,7 +3691,7 @@ def negative_svg_generator_tempfixture_checks() -> list[CheckResult]:
 
     Cases:
       A. happy path: emits one SVG that the validator accepts;
-      B. unsupported primitive kind (table) fails closed;
+      B. unsupported primitive kind (chart_placeholder) fails closed;
       C. bad palette token fails closed;
       D. image_slot whose manifest local_path is unsafe fails closed;
       E. missing render_models/ fails closed (no traceback);
@@ -4233,10 +4241,10 @@ def _build_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
     actually run against. `kind` selects the mutation applied:
 
       'happy'         — clean baseline: slide 1 is cover, slide 2 is
-                        comparison_table (an unsupported layout because
-                        the table primitive_kind is not implemented by
-                        the generator today). Generator should generate
-                        1 file and skip 1 slide.
+                        org_chart (a synthetic layout whose chart slot
+                        maps to the still-unsupported chart_placeholder
+                        primitive_kind). Generator should generate 1
+                        file and skip 1 slide.
       'bad_image_ref' — cover slide_plan references an image id not in
                         the image_manifest. Generator must FAIL closed.
       'malformed_kpi' — kpi_dashboard slide_plan content is not a list.
@@ -4273,8 +4281,8 @@ def _build_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
              "title": "Synthetic Cover", "section_id": "only",
              "summary": "x", "density": "low",
              "source_refs": ["synthetic_src_g"]},
-            {"index": 2, "layout": "comparison_table",
-             "title": "Synthetic Comparison", "section_id": "only",
+            {"index": 2, "layout": "org_chart",
+             "title": "Synthetic Org Chart", "section_id": "only",
              "summary": "x", "density": "medium",
              "source_refs": ["synthetic_src_g"]},
         ],
@@ -4304,9 +4312,8 @@ def _build_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
         {"id": "accent", "kind": "image_ref", "content": "generator_accent"},
     ]
     base_slide2_blocks = [
-        {"id": "title", "kind": "text", "content": "Synthetic Comparison"},
-        {"id": "table", "kind": "table",
-         "content": {"columns": ["A", "B"], "rows": [["1", "2"]]}},
+        {"id": "title", "kind": "text", "content": "Synthetic Org Chart"},
+        {"id": "chart", "kind": "chart_ref", "content": "synthetic"},
     ]
     if kind == "bad_image_ref":
         base_cover_blocks = [
@@ -4367,10 +4374,13 @@ def _build_generator_template(template_root: Path) -> None:
     """Build a minimal template tree that the synthetic generator workspace
     references. Includes cover and kpi_dashboard layouts (with bounds and
     primitive_kind on the required slots, matching the real business_review
-    template's shape) plus an unsupported comparison_table layout so the
-    skip-not-success path can be exercised. comparison_table maps to the
-    `table` primitive_kind, which the controlled render-model generator
-    does not implement today and remains a TODO per CLAUDE.md."""
+    template's shape) plus an unsupported `org_chart` layout so the
+    skip-not-success path can be exercised. `org_chart` maps to the
+    `chart_placeholder` primitive_kind, which the controlled render-model
+    generator does not implement today and remains a TODO per CLAUDE.md
+    (the previously-used `comparison_table` layout is now fully supported,
+    so a synthetic chart-bearing layout is needed to keep the unsupported
+    path exercised)."""
     layout_files = {
         "cover": {
             "name": "cover",
@@ -4399,11 +4409,12 @@ def _build_generator_template(template_root: Path) -> None:
                  "bounds": {"x": 64, "y": 280, "w": 1792, "h": 600}},
             ],
         },
-        "comparison_table": {
-            "name": "comparison_table",
+        "org_chart": {
+            "name": "org_chart",
             "slots": [
                 {"id": "title", "type": "text", "required": True},
-                {"id": "table", "type": "table", "required": True},
+                {"id": "chart", "type": "chart_ref", "required": True,
+                 "primitive_kind": "chart_placeholder"},
             ],
         },
     }
@@ -4511,8 +4522,8 @@ def negative_generator_tempfixture_checks() -> list[CheckResult]:
         _build_generator_workspace(ws, kind="happy")
         ret, sout, serr = run(ws, tr)
         cover_emitted = (ws / "render_models" / "01_cover.json").is_file()
-        unsupported_emitted = (ws / "render_models" / "02_comparison_table.json").is_file()
-        skip_reported = "[SKIP] slide  2: layout 'comparison_table' not implemented" in sout
+        unsupported_emitted = (ws / "render_models" / "02_org_chart.json").is_file()
+        skip_reported = "[SKIP] slide  2: layout 'org_chart' not implemented" in sout
         out.append(CheckResult(
             "tempfixture generator: happy path exits 0, "
             "emits supported cover, skips unsupported layout "
@@ -4708,7 +4719,7 @@ def negative_generator_tempfixture_checks() -> list[CheckResult]:
     #    on the next run even though the generator does not write a
     #    replacement (the slide is now skipped). Without this, the
     #    workspace would carry a stale cover render_model for a slide
-    #    the deck_plan now describes as comparison_table.
+    #    the deck_plan now describes as org_chart.
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         tr = root / "templates"
@@ -4716,21 +4727,20 @@ def negative_generator_tempfixture_checks() -> list[CheckResult]:
         _build_generator_template(tr)
         ws = root / "ws"
         _build_generator_workspace(ws, kind="happy")
-        # Mutate deck_plan slide 1 from cover -> comparison_table
+        # Mutate deck_plan slide 1 from cover -> org_chart
         # (unsupported), and align the slide_plan + section_id so the
         # workspace stays schema-valid and the generator's per-slide
         # alignment guard does not short-circuit first.
         deck = json.loads((ws / "deck_plan.json").read_text())
-        deck["slides"][0]["layout"] = "comparison_table"
+        deck["slides"][0]["layout"] = "org_chart"
         deck["slides"][0]["title"] = "Now Unsupported"
         (ws / "deck_plan.json").write_text(json.dumps(deck))
         plan1 = json.loads((ws / "slide_plans" / "01.json").read_text())
-        plan1["layout"] = "comparison_table"
+        plan1["layout"] = "org_chart"
         plan1["title"] = "Now Unsupported"
         plan1["blocks"] = [
             {"id": "title", "kind": "text", "content": "Now Unsupported"},
-            {"id": "table", "kind": "table",
-             "content": {"columns": ["A", "B"], "rows": [["1", "2"]]}},
+            {"id": "chart", "kind": "chart_ref", "content": "synthetic"},
         ]
         (ws / "slide_plans" / "01.json").write_text(json.dumps(plan1))
         # Plant a stale render_model from "before the layout change".
@@ -4757,7 +4767,7 @@ def negative_generator_tempfixture_checks() -> list[CheckResult]:
         ret, sout, serr = run(ws, tr)
         still_exists = prior.is_file()
         skipped_logged = (
-            "[SKIP] slide  1: layout 'comparison_table' not implemented"
+            "[SKIP] slide  1: layout 'org_chart' not implemented"
             in sout
         )
         cleaned_logged = "[CLEAN] render_models/01_cover.json" in sout

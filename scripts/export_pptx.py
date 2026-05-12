@@ -8,16 +8,17 @@ supported subset:
 
     layouts:         cover, kpi_dashboard, agenda, section_divider,
                      executive_summary, key_message, two_column,
-                     timeline, conclusion
-    primitive kinds: text, line, shape, image_slot, kpi
+                     timeline, conclusion, comparison_table
+    primitive kinds: text, line, shape, image_slot, kpi, table
 
 The slide body emitter is layout-agnostic — it iterates the
 render_model's `primitives` list and emits one native PPTX object per
 primitive — so widening the layout allow-list does not change how any
-single shape is rendered. The `comparison_table` layout is intentionally
-NOT in the allow-list because its primary content is a `table`
-primitive, which remains fail-closed (no native PPTX-table emission
-yet).
+single shape is rendered. `comparison_table` is now in the allow-list:
+its defining `table` primitive emits a native PPTX `<p:graphicFrame>`
+wrapping `<a:tbl>` (one `<a:gridCol>` per column, one `<a:tr>` per row,
+each `<a:tc>` holding an editable `<a:txBody>`), so every cell is
+directly editable in PowerPoint without media embedding.
 
 This is NOT a generic SVG-to-PPTX converter. It does NOT parse SVG, it
 does NOT screenshot a slide, and it does NOT rasterize a slide into a
@@ -55,6 +56,11 @@ PRIMITIVE -> NATIVE PPTX OBJECT MAPPING
                  (label / value / optional delta) — fully editable
     image_slot   <p:sp> placeholder rectangle whose <a:txBody> carries
                  the image_manifest alt_text. Media embedding is TODO.
+    table        <p:graphicFrame> wrapping <a:tbl> with one <a:gridCol>
+                 per column and a bold header row of <a:tc> cells, each
+                 cell carrying an editable <a:txBody> with its declared
+                 string content. The frame is fully editable as a native
+                 PowerPoint table.
 
 PREFLIGHT GATES (run BEFORE any output ZIP is created)
     - workspace is a directory; output extension is `.pptx`
@@ -79,16 +85,14 @@ the whole run; no partial `.pptx` is written if ANY render_model
 trips ANY gate)
     - layout is in SUPPORTED_LAYOUTS (cover, kpi_dashboard, agenda,
       section_divider, executive_summary, key_message, two_column,
-      timeline, conclusion); a render_model whose layout is outside
-      that set fails closed with a per-slide error. The contract is
-      intentionally all-or-nothing: the exporter refuses to write a
-      deck that silently drops coverage for slides whose layout is
-      not yet implemented. `comparison_table` is intentionally
-      excluded because it needs the still-unsupported `table`
-      primitive.
+      timeline, conclusion, comparison_table); a render_model whose
+      layout is outside that set fails closed with a per-slide error.
+      The contract is intentionally all-or-nothing: the exporter
+      refuses to write a deck that silently drops coverage for slides
+      whose layout is not yet implemented.
     - every primitive kind is in SUPPORTED_PRIMITIVE_KINDS (text, line,
-      shape, image_slot, kpi); a `table` or `chart_placeholder`
-      primitive fails closed with an explicit error.
+      shape, image_slot, kpi, table); a `chart_placeholder` primitive
+      fails closed with an explicit error.
 
 FAIL-CLOSED OVERALL
     - Fails if any render_model fails any per-slide gate above (no
@@ -113,11 +117,11 @@ DETERMINISM
 OUT OF SCOPE
     - SVG / PNG / JPG / GIF media embedding (deferred — image_slot is
       a placeholder shape only).
-    - PPTX `table` / `chart_placeholder` emission (deferred — fail
-      closed today).
-    - Layouts outside the SUPPORTED_LAYOUTS allow-list above
-      (`comparison_table` is the only template-declared layout left
-      out; it requires the still-unsupported `table` primitive).
+    - PPTX `chart_placeholder` emission (deferred — fail closed today).
+    - Layouts outside the SUPPORTED_LAYOUTS allow-list above. Every
+      layout declared by the business_review template skeleton is
+      currently in scope; new layouts must add a paired generator
+      branch before they may appear here.
     - Speaker notes, transitions, animations, master/layout palettes
       driven by deck-plan template themes.
     - D-One image generation, Qoder CLI integration, public network
@@ -166,8 +170,11 @@ SCHEMAS = REPO_ROOT / "schemas"
 # so this allow-list is purely a contract gate: the exporter only
 # accepts render_models whose `layout` value is on this list, and
 # fails closed (whole-run abort, no partial deck) on any other layout.
-# `comparison_table` is intentionally NOT in this set because its
-# defining content is a `table` primitive, which remains fail-closed.
+# Every layout declared by the business_review template skeleton is
+# currently in scope; the `table` primitive is exported as a native
+# `<p:graphicFrame>` wrapping `<a:tbl>`, so `comparison_table` is now
+# in the allow-list. New layouts must add a paired generator branch
+# before they may appear here.
 SUPPORTED_LAYOUTS = (
     "cover",
     "kpi_dashboard",
@@ -178,8 +185,9 @@ SUPPORTED_LAYOUTS = (
     "two_column",
     "timeline",
     "conclusion",
+    "comparison_table",
 )
-SUPPORTED_PRIMITIVE_KINDS = ("text", "line", "shape", "image_slot", "kpi")
+SUPPORTED_PRIMITIVE_KINDS = ("text", "line", "shape", "image_slot", "kpi", "table")
 
 # 1 px at 96 dpi = 9525 EMU. The render_model canvas (default
 # 1920x1080 px) maps to a 20" x 11.25" slide. We do NOT scale to the
@@ -726,6 +734,140 @@ def _render_image_slot_sp(
     )
 
 
+def _table_cell_xml(content: str, *, run_pr: str, anchor: str = "ctr") -> str:
+    """Emit one <a:tc> with a single <a:p> + <a:r> + <a:t> run. anchor
+    centers the cell text vertically; PowerPoint accepts `ctr`, `t`, `b`.
+    The cell carries an empty <a:tcPr/> so the table inherits the
+    default style and the export stays minimal — styling extensions
+    (zebra striping, borders, ...) remain TODO."""
+    return (
+        f'<a:tc>'
+        f'<a:txBody>'
+        f'<a:bodyPr wrap="square" lIns="36576" tIns="22860" '
+        f'rIns="36576" bIns="22860" anchor="{anchor}"/>'
+        f'<a:lstStyle/>'
+        f'<a:p><a:r>{run_pr}<a:t>{xml_escape(content)}</a:t></a:r></a:p>'
+        f'</a:txBody>'
+        f'<a:tcPr/>'
+        f'</a:tc>'
+    )
+
+
+def _render_table_graphicframe(prim: dict, design: dict, shape_id: int) -> str:
+    """table primitive -> native <p:graphicFrame> wrapping <a:tbl>.
+
+    Every cell carries an editable <a:txBody> with the declared string
+    content, so a PowerPoint user can click into the cell and edit it
+    directly. Column widths are distributed uniformly across the
+    primitive bounds; rows split the bounds between a single header row
+    and the body rows. Integer arithmetic only so the output is
+    byte-stable across machines and runs.
+
+    Defense-in-depth: the controlled schema already constrains
+    `columns` to a non-empty list of strings and `rows` to a non-empty
+    list of equal-length string arrays, but the emitter re-checks at
+    the point of XML generation so a malformed render_model that
+    sneaks past schema validation still fails closed here rather than
+    smuggling untrusted text into the output."""
+    bounds = prim["bounds"]
+    off_x, off_y, ext_cx, ext_cy = _bounds_to_xfrm(bounds)
+    style = _as_dict(prim.get("style")) or {}
+    color_token = style.get("color_token")
+    if not isinstance(color_token, str):
+        raise ExportError("table primitive missing style.color_token")
+    color = _resolve_palette(design, color_token)
+    body_family_chain, body_pt = _resolve_typography(design, "typography.body")
+    head_family_chain, head_pt = _resolve_typography(design, "typography.heading")
+    body_family = _font_first(body_family_chain)
+    head_family = _font_first(head_family_chain)
+    body_cp = _sz_centipoints(body_pt)
+    head_cp = _sz_centipoints(head_pt)
+
+    payload = _as_dict(prim.get("table")) or {}
+    columns = payload.get("columns")
+    rows = payload.get("rows")
+    if not isinstance(columns, list) or not columns:
+        raise ExportError("table primitive missing non-empty columns")
+    if not isinstance(rows, list) or not rows:
+        raise ExportError("table primitive missing non-empty rows")
+    col_count = len(columns)
+    body_row_count = len(rows)
+    total_rows = body_row_count + 1  # header + body
+
+    col_w_emu = ext_cx // col_count
+    row_h_emu = ext_cy // total_rows
+    if col_w_emu <= 0 or row_h_emu <= 0:
+        raise ExportError(
+            f"table primitive bounds {ext_cx}x{ext_cy} EMU too small for "
+            f"{col_count} cols x {total_rows} rows"
+        )
+
+    grid_cols_xml = "".join(
+        f'<a:gridCol w="{col_w_emu}"/>' for _ in range(col_count)
+    )
+
+    head_run_pr = _run_pr_xml(
+        size_cp=head_cp, hex_color=color, bold=True, font_first=head_family,
+    )
+    body_run_pr = _run_pr_xml(
+        size_cp=body_cp, hex_color=color, bold=False, font_first=body_family,
+    )
+
+    header_cells: list[str] = []
+    for c_i, header in enumerate(columns):
+        if not isinstance(header, str) or not header:
+            raise ExportError(
+                f"table primitive columns[{c_i}] is not a non-empty string"
+            )
+        header_cells.append(_table_cell_xml(header, run_pr=head_run_pr))
+    rows_xml: list[str] = [
+        f'<a:tr h="{row_h_emu}">{"".join(header_cells)}</a:tr>'
+    ]
+    for r_i, row in enumerate(rows):
+        if not isinstance(row, list) or len(row) != col_count:
+            raise ExportError(
+                f"table primitive rows[{r_i}] has the wrong cell count "
+                f"(expected {col_count})"
+            )
+        body_cells: list[str] = []
+        for c_i, cell in enumerate(row):
+            if not isinstance(cell, str) or not cell:
+                raise ExportError(
+                    f"table primitive rows[{r_i}][{c_i}] is not a "
+                    f"non-empty string"
+                )
+            body_cells.append(_table_cell_xml(cell, run_pr=body_run_pr))
+        rows_xml.append(
+            f'<a:tr h="{row_h_emu}">{"".join(body_cells)}</a:tr>'
+        )
+
+    pid = prim.get("id") or "table"
+    return (
+        f'<p:graphicFrame>'
+        f'<p:nvGraphicFramePr>'
+        f'<p:cNvPr id="{shape_id}" name="{_attr(f"table:{pid}")}"/>'
+        f'<p:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></p:cNvGraphicFramePr>'
+        f'<p:nvPr/>'
+        f'</p:nvGraphicFramePr>'
+        f'<p:xfrm>'
+        f'<a:off x="{off_x}" y="{off_y}"/>'
+        f'<a:ext cx="{ext_cx}" cy="{ext_cy}"/>'
+        f'</p:xfrm>'
+        f'<a:graphic>'
+        f'<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">'
+        f'<a:tbl>'
+        f'<a:tblPr firstRow="1"><a:tableStyleId>'
+        f'{{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}}'
+        f'</a:tableStyleId></a:tblPr>'
+        f'<a:tblGrid>{grid_cols_xml}</a:tblGrid>'
+        f'{"".join(rows_xml)}'
+        f'</a:tbl>'
+        f'</a:graphicData>'
+        f'</a:graphic>'
+        f'</p:graphicFrame>'
+    )
+
+
 def _render_primitive(
     prim: dict,
     design: dict,
@@ -746,12 +888,14 @@ def _render_primitive(
         return _render_image_slot_sp(
             prim, design, shape_id, manifest_alts, manifest_paths,
         )
-    # Fail closed on table / chart_placeholder / anything else. These
-    # remain TODO per references/pptx-conversion-rules.md.
+    if kind == "table":
+        return _render_table_graphicframe(prim, design, shape_id)
+    # Fail closed on chart_placeholder / anything else. These remain
+    # TODO per references/pptx-conversion-rules.md.
     raise ExportError(
         f"primitive kind {kind!r} is not supported by the PPTX exporter "
         f"today (supported: {SUPPORTED_PRIMITIVE_KINDS}); "
-        f"`table` and `chart_placeholder` are deferred and must fail closed"
+        f"`chart_placeholder` is deferred and must fail closed"
     )
 
 
@@ -780,8 +924,8 @@ def _slide_xml(
             raise ExportError(
                 f"render_model contains unsupported primitive kind "
                 f"{kind!r} (supported: {SUPPORTED_PRIMITIVE_KINDS}); "
-                f"`table` and `chart_placeholder` remain TODO and must "
-                f"fail closed in this exporter"
+                f"`chart_placeholder` remains TODO and must fail closed "
+                f"in this exporter"
             )
         shape_xml_parts.append(
             _render_primitive(prim, design, next_id, manifest_alts, manifest_paths)
@@ -1319,7 +1463,7 @@ def export_workspace(workspace: Path, output: Path) -> int:
         )
     print(
         f"\nOK: PPTX export succeeded for {len(exported)} slide(s). "
-        f"This is the expanded native editable subset — `table` and "
+        f"This is the expanded native editable subset — "
         f"`chart_placeholder` primitives, media embedding, and layouts "
         f"outside the allow-list {SUPPORTED_LAYOUTS} fail closed and "
         f"remain TODO."
@@ -1601,35 +1745,86 @@ def _run_self_tests() -> list[CheckResult]:
             stderr.strip() if rc == 0 else "",
         ))
 
-        # 3. NEGATIVE: render_model with `table` primitive.
+        # 3. POSITIVE: comparison_table workspace exports a native
+        # editable PPTX table. Replaces the previous fail-closed
+        # scenario for the `table` primitive — table is now in the
+        # SUPPORTED_PRIMITIVE_KINDS allow-list and renders as an
+        # <a:tbl> inside a <p:graphicFrame>. The fixture swaps the
+        # happy-path kpi_dashboard slide for a comparison_table slide
+        # carrying a title and a 2-col x 2-row table; the run must
+        # succeed and the resulting PPTX must contain a graphicFrame
+        # whose tbl has the expected number of <a:tr> rows.
+        import xml.etree.ElementTree as _ET
+        import zipfile as _zipfile
         table_ws = td / "with_table"
         _write_synthetic_workspace(table_ws)
-        (table_ws / "render_models" / "01_cover.json").write_text(json.dumps({
-            "index": 1,
-            "layout": "cover",
-            "canvas": {"width_px": 1920, "height_px": 1080},
-            "source_refs": ["synthetic_src"],
-            "primitives": [
-                {
-                    "id": "bad_table",
-                    "kind": "table",
-                    "bounds": {"x": 100, "y": 100, "w": 800, "h": 400},
-                    "table": {
-                        "columns": ["c1", "c2"],
-                        "rows": [["a", "b"], ["c", "d"]],
+        (table_ws / "render_models" / "02_kpi_dashboard.json").unlink()
+        (table_ws / "render_models" / "02_comparison_table.json").write_text(
+            json.dumps({
+                "index": 2,
+                "layout": "comparison_table",
+                "canvas": {"width_px": 1920, "height_px": 1080},
+                "source_refs": ["synthetic_src"],
+                "primitives": [
+                    {
+                        "id": "title",
+                        "slot_id": "title",
+                        "kind": "text",
+                        "bounds": {"x": 64, "y": 80, "w": 1792, "h": 120},
+                        "style": {
+                            "color_token": "palette.text",
+                            "typography_token": "typography.heading",
+                        },
+                        "text": {"content": "Synthetic Comparison",
+                                 "role": "heading"},
                     },
-                },
-            ],
-        }))
+                    {
+                        "id": "comparison_table",
+                        "slot_id": "table",
+                        "kind": "table",
+                        "bounds": {"x": 64, "y": 240, "w": 1792, "h": 760},
+                        "style": {"color_token": "palette.text"},
+                        "table": {
+                            "columns": ["metric", "before", "after"],
+                            "rows": [
+                                ["alpha", "<v1>", "<v2>"],
+                                ["beta", "<v3>", "<v4>"],
+                            ],
+                        },
+                    },
+                ],
+            })
+        )
         table_out = td / "table.pptx"
         rc, _stdout, stderr = _run_capture(table_ws, table_out)
-        msg = stderr + _stdout
+        table_in_slide = False
+        cell_text_present = False
+        if rc == 0 and table_out.is_file():
+            with _zipfile.ZipFile(table_out) as _zf:
+                slide_xml = _zf.read("ppt/slides/slide2.xml").decode("utf-8")
+                table_in_slide = (
+                    "<p:graphicFrame>" in slide_xml
+                    and "<a:tbl>" in slide_xml
+                    and slide_xml.count("<a:tr") == 3  # 1 header + 2 body
+                    and slide_xml.count("<a:tc>") == 9  # 3 cols x 3 rows
+                )
+                cell_text_present = (
+                    "Synthetic Comparison" in slide_xml
+                    and "<a:t>metric</a:t>" in slide_xml
+                    and "<a:t>alpha</a:t>" in slide_xml
+                    and "<a:t>&lt;v4&gt;</a:t>" in slide_xml
+                )
+                # Defense-in-depth: every slide XML must still parse.
+                for _name in _zf.namelist():
+                    if _name.endswith(".xml") or _name.endswith(".rels"):
+                        _ET.fromstring(_zf.read(_name))
         results.append(CheckResult(
-            "selftest: render_model with `table` primitive fails closed",
-            rc != 0 and "table" in msg and not table_out.exists(),
-            (f"rc={rc}, missing 'table' in stderr/stdout, "
-             f"output_exists={table_out.exists()}"
-             if rc == 0 or "table" not in msg or table_out.exists() else ""),
+            "selftest: comparison_table workspace exports a native "
+            "<p:graphicFrame>/<a:tbl> with editable cell text",
+            rc == 0 and table_in_slide and cell_text_present,
+            (f"rc={rc}, table_in_slide={table_in_slide}, "
+             f"cell_text_present={cell_text_present}; {stderr.strip()}"
+             if not (rc == 0 and table_in_slide and cell_text_present) else ""),
         ))
 
         # 4. NEGATIVE: render_model with `chart_placeholder` primitive.
@@ -1808,29 +2003,22 @@ def _run_self_tests() -> list[CheckResult]:
         # closed and no partial deck is written. Earlier versions of
         # this script treated unsupported layouts as a harmless
         # [SKIP] and still produced a `.pptx` containing the other
-        # slides; the contract is now all-or-nothing. The expanded
-        # SUPPORTED_LAYOUTS allow-list covers most template layouts,
-        # so the scenario uses `comparison_table` — the one
-        # template-declared layout left outside the allow-list
-        # because it requires the still-unsupported `table`
-        # primitive. The fixture replaces the workspace's cover
-        # slide with a `comparison_table` layout (using a text
-        # primitive only, so the layout gate trips before any
-        # primitive gate would) and keeps the kpi_dashboard slide
-        # untouched. The exporter must abort and leave no `.pptx`
-        # on disk.
+        # slides; the contract is now all-or-nothing. The fixture
+        # uses a synthetic `org_chart` layout name — every template-
+        # declared layout in the business_review skeleton is now in
+        # SUPPORTED_LAYOUTS, so the test must use a layout the
+        # exporter has explicitly never been taught about to exercise
+        # the gate. The render_model filename MUST be
+        # `01_org_chart.json` (canonical-name gate fires first in the
+        # exporter preflight) so this scenario actually exercises the
+        # unsupported-layout gate rather than the filename gate.
         unsupp_ws = td / "unsupported_layout"
         _write_synthetic_workspace(unsupp_ws)
-        # Replace the happy-path cover slide with a comparison_table
-        # slide at the same index. The render_model filename MUST be
-        # `01_comparison_table.json` (canonical-name gate fires first
-        # in the exporter preflight) so this scenario actually exercises
-        # the unsupported-layout gate rather than the filename gate.
         (unsupp_ws / "render_models" / "01_cover.json").unlink()
-        (unsupp_ws / "render_models" / "01_comparison_table.json").write_text(
+        (unsupp_ws / "render_models" / "01_org_chart.json").write_text(
             json.dumps({
                 "index": 1,
-                "layout": "comparison_table",
+                "layout": "org_chart",
                 "canvas": {"width_px": 1920, "height_px": 1080},
                 "source_refs": ["synthetic_src"],
                 "primitives": [
@@ -1842,7 +2030,7 @@ def _run_self_tests() -> list[CheckResult]:
                             "color_token": "palette.text",
                             "typography_token": "typography.heading",
                         },
-                        "text": {"content": "Comparison", "role": "heading"},
+                        "text": {"content": "Org Chart", "role": "heading"},
                     },
                 ],
             })
@@ -1855,14 +2043,14 @@ def _run_self_tests() -> list[CheckResult]:
             "(no partial deck written)",
             (
                 rc != 0
-                and "comparison_table" in msg
+                and "org_chart" in msg
                 and "supported set" in msg
                 and not unsupp_out.exists()
             ),
-            (f"rc={rc}, missing 'comparison_table'/'supported set' in "
+            (f"rc={rc}, missing 'org_chart'/'supported set' in "
              f"messages, output_exists={unsupp_out.exists()}"
              if rc == 0
-                or "comparison_table" not in msg
+                or "org_chart" not in msg
                 or "supported set" not in msg
                 or unsupp_out.exists() else ""),
         ))
@@ -2042,11 +2230,12 @@ def main(argv: list[str]) -> int:
             "render_model artifacts. Supports the cover / "
             "kpi_dashboard / agenda / section_divider / "
             "executive_summary / key_message / two_column / timeline / "
-            "conclusion layouts and the text / line / shape / "
-            "image_slot / kpi primitive kinds; everything else fails "
-            "closed. image_slot primitives emit a placeholder native "
-            "shape with alt_text — media embedding is TODO. See "
-            "references/pptx-conversion-rules.md for the full contract."
+            "conclusion / comparison_table layouts and the text / line "
+            "/ shape / image_slot / kpi / table primitive kinds; "
+            "everything else fails closed. image_slot primitives emit a "
+            "placeholder native shape with alt_text — media embedding "
+            "is TODO. See references/pptx-conversion-rules.md for the "
+            "full contract."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2082,8 +2271,9 @@ def main(argv: list[str]) -> int:
              "workspace exports and passes validate_pptx_contract; "
              "schema-valid font_family with embedded \" round-trips as "
              "&quot;; expanded-layout workspace using two_column exports "
-             "and passes validate_pptx_contract) and negatives (wrong "
-             "output extension, unsupported `table` primitive, "
+             "and passes validate_pptx_contract; comparison_table "
+             "workspace exports a native <p:graphicFrame>/<a:tbl> with "
+             "editable cells) and negatives (wrong output extension, "
              "unsupported `chart_placeholder` primitive, render_model "
              "missing a required field, image_slot image_ref not in "
              "manifest, manifest local_path with a URI scheme, "
