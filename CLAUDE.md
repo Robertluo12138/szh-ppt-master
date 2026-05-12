@@ -14,9 +14,16 @@ Claude Code's job is to implement the user's current prompt narrowly, preserve t
 
 ## Current Capability Surface
 
-The repo currently contains scaffold docs, JSON schemas, template skeletons, synthetic examples, stdlib-only validators, a deterministic render-model generator for the `cover` and `kpi_dashboard` layouts (`scripts/generate_render_models.py`), and a deterministic SVG preview renderer (`scripts/generate_svg_previews.py`) that consumes those render_models and writes per-slide previews for the supported primitive subset (`text`, `line`, `shape`, `image_slot`, `kpi`). PPTX export, chart rendering, visual regression, D-One integration, and Qoder CLI integration are **not** implemented; SVG repair (clipping out-of-bounds shapes, font fallback) and glyph-level text-overflow detection also remain TODO.
+The repo currently contains scaffold docs, JSON schemas, template skeletons, synthetic examples, stdlib-only validators, a deterministic render-model generator (`scripts/generate_render_models.py`), a deterministic SVG preview renderer (`scripts/generate_svg_previews.py`), and a deterministic native editable PPTX exporter (`scripts/export_pptx.py`). All three downstream stages consume `render_model.json` directly and cover the same minimal supported subset:
 
-Do not document unimplemented stages as working behavior, and do not claim end-to-end success — the pipeline stops at the SVG preview for the supported layouts and primitive kinds.
+- supported layouts: `cover` and `kpi_dashboard`;
+- supported primitive kinds: `text`, `line`, `shape`, `image_slot`, `kpi`.
+
+`image_slot` is exported as a native PPTX placeholder shape carrying the `image_manifest` alt_text; media embedding (copying PNG / JPG / SVG bytes into `ppt/media/`) is intentionally TODO. Anything outside the supported subset must fail closed: `table` and `chart_placeholder` primitives, every other layout, malformed render_models, undeclared image refs, and unsafe manifest paths all abort the run with a clear per-slide error rather than producing a partial deck.
+
+Full PPTX coverage (every layout, every primitive, embedded media, full editability inventory, relationship allow-list, theme palette mapping, determinism inventory), chart rendering, visual regression, D-One integration, and Qoder CLI integration are **not** implemented; SVG repair (clipping out-of-bounds shapes, font fallback) and glyph-level text-overflow detection also remain TODO.
+
+Do not document unimplemented stages as working behavior, and do not claim end-to-end success — the pipeline now stops at the minimal native editable PPTX for the supported subset.
 
 ## Architecture Notes
 

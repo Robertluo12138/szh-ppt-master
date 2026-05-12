@@ -13,7 +13,7 @@ The skill is a single linear pipeline. Stages are append-only; do not skip or re
 | 7 | Render model | per-slide plan + design_system + image_manifest + layout slots | one `render_model.json` per slide (controlled primitives, bounds, token-only style refs) | `schemas/render_model.schema.json` |
 | 8 | SVG render | per-slide render model | one SVG preview per slide under `svg_previews/` (partial: `text`, `line`, `shape`, `image_slot`, `kpi`) | XML; controlled by `check_svg_previews` in `scripts/validate_workspace.py` |
 | 9 | SVG validate | per-slide SVG | pass/fail against `check_svg_previews` | implemented (repair: TODO) |
-| 10 | PPTX export | per-slide render model + template | one editable PPTX (native shapes / text frames / pictures) | TODO — exporter not implemented; contract / container skeleton in `scripts/validate_pptx_contract.py` |
+| 10 | PPTX export | per-slide render model | one editable PPTX (native shapes / text frames / connectors) | partially implemented — `scripts/export_pptx.py` exports the supported subset (cover / kpi_dashboard; text / line / shape / image_slot / kpi); `scripts/validate_pptx_contract.py --pptx` runs the container + minimal-evidence safety/editability gates against the result; everything outside that scope still fails closed |
 | 11 | Reports | PPTX + artifacts | security / editability / visual reports | TODO |
 
 Stage 7 is the only stage between the per-slide plan and the consumers of the controlled model. Its contract is the controlled primitive / layout model defined in `schemas/render_model.schema.json` and described in `references/slide-contracts.md`. Stage 7 is the boundary the SVG renderer (stage 8) and the PPTX exporter (stage 10) **both** consume directly — they do not read `slide_plan.json` and the PPTX exporter does **not** parse the SVG. Stages 8/9 produce the preview / validation artifact; stage 10 produces native PPTX objects from the same render model.
@@ -22,7 +22,24 @@ Stage 7 is **partially implemented**: `scripts/generate_render_models.py` produc
 
 Stages 8 / 9 are **partially implemented**: `scripts/generate_svg_previews.py` reads every render_model the generator emits and writes one `svg_previews/<stem>.svg` per slide. It supports the primitive kinds the render-model generator emits today (`text`, `line`, `shape`, `image_slot`, `kpi`); every other kind (`table`, `chart_placeholder`, future kinds) fails closed on that slide. Validation runs as `check_svg_previews` inside `scripts/validate_workspace.py` — see `references/svg-design-rules.md` and `references/quality-gates.md` for the exact gates. Automatic SVG repair (out-of-bounds clipping, font fallback, density thresholds) remains TODO.
 
-Stage 10 (PPTX export) is **NOT implemented**. `scripts/validate_pptx_contract.py` is the **contract / skeleton** validator that will grow alongside the future exporter (see `references/pptx-conversion-rules.md`). Today it runs in two modes: with `--pptx <path>` it checks the basic OOXML container surface (file exists, `.pptx` extension, readable ZIP, required package entries `[Content_Types].xml`, `_rels/.rels`, `ppt/presentation.xml`); without `--pptx` it runs in skeleton mode and only reports the TODO surface (editability of text frames, no all-image slides, relationship allow-list, embedded-only media, theme palette mapping, determinism, layout scope `cover` / `kpi_dashboard`, primitive scope `text` / `line` / `shape` / `image_slot` / `kpi`). A `--self-test` flag exercises tempfixture negatives (missing path, wrong extension, non-zip content, empty ZIP, ZIP missing `ppt/presentation.xml`) plus a minimal-valid-container positive. None of this is proof that PPTX export works; the future exporter must consume `render_model.json` directly and emit native editable PPTX objects (no SVG parsing, no full-slide screenshots).
+Stage 10 (PPTX export) is **partially implemented**. `scripts/export_pptx.py` is a deterministic, stdlib-only OOXML exporter that consumes a workspace's `render_models/*.json` directly — never `slide_plan.json`, never `svg_previews/*.svg`, never any rasterized slide image. The minimal native editable subset it currently supports is:
+
+- layouts: `cover`, `kpi_dashboard`;
+- primitive kinds: `text` (editable text frame), `line` (native connector), `shape` (native preset rect / roundRect / ellipse), `kpi` (stacked-paragraph editable text frame), `image_slot` (native placeholder rectangle carrying `image_manifest` alt_text — media embedding is intentionally TODO).
+
+Everything outside that subset fails closed:
+
+- `table` and `chart_placeholder` primitives — per-slide fail with a clear error;
+- layouts other than `cover` / `kpi_dashboard` — per-slide fail-closed; the whole run aborts and no `.pptx` is written. The exporter contract is intentionally all-or-nothing — a workspace containing any out-of-scope render_model fails the run rather than silently dropping that slide;
+- wrong `--output` extension (must be `.pptx`), malformed render_model, undeclared `image_ref`, manifest `local_path` with a URI scheme — preflight fail-closed before the ZIP is written.
+
+`scripts/validate_pptx_contract.py` gates the produced `.pptx`:
+
+- with `--pptx <path>` it runs the basic OOXML container checks (file exists, `.pptx` extension, readable ZIP, required package entries `[Content_Types].xml`, `_rels/.rels`, `ppt/presentation.xml`) **plus** a minimal-evidence layer (`slide_count.inspectable`, `relationships.no_external`, `relationships.no_file_uri`, `package.no_macros`, `package.no_ole`, `package.no_activex`, `minimal_evidence.editable_text`, `minimal_evidence.not_all_image_slide`, `minimal_evidence.no_blank_slide`);
+- without `--pptx` it runs in skeleton mode and only reports the TODO surface (full-inventory editability, relationship allow-list, embedded-only media, media inventory, theme palette mapping, determinism, validator-side layout / primitive scope);
+- `--self-test` exercises tempfixture negatives for every gate above (missing path, wrong extension, non-zip content, empty ZIP, ZIP missing `ppt/presentation.xml`, external rel, `file://` rel, vbaProject.bin, oleObject.bin, activeX.xml, all-image slide, no editable text) plus two positives (minimal valid container, minimal editable PPTX).
+
+A passing run of the validator therefore proves the container shape, the absence of macro / OLE / ActiveX parts and external / `file://` relationships, and minimal evidence of editable native content. It does NOT prove the full-inventory editability / relationship allow-list / media inventory / theme palette / determinism / validator-side scope TODO surface — that work remains.
 
 ## Adaptive planning
 

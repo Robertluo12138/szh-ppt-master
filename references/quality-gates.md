@@ -50,10 +50,26 @@ The gates a deck must pass before the skill reports success. Each gate maps to a
 | `svg.fonts` — fonts are declared and resolvable | SVG validate | TODO |
 | `svg.density` — density is within threshold | SVG validate | TODO |
 | `svg.editable` — every text run is a real text node | SVG validate | TODO |
-| `pptx.contract.skeleton` — `scripts/validate_pptx_contract.py` reports the PPTX contract / TODO surface (skeleton mode) and, when `--pptx <path>` is supplied, runs the basic OOXML container checks: file exists, `.pptx` extension, readable ZIP, and required package entries (`[Content_Types].xml`, `_rels/.rels`, `ppt/presentation.xml`). Skeleton-only — NOT proof that PPTX export works | PPTX export | skeleton (contract validator only; export not implemented) |
-| `pptx.editable` — every text frame is editable, no all-image slides | PPTX export | TODO |
-| `pptx.relationships` — only allow-listed relationship types | PPTX export | TODO |
-| `pptx.media` — every media item exists, no remote refs | PPTX export | TODO |
+| `pptx.export.scope` — `scripts/export_pptx.py` writes one native editable `.pptx` from a workspace's `render_models/*.json` for the supported subset only: layouts `cover` / `kpi_dashboard`; primitive kinds `text` / `line` / `shape` / `image_slot` / `kpi`. The contract is all-or-nothing: a render_model whose layout is outside the supported set, an unsupported primitive (`table`, `chart_placeholder`), wrong output extension, malformed render_model, undeclared image_ref, or unsafe manifest path all fail closed with a per-slide error, abort the whole run, and write no partial `.pptx` | PPTX export | implemented for the supported subset (exporter `scripts/export_pptx.py`; self-test exercises every fail-closed gate plus a positive that re-checks the produced `.pptx` against the validator) |
+| `pptx.contract.skeleton` — `scripts/validate_pptx_contract.py` reports the PPTX contract / TODO surface (skeleton mode) and, when `--pptx <path>` is supplied, runs the basic OOXML container checks: file exists, `.pptx` extension, readable ZIP, and required package entries (`[Content_Types].xml`, `_rels/.rels`, `ppt/presentation.xml`) | PPTX export | implemented (container checks only — not the editability / relationship / media gates below) |
+| `pptx.minimal_evidence.editable_text` — at least one slide carries a `<p:txBody>` with a non-empty `<a:t>` run. **Minimal evidence only**: not a full editability inventory | PPTX export | implemented (`scripts/validate_pptx_contract.py --pptx`) |
+| `pptx.minimal_evidence.not_all_image_slide` — every slide that carries a `<p:pic>` also carries at least one `<p:sp>` or `<p:cxnSp>`. **Minimal evidence only**: rules out the obvious one-big-PNG failure mode | PPTX export | implemented (`scripts/validate_pptx_contract.py --pptx`) |
+| `pptx.minimal_evidence.no_blank_slide` — every slide carries at least one structural element (`<p:sp>`, `<p:cxnSp>`, or `<p:pic>`); a slide with an empty `<p:spTree>` fails closed. **Minimal evidence only**: paired with `pptx.minimal_evidence.not_all_image_slide`, the two together close the loophole where a deck mixes an editable slide with a blank one (which would otherwise pass `editable_text` and `not_all_image_slide` individually) | PPTX export | implemented (`scripts/validate_pptx_contract.py --pptx`) |
+| `pptx.slide_count.inspectable` — the validator can count `ppt/slides/slide{N}.xml` parts; zero slide parts is a FAIL | PPTX export | implemented (`scripts/validate_pptx_contract.py --pptx`) |
+| `pptx.relationships.no_external` — no `Relationship` element has `TargetMode="External"`, and no `Target` matches a URI scheme | PPTX export | implemented (`scripts/validate_pptx_contract.py --pptx`) |
+| `pptx.relationships.no_file_uri` — no `Relationship` `Target` starts with `file://` | PPTX export | implemented (`scripts/validate_pptx_contract.py --pptx`) |
+| `pptx.package.no_macros` — no `ppt/vbaProject.bin` part and no `vbaProject` content type | PPTX export | implemented (`scripts/validate_pptx_contract.py --pptx`) |
+| `pptx.package.no_ole` — no part under `ppt/embeddings/` and no `oleObject` content type | PPTX export | implemented (`scripts/validate_pptx_contract.py --pptx`) |
+| `pptx.package.no_activex` — no part under `ppt/activeX/` and no `activeX` content type | PPTX export | implemented (`scripts/validate_pptx_contract.py --pptx`) |
+| `pptx.editability.full_inventory` — every text body on every slide is a real text frame (full inventory; `pptx.minimal_evidence.editable_text` is a positive-existence check only) | PPTX export | TODO |
+| `pptx.no_image_only_slides.full_inventory` — every slide is positively confirmed to contain editable shapes (full inventory; `pptx.minimal_evidence.not_all_image_slide` + `pptx.minimal_evidence.no_blank_slide` rule out the all-image and blank-slide failure modes only) | PPTX export | TODO |
+| `pptx.relationships.allow_list` — only allow-listed relationship types appear in the package | PPTX export | TODO |
+| `pptx.media.embedded_only` — every media item is embedded inside the package; no remote refs | PPTX export | TODO |
+| `pptx.media.inventory` — every media item exists inside the package and no slide carries a dangling ref | PPTX export | TODO |
+| `pptx.theme.palette_mapping` — `design_system` palette resolves to the matching PPTX theme slots | PPTX export | TODO |
+| `pptx.determinism` — stable IDs, relationship order, and media filenames across runs | PPTX export | TODO (the exporter uses a fixed ZIP timestamp and deterministic ids today; the validator does not yet inspect them) |
+| `pptx.layouts.scope` — exported slides use only `cover` / `kpi_dashboard` layouts | PPTX export | exporter-enforced today; validator-side check is TODO |
+| `pptx.primitives.scope` — exported shapes map only to the supported five primitive kinds (`table` and `chart_placeholder` fail closed) | PPTX export | exporter-enforced today; validator-side check is TODO |
 | `security.scan` — fail-closed scan passes | Reports | TODO |
 | `visual.regression` — design diff within tolerance | Reports | TODO (not in current scope) |
 
