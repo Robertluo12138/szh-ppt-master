@@ -1443,11 +1443,13 @@ def check_render_model_filenames(workspace: Path) -> list[CheckResult]:
 
     Every `render_models/*.json` file MUST be named
     `<index:02d>_<layout>.json` where `index` and `layout` come from
-    inside the JSON. The exporter (`scripts/export_pptx.py`) reads
-    `render_models/*.json` sorted by file stem and treats that order as
-    the deck's slide order, so a file mis-named `99_agenda.json` whose
-    JSON `index` is 2 would be exported as slide N (last) rather than
-    slide 2. The render_model generator always writes the canonical
+    inside the JSON. The exporter (`scripts/export_pptx.py`) iterates
+    `deck_plan.slides[]` in declared order and resolves each entry to
+    its canonical render_model filename, so a file mis-named
+    `99_agenda.json` whose JSON `index` is 2 would appear orphan to
+    the exporter (its canonical `02_agenda.json` would appear missing)
+    and fail closed at the 1:1 coverage gate before any output is
+    written. The render_model generator always writes the canonical
     name, but a hand-edited or copied workspace could ship a stale
     name that still schema-validates. This check is the on-disk gate.
 
@@ -1485,10 +1487,12 @@ def check_render_model_filenames(workspace: Path) -> list[CheckResult]:
             (
                 f"on-disk name {rm_file.name!r} disagrees with the "
                 f"render_model's own index={idx} layout={layout!r}; "
-                f"the exporter sorts render_models/*.json by file stem "
-                f"and would place this slide out of order. Rename to "
-                f"{expected_name!r} or re-run "
-                f"scripts/generate_render_models.py"
+                f"the exporter iterates deck_plan.slides[] in declared "
+                f"order and resolves each entry to its canonical "
+                f"render_model filename, so this file would appear "
+                f"orphan (and the canonical {expected_name!r} would "
+                f"appear missing). Rename to {expected_name!r} or "
+                f"re-run scripts/generate_render_models.py"
             ) if rm_file.name != expected_name else "",
         ))
     return out
@@ -3036,9 +3040,9 @@ def negative_render_model_coverage_tempfixture_checks() -> list[CheckResult]:
       B. Partial coverage (slide 1 has a render_model, slide 2 does not)
          FAILS the check and names the missing index + layout.
       C. A workspace whose deck_plan mixes a supported slide WITH a
-         render_model and an unsupported (`comparison_table`) slide
-         WITHOUT one PASSES the check — unsupported layouts are not
-         required to have render_models.
+         render_model and an unsupported (`org_chart`, chart-bearing)
+         slide WITHOUT one PASSES the check — unsupported layouts are
+         not required to have render_models.
       D. An empty render_models/ directory does NOT trigger the check
          (matches check_render_models policy: an empty directory means
          "not yet generated", not "drift")."""
@@ -3177,11 +3181,12 @@ def _write_agenda_render_model(ws: Path, *, filename: str) -> None:
 def negative_render_model_filename_tempfixture_checks() -> list[CheckResult]:
     """Negative tempfixture proving check_render_model_filenames fails
     closed on a render_model whose on-disk filename disagrees with its
-    own JSON `index` + `layout`. The exporter sorts
-    `render_models/*.json` by file stem, so a mis-named file would
-    silently land in the wrong slide position. This is the on-disk
-    gate that the canonical-name contract is enforced even when the
-    JSON content itself is schema-valid.
+    own JSON `index` + `layout`. The exporter iterates
+    `deck_plan.slides[]` in declared order and resolves each entry to
+    its canonical render_model filename, so a mis-named file would
+    appear orphan and its canonical counterpart would appear missing.
+    This is the on-disk gate that the canonical-name contract is
+    enforced even when the JSON content itself is schema-valid.
 
     Cases:
       A. Canonical filename `02_agenda.json` whose JSON declares
@@ -3564,8 +3569,10 @@ def _build_svg_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
     mutation:
 
       'happy'        — clean baseline with a text primitive.
-      'unsupported'  — render_model carries a 'table' primitive (schema-
-                       valid, but the SVG renderer fails closed on it).
+      'unsupported'  — render_model carries a 'chart_placeholder'
+                       primitive (schema-valid, but the SVG renderer
+                       fails closed on it — chart rendering is
+                       intentionally TODO).
       'bad_token'    — color_token references a palette key that does
                        not exist in design_system.palette. Generator
                        must fail closed.
@@ -5054,7 +5061,8 @@ def main(argv: list[str]) -> int:
          check_generator_render_model_coverage(args.workspace, args.template_root)),
         ("render_models filename: every render_models/*.json file is "
          "named <index:02d>_<layout>.json matching its own JSON "
-         "(protects exporter slide order, which sorts by file stem)",
+         "(protects the exporter's deck_plan-driven 1:1 coverage gate "
+         "from mis-named files appearing orphan)",
          check_render_model_filenames(args.workspace)),
         ("svg_previews: per-render_model SVG exists + canvas viewBox + "
          "no <foreignObject> + reference safety + bounds inside canvas",
@@ -5088,8 +5096,9 @@ def main(argv: list[str]) -> int:
         ("negative tempfixtures (render_model filename): a render_model "
          "whose on-disk filename disagrees with its own JSON index + "
          "layout fails closed (e.g. 02_agenda.json renamed to "
-         "99_agenda.json) so the exporter's file-stem-sorted slide "
-         "order is protected",
+         "99_agenda.json) so the exporter's deck_plan-driven 1:1 "
+         "coverage gate cannot mistake the canonical name for missing "
+         "and the renamed file for orphan",
          negative_render_model_filename_tempfixture_checks()),
         ("negative tempfixtures (svg_preview): missing svg_preview, "
          "malformed XML, wrong root, viewBox mismatch, <foreignObject>, "

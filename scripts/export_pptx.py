@@ -29,10 +29,19 @@ fallback PowerPoint needs for SVG) remain TODO.
 
 INPUTS (all workspace-relative; the same artifacts validate_workspace
 exercises today)
+    deck_plan.json      — adaptive deck outline; drives the slide
+                          enumeration. planning.planned_slide_count
+                          must equal len(slides), and each slides[]
+                          entry maps 1:1 to a render_model file named
+                          `<index:02d>_<layout>.json`.
     design_system.json  — palette + typography + grid
     image_manifest.json — image_ref id -> local_path + alt_text
-    render_models/*.json — one per supported slide (deterministic
-                           order: sorted by file stem)
+    render_models/*.json — exactly one per deck_plan slide, named
+                           `<index:02d>_<layout>.json`. The exporter
+                           iterates deck_plan.slides[] in declared
+                           order — it does NOT just glob the directory
+                           — so a missing or orphan file aborts the
+                           run with no partial deck written.
 
 OUTPUT
     A single .pptx ZIP at --output. The OOXML package contains:
@@ -74,9 +83,17 @@ PREFLIGHT GATES (run BEFORE any output ZIP is created)
     - image_manifest.json schema-validates against
       schemas/image_manifest.schema.json and every declared
       images[].local_path passes local_path_is_safe;
-    - render_models/ exists and contains at least one *.json file;
+    - deck_plan.json schema-validates against
+      schemas/deck_plan.schema.json, planning.planned_slide_count
+      equals len(slides), every slides[] entry has integer `index`
+      and string `layout`, and `index` values are unique;
+    - render_models/ exists and contains exactly the canonical
+      filenames named by deck_plan.slides[] (no missing entry, no
+      orphan file). The exporter then iterates render_models in the
+      order declared by deck_plan.slides[];
     - every render_model file schema-validates against
-      schemas/render_model.schema.json;
+      schemas/render_model.schema.json and its declared `index` and
+      `layout` match the deck_plan entry that named the file;
     - every render_model's `image_slot.image_ref` is declared in
       image_manifest.
 
@@ -105,12 +122,12 @@ FAIL-CLOSED OVERALL
       (hex color ^#[0-9A-Fa-f]{6}$; CSS-style font_family chain).
 
 DETERMINISM
-    - Render models are read in sorted file-stem order; the resulting
-      `ppt/slides/slide{N}.xml` numbering follows that order
-      (slide1.xml is the first exported render_model, slide2.xml the
-      second, ...). The original render_model `index` is preserved in
-      the slide's non-visual name so the slide can still be traced
-      back to its workspace artifact.
+    - Render models are read in deck_plan.slides[] order; the
+      resulting `ppt/slides/slide{N}.xml` numbering follows that order
+      (slide1.xml is the first deck_plan slide, slide2.xml the second,
+      ...). The original render_model `index` is preserved in the
+      slide's non-visual name so the slide can still be traced back
+      to its workspace artifact.
     - Shape ids start at 2 and increment per primitive, deterministic.
     - Every ZIP entry is written with a fixed timestamp (1980-01-01).
 
@@ -1300,18 +1317,117 @@ def export_workspace(workspace: Path, output: Path) -> int:
             if isinstance(alt, str):
                 manifest_alts[img_id] = alt
 
+    # deck_plan.json is the source of truth for slide count and order.
+    # The exporter does NOT just glob render_models/*.json: a workspace
+    # missing one render_model would otherwise silently export a partial
+    # deck. Loading deck_plan first lets us assert exact 1:1 coverage
+    # before any output is produced.
+    deck_plan, err = _load_required_object(
+        workspace / "deck_plan.json", "deck_plan.json",
+    )
+    if deck_plan is None:
+        return _fatal(err)
+    schema_errors = _schema_validate(
+        deck_plan, SCHEMAS / "deck_plan.schema.json",
+    )
+    if schema_errors:
+        return _fatal(
+            f"deck_plan.json fails schema: {'; '.join(schema_errors)}"
+        )
+    planning = _as_dict(deck_plan.get("planning")) or {}
+    planned_count = planning.get("planned_slide_count")
+    plan_slides_raw = _as_list(deck_plan.get("slides"))
+    if plan_slides_raw is None:
+        return _fatal("deck_plan.slides must be a list")
+    if (
+        not isinstance(planned_count, int)
+        or isinstance(planned_count, bool)
+        or planned_count < 1
+    ):
+        return _fatal(
+            f"deck_plan.planning.planned_slide_count must be a positive "
+            f"integer; got {planned_count!r}"
+        )
+    if planned_count != len(plan_slides_raw):
+        return _fatal(
+            f"deck_plan.planning.planned_slide_count "
+            f"({planned_count}) does not equal len(slides) "
+            f"({len(plan_slides_raw)}); refusing to export"
+        )
+
+    # Build the (index, layout, canonical_filename) tuples in declared
+    # order. Each per-slide defensive check is also enforced by the
+    # schema, but we re-check here so a non-schema-validated deck_plan
+    # cannot reach the slide-emit loop.
+    plan_entries: list[tuple[int, str, str]] = []
+    seen_indices: set[int] = set()
+    for i, raw_slide in enumerate(plan_slides_raw):
+        slide_d = _as_dict(raw_slide)
+        if slide_d is None:
+            return _fatal(
+                f"deck_plan.slides[{i}] is not an object "
+                f"(got {type(raw_slide).__name__})"
+            )
+        idx = slide_d.get("index")
+        layout = slide_d.get("layout")
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            return _fatal(
+                f"deck_plan.slides[{i}].index is not an integer "
+                f"(got {type(idx).__name__})"
+            )
+        if not isinstance(layout, str) or not layout:
+            return _fatal(
+                f"deck_plan.slides[{i}].layout is not a non-empty string "
+                f"(got {layout!r})"
+            )
+        if idx in seen_indices:
+            return _fatal(
+                f"deck_plan.slides has duplicate index {idx} "
+                f"(slot {i}); refusing to export"
+            )
+        seen_indices.add(idx)
+        plan_entries.append((idx, layout, f"{idx:02d}_{layout}.json"))
+
     rm_dir = workspace / "render_models"
     if not rm_dir.is_dir():
         return _fatal(
             f"render_models/ not found at {rm_dir} — run "
             f"generate_render_models.py first"
         )
-    rm_files = sorted(rm_dir.glob("*.json"))
-    if not rm_files:
-        return _fatal(
-            f"render_models/ at {rm_dir} contains no *.json files — "
-            f"run generate_render_models.py first"
+
+    # 1:1 coverage: every deck_plan slide must have its canonical
+    # render_model on disk, and there must be no extra/orphan *.json
+    # under render_models/. The deck_plan is authoritative; we do NOT
+    # silently export only the files that happen to be present.
+    expected_files = {fname for _, _, fname in plan_entries}
+    on_disk_files = {p.name for p in rm_dir.glob("*.json")}
+    missing = sorted(expected_files - on_disk_files)
+    orphan = sorted(on_disk_files - expected_files)
+    if missing or orphan:
+        for name in missing:
+            print(
+                f"  [FAIL] deck_plan declares render_models/{name} but "
+                f"it is missing on disk",
+                file=sys.stderr,
+            )
+        for name in orphan:
+            print(
+                f"  [FAIL] render_models/{name} exists on disk but is "
+                f"not declared by deck_plan.slides[]; refusing to "
+                f"export an orphan",
+                file=sys.stderr,
+            )
+        print(
+            f"FAIL: PPTX export aborted; deck_plan declares "
+            f"{len(plan_entries)} slide(s) but render_models/ disagrees "
+            f"({len(missing)} missing, {len(orphan)} orphan). "
+            f"No `.pptx` was written.",
+            file=sys.stderr,
         )
+        return 1
+
+    # Build the deck_plan-ordered list of files the exporter will read.
+    rm_files = [rm_dir / fname for _, _, fname in plan_entries]
 
     # Canvas dimensions come from design_system.grid. Every render_model
     # must agree (validate_workspace.check_render_models enforces this);
@@ -1365,27 +1481,23 @@ def export_workspace(workspace: Path, output: Path) -> int:
 
         # Canonical filename gate (fail-closed).
         #
-        # The exporter reads `render_models/*.json` via
-        # `sorted(rm_dir.glob("*.json"))` and treats that order as the
-        # deck's slide order. A render_model whose JSON declares
-        # `index=2 layout="agenda"` but whose on-disk filename is
-        # `99_agenda.json` would silently sort AFTER `20_conclusion.json`
-        # and land in the wrong slide position. The render-model
-        # generator always writes the canonical name, but a hand-edited
-        # or copied workspace can still ship a stale name that
-        # schema-validates. validate_workspace.check_render_model_filenames
-        # enforces the same rule out-of-band; we mirror it here so the
-        # primary export path is protected even when callers invoke the
-        # exporter without running the workspace validator first.
+        # The 1:1 coverage gate already guaranteed that every on-disk
+        # filename is the canonical `<idx:02d>_<layout>.json` named by
+        # deck_plan, and every deck_plan slide has its canonical file
+        # present. This in-loop gate additionally requires the JSON's
+        # OWN declared `index`/`layout` to agree with the filename it
+        # was loaded from — so a `02_kpi_dashboard.json` whose body
+        # claims `index=7` or `layout="cover"` is rejected even though
+        # deck_plan and the filename agree. The two gates together
+        # transitively pin (deck_plan entry) == (canonical filename) ==
+        # (JSON body) for every slide.
         expected_name = f"{idx:02d}_{layout}.json"
         if rm_file.name != expected_name:
             fatal_errors.append(
                 f"{rel} (index={idx}, layout={layout!r}): on-disk filename "
                 f"{rm_file.name!r} disagrees with the render_model's own "
-                f"index + layout; expected {expected_name!r}. The exporter "
-                f"sorts render_models/*.json by file stem and would emit "
-                f"this slide out of order. Rename the file or re-run "
-                f"scripts/generate_render_models.py"
+                f"index + layout; expected {expected_name!r}. Rename the "
+                f"file or re-run scripts/generate_render_models.py"
             )
             continue
 
@@ -1552,15 +1664,60 @@ def export_single_render_model(rm_path: Path, design_path: Path, manifest_path: 
     return 0
 
 
+def _write_synthetic_deck_plan(
+    ws: Path,
+    slides: list[tuple[int, str]],
+) -> None:
+    """Write a synthetic deck_plan.json under `ws` whose slides[]
+    matches the supplied (index, layout) pairs. Used by the self-test
+    fixtures so the deck_plan-driven enumeration in `export_workspace`
+    has a 1:1 source of truth to gate against. Sections are aggregated
+    under a single synthetic section so the schema's
+    `sections[].slide_indices` requirement is satisfied without forcing
+    callers to pick section ids."""
+    import json
+    indices = [idx for idx, _ in slides]
+    plan = {
+        "template": "synthetic",
+        "planning": {
+            "planned_slide_count": len(slides),
+            "rationale": "synthetic self-test fixture",
+        },
+        "sections": [
+            {
+                "id": "all",
+                "title": "All",
+                "summary": "synthetic",
+                "slide_indices": indices,
+            },
+        ],
+        "slides": [
+            {
+                "index": idx,
+                "layout": layout,
+                "title": f"synthetic slide {idx}",
+                "section_id": "all",
+                "summary": "synthetic",
+                "density": "low",
+                "source_refs": ["synthetic_src"],
+            }
+            for idx, layout in slides
+        ],
+    }
+    (ws / "deck_plan.json").write_text(json.dumps(plan, indent=2))
+
+
 def _write_synthetic_workspace(ws: Path) -> None:
     """Build a deterministic happy-path workspace under `ws`. Used by
     the self-test fixtures. The render_models exercise the supported
     primitive kinds without needing any real images, so the manifest
-    stays empty and no asset files are produced. The caller can mutate
-    the fixture (add unsupported primitives, malformed JSON, ...) to
-    drive each negative test."""
+    stays empty and no asset files are produced. The deck_plan declares
+    slides 1 (cover) and 2 (kpi_dashboard) — callers that swap layouts
+    must also rewrite the deck_plan via `_write_synthetic_deck_plan` so
+    the deck_plan / render_models coverage gate stays consistent."""
     import json
     (ws / "render_models").mkdir(parents=True, exist_ok=True)
+    _write_synthetic_deck_plan(ws, [(1, "cover"), (2, "kpi_dashboard")])
     (ws / "design_system.json").write_text(json.dumps({
         "palette": {
             "primary":    "#1F3A5F",
@@ -1673,12 +1830,18 @@ def _run_self_tests() -> list[CheckResult]:
     Negatives (each returns a non-zero exit and the scenario asserts
     that — the exporter must fail closed):
       - wrong --output extension (.zip);
-      - render_model containing a `table` primitive (unsupported);
       - render_model containing a `chart_placeholder` primitive
         (unsupported);
       - render_model with a missing required field (no `primitives`);
       - image_slot whose image_ref is not declared in image_manifest;
-      - image_manifest local_path with an unsafe URI scheme."""
+      - image_manifest local_path with an unsafe URI scheme;
+      - render_model with an unsupported layout (org_chart);
+      - render_model on disk whose filename has been renamed away
+        from `<idx:02d>_<layout>.json` (fixture exercises the
+        deck_plan/render_models 1:1 coverage gate);
+      - deck_plan declares N slides but one render_model is missing;
+      - render_model on disk not declared by deck_plan (orphan);
+      - deck_plan.planning.planned_slide_count != len(slides)."""
     import io
     import json
     import tempfile
@@ -1759,6 +1922,9 @@ def _run_self_tests() -> list[CheckResult]:
         table_ws = td / "with_table"
         _write_synthetic_workspace(table_ws)
         (table_ws / "render_models" / "02_kpi_dashboard.json").unlink()
+        _write_synthetic_deck_plan(
+            table_ws, [(1, "cover"), (2, "comparison_table")],
+        )
         (table_ws / "render_models" / "02_comparison_table.json").write_text(
             json.dumps({
                 "index": 2,
@@ -2015,6 +2181,9 @@ def _run_self_tests() -> list[CheckResult]:
         unsupp_ws = td / "unsupported_layout"
         _write_synthetic_workspace(unsupp_ws)
         (unsupp_ws / "render_models" / "01_cover.json").unlink()
+        _write_synthetic_deck_plan(
+            unsupp_ws, [(1, "org_chart"), (2, "kpi_dashboard")],
+        )
         (unsupp_ws / "render_models" / "01_org_chart.json").write_text(
             json.dumps({
                 "index": 1,
@@ -2071,6 +2240,9 @@ def _run_self_tests() -> list[CheckResult]:
         expanded_ws = td / "expanded_layouts"
         _write_synthetic_workspace(expanded_ws)
         (expanded_ws / "render_models" / "02_kpi_dashboard.json").unlink()
+        _write_synthetic_deck_plan(
+            expanded_ws, [(1, "cover"), (2, "two_column")],
+        )
         (expanded_ws / "render_models" / "02_two_column.json").write_text(
             json.dumps({
                 "index": 2,
@@ -2171,17 +2343,15 @@ def _run_self_tests() -> list[CheckResult]:
             ))
 
         # 11. NEGATIVE: render_model whose on-disk filename does not
-        # match `<index:02d>_<layout>.json` fails closed in the
-        # exporter's preflight. Codex review flagged that the workspace
-        # validator's filename gate did not protect the primary export
-        # path; the exporter sorts render_models/*.json by file stem
-        # and would otherwise place a mis-named slide out of order. The
-        # fixture takes a happy-path workspace, renames its first
-        # render_model from `01_cover.json` to `99_cover.json` (the
-        # JSON still says `index=1 layout="cover"`), runs the
-        # exporter, and asserts that the run aborts, the failure
-        # message names both the actual on-disk filename and the
-        # expected canonical filename, and no `.pptx` is written.
+        # match `<index:02d>_<layout>.json` fails closed before any
+        # output is written. The deck_plan/render_models 1:1 coverage
+        # gate fires first (the renamed `99_cover.json` is orphan;
+        # `01_cover.json` is missing), so the exporter aborts with a
+        # FAIL line for each filename. The earlier in-loop
+        # canonical-filename gate is still in place as defense in
+        # depth for any case the coverage gate cannot catch (a JSON
+        # whose declared index/layout disagrees with the filename
+        # deck_plan named).
         mis_named_ws = td / "mis_named_filename"
         _write_synthetic_workspace(mis_named_ws)
         (mis_named_ws / "render_models" / "01_cover.json").rename(
@@ -2206,6 +2376,116 @@ def _run_self_tests() -> list[CheckResult]:
                 or "99_cover.json" not in msg
                 or "01_cover.json" not in msg
                 or mis_named_out.exists() else ""),
+        ))
+
+        # 12. NEGATIVE: deck_plan declares 2 slides but one
+        # render_model file is missing on disk. Codex review flagged
+        # that the previous workspace-mode happily globbed
+        # render_models/*.json and exported only the files present —
+        # so a 20-slide deck_plan missing one render_model would yield
+        # a 19-slide `.pptx` and exit 0. The fixture builds the happy
+        # workspace (2 deck_plan slides + 2 render_models), deletes
+        # `02_kpi_dashboard.json`, runs the exporter, and asserts that
+        # the run aborts naming the missing file and that no `.pptx`
+        # is written.
+        miss_rm_ws = td / "missing_render_model"
+        _write_synthetic_workspace(miss_rm_ws)
+        (miss_rm_ws / "render_models" / "02_kpi_dashboard.json").unlink()
+        miss_rm_out = td / "missing_rm.pptx"
+        rc, _stdout, stderr = _run_capture(miss_rm_ws, miss_rm_out)
+        msg = stderr + _stdout
+        results.append(CheckResult(
+            "selftest: deck_plan declares 2 slides but one render_model "
+            "is missing fails closed (no partial deck written)",
+            (
+                rc != 0
+                and "02_kpi_dashboard.json" in msg
+                and "missing" in msg.lower()
+                and not miss_rm_out.exists()
+            ),
+            (f"rc={rc}, missing '02_kpi_dashboard.json'/'missing' in "
+             f"messages, output_exists={miss_rm_out.exists()}"
+             if rc == 0
+                or "02_kpi_dashboard.json" not in msg
+                or "missing" not in msg.lower()
+                or miss_rm_out.exists() else ""),
+        ))
+
+        # 13. NEGATIVE: an orphan render_model (on disk but not
+        # declared by deck_plan.slides[]) fails closed. The happy
+        # workspace declares slides 1 + 2 in deck_plan; the fixture
+        # drops a third file `03_orphan.json` under render_models/.
+        # The exporter must refuse to export rather than silently
+        # ignoring or including the orphan.
+        orphan_ws = td / "orphan_render_model"
+        _write_synthetic_workspace(orphan_ws)
+        (orphan_ws / "render_models" / "03_orphan.json").write_text(
+            json.dumps({
+                "index": 3,
+                "layout": "cover",
+                "canvas": {"width_px": 1920, "height_px": 1080},
+                "source_refs": ["synthetic_src"],
+                "primitives": [
+                    {
+                        "id": "title",
+                        "kind": "text",
+                        "bounds": {"x": 100, "y": 100, "w": 1280, "h": 120},
+                        "style": {
+                            "color_token": "palette.text",
+                            "typography_token": "typography.heading",
+                        },
+                        "text": {"content": "stray", "role": "heading"},
+                    },
+                ],
+            })
+        )
+        orphan_out = td / "orphan.pptx"
+        rc, _stdout, stderr = _run_capture(orphan_ws, orphan_out)
+        msg = stderr + _stdout
+        results.append(CheckResult(
+            "selftest: orphan render_model not declared by deck_plan "
+            "fails closed (no partial deck written)",
+            (
+                rc != 0
+                and "03_orphan.json" in msg
+                and "orphan" in msg.lower()
+                and not orphan_out.exists()
+            ),
+            (f"rc={rc}, missing '03_orphan.json'/'orphan' in messages, "
+             f"output_exists={orphan_out.exists()}"
+             if rc == 0
+                or "03_orphan.json" not in msg
+                or "orphan" not in msg.lower()
+                or orphan_out.exists() else ""),
+        ))
+
+        # 14. NEGATIVE: deck_plan.planning.planned_slide_count
+        # disagrees with len(slides). The render_models on disk match
+        # slides[], but the planning record is internally inconsistent
+        # — the exporter must refuse the deck_plan rather than trust
+        # one field over the other.
+        bad_plan_ws = td / "bad_plan_count"
+        _write_synthetic_workspace(bad_plan_ws)
+        plan_path = bad_plan_ws / "deck_plan.json"
+        plan_obj = json.loads(plan_path.read_text())
+        plan_obj["planning"]["planned_slide_count"] = 99
+        plan_path.write_text(json.dumps(plan_obj, indent=2))
+        bad_plan_out = td / "bad_plan.pptx"
+        rc, _stdout, stderr = _run_capture(bad_plan_ws, bad_plan_out)
+        msg = stderr + _stdout
+        results.append(CheckResult(
+            "selftest: deck_plan.planned_slide_count != len(slides) "
+            "fails closed",
+            (
+                rc != 0
+                and "planned_slide_count" in msg
+                and not bad_plan_out.exists()
+            ),
+            (f"rc={rc}, missing 'planned_slide_count' in messages, "
+             f"output_exists={bad_plan_out.exists()}"
+             if rc == 0
+                or "planned_slide_count" not in msg
+                or bad_plan_out.exists() else ""),
         ))
 
     return results
@@ -2277,8 +2557,12 @@ def main(argv: list[str]) -> int:
              "unsupported `chart_placeholder` primitive, render_model "
              "missing a required field, image_slot image_ref not in "
              "manifest, manifest local_path with a URI scheme, "
-             "render_model with an unsupported layout). Exits non-zero "
-             "if any positive or negative is not handled as expected.",
+             "render_model with an unsupported layout, mis-named "
+             "render_model file, deck_plan-declared render_model "
+             "missing on disk, orphan render_model not declared by "
+             "deck_plan, deck_plan planned_slide_count disagrees with "
+             "len(slides)). Exits non-zero if any positive or "
+             "negative is not handled as expected.",
     )
     args = parser.parse_args(argv)
 

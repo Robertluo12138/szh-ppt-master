@@ -5,6 +5,7 @@ The terminal output of the pipeline is an **editable** PPTX. An **expanded nativ
 ## Implementation status
 
 - An **expanded vertical slice** of PPTX export is implemented (`scripts/export_pptx.py`):
+  - slide enumeration is driven by `deck_plan.json`: the exporter iterates `deck_plan.slides[]` in declared order and resolves each entry to its canonical `render_models/<idx:02d>_<layout>.json`. A missing planned render_model, an orphan render_model not named by `deck_plan`, or a `planning.planned_slide_count` that disagrees with `len(slides)` fails closed before any output is written;
   - layouts: `cover`, `kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `timeline`, `conclusion`, `comparison_table`. The slide-body emitter is layout-agnostic — it iterates the render_model's `primitives` list and emits one native PPTX object per primitive — so adding a layout to this allow-list does not change how any single shape is rendered;
   - primitive kinds: `text`, `line`, `shape`, `image_slot`, `kpi`, `table` (the `table` primitive emits a native `<p:graphicFrame>` wrapping `<a:tbl>` with one `<a:gridCol>` per column, a bold header row, and an editable `<a:txBody>` per `<a:tc>` cell);
   - the exporter consumes `render_model.json` directly — it does **not** parse `svg_previews/*.svg`, does **not** screenshot a slide, and does **not** rasterize a whole slide into a single picture;
@@ -57,6 +58,7 @@ Container basics (unchanged):
 Minimal-evidence gates (grew alongside the exporter):
 
 - `slide_count.inspectable` — counts `ppt/slides/slide{N}.xml` parts; a run with zero slide parts fails closed (the exporter requires at least one exported slide);
+- `slide_count.expected` — caller-driven. When the CLI is invoked with `--expected-slide-count N` alongside `--pptx`, the slide-part count must equal `N`, otherwise the run fails closed. This is the validator-side complement to the exporter's `deck_plan` / `render_models` 1:1 coverage gate — it catches a deck the exporter silently truncated;
 - `relationships.no_external` — no `Relationship` element has `TargetMode="External"`, and no `Target` value matches the `^[A-Za-z][A-Za-z0-9+.-]*:` URI-scheme prefix;
 - `relationships.no_file_uri` — no `Relationship` `Target` starts with `file://` (subset of the above, surfaced separately so a regression is unmistakable);
 - `relationships.allow_list` — every `Relationship` `Type` URL is in `{officeDocument, slide, slideMaster, slideLayout, theme}` (canonical OOXML URLs). An unexpected internal Type (hyperlink, comments, image, chart, embedding, ...) trips the gate even when the Target is local and lacks a URI scheme;

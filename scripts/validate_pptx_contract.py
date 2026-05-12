@@ -45,6 +45,11 @@ CHECKS TODAY (all fail-closed; exit 1 on any failure)
                             with zero slide parts is a FAIL (the
                             exporter requires at least one exported
                             slide).
+    slide_count.expected  — caller-driven gate. When --expected-slide-
+                            count N is passed, the validator fails
+                            closed if the number of slide parts is not
+                            exactly N. Optional; only active when the
+                            flag is supplied.
     relationships.no_external
                           — no Relationship element has
                             TargetMode="External", and no Target
@@ -416,10 +421,19 @@ def _slide_shape_counts(zf: zipfile.ZipFile, slide_part: str) -> tuple[int, int,
     return (n_sp, n_cxn, n_tx, n_pic)
 
 
-def check_generated_pptx(pptx_path: Path) -> list[CheckResult]:
+def check_generated_pptx(
+    pptx_path: Path,
+    expected_slide_count: int | None = None,
+) -> list[CheckResult]:
     """Run the minimal-evidence + safety checks against a generated
     PPTX. Returns one CheckResult per gate. Every gate here is in
     addition to (not a replacement for) check_container.
+
+    When `expected_slide_count` is supplied, an additional fail-closed
+    `slide_count.expected` gate compares the number of
+    `ppt/slides/slide{N}.xml` parts against the caller's claim. This
+    is what makes a 19-slide PPTX claiming "20 slides" fail at the
+    validator level even though the container looks well-formed.
 
     Every check is fail-closed: a check that cannot read its target
     returns FAIL with the read reason. The function is itself
@@ -450,6 +464,22 @@ def check_generated_pptx(pptx_path: Path) -> list[CheckResult]:
             (f"counted {len(slide_parts)} slide part(s): "
              f"{', '.join(slide_parts) if slide_parts else '(none)'}"),
         ))
+
+        # 1b. slide_count.expected (optional, caller-driven)
+        # A caller that knows how many slides the deck SHOULD have can
+        # ask the validator to fail closed on a mismatch. This is the
+        # validator-side complement to the deck_plan/render_models 1:1
+        # coverage gate in scripts/export_pptx.py: it catches the case
+        # where a 20-slide deck_plan exports as a 19-slide `.pptx` and
+        # the container shape looks otherwise correct.
+        if expected_slide_count is not None:
+            actual = len(slide_parts)
+            out.append(CheckResult(
+                f"slide_count.expected: {pptx_path.name}",
+                actual == expected_slide_count,
+                (f"expected {expected_slide_count} slide(s), "
+                 f"found {actual}"),
+            ))
 
         # 2 + 3 + 4. relationships.no_external +
         # relationships.no_file_uri + relationships.allow_list.
@@ -632,9 +662,16 @@ _TODO_SECTION_TITLE = (
 )
 
 
-def run(pptx_path: Path | None) -> int:
+def run(
+    pptx_path: Path | None,
+    expected_slide_count: int | None = None,
+) -> int:
     """Entry point for skeleton / container modes. Returns the
     process exit code.
+
+    `expected_slide_count`, when supplied alongside `pptx_path`,
+    activates the `slide_count.expected` gate in
+    `check_generated_pptx`.
 
     Print order is deliberate: the TODO surface is emitted BEFORE any
     failable build step (`check_container` /
@@ -665,8 +702,19 @@ def run(pptx_path: Path | None) -> int:
         if not container_failed:
             fails += _print_results(
                 f"minimal-evidence checks ({pptx_path})",
-                check_generated_pptx(pptx_path),
+                check_generated_pptx(
+                    pptx_path,
+                    expected_slide_count=expected_slide_count,
+                ),
             )
+    elif expected_slide_count is not None:
+        # Caller asked for an expected slide count but did not supply
+        # --pptx; there is nothing to compare against.
+        print(
+            "FAIL: --expected-slide-count requires --pptx",
+            file=sys.stderr,
+        )
+        return 2
     print()
     if fails:
         print(f"FAIL: {fails} check(s) did not pass.")
@@ -809,11 +857,15 @@ def _run_tempfixture_negatives() -> list[CheckResult]:
       - slide with no <p:txBody> anywhere — fails
         minimal_evidence.editable_text;
       - relationship with an unexpected Type URL (comments) — fails
-        relationships.allow_list even though Target is local.
+        relationships.allow_list even though Target is local;
+      - 2-slide PPTX with expected_slide_count=3 — fails
+        slide_count.expected.
 
-    Generated-pptx positive:
+    Generated-pptx positives:
       - minimal editable PPTX (one <p:sp> with a non-empty <a:t>) —
-        passes every container + generated-pptx gate."""
+        passes every container + generated-pptx gate;
+      - 2-slide editable PPTX with expected_slide_count=2 — passes
+        slide_count.expected."""
     import tempfile
 
     out: list[CheckResult] = []
@@ -1055,6 +1107,33 @@ def _run_tempfixture_negatives() -> list[CheckResult]:
             "; ".join(r.detail for r in g_res if not r.ok),
         ))
 
+        # 17a. slide_count.expected — positive: a 2-slide PPTX
+        # validates cleanly against expected_slide_count=2.
+        two_slide_pos = td / "two_slide_pos.pptx"
+        _write_minimal_editable_pptx(
+            two_slide_pos,
+            slides=[_EDITABLE_SP_XML, _EDITABLE_SP_XML],
+        )
+        g_res = check_generated_pptx(two_slide_pos, expected_slide_count=2)
+        out.append(CheckResult(
+            "tempfixture: 2-slide PPTX passes slide_count.expected=2",
+            all(r.ok for r in g_res),
+            "; ".join(f"{r.name}: {r.detail}" for r in g_res if not r.ok),
+        ))
+
+        # 17b. slide_count.expected — negative: a 2-slide PPTX fails
+        # closed when the caller claims expected_slide_count=3.
+        g_res = check_generated_pptx(two_slide_pos, expected_slide_count=3)
+        out.append(CheckResult(
+            "tempfixture: 2-slide PPTX fails slide_count.expected=3",
+            any(
+                r.name.startswith("slide_count.expected")
+                and not r.ok
+                for r in g_res
+            ),
+            "; ".join(r.detail for r in g_res if not r.ok),
+        ))
+
         # 17. relationships.allow_list — a relationship with an
         # unexpected Type URL (e.g. comments) fails the allow-list
         # gate even when its Target is local and lacks a URI scheme.
@@ -1122,6 +1201,8 @@ def main(argv: list[str]) -> int:
             "allow-list, no macros / OLE / ActiveX parts, at least one "
             "editable text run, no all-image slide, no blank slide, "
             "every slide carries at least one <p:sp> or <p:cxnSp>). "
+            "Add --expected-slide-count N to also fail closed if the "
+            "number of ppt/slides/slide{N}.xml parts != N. "
             "Without --pptx, runs in skeleton mode and only reports "
             "the contract / TODO surface. --self-test runs the "
             "in-script tempfixture negatives + positives. The TODO "
@@ -1142,6 +1223,19 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--expected-slide-count",
+        type=int,
+        default=None,
+        help=(
+            "Optional positive integer. When supplied alongside "
+            "--pptx, activates the slide_count.expected gate: the "
+            "number of ppt/slides/slide{N}.xml parts in the package "
+            "must equal this value, otherwise the run fails closed. "
+            "Use this from CI to catch a deck that the exporter "
+            "silently truncated."
+        ),
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help=(
@@ -1151,10 +1245,11 @@ def main(argv: list[str]) -> int:
             "unexpected relationship Type, vba / OLE / ActiveX parts, "
             "all-image slide [fails both not_all_image_slide and "
             "every_slide_has_native_shape], no editable text, blank "
-            "slide alongside an editable one) plus a "
-            "minimal-valid-container positive and a minimal-editable "
-            "PPTX positive. Exits non-zero if any negative is not "
-            "caught or any positive is not accepted."
+            "slide alongside an editable one, slide_count.expected "
+            "mismatch) plus a minimal-valid-container positive, a "
+            "minimal-editable PPTX positive, and a 2-slide PPTX "
+            "passing slide_count.expected=2. Exits non-zero if any "
+            "negative is not caught or any positive is not accepted."
         ),
     )
     args = parser.parse_args(argv)
@@ -1184,7 +1279,20 @@ def main(argv: list[str]) -> int:
         )
         return 0
 
-    return run(args.pptx)
+    if (
+        args.expected_slide_count is not None
+        and args.expected_slide_count < 1
+    ):
+        print(
+            f"FAIL: --expected-slide-count must be a positive integer; "
+            f"got {args.expected_slide_count}",
+            file=sys.stderr,
+        )
+        return 2
+    return run(
+        args.pptx,
+        expected_slide_count=args.expected_slide_count,
+    )
 
 
 if __name__ == "__main__":

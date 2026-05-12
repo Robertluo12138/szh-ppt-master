@@ -9,7 +9,7 @@ The security scan **must fail** the artifact (not warn) when any of the followin
 1. An artifact references an external URL (`http://`, `https://`, protocol-relative `//`, or any non-local scheme other than the explicitly allowed set, currently empty).
 2. An artifact references `file://`.
 3. An artifact references an absolute filesystem path (`/...` on POSIX, `X:\...` on Windows). Paths must be relative to the workspace.
-4. A PPTX (when conversion is implemented) contains a relationship type outside the allowed set. The allowed set is **TODO**; until then, all relationship types must be enumerated and confirmed safe before being added.
+4. A PPTX contains a relationship type outside the allowed set. The allow-list is enforced by `scripts/validate_pptx_contract.py`'s `relationships.allow_list` gate over the canonical OOXML `Type` URLs `officeDocument`, `slide`, `slideMaster`, `slideLayout`, `theme` (the set the current exporter emits). Adding a new relationship type — e.g. `image` once media embedding lands — requires extending the allow-list in lockstep with the exporter so an out-of-band relationship still fails closed.
 5. A PPTX (when conversion is implemented) contains OLE objects, ActiveX controls, embedded macros, or remote-loaded media.
 6. An `image_manifest` entry references a `local_path` that does not exist or escapes the workspace (`..`).
 7. Any stage produced an artifact that failed schema validation, or whose validation status is "unknown".
@@ -37,6 +37,5 @@ A run with errored checks is **not** a pass, even if every executed check passed
 
 ## TODOs
 
-- Enumerate the allowed PPTX relationship types once PPTX conversion is in scope.
 - Define a canonical list of check names so reports are diffable across runs.
 - Decide whether the scan should also reject embedded base64 image data above a size threshold (likely yes).
