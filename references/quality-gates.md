@@ -50,6 +50,7 @@ The gates a deck must pass before the skill reports success. Each gate maps to a
 | `svg.fonts` — fonts are declared and resolvable | SVG validate | TODO |
 | `svg.density` — density is within threshold | SVG validate | TODO |
 | `svg.editable` — every text run is a real text node | SVG validate | TODO |
+| `pptx.contract.skeleton` — `scripts/validate_pptx_contract.py` reports the PPTX contract / TODO surface (skeleton mode) and, when `--pptx <path>` is supplied, runs the basic OOXML container checks: file exists, `.pptx` extension, readable ZIP, and required package entries (`[Content_Types].xml`, `_rels/.rels`, `ppt/presentation.xml`). Skeleton-only — NOT proof that PPTX export works | PPTX export | skeleton (contract validator only; export not implemented) |
 | `pptx.editable` — every text frame is editable, no all-image slides | PPTX export | TODO |
 | `pptx.relationships` — only allow-listed relationship types | PPTX export | TODO |
 | `pptx.media` — every media item exists, no remote refs | PPTX export | TODO |

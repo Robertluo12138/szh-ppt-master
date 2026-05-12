@@ -14,9 +14,9 @@ Claude Code's job is to implement the user's current prompt narrowly, preserve t
 
 ## Current Capability Surface
 
-The repo currently contains scaffold docs, JSON schemas, template skeletons, synthetic examples, and stdlib-only validators. It does not yet implement real SVG generation, PPTX export, D-One integration, chart rendering, visual regression, or Qoder CLI integration.
+The repo currently contains scaffold docs, JSON schemas, template skeletons, synthetic examples, stdlib-only validators, a deterministic render-model generator for the `cover` and `kpi_dashboard` layouts (`scripts/generate_render_models.py`), and a deterministic SVG preview renderer (`scripts/generate_svg_previews.py`) that consumes those render_models and writes per-slide previews for the supported primitive subset (`text`, `line`, `shape`, `image_slot`, `kpi`). PPTX export, chart rendering, visual regression, D-One integration, and Qoder CLI integration are **not** implemented; SVG repair (clipping out-of-bounds shapes, font fallback) and glyph-level text-overflow detection also remain TODO.
 
-Do not document unimplemented stages as working behavior.
+Do not document unimplemented stages as working behavior, and do not claim end-to-end success — the pipeline stops at the SVG preview for the supported layouts and primitive kinds.
 
 ## Architecture Notes
 

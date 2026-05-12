@@ -39,7 +39,7 @@ projects/               # generated workspaces (not committed; created by users)
 
 ## Verification today
 
-Five stdlib-only Python commands are wired up — three validators (`validate_artifacts.py`, `validate_scaffold.py`, `validate_workspace.py`) and two deterministic generators (`generate_render_models.py`, `generate_svg_previews.py`). No third-party dependencies are required.
+Six stdlib-only Python commands are wired up — four validators (`validate_artifacts.py`, `validate_scaffold.py`, `validate_workspace.py`, `validate_pptx_contract.py`) and two deterministic generators (`generate_render_models.py`, `generate_svg_previews.py`). No third-party dependencies are required. `validate_pptx_contract.py` is a **contract / skeleton** validator for the future PPTX export stage — it is NOT proof that export works (export itself is not implemented).
 
 ### Single-artifact structural validation
 
@@ -132,7 +132,31 @@ python3 scripts/generate_svg_previews.py \
 
 The renderer supports the primitive kinds the generator emits today — `text`, `line`, `shape`, `image_slot`, `kpi`. Any other kind (`table`, `chart_placeholder`, or any future kind) fails closed on that slide. Token resolution: `palette.*` resolves to a raw hex via `design_system.palette.X` (the resolved value must match `^#[0-9A-Fa-f]{6}$`); `typography.heading|body` resolves to a `(font_family, size_pt)` pair via `design_system.typography.X` (`font_family` must match the CSS-style fallback-chain pattern); an unresolved or schema-violating token fails closed at the resolver, including for the background `<rect>` (no direct dict bypass). Image references resolve through `image_manifest.images[].id -> local_path`; the resolved path must pass the same path-safety rule the workspace validator enforces (no URI scheme, no POSIX-absolute, no leading backslash, no protocol-relative, no `..` segment, no empty). **Preflight** (runs before any cleanup): `design_system.json` and `image_manifest.json` are schema-validated, and every `image_manifest.images[].local_path` is run through `local_path_is_safe`. A preflight failure exits non-zero, prints no `OK:`, and does **not** delete any pre-existing `svg_previews/*.svg`. Before generating, every existing `svg_previews/*.svg` is removed (the `*.svg` namespace is generator-owned), so a stale preview cannot survive a fail-closed mismatch or a render_model deletion; non-SVG files (READMEs, `.md` / `.txt` notes) are preserved. After writing, the script re-runs the same `check_svg_previews` gate the workspace validator uses, so output drift fails immediately.
 
-All other tools — PPTX export, security scan, visual regression, image manifest population from real assets, D-One integration, Qoder CLI — are still **not implemented**. Do not document them as available. Render-model generation for layouts other than `cover` and `kpi_dashboard`, and SVG rendering of primitive kinds outside `text` / `line` / `shape` / `image_slot` / `kpi`, are also not implemented.
+### PPTX export contract skeleton
+
+`scripts/validate_pptx_contract.py` is a stdlib-only, fail-closed **contract / skeleton** validator for the future PPTX export stage. PPTX export itself is **NOT implemented**; no `*.pptx` is produced anywhere in this repo. The script exists to lock the container surface and the TODO surface so a future exporter cannot quietly skip them. See `references/pptx-conversion-rules.md` for the contract.
+
+```
+# Skeleton mode — reports the contract / TODO surface only. Does not
+# open or fabricate any file. Useful as a reminder that PPTX export
+# is not implemented.
+python3 scripts/validate_pptx_contract.py
+
+# Container mode — when a .pptx is supplied, runs the basic OOXML
+# container checks against it: file exists, .pptx extension,
+# readable ZIP, required package entries ([Content_Types].xml,
+# _rels/.rels, ppt/presentation.xml).
+python3 scripts/validate_pptx_contract.py --pptx path/to/deck.pptx
+
+# Self-test — exercises the tempfixture negatives (missing file,
+# wrong extension, non-zip content, empty ZIP, ZIP missing
+# ppt/presentation.xml) plus a minimal-valid-container positive.
+python3 scripts/validate_pptx_contract.py --self-test
+```
+
+Deeper checks — text-frame editability, no all-image slides, relationship allow-list, embedded-only media, theme palette mapping, determinism, layout scope (`cover` and `kpi_dashboard`), and primitive scope (`text` / `line` / `shape` / `image_slot` / `kpi`; `table` and `chart_placeholder` must fail closed) — remain TODO and are explicitly reported as such in every run. A passing run of this validator is NOT proof that export works.
+
+All other tools — PPTX export itself, security scan, visual regression, image manifest population from real assets, D-One integration, Qoder CLI — are still **not implemented**. Do not document them as available. Render-model generation for layouts other than `cover` and `kpi_dashboard`, and SVG rendering of primitive kinds outside `text` / `line` / `shape` / `image_slot` / `kpi`, are also not implemented.
 
 ## Engineering rules
 

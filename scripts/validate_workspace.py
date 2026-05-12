@@ -103,8 +103,14 @@ TRACEBACK SAFETY
     artifacts) prove this stays true.
 
 OUT OF SCOPE
-    No SVG generation, no PPTX export, no D-One, no Qoder, no network.
-    Those stages are not implemented in this repo.
+    This validator does NOT generate SVG. SVG generation is a separate
+    stage implemented by scripts/generate_svg_previews.py (today supporting
+    primitive kinds text / line / shape / image_slot / kpi for the cover
+    and kpi_dashboard layouts). Validation of the generated previews is
+    performed here by check_svg_previews above.
+    PPTX export, D-One image generation, Qoder CLI integration, and any
+    network behavior are NOT implemented in this repo and remain out of
+    scope until their scripts exist.
 """
 
 from __future__ import annotations

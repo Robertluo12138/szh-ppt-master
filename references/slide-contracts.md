@@ -82,6 +82,8 @@ Every other layout — `agenda`, `section_divider`, `executive_summary`, `key_me
 
 The generator never invents source content. All text and KPI rows come from `slide_plan.blocks[].content`. The generator is fail-closed on missing / malformed inputs, unsafe `deck_plan.template`, unknown `image_ref`, malformed kpi entries, a missing required slide_plan block, **a stale / mismatched slide_plan** (matched by JSON index but whose `layout` or `title` disagrees with the deck_plan slide), schema-invalid output, or workspace cross-check failure — and re-runs the same `check_render_models` gate the workspace validator uses, so output drift fails immediately rather than after the next CI run.
 
+Before generating, the script **removes every** `render_models/*.json` file. The workspace validator schema-validates every `*.json` in this directory as a render_model, so the `*.json` namespace is generator-owned by `scripts/generate_render_models.py`. This covers four stale-file scenarios: (1) a previous successful run for a slide that now fails closed, (2) a previous successful run for a slide whose deck_plan layout has since changed to one the generator does not implement (slide gets skipped, no replacement), (3) the slide has been **removed from deck_plan entirely** (orphan with no current owner — would otherwise surface as a post-hoc cross-check failure), and (4) idempotent regeneration (the file is deleted and immediately rewritten). Non-`.json` files in `render_models/` (READMEs, `.md` / `.txt` notes) are left untouched — the cleanup glob targets `*.json` only.
+
 ### SVG preview generator
 
 `scripts/generate_svg_previews.py` is the stage-8 implementation. It reads `<workspace>/render_models/*.json` and writes `<workspace>/svg_previews/<stem>.svg` for each. The renderer consumes `render_model.json` only — it does NOT read `slide_plan.json`, so the controlled primitive contract cannot be bypassed.
@@ -90,12 +92,10 @@ The generator never invents source content. All text and KPI rows come from `sli
 - Tokens: `palette.*` resolves to a raw hex via `design_system.palette.X`; `typography.heading|body` resolves to a `(font_family, size_pt)` pair via `design_system.typography.X`. An unresolved token fails closed.
 - Image references: resolve through `image_manifest.images[].id → local_path`. The resolved `local_path` must pass the same path-safety rule the workspace validator enforces; an undeclared or unsafe `image_ref` fails closed.
 - Output naming: `<idx>_<layout>.svg`, matching the render_model file stem.
-- Stale-file cleanup: every existing `svg_previews/*.svg` is removed before regeneration (the `*.svg` namespace is generator-owned). Non-SVG files (READMEs, `.md` / `.txt` notes) are preserved.
+- Stale-file cleanup: every existing `svg_previews/*.svg` is removed before regeneration. The `*.svg` namespace under `svg_previews/` is owned by `scripts/generate_svg_previews.py` and only `*.svg` files are deleted — non-SVG files in `svg_previews/` (READMEs, `.md` / `.txt` notes) are preserved. This script does NOT touch `render_models/`; cleanup of `render_models/*.json` is owned by `scripts/generate_render_models.py` (see "Generator scope" above).
 - Post-write check: the script re-runs the same `check_svg_previews` gate the workspace validator uses, so output drift fails immediately.
 
 See `references/svg-design-rules.md` for the SVG-side contract and the exhaustive list of validator checks; see `references/quality-gates.md` for the `svg.*` gate identifiers.
-
-Before generating, the script also **removes every** `render_models/*.json` file. The workspace validator schema-validates every `*.json` in this directory as a render_model, so the `*.json` namespace is generator-owned. This covers four stale-file scenarios: (1) a previous successful run for a slide that now fails closed, (2) a previous successful run for a slide whose deck_plan layout has since changed to one the generator does not implement (slide gets skipped, no replacement), (3) the slide has been **removed from deck_plan entirely** (orphan with no current owner — would otherwise surface as a post-hoc cross-check failure), and (4) idempotent regeneration (the file is deleted and immediately rewritten). Non-`.json` files (READMEs, `.md` / `.txt` notes) are left untouched — the cleanup glob targets `*.json` only.
 
 ## Block kinds
 
