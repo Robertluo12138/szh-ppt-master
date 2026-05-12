@@ -41,10 +41,57 @@ CHECKS (all fail-closed; exit 1 on any failure)
                     workspace; symlink escape is rejected.
     image refs:     every slide_plan.image_refs id is declared in
                     image_manifest.
+    render models:  if workspace ships render_models/*.json, each one
+                    validates against render_model.schema.json (controlled
+                    primitive kinds only, required bounds, required and
+                    non-empty source_refs, token-only style refs,
+                    additionalProperties:false everywhere) and crosses with
+                    deck_plan / design_system / image_manifest / layout
+                    slots (index, layout, canvas==grid, source_refs are a
+                    subset of deck_brief.source_refs — fail-closed if the
+                    deck_brief is missing / malformed / empty — primitive
+                    ids unique, bounds inside canvas, kind-payload
+                    alignment, slot_id known, slot.primitive_kind or
+                    slot.type->primitive_kind default, slot.bounds contain
+                    primitive bounds, image_ref declared, palette tokens
+                    resolve, no URI-scheme prefix in reference fields).
+                    The directory is optional today: a workspace that does
+                    not ship render models is silently skipped.
+    svg previews:   if workspace ships render_models/*.json, each one
+                    must have a matching svg_previews/<stem>.svg. Each
+                    SVG must parse as XML, root <svg> with a viewBox
+                    that matches the render_model canvas, no
+                    <foreignObject> anywhere, every reference-bearing
+                    attribute (href / xlink:href / src / *href*) passes
+                    the same path-safety rule as image_manifest paths
+                    (no URI scheme, no absolute, no '..', no leading
+                    backslash, no empty), every <image> href is a path
+                    declared in image_manifest, every <rect> / <image>
+                    / <ellipse> / <circle> / <line> with explicit
+                    numeric geometry stays inside the canvas, and every
+                    <text> with numeric x/y has its anchor point
+                    inside the canvas. The validator does NOT enforce
+                    a <text> width / height / wrapping box — that
+                    needs font metrics this stdlib-only validator does
+                    not carry, and remains a TODO in
+                    references/svg-design-rules.md. The svg_previews/
+                    directory is generator-owned (*.svg);
+                    render_models without a matching svg preview FAIL.
 
 NEGATIVE TESTS (built in; exercised in the same run)
     unsafe scheme, absolute path, path traversal, missing media,
     unknown layout, missing slide_plan, required-slot mismatch.
+    render_model: unsupported kind, missing bounds, missing / empty
+    source_refs, invalid token refs, URLs / file:// / absolute paths /
+    path traversal in image_ref, arbitrary SVG-like fields, kind-payload
+    mismatch, bounds outside canvas, unknown slot_id, slot.primitive_kind
+    mismatch, image_ref not in manifest, unknown palette token,
+    source_refs cross-check fail-closed under missing / malformed / empty
+    deck_brief.source_refs, duplicate primitive ids.
+    svg_preview: missing for a render_model, malformed XML, wrong root
+    element, viewBox mismatch with canvas, <foreignObject> present,
+    href with URI scheme / absolute / '..' / file://, href not
+    declared in image_manifest, element outside canvas.
 
 TRACEBACK SAFETY
     Every check function is defensive against malformed-but-loadable
@@ -77,9 +124,27 @@ from validate_scaffold import (  # noqa: E402
     local_path_is_safe,
     _resolves_within,
     _slide_plan_against_layout,
+    _URI_SCHEME_PREFIX,
 )
 
 SCHEMAS = REPO_ROOT / "schemas"
+
+RENDER_PRIMITIVE_KINDS = (
+    "text", "shape", "line", "image_slot", "table", "kpi", "chart_placeholder",
+)
+# slot.type (from layout.schema.json) -> default render primitive kind. Used
+# when a layout slot has no explicit primitive_kind override. The renderer can
+# still treat a callout as a shape+text composite later; this default is the
+# minimum mapping the controlled model commits to today.
+DEFAULT_SLOT_TYPE_TO_PRIMITIVE_KIND = {
+    "text": "text",
+    "list": "text",
+    "callout": "text",
+    "kpi": "kpi",
+    "table": "table",
+    "image_ref": "image_slot",
+    "chart_ref": "chart_placeholder",
+}
 
 CORE_ARTIFACT_SCHEMAS = {
     "deck_brief.json":     "deck_brief.schema.json",
@@ -893,6 +958,612 @@ def check_image_manifest(workspace: Path) -> list[CheckResult]:
     return out
 
 
+def _walk_strings(node: object):
+    """Yield every string value reachable from node, walking dicts and lists.
+    Used by the render_model URI-scheme defense check."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for v in node.values():
+            yield from _walk_strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _walk_strings(v)
+
+
+def _render_model_reference_strings(prim_d: dict):
+    """Yield reference / identifier strings from a render_model primitive
+    where a URI / path is never legitimate (ids, kinds, token refs,
+    image_ref). Content fields like text.content, kpi.label/value/delta,
+    chart_placeholder.caption, image_slot.alt_text, and table cells are
+    NOT walked — those are display text and may legitimately mention a
+    URL-like substring. The schema's pattern rules already forbid URIs
+    in the fields walked here; this walker is a defense-in-depth check."""
+    for key in ("id", "slot_id", "kind"):
+        v = prim_d.get(key)
+        if isinstance(v, str):
+            yield v
+    style = prim_d.get("style")
+    if isinstance(style, dict):
+        for k, v in style.items():
+            if isinstance(v, str):
+                yield v
+    img = prim_d.get("image_slot")
+    if isinstance(img, dict):
+        v = img.get("image_ref")
+        if isinstance(v, str):
+            yield v
+
+
+def check_render_models(workspace: Path, template_root: Path) -> list[CheckResult]:
+    """Validate workspace/render_models/*.json against render_model.schema.json
+    and the cross-artifact rules the controlled primitive contract requires.
+
+    The render_models/ directory is optional. If it is absent or empty
+    no checks fire — render-model generation is a downstream stage that
+    not every workspace ships yet. When the directory does ship files,
+    every cross-check below is fail-closed.
+
+    Cross-checks (run after schema validation passes):
+      - index matches a deck_plan slide;
+      - layout matches that deck_plan slide's layout;
+      - canvas dimensions match design_system.grid (if available);
+      - source_refs are a subset of deck_brief.source_refs. The check is
+        fail-closed: a missing / malformed / empty deck_brief is surfaced
+        as a FAIL on every render_model rather than silently skipped, so
+        a workspace cannot claim render-model traceability without a
+        deck_brief that lists the same source ids;
+      - every primitive id is unique within the render_model;
+      - bounds fit inside the canvas (x+w <= width, y+h <= height);
+      - exactly one kind-specific payload field is present, and it
+        matches `kind` (e.g. kind=kpi requires the kpi payload and
+        forbids text/shape/line/image_slot/table/chart_placeholder);
+      - slot_id (when set) refers to a slot id on the chosen layout;
+      - if that slot declares primitive_kind, it must equal the
+        primitive's kind; if it declares bounds, the primitive's bounds
+        must fit inside slot.bounds;
+      - kind=image_slot's image_ref must be declared in image_manifest;
+      - style.fill_token / color_token / stroke_token must resolve to a
+        key present in design_system.palette;
+      - reference-field strings (id, slot_id, kind, style tokens,
+        image_ref) carry no URI-scheme prefix — schema pattern already
+        forbids this; the check is a defense-in-depth catch.
+    """
+    out: list[CheckResult] = []
+    rm_dir = workspace / "render_models"
+    if not rm_dir.is_dir():
+        return out
+    rm_files = sorted(rm_dir.glob("*.json"))
+    if not rm_files:
+        return out
+
+    brief_raw, brief_load_err = _try_load(workspace / "deck_brief.json")
+    brief = _as_dict(brief_raw) if brief_raw is not None else None
+    brief_refs: set[str] = set()
+    # brief_refs_status is empty when the cross-check is permitted to run,
+    # otherwise it carries a one-line reason. The render_model loop below
+    # uses it to FAIL closed (rather than silently skip) when deck_brief is
+    # missing, malformed, or has no source_refs of its own.
+    if brief_raw is None:
+        brief_refs_status = f"deck_brief.json unavailable: {brief_load_err}"
+    elif brief is None:
+        brief_refs_status = (
+            f"deck_brief.json root is not an object "
+            f"(got {type(brief_raw).__name__})"
+        )
+    else:
+        brief_refs_raw = brief.get("source_refs")
+        brief_refs_list = _as_list(brief_refs_raw)
+        if brief_refs_list is None:
+            brief_refs_status = (
+                f"deck_brief.source_refs is not a list "
+                f"(got {type(brief_refs_raw).__name__})"
+            )
+        else:
+            string_refs = [r for r in brief_refs_list if isinstance(r, str)]
+            if not string_refs:
+                brief_refs_status = "deck_brief.source_refs is empty"
+            else:
+                brief_refs = set(string_refs)
+                brief_refs_status = ""
+
+    deck_raw, _ = _try_load(workspace / "deck_plan.json")
+    deck = _as_dict(deck_raw) if deck_raw is not None else None
+    deck_slides_by_index: dict[int, dict] = {}
+    template_name = ""
+    if deck is not None:
+        for s in _as_list(deck.get("slides")) or []:
+            s_d = _as_dict(s)
+            if s_d is not None and isinstance(s_d.get("index"), int):
+                deck_slides_by_index[s_d["index"]] = s_d
+        t_raw = deck.get("template", "")
+        if isinstance(t_raw, str):
+            template_name = t_raw
+
+    design_raw, _ = _try_load(workspace / "design_system.json")
+    design = _as_dict(design_raw) if design_raw is not None else None
+    palette_keys: set[str] = set()
+    grid: dict | None = None
+    if design is not None:
+        palette = _as_dict(design.get("palette"))
+        if palette is not None:
+            palette_keys = {k for k in palette.keys() if isinstance(k, str)}
+        grid = _as_dict(design.get("grid"))
+
+    manifest_raw, _ = _try_load(workspace / "image_manifest.json")
+    manifest = _as_dict(manifest_raw) if manifest_raw is not None else None
+    manifest_ids: set[str] = set()
+    if manifest is not None:
+        for img in _as_list(manifest.get("images")) or []:
+            img_d = _as_dict(img)
+            if img_d is not None and isinstance(img_d.get("id"), str):
+                manifest_ids.add(img_d["id"])
+
+    layouts: dict[str, dict] = {}
+    if template_name:
+        ok, template_dir, _ = _safe_load_inside(template_root, template_name)
+        if ok and template_dir is not None:
+            layouts = _load_template_layouts(template_dir)
+
+    for rm_file in rm_files:
+        rm_raw, err = _try_load(rm_file)
+        if rm_raw is None:
+            out.append(CheckResult(
+                f"render_model {rm_file.name}: loadable", False, err,
+            ))
+            continue
+        rm = _as_dict(rm_raw)
+        if rm is None:
+            out.append(CheckResult(
+                f"render_model {rm_file.name}: root is an object",
+                False, f"got {type(rm_raw).__name__}",
+            ))
+            continue
+
+        errors = _schema_validate(rm, SCHEMAS / "render_model.schema.json")
+        out.append(CheckResult(
+            f"render_model {rm_file.name}: validates against render_model.schema.json",
+            not errors,
+            "; ".join(errors),
+        ))
+        if errors:
+            continue
+
+        # index / layout cross-check against deck_plan.
+        idx = rm.get("index")
+        deck_slide = deck_slides_by_index.get(idx) if isinstance(idx, int) else None
+        out.append(CheckResult(
+            f"render_model {rm_file.name}: index {idx} matches a deck_plan slide",
+            deck_slide is not None,
+            f"deck_plan slide indices: {sorted(deck_slides_by_index)}",
+        ))
+        if deck_slide is not None:
+            deck_layout = deck_slide.get("layout")
+            out.append(CheckResult(
+                f"render_model {rm_file.name}: layout {rm.get('layout')!r} "
+                f"matches deck_plan slide layout {deck_layout!r}",
+                rm.get("layout") == deck_layout,
+            ))
+
+        canvas = _as_dict(rm.get("canvas")) or {}
+        canvas_w = canvas.get("width_px")
+        canvas_h = canvas.get("height_px")
+        if (
+            grid is not None
+            and isinstance(grid.get("width_px"), int)
+            and isinstance(grid.get("height_px"), int)
+        ):
+            out.append(CheckResult(
+                f"render_model {rm_file.name}: canvas matches design_system.grid "
+                f"({canvas_w}x{canvas_h} vs {grid['width_px']}x{grid['height_px']})",
+                canvas_w == grid["width_px"] and canvas_h == grid["height_px"],
+            ))
+
+        # source_refs cross-check, fail-closed. The schema already requires
+        # source_refs and minItems:1 (so a missing/empty render_model
+        # source_refs surfaces at schema time above). The cross-check here
+        # must fail closed when deck_brief is unavailable rather than
+        # silently skip — we surface brief_refs_status as the reason.
+        rm_refs_list = _as_list(rm.get("source_refs")) or []
+        if brief_refs_status:
+            out.append(CheckResult(
+                f"render_model {rm_file.name}: source_refs can be cross-checked "
+                f"against deck_brief.source_refs",
+                False, brief_refs_status,
+            ))
+        else:
+            for ref in rm_refs_list:
+                if not isinstance(ref, str) or ref not in brief_refs:
+                    out.append(CheckResult(
+                        f"render_model {rm_file.name}: source_ref {ref!r} "
+                        f"declared in deck_brief.source_refs",
+                        False, f"brief source_refs: {sorted(brief_refs)}",
+                    ))
+
+        # Layout slots, indexed by id, for slot_id cross-checks.
+        layout = _as_dict(layouts.get(rm.get("layout"))) if rm.get("layout") else None
+        slots_by_id: dict[str, dict] = {}
+        if layout is not None:
+            for s in _as_list(layout.get("slots")) or []:
+                s_d = _as_dict(s)
+                if s_d is not None and isinstance(s_d.get("id"), str):
+                    slots_by_id[s_d["id"]] = s_d
+
+        seen_ids: set[str] = set()
+        for i, prim in enumerate(_as_list(rm.get("primitives")) or []):
+            prim_d = _as_dict(prim)
+            if prim_d is None:
+                continue  # schema validation already caught this
+            pid = prim_d.get("id")
+            kind = prim_d.get("kind")
+            label = f"render_model {rm_file.name} primitive[{i}] id={pid!r}"
+
+            if isinstance(pid, str):
+                out.append(CheckResult(
+                    f"{label}: id is unique within this render_model",
+                    pid not in seen_ids,
+                ))
+                seen_ids.add(pid)
+
+            bounds = _as_dict(prim_d.get("bounds")) or {}
+            if (
+                isinstance(canvas_w, int) and isinstance(canvas_h, int)
+                and all(isinstance(bounds.get(k), int) for k in ("x", "y", "w", "h"))
+            ):
+                x, y, w, h = bounds["x"], bounds["y"], bounds["w"], bounds["h"]
+                inside = x + w <= canvas_w and y + h <= canvas_h
+                out.append(CheckResult(
+                    f"{label}: bounds fit inside canvas "
+                    f"({x},{y},{w}x{h} vs {canvas_w}x{canvas_h})",
+                    inside,
+                ))
+
+            payload_keys_present = [k for k in RENDER_PRIMITIVE_KINDS if k in prim_d]
+            expected = [kind] if kind in RENDER_PRIMITIVE_KINDS else []
+            out.append(CheckResult(
+                f"{label}: payload field matches kind {kind!r} "
+                f"(present={payload_keys_present}, expected={expected})",
+                payload_keys_present == expected,
+            ))
+
+            slot_id = prim_d.get("slot_id")
+            if isinstance(slot_id, str):
+                slot = slots_by_id.get(slot_id)
+                out.append(CheckResult(
+                    f"{label}: slot_id {slot_id!r} exists on layout {rm.get('layout')!r}",
+                    slot is not None,
+                    f"known slot ids: {sorted(slots_by_id)}",
+                ))
+                if isinstance(slot, dict):
+                    slot_pk = slot.get("primitive_kind")
+                    if isinstance(slot_pk, str):
+                        out.append(CheckResult(
+                            f"{label}: kind {kind!r} matches slot.primitive_kind {slot_pk!r}",
+                            kind == slot_pk,
+                        ))
+                    else:
+                        slot_type = slot.get("type")
+                        default_pk = DEFAULT_SLOT_TYPE_TO_PRIMITIVE_KIND.get(slot_type)
+                        if default_pk is not None:
+                            out.append(CheckResult(
+                                f"{label}: kind {kind!r} matches default "
+                                f"slot.type={slot_type!r} -> primitive {default_pk!r}",
+                                kind == default_pk,
+                            ))
+                    slot_bounds = _as_dict(slot.get("bounds"))
+                    if (
+                        slot_bounds is not None
+                        and all(isinstance(slot_bounds.get(k), int)
+                                for k in ("x", "y", "w", "h"))
+                        and all(isinstance(bounds.get(k), int)
+                                for k in ("x", "y", "w", "h"))
+                    ):
+                        sx, sy = slot_bounds["x"], slot_bounds["y"]
+                        sw, sh = slot_bounds["w"], slot_bounds["h"]
+                        bx, by = bounds["x"], bounds["y"]
+                        bw, bh = bounds["w"], bounds["h"]
+                        fits = (
+                            bx >= sx and by >= sy
+                            and bx + bw <= sx + sw
+                            and by + bh <= sy + sh
+                        )
+                        out.append(CheckResult(
+                            f"{label}: bounds fit inside slot {slot_id!r}.bounds",
+                            fits,
+                            f"primitive=({bx},{by},{bw}x{bh}), "
+                            f"slot=({sx},{sy},{sw}x{sh})",
+                        ))
+
+            if kind == "image_slot":
+                img_payload = _as_dict(prim_d.get("image_slot")) or {}
+                image_ref = img_payload.get("image_ref")
+                if isinstance(image_ref, str):
+                    out.append(CheckResult(
+                        f"{label}: image_ref {image_ref!r} declared in image_manifest",
+                        image_ref in manifest_ids,
+                        f"manifest ids: {sorted(manifest_ids)}",
+                    ))
+
+            style = _as_dict(prim_d.get("style")) or {}
+            for token_field in ("fill_token", "color_token", "stroke_token"):
+                token = style.get(token_field)
+                if isinstance(token, str) and token.startswith("palette."):
+                    key = token.split(".", 1)[1]
+                    if palette_keys:
+                        out.append(CheckResult(
+                            f"{label}: {token_field} {token!r} resolves "
+                            f"to a design_system palette key",
+                            key in palette_keys,
+                            f"palette keys: {sorted(palette_keys)}",
+                        ))
+
+            offending = [
+                s for s in _render_model_reference_strings(prim_d)
+                if _URI_SCHEME_PREFIX.match(s)
+            ]
+            out.append(CheckResult(
+                f"{label}: no reference-field string carries a URI-scheme prefix",
+                not offending,
+                f"offending: {offending}",
+            ))
+    return out
+
+
+SVG_NS = "http://www.w3.org/2000/svg"
+
+
+def _strip_ns(tag: str) -> str:
+    """Return the local name from an ElementTree namespaced tag.
+    ElementTree formats namespaced tags as '{ns}local' — strip the
+    namespace so the validator can compare against bare element names."""
+    if isinstance(tag, str) and tag.startswith("{"):
+        end = tag.find("}")
+        if end >= 0:
+            return tag[end + 1 :]
+    return tag if isinstance(tag, str) else ""
+
+
+def _iter_elements(root):
+    """Yield every element under root, including root itself."""
+    yield root
+    for el in root.iter():
+        if el is root:
+            continue
+        yield el
+
+
+def check_svg_previews(workspace: Path, template_root: Path) -> list[CheckResult]:
+    """Validate workspace/svg_previews/*.svg against the corresponding
+    workspace/render_models/*.json.
+
+    The svg_previews/ directory is optional. If render_models/ is absent
+    or empty, no checks fire — the SVG preview stage only matters once
+    the render-model generator has produced output. When the workspace
+    ships render_models but no svg_previews/, each missing preview is
+    reported as a FAIL.
+
+    Checks (every gate is fail-closed):
+      - svg_previews/<stem>.svg exists for each render_models/<stem>.json;
+      - the SVG parses as XML with a root element named 'svg' in the
+        SVG namespace;
+      - the root viewBox attribute equals '0 0 <width> <height>' where
+        width/height match the render_model canvas;
+      - no <foreignObject> element appears anywhere in the tree
+        (HTML-in-SVG escape hatch is forbidden);
+      - every reference-bearing attribute string (href, xlink:href, src,
+        and any attribute name ending with 'href') passes the same
+        path-safety rule the workspace uses for image_manifest paths:
+        no URI scheme prefix, no POSIX-absolute path, no leading
+        backslash, no protocol-relative, no '..' segment, no empty
+        string;
+      - every reference value names an image_manifest entry id whose
+        declared local_path equals the reference (undeclared references
+        are rejected);
+      - every <rect>, <line>, <image>, <ellipse>, <circle> with
+        explicit numeric position/size attributes stays inside the
+        canvas, and every <text> with numeric x/y has its anchor
+        point inside the canvas (best-effort: <text> width / height /
+        wrapping at the glyph level is NOT enforced — that needs
+        font metrics this stdlib-only validator does not carry, and
+        remains a TODO in references/svg-design-rules.md)."""
+    import xml.etree.ElementTree as ET
+
+    out: list[CheckResult] = []
+    rm_dir = workspace / "render_models"
+    if not rm_dir.is_dir():
+        return out
+    rm_files = sorted(rm_dir.glob("*.json"))
+    if not rm_files:
+        return out
+
+    sp_dir = workspace / "svg_previews"
+
+    # Build image_manifest map for cross-checks.
+    manifest_raw, _ = _try_load(workspace / "image_manifest.json")
+    manifest = _as_dict(manifest_raw) if manifest_raw is not None else None
+    manifest_path_by_id: dict[str, str] = {}
+    if manifest is not None:
+        for img in _as_list(manifest.get("images")) or []:
+            img_d = _as_dict(img)
+            if img_d is None:
+                continue
+            img_id = img_d.get("id")
+            local_path = img_d.get("local_path")
+            if isinstance(img_id, str) and isinstance(local_path, str):
+                manifest_path_by_id[img_id] = local_path
+    declared_paths = set(manifest_path_by_id.values())
+
+    for rm_file in rm_files:
+        stem = rm_file.stem
+        svg_path = sp_dir / f"{stem}.svg"
+        label = f"svg_preview {stem}.svg"
+
+        if not svg_path.is_file():
+            out.append(CheckResult(
+                f"{label}: exists for render_models/{rm_file.name}",
+                False,
+                f"missing {svg_path}",
+            ))
+            continue
+        out.append(CheckResult(
+            f"{label}: exists for render_models/{rm_file.name}",
+            True,
+        ))
+
+        # Load the matching render_model so canvas can be cross-checked.
+        rm_raw, err = _try_load(rm_file)
+        rm = _as_dict(rm_raw) if rm_raw is not None else None
+        canvas = _as_dict(rm.get("canvas")) if rm is not None else None
+        canvas_w = canvas.get("width_px") if canvas is not None else None
+        canvas_h = canvas.get("height_px") if canvas is not None else None
+
+        try:
+            text = svg_path.read_text()
+        except OSError as exc:
+            out.append(CheckResult(
+                f"{label}: readable", False, f"read error: {exc}",
+            ))
+            continue
+        try:
+            tree_root = ET.fromstring(text)
+        except ET.ParseError as exc:
+            out.append(CheckResult(
+                f"{label}: parses as XML", False, f"parse error: {exc}",
+            ))
+            continue
+        out.append(CheckResult(f"{label}: parses as XML", True))
+
+        root_tag = _strip_ns(tree_root.tag)
+        out.append(CheckResult(
+            f"{label}: root element is <svg> in the SVG namespace",
+            root_tag == "svg" and tree_root.tag == f"{{{SVG_NS}}}svg",
+            f"root tag: {tree_root.tag!r}",
+        ))
+
+        viewbox = tree_root.attrib.get("viewBox", "")
+        if isinstance(canvas_w, int) and isinstance(canvas_h, int):
+            expected_viewbox = f"0 0 {canvas_w} {canvas_h}"
+            out.append(CheckResult(
+                f"{label}: viewBox matches render_model canvas",
+                viewbox == expected_viewbox,
+                f"viewBox={viewbox!r}, expected={expected_viewbox!r}",
+            ))
+
+        foreign_objects = [
+            el for el in _iter_elements(tree_root)
+            if _strip_ns(el.tag) == "foreignObject"
+        ]
+        out.append(CheckResult(
+            f"{label}: contains no <foreignObject>",
+            not foreign_objects,
+            f"found {len(foreign_objects)} <foreignObject> element(s)",
+        ))
+
+        # Reference / attribute walks.
+        offending_refs: list[tuple[str, str, str]] = []
+        undeclared_refs: list[tuple[str, str]] = []
+        for el in _iter_elements(tree_root):
+            local_tag = _strip_ns(el.tag)
+            for attr_name, attr_value in el.attrib.items():
+                local_attr = _strip_ns(attr_name)
+                if not isinstance(attr_value, str):
+                    continue
+                is_ref_attr = (
+                    local_attr in ("href", "src")
+                    or local_attr.endswith("href")
+                )
+                if not is_ref_attr:
+                    continue
+                if not local_path_is_safe(attr_value):
+                    offending_refs.append((local_tag, local_attr, attr_value))
+                    continue
+                # A safe ref must also be one this workspace declared
+                # via image_manifest. We allow only references whose
+                # value exactly equals a manifest local_path; this
+                # rejects future hand-edited SVGs that add an internal-
+                # looking but undeclared path.
+                if local_tag == "image":
+                    if attr_value not in declared_paths:
+                        undeclared_refs.append((local_attr, attr_value))
+        out.append(CheckResult(
+            f"{label}: no reference-bearing attribute carries a URI scheme, "
+            f"absolute path, '..' segment, or other unsafe form",
+            not offending_refs,
+            f"offending: {offending_refs}",
+        ))
+        out.append(CheckResult(
+            f"{label}: every <image> href is declared in image_manifest",
+            not undeclared_refs,
+            f"undeclared: {undeclared_refs}, "
+            f"declared paths: {sorted(declared_paths)}",
+        ))
+
+        # Bounds-inside-canvas (best-effort). Checks elements whose
+        # geometry is expressed via the standard numeric attributes:
+        #   rect, image:       x, y, width, height
+        #   ellipse:           cx, cy, rx, ry
+        #   circle:            cx, cy, r
+        #   line:              x1, y1, x2, y2
+        #   text:              x, y (no width/height — SVG <text> has no
+        #                      intrinsic box; the validator only checks
+        #                      that the anchor point sits inside the
+        #                      canvas. Text overflow / wrapping at the
+        #                      glyph level requires font metrics this
+        #                      stdlib-only validator does not have, so
+        #                      that part of the rule remains a TODO in
+        #                      references/svg-design-rules.md.)
+        # The root <svg> itself is excluded — its width/height define
+        # the canvas.
+        if isinstance(canvas_w, int) and isinstance(canvas_h, int):
+            outside: list[tuple[str, str]] = []
+            for el in _iter_elements(tree_root):
+                if el is tree_root:
+                    continue
+                tag = _strip_ns(el.tag)
+                a = el.attrib
+                try:
+                    if tag in ("rect", "image"):
+                        x = float(a["x"]); y = float(a["y"])
+                        w = float(a["width"]); h = float(a["height"])
+                        if x < 0 or y < 0 or x + w > canvas_w or y + h > canvas_h:
+                            outside.append((tag, f"x={x},y={y},w={w},h={h}"))
+                    elif tag == "ellipse":
+                        cx = float(a["cx"]); cy = float(a["cy"])
+                        rx = float(a["rx"]); ry = float(a["ry"])
+                        if (cx - rx) < 0 or (cy - ry) < 0 or (cx + rx) > canvas_w or (cy + ry) > canvas_h:
+                            outside.append((tag, f"cx={cx},cy={cy},rx={rx},ry={ry}"))
+                    elif tag == "circle":
+                        cx = float(a["cx"]); cy = float(a["cy"])
+                        r = float(a["r"])
+                        if (cx - r) < 0 or (cy - r) < 0 or (cx + r) > canvas_w or (cy + r) > canvas_h:
+                            outside.append((tag, f"cx={cx},cy={cy},r={r}"))
+                    elif tag == "line":
+                        x1 = float(a["x1"]); y1 = float(a["y1"])
+                        x2 = float(a["x2"]); y2 = float(a["y2"])
+                        for cx_, cy_ in ((x1, y1), (x2, y2)):
+                            if cx_ < 0 or cy_ < 0 or cx_ > canvas_w or cy_ > canvas_h:
+                                outside.append((tag, f"x1={x1},y1={y1},x2={x2},y2={y2}"))
+                                break
+                    elif tag == "text":
+                        x = float(a["x"]); y = float(a["y"])
+                        if x < 0 or y < 0 or x > canvas_w or y > canvas_h:
+                            outside.append((tag, f"x={x},y={y}"))
+                except (KeyError, ValueError):
+                    # Element lacks the standard numeric attributes
+                    # this best-effort walker recognises. Other gates
+                    # (URI-scheme walk, foreignObject check, schema) keep
+                    # it bounded; we don't fabricate failures for
+                    # elements whose geometry is expressed differently.
+                    continue
+            out.append(CheckResult(
+                f"{label}: every element with explicit numeric geometry "
+                f"stays inside the canvas (best-effort)",
+                not outside,
+                f"outside: {outside}",
+            ))
+    return out
+
+
 def negative_checks(workspace: Path, template_root: Path) -> list[CheckResult]:
     """Built-in negative tests covering every category required by the
     task: unsafe schemes, absolute paths, path traversal, missing
@@ -1618,6 +2289,2195 @@ def negative_planner_semantics_tempfixture_checks() -> list[CheckResult]:
     return out
 
 
+def _baseline_render_model_workspace(ws: Path) -> None:
+    """Build a minimal but complete workspace that ships one render_model
+    primitive and passes check_render_models. Each negative test below
+    mutates exactly one piece of this baseline. Stdlib-only; nothing real
+    is referenced. The template is built under templates/ inside the same
+    temp dir so the tempfixture is self-contained."""
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "deck_brief.json").write_text(json.dumps({
+        "title": "Synthetic", "audience": "A", "objective": "O",
+        "source_refs": ["synthetic_src_x"],
+    }))
+    (ws / "deck_plan.json").write_text(json.dumps({
+        "template": "synthetic_render_tmpl",
+        "planning": {"planned_slide_count": 1, "rationale": "synthetic"},
+        "sections": [
+            {"id": "only", "title": "Only", "summary": "x", "slide_indices": [1]},
+        ],
+        "slides": [
+            {"index": 1, "layout": "tile",
+             "title": "Synthetic Tile", "section_id": "only",
+             "summary": "x", "density": "low",
+             "source_refs": ["synthetic_src_x"]},
+        ],
+    }))
+    (ws / "design_system.json").write_text(json.dumps({
+        "palette": {
+            "primary":    "#111111",
+            "background": "#FFFFFF",
+            "text":       "#222222",
+        },
+        "typography": {
+            "heading": {"font_family": "Arial, sans-serif", "size_pt": 28},
+            "body":    {"font_family": "Arial, sans-serif", "size_pt": 14},
+        },
+        "grid": {"width_px": 1920, "height_px": 1080, "margin_px": 64},
+    }))
+    (ws / "image_manifest.json").write_text(json.dumps({"images": []}))
+    (ws / "slide_plans").mkdir(exist_ok=True)
+    (ws / "slide_plans" / "01.json").write_text(json.dumps({
+        "index": 1, "layout": "tile", "title": "Synthetic Tile",
+        "blocks": [{"id": "headline", "kind": "text", "content": "Synthetic Tile"}],
+    }))
+    (ws / "render_models").mkdir(exist_ok=True)
+    (ws / "render_models" / "01.json").write_text(json.dumps({
+        "index": 1,
+        "layout": "tile",
+        "canvas": {"width_px": 1920, "height_px": 1080},
+        "source_refs": ["synthetic_src_x"],
+        "primitives": [
+            {
+                "id": "headline",
+                "slot_id": "headline",
+                "kind": "text",
+                "bounds": {"x": 100, "y": 100, "w": 800, "h": 120},
+                "style": {
+                    "color_token": "palette.text",
+                    "typography_token": "typography.heading",
+                },
+                "text": {"content": "Synthetic headline", "role": "heading"},
+            },
+        ],
+    }))
+
+
+def _build_render_model_template(template_root: Path) -> None:
+    """Build a single-template tree under template_root that the
+    baseline render_model workspace references. The tile layout has a
+    single required slot 'headline' with bounds + primitive_kind set."""
+    _make_template_dir(
+        template_root,
+        "synthetic_render_tmpl",
+        layout_files={
+            "tile": {
+                "name": "tile",
+                "slots": [
+                    {
+                        "id": "headline", "type": "text", "required": True,
+                        "primitive_kind": "text",
+                        "bounds": {"x": 64, "y": 64, "w": 1000, "h": 200},
+                    },
+                ],
+            },
+        },
+        declared_layouts=["tile"],
+    )
+
+
+def negative_render_model_tempfixture_checks() -> list[CheckResult]:
+    """Negative tempfixtures proving the render_model contract fails
+    closed on each forbidden mutation: schema-level rejections
+    (unsupported kind, missing bounds, invalid token refs, URLs / file:// /
+    absolute paths / path traversal in image_ref, arbitrary SVG-like
+    fields) and runtime cross-checks (kind-payload mismatch, bounds
+    outside canvas, unknown slot_id, slot.primitive_kind mismatch,
+    image_ref not declared in manifest, palette token not in
+    design_system, duplicate primitive ids)."""
+    import tempfile
+    out: list[CheckResult] = []
+
+    # Sanity: the minimal baseline workspace must itself pass every
+    # render_model check. Catches regressions in the baseline writer or
+    # in check_render_models.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        results = check_render_models(ws, tr)
+        out.append(CheckResult(
+            "tempfixture: minimal render_model baseline passes check_render_models",
+            all(r.ok for r in results),
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # Schema-level negatives: build the baseline, mutate the on-disk
+    # render_model, expect schema validation inside check_render_models
+    # to fail with no traceback.
+    schema_negatives: list[tuple[str, callable]] = [
+        ("unsupported kind 'svg'",
+         lambda rm: rm["primitives"][0].__setitem__("kind", "svg")),
+        ("unsupported kind 'foreignObject'",
+         lambda rm: rm["primitives"][0].__setitem__("kind", "foreignObject")),
+        ("missing bounds",
+         lambda rm: rm["primitives"][0].pop("bounds")),
+        ("invalid token ref (no prefix)",
+         lambda rm: rm["primitives"][0].setdefault("style", {}).__setitem__("color_token", "raw_color")),
+        ("invalid token ref (wrong domain)",
+         lambda rm: rm["primitives"][0].setdefault("style", {}).__setitem__("color_token", "external.thing")),
+        ("invalid typography token",
+         lambda rm: rm["primitives"][0].setdefault("style", {}).__setitem__("typography_token", "typography.unknown")),
+        ("external URL in image_ref",
+         lambda rm: _swap_to_image_slot(rm, "http://example.com/x.png")),
+        ("file:// in image_ref",
+         lambda rm: _swap_to_image_slot(rm, "file:///etc/passwd")),
+        ("absolute path in image_ref",
+         lambda rm: _swap_to_image_slot(rm, "/etc/passwd")),
+        ("path traversal in image_ref",
+         lambda rm: _swap_to_image_slot(rm, "../escape")),
+        ("arbitrary SVG-like field on primitive (transform)",
+         lambda rm: rm["primitives"][0].__setitem__("transform", "translate(10,20)")),
+        ("arbitrary SVG-like field on primitive (viewBox)",
+         lambda rm: rm["primitives"][0].__setitem__("viewBox", "0 0 100 100")),
+        ("arbitrary SVG-like field on primitive (href)",
+         lambda rm: rm["primitives"][0].__setitem__("href", "http://example.com")),
+        ("arbitrary SVG-like field at root (xmlns)",
+         lambda rm: rm.__setitem__("xmlns", "http://www.w3.org/2000/svg")),
+        ("arbitrary SVG-like field at root (defs)",
+         lambda rm: rm.__setitem__("defs", [])),
+    ]
+    for label, mutator in schema_negatives:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tr = root / "templates"
+            tr.mkdir()
+            _build_render_model_template(tr)
+            ws = root / "ws"
+            _baseline_render_model_workspace(ws)
+            rm = json.loads((ws / "render_models" / "01.json").read_text())
+            mutator(rm)
+            (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+            try:
+                results = check_render_models(ws, tr)
+                no_traceback = True
+                exc_kind = ""
+            except Exception as exc:  # noqa: BLE001
+                results = []
+                no_traceback = False
+                exc_kind = type(exc).__name__
+            schema_failed = any(
+                "validates against render_model.schema.json" in r.name and not r.ok
+                for r in results
+            )
+            out.append(CheckResult(
+                f"tempfixture: render_model schema rejects {label}",
+                no_traceback and schema_failed,
+                f"no_traceback={no_traceback}, exc={exc_kind}, "
+                f"results={[r.name for r in results if not r.ok]}",
+            ))
+
+    # Runtime cross-check negatives.
+
+    # A. kind-payload mismatch: kind=text but only kpi payload present.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        rm = json.loads((ws / "render_models" / "01.json").read_text())
+        prim = rm["primitives"][0]
+        prim.pop("text", None)
+        prim["kpi"] = {"label": "L", "value": "V"}
+        # Keep kind=text on purpose to trigger the kind/payload mismatch.
+        (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "payload field matches kind" in r.name and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: kind-payload mismatch is detected at runtime",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # B. Bounds outside the canvas.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        rm = json.loads((ws / "render_models" / "01.json").read_text())
+        rm["primitives"][0]["bounds"] = {"x": 0, "y": 0, "w": 9999, "h": 9999}
+        # Pull the slot reference too so we don't ALSO fail on slot bounds —
+        # the canvas check is what we want to exercise here.
+        rm["primitives"][0].pop("slot_id", None)
+        (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "bounds fit inside canvas" in r.name and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: bounds outside canvas are detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # C. Unknown slot_id.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        rm = json.loads((ws / "render_models" / "01.json").read_text())
+        rm["primitives"][0]["slot_id"] = "no_such_slot"
+        (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "exists on layout" in r.name and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: unknown slot_id is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # D. slot.primitive_kind mismatch: layout slot says text, primitive says shape.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        rm = json.loads((ws / "render_models" / "01.json").read_text())
+        rm["primitives"][0]["kind"] = "shape"
+        rm["primitives"][0].pop("text", None)
+        rm["primitives"][0]["shape"] = {"shape_kind": "rectangle"}
+        (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "matches slot.primitive_kind" in r.name and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: slot.primitive_kind mismatch is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # E. image_ref not declared in manifest.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        # Drop slot_id so we don't also fail the kind/primitive-kind check.
+        rm = json.loads((ws / "render_models" / "01.json").read_text())
+        rm["primitives"][0] = {
+            "id": "pic",
+            "kind": "image_slot",
+            "bounds": {"x": 100, "y": 100, "w": 200, "h": 200},
+            "image_slot": {"image_ref": "no_such_image"},
+        }
+        (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "declared in image_manifest" in r.name and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: image_ref not in image_manifest is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # F. palette token resolves nowhere in the design_system.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        rm = json.loads((ws / "render_models" / "01.json").read_text())
+        rm["primitives"][0].setdefault("style", {})["color_token"] = "palette.no_such_color"
+        (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "resolves to a design_system palette key" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: unknown palette token is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # F2. source_refs cross-check is fail-closed when deck_brief.json is
+    # missing — must NOT silently skip the check.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        (ws / "deck_brief.json").unlink()
+        results = check_render_models(ws, tr)
+        detected = any(
+            "source_refs can be cross-checked against deck_brief.source_refs" in r.name
+            and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: missing deck_brief.json fails source_refs cross-check (fail-closed)",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # F3. source_refs cross-check is fail-closed when deck_brief.source_refs
+    # is malformed (not a list).
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        brief = json.loads((ws / "deck_brief.json").read_text())
+        brief["source_refs"] = "not a list"
+        (ws / "deck_brief.json").write_text(json.dumps(brief))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "source_refs can be cross-checked against deck_brief.source_refs" in r.name
+            and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: malformed deck_brief.source_refs fails source_refs cross-check (fail-closed)",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # F4. source_refs cross-check is fail-closed when deck_brief.source_refs
+    # is empty (no ids to validate against).
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        brief = json.loads((ws / "deck_brief.json").read_text())
+        brief["source_refs"] = []
+        (ws / "deck_brief.json").write_text(json.dumps(brief))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "source_refs can be cross-checked against deck_brief.source_refs" in r.name
+            and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: empty deck_brief.source_refs fails source_refs cross-check (fail-closed)",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # G. Duplicate primitive ids.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        rm = json.loads((ws / "render_models" / "01.json").read_text())
+        # Append a second primitive with the same id.
+        dup = json.loads(json.dumps(rm["primitives"][0]))
+        dup["bounds"] = {"x": 100, "y": 300, "w": 400, "h": 80}
+        dup.pop("slot_id", None)
+        rm["primitives"].append(dup)
+        (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "id is unique within this render_model" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: duplicate primitive id is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    return out
+
+
+def _write_baseline_svg_preview(ws: Path) -> Path:
+    """Write a minimal SVG preview that passes check_svg_previews for the
+    render_model the _baseline_render_model_workspace builder produced.
+    Used as the clean starting point for the svg_preview negatives below."""
+    sp_dir = ws / "svg_previews"
+    sp_dir.mkdir(parents=True, exist_ok=True)
+    out_path = sp_dir / "01.svg"
+    out_path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" '
+        'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+        '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+        '  <text x="108" y="118" font-family="Arial" '
+        'font-size="37.333px" fill="#222222" font-weight="700">'
+        'Synthetic headline</text>\n'
+        '</svg>\n'
+    )
+    return out_path
+
+
+def negative_svg_preview_tempfixture_checks() -> list[CheckResult]:
+    """Negative tempfixtures proving check_svg_previews fails closed on
+    each forbidden mutation: missing svg_preview file, malformed XML,
+    wrong root element, viewBox not matching canvas, <foreignObject>
+    present, href carrying URI scheme / absolute / '..' / file://,
+    <image> href not declared in image_manifest, element outside the
+    canvas. Each case starts from a clean baseline workspace and
+    applies exactly one mutation."""
+    import tempfile
+    out: list[CheckResult] = []
+
+    # Sanity: the minimal baseline must itself pass. Catches regressions
+    # in either the baseline writer or check_svg_previews.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        _write_baseline_svg_preview(ws)
+        results = check_svg_previews(ws, tr)
+        out.append(CheckResult(
+            "tempfixture svg_preview: minimal baseline passes check_svg_previews",
+            all(r.ok for r in results),
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # A. Missing svg_preview for a render_model.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        # Deliberately do NOT write the svg_preview.
+        results = check_svg_previews(ws, tr)
+        detected = any(
+            "exists for render_models/" in r.name and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture svg_preview: missing svg_preview for a render_model "
+            "is detected (fail-closed)",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # B. Malformed XML.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        out_path = _write_baseline_svg_preview(ws)
+        out_path.write_text("<svg><not closed properly")
+        results = check_svg_previews(ws, tr)
+        detected = any(
+            "parses as XML" in r.name and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture svg_preview: malformed XML is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # C. Wrong root element (HTML <div> at the root).
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        out_path = _write_baseline_svg_preview(ws)
+        out_path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<div xmlns="http://www.w3.org/1999/xhtml"/>\n'
+        )
+        results = check_svg_previews(ws, tr)
+        detected = any(
+            "root element is <svg> in the SVG namespace" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture svg_preview: wrong root element is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # D. viewBox mismatch with canvas.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        out_path = _write_baseline_svg_preview(ws)
+        out_path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 100 100" width="1920" height="1080">\n'
+            '  <rect x="0" y="0" width="100" height="100" fill="#FFFFFF"/>\n'
+            '</svg>\n'
+        )
+        results = check_svg_previews(ws, tr)
+        detected = any(
+            "viewBox matches render_model canvas" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture svg_preview: viewBox mismatch with canvas is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # E. <foreignObject> present.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        out_path = _write_baseline_svg_preview(ws)
+        out_path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+            '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+            '  <foreignObject x="0" y="0" width="100" height="100"/>\n'
+            '</svg>\n'
+        )
+        results = check_svg_previews(ws, tr)
+        detected = any(
+            "contains no <foreignObject>" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture svg_preview: <foreignObject> is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # F. href with URI scheme (http://).
+    for bad_ref, label in (
+        ("http://example.com/x.png",     "http URL"),
+        ("file:///etc/passwd",            "file:// URL"),
+        ("/etc/passwd",                   "POSIX-absolute path"),
+        ("../escape/x.png",               "path traversal"),
+        ("data:image/png;base64,abc",     "data URI"),
+        ("javascript:alert(1)",           "javascript URI"),
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tr = root / "templates"
+            tr.mkdir()
+            _build_render_model_template(tr)
+            ws = root / "ws"
+            _baseline_render_model_workspace(ws)
+            out_path = _write_baseline_svg_preview(ws)
+            out_path.write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+                '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+                f'  <image x="100" y="100" width="200" height="200" href="{bad_ref}"/>\n'
+                '</svg>\n'
+            )
+            results = check_svg_previews(ws, tr)
+            detected = any(
+                "no reference-bearing attribute carries a URI scheme" in r.name
+                and not r.ok
+                for r in results
+            )
+            out.append(CheckResult(
+                f"tempfixture svg_preview: unsafe href ({label}) is detected",
+                detected,
+                "; ".join(f"{r.name}" for r in results if not r.ok),
+            ))
+
+    # G. <image> href is a safe path but not declared in image_manifest.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        out_path = _write_baseline_svg_preview(ws)
+        out_path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+            '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+            '  <image x="100" y="100" width="200" height="200" '
+            'href="assets/undeclared.svg"/>\n'
+            '</svg>\n'
+        )
+        results = check_svg_previews(ws, tr)
+        detected = any(
+            "every <image> href is declared in image_manifest" in r.name
+            and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture svg_preview: undeclared <image> href is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # H. Rect element outside the canvas.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        out_path = _write_baseline_svg_preview(ws)
+        out_path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+            '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+            '  <rect x="0" y="0" width="9999" height="9999" fill="#000000"/>\n'
+            '</svg>\n'
+        )
+        results = check_svg_previews(ws, tr)
+        detected = any(
+            "stays inside the canvas" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture svg_preview: rect outside canvas is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # I. <text> anchor outside the canvas. <text> has x/y but no
+    #    width/height — the validator must still catch a negative or
+    #    >canvas anchor point so a stray text glyph drawn at
+    #    x="-100" y="-100" cannot slip through.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        out_path = _write_baseline_svg_preview(ws)
+        out_path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+            '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+            '  <text x="-100" y="-100" font-family="Arial" '
+            'font-size="20px" fill="#222222">offscreen</text>\n'
+            '</svg>\n'
+        )
+        results = check_svg_previews(ws, tr)
+        detected = any(
+            "stays inside the canvas" in r.name and not r.ok
+            and ("'text'" in r.detail or "text" in r.detail)
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture svg_preview: <text> anchor outside canvas "
+            "(x=-100, y=-100) is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # J. <text> anchor beyond the right / bottom edge of the canvas.
+    #    Covers the second half of the rule (x > width / y > height).
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        out_path = _write_baseline_svg_preview(ws)
+        out_path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+            '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+            '  <text x="9999" y="9999" font-family="Arial" '
+            'font-size="20px" fill="#222222">offscreen</text>\n'
+            '</svg>\n'
+        )
+        results = check_svg_previews(ws, tr)
+        detected = any(
+            "stays inside the canvas" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture svg_preview: <text> anchor beyond right/bottom "
+            "of the canvas (x=9999, y=9999) is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    return out
+
+
+def _build_svg_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
+    """Build a workspace whose render_models/ has one schema-valid
+    render_model that the SVG generator can render. `kind` picks the
+    mutation:
+
+      'happy'        — clean baseline with a text primitive.
+      'unsupported'  — render_model carries a 'table' primitive (schema-
+                       valid, but the SVG renderer fails closed on it).
+      'bad_token'    — color_token references a palette key that does
+                       not exist in design_system.palette. Generator
+                       must fail closed.
+      'image_unsafe' — image_manifest declares a local_path that fails
+                       local_path_is_safe (drive prefix). The SVG
+                       generator must refuse to render the image_slot.
+    """
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "deck_brief.json").write_text(json.dumps({
+        "title": "Synthetic", "audience": "A", "objective": "O",
+        "source_refs": ["synthetic_src_s"],
+    }))
+    (ws / "deck_plan.json").write_text(json.dumps({
+        "template": "svg_tmpl",
+        "planning": {"planned_slide_count": 1, "rationale": "synthetic"},
+        "sections": [
+            {"id": "only", "title": "Only", "summary": "x",
+             "slide_indices": [1]},
+        ],
+        "slides": [
+            {"index": 1, "layout": "tile",
+             "title": "Synthetic Slide", "section_id": "only",
+             "summary": "x", "density": "low",
+             "source_refs": ["synthetic_src_s"]},
+        ],
+    }))
+    (ws / "design_system.json").write_text(json.dumps({
+        "palette": {
+            "primary":    "#111111",
+            "background": "#FFFFFF",
+            "text":       "#222222",
+        },
+        "typography": {
+            "heading": {"font_family": "Arial, sans-serif", "size_pt": 28},
+            "body":    {"font_family": "Arial, sans-serif", "size_pt": 14},
+        },
+        "grid": {"width_px": 1920, "height_px": 1080, "margin_px": 64},
+    }))
+    images = []
+    if kind == "image_unsafe":
+        images.append({
+            "id": "bad_img",
+            "local_path": "C:\\Windows\\evil.png",
+            "source": "synthetic", "alt_text": "synthetic",
+            "intended_use": "spot illustration",
+            "width_px": 200, "height_px": 200,
+        })
+    (ws / "image_manifest.json").write_text(json.dumps({"images": images}))
+    (ws / "slide_plans").mkdir(exist_ok=True)
+    (ws / "slide_plans" / "01.json").write_text(json.dumps({
+        "index": 1, "layout": "tile", "title": "Synthetic Slide",
+        "blocks": [{"id": "headline", "kind": "text", "content": "Synthetic"}],
+    }))
+    (ws / "render_models").mkdir(exist_ok=True)
+    primitive = {
+        "id": "headline",
+        "slot_id": "headline",
+        "kind": "text",
+        "bounds": {"x": 100, "y": 100, "w": 800, "h": 120},
+        "style": {
+            "color_token": "palette.text",
+            "typography_token": "typography.heading",
+        },
+        "text": {"content": "Synthetic headline", "role": "heading"},
+    }
+    if kind == "unsupported":
+        # Schema-valid table primitive (the SVG renderer fails closed on it
+        # since current generated fixtures never emit a table).
+        primitive = {
+            "id": "tbl",
+            "kind": "table",
+            "bounds": {"x": 100, "y": 100, "w": 800, "h": 400},
+            "table": {
+                "columns": ["A", "B"],
+                "rows": [["1", "2"]],
+            },
+        }
+    if kind == "bad_token":
+        primitive["style"]["color_token"] = "palette.no_such_color"
+    if kind == "image_unsafe":
+        primitive = {
+            "id": "pic",
+            "kind": "image_slot",
+            "bounds": {"x": 100, "y": 100, "w": 200, "h": 200},
+            "image_slot": {"image_ref": "bad_img"},
+        }
+    (ws / "render_models" / "01_tile.json").write_text(json.dumps({
+        "index": 1,
+        "layout": "tile",
+        "canvas": {"width_px": 1920, "height_px": 1080},
+        "source_refs": ["synthetic_src_s"],
+        "primitives": [primitive],
+    }))
+
+
+def _build_svg_generator_template(template_root: Path) -> None:
+    """Build a template tree the SVG generator workspace references."""
+    _make_template_dir(
+        template_root,
+        "svg_tmpl",
+        layout_files={
+            "tile": {
+                "name": "tile",
+                "slots": [
+                    {"id": "headline", "type": "text", "required": True,
+                     "primitive_kind": "text",
+                     "bounds": {"x": 64, "y": 64, "w": 1000, "h": 200}},
+                ],
+            },
+        },
+        declared_layouts=["tile"],
+    )
+
+
+def negative_svg_generator_tempfixture_checks() -> list[CheckResult]:
+    """End-to-end tempfixture tests of scripts/generate_svg_previews.py.
+
+    Imports the script as a module and drives it via its main(argv)
+    entry point — no subprocess, no network, stdlib only.
+
+    Cases:
+      A. happy path: emits one SVG that the validator accepts;
+      B. unsupported primitive kind (table) fails closed;
+      C. bad palette token fails closed;
+      D. image_slot whose manifest local_path is unsafe fails closed;
+      E. missing render_models/ fails closed (no traceback);
+      F. pre-existing stale *.svg from a previous run is REMOVED;
+      G. non-SVG files in svg_previews/ are PRESERVED across runs.
+    """
+    import contextlib
+    import importlib
+    import io
+    import tempfile
+    out: list[CheckResult] = []
+
+    if "generate_svg_previews" in sys.modules:
+        svg_mod = importlib.reload(sys.modules["generate_svg_previews"])
+    else:
+        svg_mod = importlib.import_module("generate_svg_previews")
+
+    def run(ws: Path, tr: Path) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                ret = svg_mod.main([
+                    "--workspace", str(ws), "--template-root", str(tr),
+                ])
+            exc_kind = ""
+        except SystemExit as exc:
+            ret = exc.code if isinstance(exc.code, int) else 1
+            exc_kind = ""
+        except Exception as exc:  # noqa: BLE001
+            ret = 1
+            exc_kind = type(exc).__name__
+        return (ret, stdout.getvalue(), stderr.getvalue() + (
+            f"\nUNEXPECTED EXCEPTION {exc_kind}" if exc_kind else ""
+        ))
+
+    # A. Happy path.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="happy")
+        ret, sout, serr = run(ws, tr)
+        emitted = (ws / "svg_previews" / "01_tile.svg").is_file()
+        out.append(CheckResult(
+            "tempfixture svg_generator: happy path exits 0 and emits svg_preview",
+            ret == 0 and emitted and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, emitted={emitted}, sout={sout!r}, stderr={serr!r}",
+        ))
+
+    # B. Unsupported primitive kind (table).
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="unsupported")
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture svg_generator: unsupported primitive kind fails closed",
+            ret != 0
+            and "not supported by the SVG renderer" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # C. Bad palette token.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="bad_token")
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture svg_generator: unknown palette token fails closed",
+            ret != 0
+            and "does not resolve in design_system.palette" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # D. image_slot with unsafe manifest local_path. The preflight
+    # catches the unsafe path BEFORE any rendering ever runs, so the
+    # fail-closed signal comes from the manifest path-safety gate
+    # rather than from _render_image_slot. Either error path keeps
+    # the same contract: non-zero exit, no rendering, no OK. We
+    # accept whichever message fires — the resolver-level check is
+    # still proven by case D2 below, which invokes _render_svg
+    # directly on a render_model with an unsafe image_slot.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="image_unsafe")
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture svg_generator: image_slot resolving to unsafe "
+            "manifest local_path fails closed (caught at the preflight "
+            "manifest gate before any rendering)",
+            ret != 0
+            and "unsafe local_path" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # D2. Defense-in-depth at the renderer: even if a manifest with an
+    # unsafe local_path somehow slipped past the preflight, the
+    # _render_image_slot path inside the renderer must still refuse to
+    # emit it. We prove that by invoking _render_svg directly on a
+    # crafted render_model + manifest dict that bypasses main()'s
+    # preflight entirely.
+    if "generate_svg_previews" in sys.modules:
+        import importlib
+        svg_mod_d2 = importlib.reload(sys.modules["generate_svg_previews"])
+    else:
+        import importlib
+        svg_mod_d2 = importlib.import_module("generate_svg_previews")
+    minimal_design = {
+        "palette": {"primary": "#111111", "background": "#FFFFFF", "text": "#222222"},
+        "typography": {
+            "heading": {"font_family": "Arial", "size_pt": 28},
+            "body":    {"font_family": "Arial", "size_pt": 14},
+        },
+        "grid": {"width_px": 1920, "height_px": 1080, "margin_px": 64},
+    }
+    rm_image = {
+        "index": 1, "layout": "tile",
+        "canvas": {"width_px": 1920, "height_px": 1080},
+        "source_refs": ["synthetic_src_s"],
+        "primitives": [{
+            "id": "pic", "kind": "image_slot",
+            "bounds": {"x": 100, "y": 100, "w": 200, "h": 200},
+            "image_slot": {"image_ref": "bad_img"},
+        }],
+    }
+    try:
+        svg_mod_d2._render_svg(
+            rm_image, minimal_design,
+            {"bad_img": "C:\\Windows\\evil.png"},
+            {},
+        )
+        raised_d2 = False
+        d2_msg = ""
+    except svg_mod_d2.RenderError as exc:
+        raised_d2 = True
+        d2_msg = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        raised_d2 = False
+        d2_msg = f"UNEXPECTED {type(exc).__name__}: {exc}"
+    out.append(CheckResult(
+        "tempfixture svg_generator: _render_image_slot also refuses an "
+        "unsafe manifest local_path at render time (defense-in-depth, "
+        "not just the preflight)",
+        raised_d2 and "resolves to unsafe local_path" in d2_msg,
+        f"raised={raised_d2}, msg={d2_msg!r}",
+    ))
+
+    # E. Missing render_models/.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="happy")
+        # Wipe render_models/ entirely.
+        import shutil
+        shutil.rmtree(ws / "render_models")
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture svg_generator: missing render_models/ fails closed (no traceback)",
+            ret != 0
+            and "render_models/ not found" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # E1. Schema-invalid design_system (palette value is not a 6-digit
+    #     hex). Up-front design_system schema validation must fail closed
+    #     before any rendering — XML escaping would otherwise leak a
+    #     `url(...)` reference into the SVG `fill` attribute, which an
+    #     SVG consumer (browser) would dereference.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="happy")
+        design = json.loads((ws / "design_system.json").read_text())
+        design["palette"]["text"] = "url(javascript:alert(1))"
+        (ws / "design_system.json").write_text(json.dumps(design))
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture svg_generator: design_system with a non-hex "
+            "palette value (e.g. url(javascript:...)) fails closed at "
+            "schema-validation startup",
+            ret != 0
+            and "design_system.json fails design_system.schema.json" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # E2. Defense-in-depth: even if a malformed palette value somehow
+    #     slipped past schema validation (e.g. additionalProperties on
+    #     the palette object lets an unexpected key through), the
+    #     per-token resolver MUST reject anything that does not match
+    #     ^#[0-9A-Fa-f]{6}$. We simulate that by adding an extra
+    #     palette key whose value violates the hex pattern AND pointing
+    #     a render_model primitive's color_token at it. The schema's
+    #     additionalProperties on `palette` constrains values via
+    #     pattern, so this case also fails at schema time — confirming
+    #     the up-front gate covers extra keys too.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="happy")
+        design = json.loads((ws / "design_system.json").read_text())
+        design["palette"]["danger"] = "not_a_hex_color"
+        (ws / "design_system.json").write_text(json.dumps(design))
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture svg_generator: extra palette entry with a "
+            "non-hex value is rejected (schema's additionalProperties "
+            "pattern on palette catches it)",
+            ret != 0
+            and "design_system.json fails design_system.schema.json" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # E3. Schema-invalid design_system font_family (does not match the
+    #     CSS-style fallback-chain pattern). The renderer would
+    #     otherwise emit a structurally broken `font-family` attribute.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="happy")
+        design = json.loads((ws / "design_system.json").read_text())
+        # Trailing comma violates ^[^,]+(\s*,\s*[^,]+)*$.
+        design["typography"]["heading"]["font_family"] = "Arial,"
+        (ws / "design_system.json").write_text(json.dumps(design))
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture svg_generator: design_system with a "
+            "schema-violating font_family (trailing comma) fails closed",
+            ret != 0
+            and "design_system.json fails design_system.schema.json" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # E4. Defense-in-depth at the resolver itself: bypass the schema
+    #     check by making the design_system schema-valid up front, then
+    #     swap the palette value on disk for an unsafe one AFTER the
+    #     schema gate would have run. We cannot literally bypass the
+    #     gate from outside, so we instead test the resolver in
+    #     isolation: invoke _resolve_palette on a crafted design dict
+    #     whose palette value is unsafe and confirm RenderError is
+    #     raised. This proves the gate is layered, not single-point.
+    if "generate_svg_previews" in sys.modules:
+        svg_mod_resolved = sys.modules["generate_svg_previews"]
+    else:
+        import importlib
+        svg_mod_resolved = importlib.import_module("generate_svg_previews")
+    bad_design_palette = {
+        "palette": {"text": "url(javascript:alert(1))"},
+        "typography": {
+            "heading": {"font_family": "Arial", "size_pt": 28},
+            "body":    {"font_family": "Arial", "size_pt": 14},
+        },
+        "grid": {"width_px": 1920, "height_px": 1080, "margin_px": 64},
+    }
+    try:
+        svg_mod_resolved._resolve_palette(bad_design_palette, "palette.text")
+        raised_palette = False
+        palette_msg = ""
+    except svg_mod_resolved.RenderError as exc:
+        raised_palette = True
+        palette_msg = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        raised_palette = False
+        palette_msg = f"UNEXPECTED {type(exc).__name__}: {exc}"
+    out.append(CheckResult(
+        "tempfixture svg_generator: _resolve_palette refuses a non-hex "
+        "palette value at the resolver (defense-in-depth, not just "
+        "the schema gate)",
+        raised_palette and "unsafe value" in palette_msg,
+        f"raised={raised_palette}, msg={palette_msg!r}",
+    ))
+
+    # E5. Defense-in-depth at the resolver for typography.font_family.
+    bad_design_typo = {
+        "palette": {"primary": "#111111", "background": "#FFFFFF", "text": "#222222"},
+        "typography": {
+            "heading": {"font_family": "Arial,", "size_pt": 28},
+            "body":    {"font_family": "Arial", "size_pt": 14},
+        },
+        "grid": {"width_px": 1920, "height_px": 1080, "margin_px": 64},
+    }
+    try:
+        svg_mod_resolved._resolve_typography(bad_design_typo, "typography.heading")
+        raised_typo = False
+        typo_msg = ""
+    except svg_mod_resolved.RenderError as exc:
+        raised_typo = True
+        typo_msg = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        raised_typo = False
+        typo_msg = f"UNEXPECTED {type(exc).__name__}: {exc}"
+    out.append(CheckResult(
+        "tempfixture svg_generator: _resolve_typography refuses a "
+        "font_family that does not match the CSS-style fallback chain "
+        "pattern (defense-in-depth at the resolver)",
+        raised_typo and "does not match" in typo_msg,
+        f"raised={raised_typo}, msg={typo_msg!r}",
+    ))
+
+    # E6. The SVG background rect MUST route palette.background through
+    #     _resolve_palette and not read design.palette.background
+    #     directly. The schema gate catches an unsafe background up
+    #     front in main(), but the renderer is also invoked by other
+    #     code paths (importers, tests, future callers) where the
+    #     schema gate may not have run. We prove the gate-at-render
+    #     contract by calling _render_svg directly with a design dict
+    #     whose palette.background is unsafe and confirming it raises
+    #     RenderError before emitting anything.
+    bad_bg_design = {
+        "palette": {
+            "primary":    "#111111",
+            "background": "url(javascript:alert(1))",
+            "text":       "#222222",
+        },
+        "typography": {
+            "heading": {"font_family": "Arial", "size_pt": 28},
+            "body":    {"font_family": "Arial", "size_pt": 14},
+        },
+        "grid": {"width_px": 1920, "height_px": 1080, "margin_px": 64},
+    }
+    minimal_render_model = {
+        "index": 1,
+        "layout": "tile",
+        "canvas": {"width_px": 1920, "height_px": 1080},
+        "source_refs": ["synthetic_src_s"],
+        "primitives": [
+            {
+                "id": "headline",
+                "kind": "text",
+                "bounds": {"x": 100, "y": 100, "w": 800, "h": 120},
+                "style": {
+                    "color_token": "palette.text",
+                    "typography_token": "typography.heading",
+                },
+                "text": {"content": "Synthetic", "role": "heading"},
+            },
+        ],
+    }
+    try:
+        svg_mod_resolved._render_svg(
+            minimal_render_model, bad_bg_design, {}, {},
+        )
+        raised_bg = False
+        bg_msg = ""
+    except svg_mod_resolved.RenderError as exc:
+        raised_bg = True
+        bg_msg = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        raised_bg = False
+        bg_msg = f"UNEXPECTED {type(exc).__name__}: {exc}"
+    out.append(CheckResult(
+        "tempfixture svg_generator: _render_svg's background rect "
+        "routes palette.background through _resolve_palette and "
+        "rejects an unsafe value (no direct dict read bypass)",
+        raised_bg and "palette.background" in bg_msg and "unsafe value" in bg_msg,
+        f"raised={raised_bg}, msg={bg_msg!r}",
+    ))
+
+    # E7. PREFLIGHT: malformed image_manifest.json (root is `{}`,
+    #     missing the required `images` array). Before this fix the
+    #     run would succeed when the current render_models happened
+    #     not to use image slots — falsely claiming OK while the
+    #     workspace's manifest was broken. The shared invariant: a
+    #     pre-existing svg_previews/*.svg from a previous good run
+    #     SURVIVES the failed run (no cleanup before the gate).
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="happy")
+        # Plant a previously-good svg_preview file on disk.
+        (ws / "svg_previews").mkdir(exist_ok=True)
+        prior = ws / "svg_previews" / "01_tile.svg"
+        prior.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+            '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+            '</svg>\n'
+        )
+        # Break image_manifest.json by replacing it with `{}`.
+        (ws / "image_manifest.json").write_text("{}")
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture svg_generator: malformed image_manifest "
+            "(missing required 'images' array) fails closed BEFORE "
+            "cleanup; pre-existing svg_preview is preserved and no "
+            "OK is reported",
+            ret != 0
+            and prior.is_file()
+            and "OK:" not in sout
+            and "image_manifest.json fails image_manifest.schema.json" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, prior_exists={prior.is_file()}, "
+            f"ok_in_sout={'OK:' in sout}, sout={sout!r}, stderr={serr!r}",
+        ))
+
+    # E8. PREFLIGHT: image_manifest with an unsafe local_path. Same
+    #     contract — fail BEFORE cleanup. The manifest is otherwise
+    #     schema-valid but lists e.g. '..' or '/absolute/path'.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="happy")
+        (ws / "svg_previews").mkdir(exist_ok=True)
+        prior = ws / "svg_previews" / "01_tile.svg"
+        prior.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+            '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+            '</svg>\n'
+        )
+        (ws / "image_manifest.json").write_text(json.dumps({
+            "images": [
+                {"id": "unsafe_img",
+                 "local_path": "../escape.svg",
+                 "source": "synthetic"},
+            ],
+        }))
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture svg_generator: image_manifest declares an "
+            "unsafe local_path ('..' segment) fails closed BEFORE "
+            "cleanup; pre-existing svg_preview is preserved",
+            ret != 0
+            and prior.is_file()
+            and "OK:" not in sout
+            and "unsafe local_path" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, prior_exists={prior.is_file()}, "
+            f"sout={sout!r}, stderr={serr!r}",
+        ))
+
+    # F. Stale *.svg from a previous run is REMOVED when current run
+    # would not produce that file.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="happy")
+        # Plant a stale svg for a render_model the workspace no longer ships.
+        (ws / "svg_previews").mkdir(exist_ok=True)
+        stale = ws / "svg_previews" / "99_ghost.svg"
+        stale.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 1920 1080" width="1920" height="1080"/>\n'
+        )
+        ret, sout, serr = run(ws, tr)
+        still_exists = stale.is_file()
+        cleaned_logged = "[CLEAN] svg_previews/99_ghost.svg" in sout
+        out.append(CheckResult(
+            "tempfixture svg_generator: stale *.svg from a previous run "
+            "is REMOVED by the cleanup sweep",
+            ret == 0
+            and not still_exists
+            and cleaned_logged
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, still_exists={still_exists}, "
+            f"cleaned_logged={cleaned_logged}, "
+            f"sout={sout!r}, stderr={serr!r}",
+        ))
+
+    # G. Non-SVG files are PRESERVED. Mirrors the *.json cleanup philosophy
+    # of generate_render_models.py: glob is targeted; manual notes survive.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_svg_generator_template(tr)
+        ws = root / "ws"
+        _build_svg_generator_workspace(ws, kind="happy")
+        (ws / "svg_previews").mkdir(exist_ok=True)
+        readme = ws / "svg_previews" / "NOTES.md"
+        readme.write_text("manual notes\n")
+        ret, sout, serr = run(ws, tr)
+        readme_preserved = readme.is_file()
+        out.append(CheckResult(
+            "tempfixture svg_generator: non-SVG files in svg_previews/ "
+            "(NOTES.md) are PRESERVED — cleanup glob targets *.svg only",
+            ret == 0
+            and readme_preserved
+            and "[CLEAN] svg_previews/NOTES.md" not in sout
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, readme_preserved={readme_preserved}, "
+            f"sout={sout!r}, stderr={serr!r}",
+        ))
+
+    return out
+
+
+def _swap_to_image_slot(rm: dict, image_ref: str) -> None:
+    """Mutator helper: replace the baseline text primitive with an
+    image_slot primitive whose image_ref carries the bad value being
+    tested. Used by the schema-level negative loop."""
+    rm["primitives"][0] = {
+        "id": "headline",
+        "kind": "image_slot",
+        "bounds": {"x": 100, "y": 100, "w": 200, "h": 200},
+        "image_slot": {"image_ref": image_ref},
+    }
+
+
+def _build_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
+    """Build a tiny synthetic workspace that the render_model generator can
+    actually run against. `kind` selects the mutation applied:
+
+      'happy'         — clean baseline: slide 1 is cover, slide 2 is
+                        executive_summary (an unsupported layout). The
+                        generator should generate 1 file and skip 1 slide.
+      'bad_image_ref' — cover slide_plan references an image id not in
+                        the image_manifest. Generator must FAIL closed.
+      'malformed_kpi' — kpi_dashboard slide_plan content is not a list.
+                        Generator must FAIL closed.
+      'missing_required_block' — cover slide_plan omits the required
+                        'title' text block. Generator must FAIL closed.
+      'stale_layout'  — slide 1's slide_plan declares layout='two_column'
+                        while the deck_plan slide still says 'cover'.
+                        Generator must FAIL closed before invoking any
+                        layout-specific code path.
+      'stale_title'   — slide 1's slide_plan has a title string that
+                        disagrees with the deck_plan slide's title.
+                        Generator must FAIL closed.
+
+    The template root is built separately by _build_generator_template
+    below; both directories live under the same tmpdir so callers can
+    pass them in without colliding with other tempfixtures."""
+    ws.mkdir(parents=True, exist_ok=True)
+    base_brief = {
+        "title": "Synthetic Generator Workspace",
+        "audience": "tests",
+        "objective": "exercise the generator",
+        "source_refs": ["synthetic_src_g"],
+    }
+    base_deck = {
+        "template": "generator_tmpl",
+        "planning": {"planned_slide_count": 2, "rationale": "synthetic"},
+        "sections": [
+            {"id": "only", "title": "Only", "summary": "x",
+             "slide_indices": [1, 2]},
+        ],
+        "slides": [
+            {"index": 1, "layout": "cover",
+             "title": "Synthetic Cover", "section_id": "only",
+             "summary": "x", "density": "low",
+             "source_refs": ["synthetic_src_g"]},
+            {"index": 2, "layout": "executive_summary",
+             "title": "Synthetic Summary", "section_id": "only",
+             "summary": "x", "density": "medium",
+             "source_refs": ["synthetic_src_g"]},
+        ],
+    }
+    base_design = {
+        "palette": {
+            "primary":    "#111111",
+            "background": "#FFFFFF",
+            "text":       "#222222",
+        },
+        "typography": {
+            "heading": {"font_family": "Arial, sans-serif", "size_pt": 28},
+            "body":    {"font_family": "Arial, sans-serif", "size_pt": 14},
+        },
+        "grid": {"width_px": 1920, "height_px": 1080, "margin_px": 64},
+    }
+    base_manifest = {
+        "images": [
+            {"id": "generator_accent", "local_path": "assets/g.svg",
+             "source": "synthetic", "alt_text": "synthetic accent",
+             "intended_use": "spot illustration",
+             "width_px": 320, "height_px": 320},
+        ],
+    }
+    base_cover_blocks = [
+        {"id": "title", "kind": "text", "content": "Synthetic Cover"},
+        {"id": "accent", "kind": "image_ref", "content": "generator_accent"},
+    ]
+    base_summary_blocks = [
+        {"id": "title", "kind": "text", "content": "Synthetic Summary"},
+        {"id": "summary", "kind": "text", "content": "Synthetic summary body."},
+    ]
+    if kind == "bad_image_ref":
+        base_cover_blocks = [
+            {"id": "title", "kind": "text", "content": "Synthetic Cover"},
+            {"id": "accent", "kind": "image_ref",
+             "content": "no_such_image_in_manifest"},
+        ]
+    if kind == "malformed_kpi":
+        base_deck["slides"][1] = {
+            "index": 2, "layout": "kpi_dashboard",
+            "title": "Bad KPI", "section_id": "only",
+            "summary": "x", "density": "high",
+            "source_refs": ["synthetic_src_g"],
+        }
+        base_summary_blocks = [
+            {"id": "title", "kind": "text", "content": "Bad KPI"},
+            {"id": "kpis", "kind": "kpi", "content": "not a list"},
+        ]
+    if kind == "missing_required_block":
+        base_cover_blocks = [
+            # 'title' deliberately omitted.
+            {"id": "subtitle", "kind": "text", "content": "no title here"},
+        ]
+    cover_plan_layout = "cover"
+    cover_plan_title = base_deck["slides"][0]["title"]
+    if kind == "stale_layout":
+        # deck_plan still says cover, but the slide_plan claims two_column.
+        # Matching by index alone would silently feed two_column-shaped
+        # content into the cover generator. The guard must catch this.
+        cover_plan_layout = "two_column"
+    if kind == "stale_title":
+        cover_plan_title = "A title that does not match the deck_plan"
+    (ws / "deck_brief.json").write_text(json.dumps(base_brief))
+    (ws / "deck_plan.json").write_text(json.dumps(base_deck))
+    (ws / "design_system.json").write_text(json.dumps(base_design))
+    (ws / "image_manifest.json").write_text(json.dumps(base_manifest))
+    (ws / "assets").mkdir(exist_ok=True)
+    (ws / "assets" / "g.svg").write_text(
+        "<svg xmlns='http://www.w3.org/2000/svg' width='320' height='320'/>"
+    )
+    plans = ws / "slide_plans"
+    plans.mkdir(exist_ok=True)
+    (plans / "01.json").write_text(json.dumps({
+        "index": 1, "layout": cover_plan_layout,
+        "title": cover_plan_title,
+        "blocks": base_cover_blocks,
+        "image_refs": ["generator_accent"] if kind != "bad_image_ref" else [],
+    }))
+    slide2 = base_deck["slides"][1]
+    (plans / "02.json").write_text(json.dumps({
+        "index": 2, "layout": slide2["layout"],
+        "title": slide2["title"],
+        "blocks": base_summary_blocks,
+    }))
+
+
+def _build_generator_template(template_root: Path) -> None:
+    """Build a minimal template tree that the synthetic generator workspace
+    references. Includes cover and kpi_dashboard layouts (with bounds and
+    primitive_kind on the required slots, matching the real business_review
+    template's shape) plus an unsupported executive_summary layout so the
+    skip-not-success path can be exercised."""
+    layout_files = {
+        "cover": {
+            "name": "cover",
+            "slots": [
+                {"id": "title", "type": "text", "required": True,
+                 "primitive_kind": "text",
+                 "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200}},
+                {"id": "subtitle", "type": "text", "required": False,
+                 "primitive_kind": "text"},
+                {"id": "presenter", "type": "text", "required": False,
+                 "primitive_kind": "text"},
+                {"id": "date", "type": "text", "required": False,
+                 "primitive_kind": "text"},
+                {"id": "accent", "type": "image_ref", "required": False,
+                 "primitive_kind": "image_slot"},
+            ],
+        },
+        "kpi_dashboard": {
+            "name": "kpi_dashboard",
+            "slots": [
+                {"id": "title", "type": "text", "required": True,
+                 "primitive_kind": "text",
+                 "bounds": {"x": 64, "y": 80, "w": 1792, "h": 120}},
+                {"id": "kpis", "type": "kpi", "required": True,
+                 "primitive_kind": "kpi",
+                 "bounds": {"x": 64, "y": 280, "w": 1792, "h": 600}},
+            ],
+        },
+        "executive_summary": {
+            "name": "executive_summary",
+            "slots": [
+                {"id": "title", "type": "text", "required": True},
+                {"id": "summary", "type": "text", "required": True},
+            ],
+        },
+    }
+    _make_template_dir(
+        template_root,
+        "generator_tmpl",
+        declared_layouts=list(layout_files.keys()),
+        layout_files=layout_files,
+    )
+
+
+def negative_generator_tempfixture_checks() -> list[CheckResult]:
+    """End-to-end tempfixture tests of scripts/generate_render_models.py.
+
+    Imports the script as a module and drives it via its main(argv)
+    entry point — no subprocess, no network, stdlib only. Stdout/stderr
+    are captured per case so the assertions inspect what the script
+    actually printed.
+
+    Cases:
+      A. happy path: one cover generated, one unsupported layout skipped
+         (skip is reported as not-implemented, NOT as success);
+      B. unknown image_ref in cover.accent fails closed;
+      C. malformed kpi block content (not a list) fails closed;
+      D. cover slide_plan missing required 'title' text block fails closed;
+      E. missing deck_plan.json fails closed (no traceback);
+      F. unsafe deck_plan.template fails closed (no traceback);
+      G. stale slide_plan.layout (mismatch with deck_plan.layout) fails
+         closed and emits no render_model — guards against drift where
+         the slide_plan is hand-edited to a different layout while the
+         deck_plan still names the original;
+      H. stale slide_plan.title (mismatch with deck_plan.title) fails
+         closed and emits no render_model;
+      I. a pre-existing render_model file on disk from a previous good
+         run is REMOVED when the current run fails closed on that slide
+         (here triggered via the stale_layout kind). A stale lie cannot
+         survive a fail-closed mismatch.
+      J. a pre-existing render_model file for a slide whose deck_plan
+         layout has since changed to one the generator does not
+         implement is REMOVED on the next run, even though the
+         generator does not write a replacement for that slide.
+      K. an ORPHAN render_model (for a slide index no longer in
+         deck_plan — deck shrank, slide moved index, ...) is REMOVED
+         by the cleanup sweep before check_render_models runs, so it
+         does not surface as a post-hoc cross-check failure.
+      L. NON-.json files in render_models/ (README.md, NOTES.txt, ...)
+         are PRESERVED across runs — the cleanup glob only matches
+         *.json. The workspace validator schema-validates every
+         *.json as a render_model, so the *.json namespace itself is
+         generator-owned, but non-JSON files are out of scope and
+         must not be silently deleted.
+      M. PREFLIGHT: deck_plan.slides missing entirely. The generator
+         must fail closed BEFORE the render_models/ cleanup sweep,
+         leaving any pre-existing *.json on disk untouched. Without
+         preflight, the run would wipe render_models/*.json and then
+         silently report "OK: generated 0".
+      N. PREFLIGHT: deck_plan.slides is not a list (string here).
+         Same fail-closed-before-cleanup guarantee as M.
+      O. PREFLIGHT: planning.planned_slide_count disagrees with
+         len(deck_plan.slides). Schema cannot express this equality;
+         preflight reaches check_planner_semantics, which catches it.
+         The pre-existing render_model survives the failed run.
+    """
+    import contextlib
+    import importlib
+    import io
+    import tempfile
+    out: list[CheckResult] = []
+
+    # Import the generator lazily — script lives alongside this one under
+    # scripts/, and REPO_ROOT/scripts is already on sys.path via the
+    # validate_scaffold/validate_workspace pair.
+    if "generate_render_models" in sys.modules:
+        gen_mod = importlib.reload(sys.modules["generate_render_models"])
+    else:
+        gen_mod = importlib.import_module("generate_render_models")
+
+    def run(ws: Path, tr: Path) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout), \
+                 contextlib.redirect_stderr(stderr):
+                ret = gen_mod.main([
+                    "--workspace", str(ws), "--template-root", str(tr),
+                ])
+            exc_kind = ""
+        except SystemExit as exc:  # argparse + _fatal use sys.exit
+            ret = exc.code if isinstance(exc.code, int) else 1
+            exc_kind = ""
+        except Exception as exc:  # noqa: BLE001 - we want to see ANY raise
+            ret = 1
+            exc_kind = type(exc).__name__
+        return (ret, stdout.getvalue(), stderr.getvalue() + (
+            f"\nUNEXPECTED EXCEPTION {exc_kind}" if exc_kind else ""
+        ))
+
+    # A. Happy + skip.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="happy")
+        ret, sout, serr = run(ws, tr)
+        cover_emitted = (ws / "render_models" / "01_cover.json").is_file()
+        summary_emitted = (ws / "render_models" / "02_executive_summary.json").is_file()
+        skip_reported = "[SKIP] slide  2: layout 'executive_summary' not implemented" in sout
+        out.append(CheckResult(
+            "tempfixture generator: happy path exits 0, "
+            "emits supported cover, skips unsupported layout "
+            "(reports as not implemented, NOT as success)",
+            ret == 0 and cover_emitted and not summary_emitted and skip_reported,
+            f"ret={ret}, cover_emitted={cover_emitted}, "
+            f"summary_emitted={summary_emitted}, skip_reported={skip_reported}, "
+            f"stderr={serr!r}",
+        ))
+
+    # B. Bad image_ref in cover.accent.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="bad_image_ref")
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture generator: image_ref not in manifest fails closed",
+            ret != 0
+            and "not declared in image_manifest" in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # C. Malformed kpi block content.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="malformed_kpi")
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture generator: kpi block with non-list content fails closed",
+            ret != 0
+            and "non-empty list of KPI" in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # D. cover slide_plan missing required title block.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="missing_required_block")
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture generator: cover slide_plan missing 'title' block fails closed",
+            ret != 0
+            and "missing slide_plan block for slot id 'title'" in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # E. Missing deck_plan.json.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="happy")
+        (ws / "deck_plan.json").unlink()
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture generator: missing deck_plan.json fails closed (no traceback)",
+            ret != 0
+            and "deck_plan.json not loadable" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # F. Unsafe deck_plan.template.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="happy")
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        deck["template"] = "../../etc/passwd"
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture generator: unsafe deck_plan.template fails closed",
+            ret != 0
+            and "unsafe or outside template-root" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, stderr={serr!r}",
+        ))
+
+    # G. Stale slide_plan: layout disagrees with deck_plan slide.layout.
+    # Without the layout-equality guard the generator would feed
+    # two_column-shaped content into the cover generator and emit a
+    # cover-labelled render_model whose blocks came from the wrong layout.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="stale_layout")
+        ret, sout, serr = run(ws, tr)
+        emitted = (ws / "render_models" / "01_cover.json").is_file()
+        out.append(CheckResult(
+            "tempfixture generator: stale slide_plan.layout (mismatch with "
+            "deck_plan.layout) fails closed and emits no render_model",
+            ret != 0
+            and "does not match deck_plan.layout" in serr
+            and not emitted
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, emitted={emitted}, stderr={serr!r}",
+        ))
+
+    # H. Stale slide_plan: title disagrees with deck_plan slide.title.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="stale_title")
+        ret, sout, serr = run(ws, tr)
+        emitted = (ws / "render_models" / "01_cover.json").is_file()
+        out.append(CheckResult(
+            "tempfixture generator: stale slide_plan.title (mismatch with "
+            "deck_plan.title) fails closed and emits no render_model",
+            ret != 0
+            and "does not match deck_plan.title" in serr
+            and not emitted
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, emitted={emitted}, stderr={serr!r}",
+        ))
+
+    # I. Pre-existing render_model from a previous successful run is
+    #    REMOVED when this run fails closed on that slide. Without the
+    #    cleanup step the stale file would survive a fail-closed
+    #    mismatch and continue to claim authority for the slide.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="stale_layout")
+        # Plant a previously-good render_model file on disk. Content is
+        # not inspected after the cleanup decision — leading-digit index
+        # is all that matters — but a schema-valid body keeps the test
+        # truthful to the "previous successful run" framing.
+        (ws / "render_models").mkdir(exist_ok=True)
+        prior = ws / "render_models" / "01_cover.json"
+        prior.write_text(json.dumps({
+            "index": 1,
+            "layout": "cover",
+            "canvas": {"width_px": 1920, "height_px": 1080},
+            "source_refs": ["synthetic_src_g"],
+            "primitives": [{
+                "id": "title",
+                "slot_id": "title",
+                "kind": "text",
+                "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200},
+                "style": {
+                    "color_token": "palette.text",
+                    "typography_token": "typography.heading",
+                },
+                "text": {"content": "previous run", "role": "heading"},
+            }],
+        }))
+        assert prior.is_file(), "test setup: pre-placed file must exist"
+        ret, sout, serr = run(ws, tr)
+        still_exists = prior.is_file()
+        cleaned_logged = "[CLEAN] render_models/01_cover.json" in sout
+        out.append(CheckResult(
+            "tempfixture generator: pre-existing render_model from a "
+            "previous run is REMOVED when current run fails closed on "
+            "that slide (stale file cannot survive fail-closed mismatch)",
+            ret != 0
+            and not still_exists
+            and cleaned_logged
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, still_exists={still_exists}, "
+            f"cleaned_logged={cleaned_logged}, sout={sout!r}, stderr={serr!r}",
+        ))
+
+    # J. Slide's layout was previously supported (so a render_model
+    #    was produced) but the deck_plan has since changed it to an
+    #    unsupported layout. The pre-existing render_model is REMOVED
+    #    on the next run even though the generator does not write a
+    #    replacement (the slide is now skipped). Without this, the
+    #    workspace would carry a stale cover render_model for a slide
+    #    the deck_plan now describes as executive_summary.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="happy")
+        # Mutate deck_plan slide 1 from cover -> executive_summary
+        # (unsupported), and align the slide_plan + section_id so the
+        # workspace stays schema-valid and the generator's per-slide
+        # alignment guard does not short-circuit first.
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        deck["slides"][0]["layout"] = "executive_summary"
+        deck["slides"][0]["title"] = "Now Unsupported"
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        plan1 = json.loads((ws / "slide_plans" / "01.json").read_text())
+        plan1["layout"] = "executive_summary"
+        plan1["title"] = "Now Unsupported"
+        plan1["blocks"] = [
+            {"id": "title", "kind": "text", "content": "Now Unsupported"},
+            {"id": "summary", "kind": "text", "content": "Body."},
+        ]
+        (ws / "slide_plans" / "01.json").write_text(json.dumps(plan1))
+        # Plant a stale render_model from "before the layout change".
+        (ws / "render_models").mkdir(exist_ok=True)
+        prior = ws / "render_models" / "01_cover.json"
+        prior.write_text(json.dumps({
+            "index": 1,
+            "layout": "cover",
+            "canvas": {"width_px": 1920, "height_px": 1080},
+            "source_refs": ["synthetic_src_g"],
+            "primitives": [{
+                "id": "title",
+                "slot_id": "title",
+                "kind": "text",
+                "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200},
+                "style": {
+                    "color_token": "palette.text",
+                    "typography_token": "typography.heading",
+                },
+                "text": {"content": "stale cover", "role": "heading"},
+            }],
+        }))
+        assert prior.is_file(), "test setup: pre-placed file must exist"
+        ret, sout, serr = run(ws, tr)
+        still_exists = prior.is_file()
+        skipped_logged = (
+            "[SKIP] slide  1: layout 'executive_summary' not implemented"
+            in sout
+        )
+        cleaned_logged = "[CLEAN] render_models/01_cover.json" in sout
+        out.append(CheckResult(
+            "tempfixture generator: pre-existing render_model is REMOVED "
+            "when the slide's deck_plan layout has changed to one the "
+            "generator does not implement (no replacement is written)",
+            ret == 0
+            and not still_exists
+            and skipped_logged
+            and cleaned_logged
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, still_exists={still_exists}, "
+            f"skipped_logged={skipped_logged}, cleaned_logged={cleaned_logged}, "
+            f"sout={sout!r}, stderr={serr!r}",
+        ))
+
+    # K. Orphan render_model: the file's slide index is no longer in
+    #    deck_plan at all (deck size shrank, slide moved indices, etc.).
+    #    Without cleanup, check_render_models would later flag this
+    #    file with "index does not match a deck_plan slide" and the
+    #    generator's own cross-check would fail the run — turning a
+    #    stale on-disk file into a confusing post-hoc error. The
+    #    cleanup sweep removes it up front instead.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="happy")
+        # The synthetic deck_plan in the happy workspace declares
+        # indices 1 and 2. Plant a render_model for an index (99) that
+        # the deck_plan no longer (and never did) claim.
+        (ws / "render_models").mkdir(exist_ok=True)
+        orphan = ws / "render_models" / "99_cover.json"
+        orphan.write_text(json.dumps({
+            "index": 99,
+            "layout": "cover",
+            "canvas": {"width_px": 1920, "height_px": 1080},
+            "source_refs": ["synthetic_src_g"],
+            "primitives": [{
+                "id": "title",
+                "slot_id": "title",
+                "kind": "text",
+                "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200},
+                "style": {
+                    "color_token": "palette.text",
+                    "typography_token": "typography.heading",
+                },
+                "text": {"content": "orphan", "role": "heading"},
+            }],
+        }))
+        assert orphan.is_file(), "test setup: orphan file must exist"
+        ret, sout, serr = run(ws, tr)
+        still_exists = orphan.is_file()
+        cleaned_logged = "[CLEAN] render_models/99_cover.json" in sout
+        out.append(CheckResult(
+            "tempfixture generator: orphan render_model for a slide "
+            "no longer in deck_plan (deck shrank or slide moved index) "
+            "is REMOVED before check_render_models runs, so it does "
+            "not surface as a post-hoc cross-check failure",
+            ret == 0
+            and not still_exists
+            and cleaned_logged
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, still_exists={still_exists}, "
+            f"cleaned_logged={cleaned_logged}, sout={sout!r}, stderr={serr!r}",
+        ))
+
+    # L. Non-JSON files are NOT cleaned. Proves the cleanup glob is
+    #    targeted at *.json (which is generator-owned and validated as
+    #    render_models by the workspace runner) and does not wipe
+    #    unrelated files (READMEs, .md / .txt notes) that happen to
+    #    live in render_models/.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="happy")
+        (ws / "render_models").mkdir(exist_ok=True)
+        readme = ws / "render_models" / "NOTES.md"
+        readme.write_text("Manual notes about this workspace.\n")
+        also = ws / "render_models" / "checklist.txt"
+        also.write_text("manual checklist\n")
+        ret, sout, serr = run(ws, tr)
+        readme_preserved = readme.is_file()
+        txt_preserved = also.is_file()
+        any_cleaned_non_json = (
+            "[CLEAN] render_models/NOTES.md" in sout
+            or "[CLEAN] render_models/checklist.txt" in sout
+        )
+        out.append(CheckResult(
+            "tempfixture generator: non-JSON files in render_models/ "
+            "(NOTES.md, checklist.txt) are PRESERVED — cleanup glob "
+            "targets *.json only, leaving manual notes / READMEs alone",
+            ret == 0
+            and readme_preserved
+            and txt_preserved
+            and not any_cleaned_non_json
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, readme_preserved={readme_preserved}, "
+            f"txt_preserved={txt_preserved}, "
+            f"any_cleaned_non_json={any_cleaned_non_json}, "
+            f"sout={sout!r}, stderr={serr!r}",
+        ))
+
+    # Preflight cases M / N / O. The generator must fail closed BEFORE
+    # the render_models/ cleanup sweep whenever the input contract is
+    # malformed in a way that makes generation meaningless. The shared
+    # invariant proved by all three: a pre-existing render_model file
+    # on disk SURVIVES the failed run. Without preflight, the run would
+    # delete every *.json under render_models/ and then report "OK:
+    # generated 0" — silently wiping the previous good output.
+    _prior_render_model_body = {
+        "index": 1,
+        "layout": "cover",
+        "canvas": {"width_px": 1920, "height_px": 1080},
+        "source_refs": ["synthetic_src_g"],
+        "primitives": [{
+            "id": "title",
+            "slot_id": "title",
+            "kind": "text",
+            "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200},
+            "style": {
+                "color_token": "palette.text",
+                "typography_token": "typography.heading",
+            },
+            "text": {"content": "previous good run", "role": "heading"},
+        }],
+    }
+
+    # M. deck_plan.slides is missing entirely. Schema requires it; the
+    #    explicit slides-shape check also flags it. Either way, preflight
+    #    must reject before cleanup. Pre-existing render_model survives.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="happy")
+        (ws / "render_models").mkdir(exist_ok=True)
+        prior = ws / "render_models" / "01_cover.json"
+        prior.write_text(json.dumps(_prior_render_model_body))
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        del deck["slides"]
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture generator: missing deck_plan.slides fails closed "
+            "BEFORE cleanup; pre-existing render_model file is preserved "
+            "and no OK is reported",
+            ret != 0
+            and prior.is_file()
+            and "OK:" not in sout
+            and "[PREFLIGHT FAIL]" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, prior_exists={prior.is_file()}, "
+            f"ok_in_sout={'OK:' in sout}, "
+            f"preflight_marker={'[PREFLIGHT FAIL]' in serr}, "
+            f"sout={sout!r}, stderr={serr!r}",
+        ))
+
+    # N. deck_plan.slides is not a list (string here). Schema rejects it;
+    #    the explicit slides-shape check also rejects it. Preflight must
+    #    fail before cleanup. Pre-existing render_model survives.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="happy")
+        (ws / "render_models").mkdir(exist_ok=True)
+        prior = ws / "render_models" / "01_cover.json"
+        prior.write_text(json.dumps(_prior_render_model_body))
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        deck["slides"] = "this is not a list"
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture generator: deck_plan.slides not a list (string) "
+            "fails closed BEFORE cleanup; pre-existing render_model file "
+            "is preserved and no OK is reported",
+            ret != 0
+            and prior.is_file()
+            and "OK:" not in sout
+            and "[PREFLIGHT FAIL]" in serr
+            and "deck_plan.slides must be a list" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, prior_exists={prior.is_file()}, "
+            f"ok_in_sout={'OK:' in sout}, "
+            f"preflight_marker={'[PREFLIGHT FAIL]' in serr}, "
+            f"sout={sout!r}, stderr={serr!r}",
+        ))
+
+    # O. planning.planned_slide_count disagrees with len(slides). Schema
+    #    cannot express this equality; check_planner_semantics catches it.
+    #    Preflight runs that cross-check, so the run must still fail
+    #    closed before cleanup and the prior file must survive.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_generator_template(tr)
+        ws = root / "ws"
+        _build_generator_workspace(ws, kind="happy")
+        (ws / "render_models").mkdir(exist_ok=True)
+        prior = ws / "render_models" / "01_cover.json"
+        prior.write_text(json.dumps(_prior_render_model_body))
+        deck = json.loads((ws / "deck_plan.json").read_text())
+        deck["planning"]["planned_slide_count"] = 99
+        (ws / "deck_plan.json").write_text(json.dumps(deck))
+        ret, sout, serr = run(ws, tr)
+        out.append(CheckResult(
+            "tempfixture generator: planning.planned_slide_count != "
+            "len(slides) fails closed BEFORE cleanup (planner-semantics "
+            "cross-check); pre-existing render_model file is preserved "
+            "and no OK is reported",
+            ret != 0
+            and prior.is_file()
+            and "OK:" not in sout
+            and "[PREFLIGHT FAIL]" in serr
+            and "planning.planned_slide_count" in serr
+            and "UNEXPECTED EXCEPTION" not in serr,
+            f"ret={ret}, prior_exists={prior.is_file()}, "
+            f"ok_in_sout={'OK:' in sout}, "
+            f"preflight_marker={'[PREFLIGHT FAIL]' in serr}, "
+            f"sout={sout!r}, stderr={serr!r}",
+        ))
+
+    return out
+
+
 def _print(section: str, results: list[CheckResult]) -> int:
     print(f"\n== {section} ==")
     fails = 0
@@ -1660,6 +4520,11 @@ def main(argv: list[str]) -> int:
          check_planner_semantics(args.workspace)),
         ("image_manifest: path-safety + media resolution + image_refs",
          check_image_manifest(args.workspace)),
+        ("render_models: schema + cross-artifact controlled-primitive contract",
+         check_render_models(args.workspace, args.template_root)),
+        ("svg_previews: per-render_model SVG exists + canvas viewBox + "
+         "no <foreignObject> + reference safety + bounds inside canvas",
+         check_svg_previews(args.workspace, args.template_root)),
         ("negative: unsafe scheme, absolute, traversal, missing media, "
          "unknown layout, missing slide_plan, slot mismatch",
          negative_checks(args.workspace, args.template_root)),
@@ -1672,6 +4537,44 @@ def main(argv: list[str]) -> int:
          "mismatch, missing / duplicate / orphan section indices, "
          "unknown / mis-listed slide.section_id, undeclared slide.source_refs",
          negative_planner_semantics_tempfixture_checks()),
+        ("negative tempfixtures (render_model): unsupported kind, missing "
+         "bounds, invalid token refs, external URL / file:// / absolute "
+         "path / path traversal in image_ref, arbitrary SVG-like fields, "
+         "kind-payload mismatch, bounds outside canvas, unknown slot_id, "
+         "slot.primitive_kind mismatch, image_ref not in manifest, "
+         "unknown palette token, source_refs cross-check fails closed when "
+         "deck_brief is missing / malformed / empty, duplicate primitive ids",
+         negative_render_model_tempfixture_checks()),
+        ("negative tempfixtures (svg_preview): missing svg_preview, "
+         "malformed XML, wrong root, viewBox mismatch, <foreignObject>, "
+         "href URL / file:// / absolute / '..' / data: / javascript:, "
+         "undeclared <image> href, rect outside canvas, <text> anchor "
+         "outside canvas (negative and beyond-edge)",
+         negative_svg_preview_tempfixture_checks()),
+        ("negative tempfixtures (svg generator): happy path emits svg; "
+         "fails closed on unsupported primitive kind, unknown palette "
+         "token, image_slot resolving to unsafe manifest local_path, "
+         "missing render_models/, non-hex / schema-violating design "
+         "tokens (palette + font_family); PREFLIGHT (runs before "
+         "cleanup) rejects malformed image_manifest.json (missing "
+         "'images') and unsafe image_manifest local_path without "
+         "deleting any pre-existing svg_previews/*.svg; resolvers "
+         "reject unsafe values directly (defense-in-depth, including "
+         "the background rect); stale *.svg is cleaned, non-SVG files "
+         "are preserved",
+         negative_svg_generator_tempfixture_checks()),
+        ("negative tempfixtures (render-model generator): happy path "
+         "emits supported layout + skips unsupported as not implemented; "
+         "fails closed on unknown image_ref, malformed kpi block, "
+         "missing required slide_plan block, missing deck_plan.json, "
+         "unsafe deck_plan.template, and stale slide_plan (layout or "
+         "title disagrees with deck_plan); cleans up pre-existing "
+         "render_model files when the current run fails closed or the "
+         "slide's layout is no longer supported; PREFLIGHT (runs before "
+         "cleanup) rejects missing / non-list slides and "
+         "planned_slide_count != len(slides) without deleting any "
+         "pre-existing render_models/*.json",
+         negative_generator_tempfixture_checks()),
     ]
     fails = 0
     for title, results in sections:

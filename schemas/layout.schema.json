@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "layout.schema.json",
   "title": "Layout Skeleton",
-  "description": "Skeleton definition for one layout under a template. Lists the named slots the layout exposes and their kinds. Slot bounds, typography roles, and SVG mapping are TODO.",
+  "description": "Skeleton definition for one layout under a template. Lists the named slots the layout exposes, their kinds, optional bounds, and the controlled render primitive each slot maps to. A slot's primitive_kind (when set) is the only render_model primitive kind allowed for a render_model primitive whose slot_id targets this slot.",
   "type": "object",
   "required": ["name", "slots"],
   "additionalProperties": false,
@@ -39,6 +39,31 @@
           },
           "required": {
             "type": "boolean"
+          },
+          "bounds": {
+            "type": "object",
+            "required": ["x", "y", "w", "h"],
+            "additionalProperties": false,
+            "description": "Optional axis-aligned bounding box, in canvas pixels relative to the same grid as design_system.grid. When set, render_model primitives whose slot_id targets this slot must keep their own bounds inside it. Optional today so existing layouts continue to validate; the renderer will require it once SVG/PPTX export comes online.",
+            "properties": {
+              "x": { "type": "integer", "minimum": 0 },
+              "y": { "type": "integer", "minimum": 0 },
+              "w": { "type": "integer", "exclusiveMinimum": 0 },
+              "h": { "type": "integer", "exclusiveMinimum": 0 }
+            }
+          },
+          "primitive_kind": {
+            "type": "string",
+            "enum": [
+              "text",
+              "shape",
+              "line",
+              "image_slot",
+              "table",
+              "kpi",
+              "chart_placeholder"
+            ],
+            "description": "Optional explicit mapping from this slot to a render_model primitive kind. When unset, validators fall back to the default slot.type -> primitive.kind table documented in references/slide-contracts.md (text/list/callout -> text, kpi -> kpi, table -> table, image_ref -> image_slot, chart_ref -> chart_placeholder)."
           }
         }
       }

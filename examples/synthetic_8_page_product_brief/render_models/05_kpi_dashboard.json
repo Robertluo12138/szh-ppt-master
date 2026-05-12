@@ -1,0 +1,108 @@
+{
+  "index": 5,
+  "layout": "kpi_dashboard",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_q"
+  ],
+  "primitives": [
+    {
+      "id": "title",
+      "slot_id": "title",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 80,
+        "w": 1792,
+        "h": 120
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Target Metrics",
+        "role": "heading"
+      }
+    },
+    {
+      "id": "kpi_band_bg",
+      "kind": "shape",
+      "bounds": {
+        "x": 64,
+        "y": 280,
+        "w": 1792,
+        "h": 600
+      },
+      "style": {
+        "fill_token": "palette.background",
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 2
+      },
+      "shape": {
+        "shape_kind": "rounded_rectangle",
+        "corner_radius_px": 12
+      }
+    },
+    {
+      "id": "kpi_01",
+      "slot_id": "kpis",
+      "kind": "kpi",
+      "bounds": {
+        "x": 96,
+        "y": 310,
+        "w": 568,
+        "h": 540
+      },
+      "style": {
+        "color_token": "palette.text"
+      },
+      "kpi": {
+        "label": "metric_x",
+        "value": "<value>",
+        "delta": "<delta>"
+      }
+    },
+    {
+      "id": "kpi_02",
+      "slot_id": "kpis",
+      "kind": "kpi",
+      "bounds": {
+        "x": 676,
+        "y": 310,
+        "w": 568,
+        "h": 540
+      },
+      "style": {
+        "color_token": "palette.text"
+      },
+      "kpi": {
+        "label": "metric_y",
+        "value": "<value>",
+        "delta": "<delta>"
+      }
+    },
+    {
+      "id": "kpi_03",
+      "slot_id": "kpis",
+      "kind": "kpi",
+      "bounds": {
+        "x": 1256,
+        "y": 310,
+        "w": 568,
+        "h": 540
+      },
+      "style": {
+        "color_token": "palette.text"
+      },
+      "kpi": {
+        "label": "metric_z",
+        "value": "<value>",
+        "delta": "<delta>"
+      }
+    }
+  ]
+}

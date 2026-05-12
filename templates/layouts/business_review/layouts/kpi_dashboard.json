@@ -3,8 +3,20 @@
   "status": "skeleton",
   "purpose": "Grid of KPI tiles, each with a label, value, and optional delta.",
   "slots": [
-    { "id": "title", "type": "text", "required": true },
-    { "id": "kpis",  "type": "kpi",  "required": true }
+    {
+      "id": "title",
+      "type": "text",
+      "required": true,
+      "primitive_kind": "text",
+      "bounds": { "x": 64, "y": 80, "w": 1792, "h": 120 }
+    },
+    {
+      "id": "kpis",
+      "type": "kpi",
+      "required": true,
+      "primitive_kind": "kpi",
+      "bounds": { "x": 64, "y": 280, "w": 1792, "h": 600 }
+    }
   ],
-  "todo": "Define KPI tile count (e.g. 3 / 4 / 6), bounds, and delta formatting rules."
+  "todo": "Define KPI tile count (e.g. 3 / 4 / 6) and delta formatting rules."
 }

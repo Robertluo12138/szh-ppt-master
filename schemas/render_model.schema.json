@@ -1,0 +1,223 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "render_model.schema.json",
+  "title": "Slide Render Model",
+  "description": "Per-slide controlled layout / render model. The intermediate artifact between a slide_plan and the (still-TODO) SVG preview and editable PPTX export. Only owned primitives are allowed: text, shape, line, image_slot, table, kpi, chart_placeholder. This schema is deliberately NOT an arbitrary-SVG-to-PPTX contract: no SVG-specific keys (transform, viewBox, href, xlink:href, filter, foreignObject, ...) are accepted. Bounds are required for every primitive. Style references must be token refs into the design_system, not raw values. Image references are by image_manifest id, not by URL or path. Content must be synthetic and source-traceable; raw sensitive source text does not belong here.",
+  "type": "object",
+  "required": ["index", "layout", "canvas", "source_refs", "primitives"],
+  "additionalProperties": false,
+  "properties": {
+    "index": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1-based slide index. Validators cross-check this against the matching deck_plan.slides[].index and slide_plans/<file>.index."
+    },
+    "layout": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Layout id this render model targets. Validators cross-check this against the matching deck_plan.slides[].layout and a layout name in the chosen template."
+    },
+    "canvas": {
+      "type": "object",
+      "required": ["width_px", "height_px"],
+      "additionalProperties": false,
+      "description": "Pixel canvas the primitives live on. Validators cross-check this against design_system.grid.width_px / height_px when the design_system is available.",
+      "properties": {
+        "width_px": { "type": "integer", "exclusiveMinimum": 0 },
+        "height_px": { "type": "integer", "exclusiveMinimum": 0 }
+      }
+    },
+    "source_refs": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Required and non-empty. Opaque source identifiers this slide draws from. Validators require every value to be declared in deck_brief.source_refs, and fail closed (not silently skip) if the deck_brief is missing, malformed, or has no source_refs of its own. Keeps render models source-traceable without putting raw source text on disk.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "primitives": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Ordered list of controlled primitives. The only kinds accepted are text, shape, line, image_slot, table, kpi, chart_placeholder. No SVG-specific kinds, no arbitrary HTML/foreignObject. Primitive ids are unique within the slide. The kind-specific payload field (text / shape / line / image_slot / table / kpi / chart_placeholder) must match 'kind' exactly; the runtime validator enforces that.",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "bounds"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "description": "Stable id, unique within this slide's render model."
+          },
+          "slot_id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "description": "Optional reference to a layout slot id. When set, validators cross-check that the named slot exists on the chosen layout and (if the layout slot declares primitive_kind) that this primitive's kind matches that mapping."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "text",
+              "shape",
+              "line",
+              "image_slot",
+              "table",
+              "kpi",
+              "chart_placeholder"
+            ],
+            "description": "The controlled primitive kind. New kinds may not be added without a schema bump and matching validator support."
+          },
+          "bounds": {
+            "type": "object",
+            "required": ["x", "y", "w", "h"],
+            "additionalProperties": false,
+            "description": "Axis-aligned bounding box in canvas pixels. Validators enforce x+w <= canvas.width_px and y+h <= canvas.height_px.",
+            "properties": {
+              "x": { "type": "integer", "minimum": 0 },
+              "y": { "type": "integer", "minimum": 0 },
+              "w": { "type": "integer", "exclusiveMinimum": 0 },
+              "h": { "type": "integer", "exclusiveMinimum": 0 }
+            }
+          },
+          "style": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Token references into the design_system. Raw color / font values are not permitted here; the renderer resolves tokens at render time.",
+            "properties": {
+              "fill_token": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^palette\\.[a-z][a-z0-9_]*$",
+                "description": "Reference into design_system.palette, e.g. 'palette.primary' or 'palette.accent'."
+              },
+              "color_token": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^palette\\.[a-z][a-z0-9_]*$",
+                "description": "Reference into design_system.palette used as text or stroke color."
+              },
+              "stroke_token": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^palette\\.[a-z][a-z0-9_]*$"
+              },
+              "stroke_width_px": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "typography_token": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^typography\\.(heading|body)$",
+                "description": "Reference into design_system.typography. The two roles supported today are heading and body."
+              }
+            }
+          },
+          "text": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["content"],
+            "description": "Payload for kind=text. content is the literal display string; role is the typographic role.",
+            "properties": {
+              "content": { "type": "string", "minLength": 1 },
+              "role": {
+                "type": "string",
+                "enum": ["heading", "subheading", "body", "caption", "callout"]
+              }
+            }
+          },
+          "shape": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["shape_kind"],
+            "description": "Payload for kind=shape. Only closed shapes that map natively to PPTX are accepted.",
+            "properties": {
+              "shape_kind": {
+                "type": "string",
+                "enum": ["rectangle", "rounded_rectangle", "ellipse"]
+              },
+              "corner_radius_px": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Only meaningful for shape_kind=rounded_rectangle."
+              }
+            }
+          },
+          "line": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Payload for kind=line. The line is drawn corner-to-corner inside bounds (top-left to bottom-right). For a horizontal divider give bounds.h=1; for a vertical divider give bounds.w=1.",
+            "properties": {
+              "stroke_style": {
+                "type": "string",
+                "enum": ["solid", "dashed"]
+              }
+            }
+          },
+          "image_slot": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["image_ref"],
+            "description": "Payload for kind=image_slot. image_ref names an image_manifest entry id; the slot is rendered as the referenced image at this primitive's bounds. URLs, file:// paths, and absolute paths are NOT permitted here — the pattern below restricts image_ref to a manifest id.",
+            "properties": {
+              "image_ref": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[a-z][a-z0-9_]*$",
+                "description": "Manifest entry id; validators cross-check this is declared in image_manifest.images[].id."
+              },
+              "alt_text": { "type": "string", "minLength": 1 }
+            }
+          },
+          "table": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["columns", "rows"],
+            "description": "Payload for kind=table. Header columns plus rows of string cells. Renders as a native PPTX table.",
+            "properties": {
+              "columns": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "rows": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          },
+          "kpi": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["label", "value"],
+            "description": "Payload for kind=kpi. A single labeled value with optional delta string. Content is treated as a display string; no numeric arithmetic happens here.",
+            "properties": {
+              "label": { "type": "string", "minLength": 1 },
+              "value": { "type": "string", "minLength": 1 },
+              "delta": { "type": "string", "minLength": 1 }
+            }
+          },
+          "chart_placeholder": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["caption"],
+            "description": "Payload for kind=chart_placeholder. Reserves the bounds for a chart that the renderer does not yet implement. Carries the intended chart_kind and a synthetic caption so the slot is inspectable in previews. Charting is TODO.",
+            "properties": {
+              "caption": { "type": "string", "minLength": 1 },
+              "chart_kind": {
+                "type": "string",
+                "enum": ["bar", "column", "line", "pie"]
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

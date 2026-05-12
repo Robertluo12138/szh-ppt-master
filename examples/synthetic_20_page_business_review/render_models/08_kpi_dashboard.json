@@ -1,0 +1,127 @@
+{
+  "index": 8,
+  "layout": "kpi_dashboard",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_b"
+  ],
+  "primitives": [
+    {
+      "id": "title",
+      "slot_id": "title",
+      "kind": "text",
+      "bounds": {
+        "x": 64,
+        "y": 80,
+        "w": 1792,
+        "h": 120
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Quarter KPIs",
+        "role": "heading"
+      }
+    },
+    {
+      "id": "kpi_band_bg",
+      "kind": "shape",
+      "bounds": {
+        "x": 64,
+        "y": 280,
+        "w": 1792,
+        "h": 600
+      },
+      "style": {
+        "fill_token": "palette.background",
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 2
+      },
+      "shape": {
+        "shape_kind": "rounded_rectangle",
+        "corner_radius_px": 12
+      }
+    },
+    {
+      "id": "kpi_01",
+      "slot_id": "kpis",
+      "kind": "kpi",
+      "bounds": {
+        "x": 96,
+        "y": 310,
+        "w": 423,
+        "h": 540
+      },
+      "style": {
+        "color_token": "palette.text"
+      },
+      "kpi": {
+        "label": "metric_a",
+        "value": "<value>",
+        "delta": "<delta>"
+      }
+    },
+    {
+      "id": "kpi_02",
+      "slot_id": "kpis",
+      "kind": "kpi",
+      "bounds": {
+        "x": 531,
+        "y": 310,
+        "w": 423,
+        "h": 540
+      },
+      "style": {
+        "color_token": "palette.text"
+      },
+      "kpi": {
+        "label": "metric_b",
+        "value": "<value>",
+        "delta": "<delta>"
+      }
+    },
+    {
+      "id": "kpi_03",
+      "slot_id": "kpis",
+      "kind": "kpi",
+      "bounds": {
+        "x": 966,
+        "y": 310,
+        "w": 423,
+        "h": 540
+      },
+      "style": {
+        "color_token": "palette.text"
+      },
+      "kpi": {
+        "label": "metric_c",
+        "value": "<value>",
+        "delta": "<delta>"
+      }
+    },
+    {
+      "id": "kpi_04",
+      "slot_id": "kpis",
+      "kind": "kpi",
+      "bounds": {
+        "x": 1401,
+        "y": 310,
+        "w": 423,
+        "h": 540
+      },
+      "style": {
+        "color_token": "palette.text"
+      },
+      "kpi": {
+        "label": "metric_d",
+        "value": "<value>",
+        "delta": "<delta>"
+      }
+    }
+  ]
+}

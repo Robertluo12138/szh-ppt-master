@@ -3,11 +3,37 @@
   "status": "skeleton",
   "purpose": "Opening slide. Establishes the deck topic, presenter, and date.",
   "slots": [
-    { "id": "title",     "type": "text",      "required": true },
-    { "id": "subtitle",  "type": "text",      "required": false },
-    { "id": "presenter", "type": "text",      "required": false },
-    { "id": "date",      "type": "text",      "required": false },
-    { "id": "accent",    "type": "image_ref", "required": false }
+    {
+      "id": "title",
+      "type": "text",
+      "required": true,
+      "primitive_kind": "text",
+      "bounds": { "x": 160, "y": 320, "w": 1280, "h": 200 }
+    },
+    {
+      "id": "subtitle",
+      "type": "text",
+      "required": false,
+      "primitive_kind": "text"
+    },
+    {
+      "id": "presenter",
+      "type": "text",
+      "required": false,
+      "primitive_kind": "text"
+    },
+    {
+      "id": "date",
+      "type": "text",
+      "required": false,
+      "primitive_kind": "text"
+    },
+    {
+      "id": "accent",
+      "type": "image_ref",
+      "required": false,
+      "primitive_kind": "image_slot"
+    }
   ],
-  "todo": "Define bounds, typography roles per slot, and SVG mapping."
+  "todo": "Define bounds for the optional slots; the renderer will pin them once SVG/PPTX export comes online."
 }

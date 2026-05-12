@@ -10,10 +10,17 @@ The skill is a single linear pipeline. Stages are append-only; do not skip or re
 | 4 | Design system | `deck_plan.json` + template | `design_system.json` | `schemas/design_system.schema.json` |
 | 5 | Per-slide plan | `deck_plan.json` + `design_system.json` | one `slide_plan.json` per slide | `schemas/slide_plan.schema.json` |
 | 6 | Image manifest | per-slide plans | `image_manifest.json` | `schemas/image_manifest.schema.json` |
-| 7 | SVG render | per-slide plan + design_system + image_manifest | one SVG per slide | TODO |
-| 8 | SVG validate / repair | per-slide SVG | validated SVG + repair report | TODO |
-| 9 | PPTX export | validated SVGs + template | one editable PPTX | TODO |
-| 10 | Reports | PPTX + artifacts | security / editability / visual reports | TODO |
+| 7 | Render model | per-slide plan + design_system + image_manifest + layout slots | one `render_model.json` per slide (controlled primitives, bounds, token-only style refs) | `schemas/render_model.schema.json` |
+| 8 | SVG render | per-slide render model | one SVG preview per slide under `svg_previews/` (partial: `text`, `line`, `shape`, `image_slot`, `kpi`) | XML; controlled by `check_svg_previews` in `scripts/validate_workspace.py` |
+| 9 | SVG validate | per-slide SVG | pass/fail against `check_svg_previews` | implemented (repair: TODO) |
+| 10 | PPTX export | per-slide render model + template | one editable PPTX (native shapes / text frames / pictures) | TODO |
+| 11 | Reports | PPTX + artifacts | security / editability / visual reports | TODO |
+
+Stage 7 is the only stage between the per-slide plan and the consumers of the controlled model. Its contract is the controlled primitive / layout model defined in `schemas/render_model.schema.json` and described in `references/slide-contracts.md`. Stage 7 is the boundary the SVG renderer (stage 8) and the PPTX exporter (stage 10) **both** consume directly — they do not read `slide_plan.json` and the PPTX exporter does **not** parse the SVG. Stages 8/9 produce the preview / validation artifact; stage 10 produces native PPTX objects from the same render model.
+
+Stage 7 is **partially implemented**: `scripts/generate_render_models.py` produces deterministic render models for the **two supported layouts only** — `cover` and `kpi_dashboard`. Every other layout (`agenda`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `comparison_table`, `timeline`, `conclusion`, and any future addition) is listed as `[SKIP] … not implemented` by the script and is **not** counted as success. Slides for unsupported layouts have no `render_model.json` and cannot proceed to stages 8 / 10 until the generator is extended. The script is fail-closed on missing / malformed inputs, unsafe `deck_plan.template`, unknown `image_ref`, malformed kpi entries, missing required slide_plan block, schema-invalid output, or workspace cross-check failure.
+
+Stages 8 / 9 are **partially implemented**: `scripts/generate_svg_previews.py` reads every render_model the generator emits and writes one `svg_previews/<stem>.svg` per slide. It supports the primitive kinds the render-model generator emits today (`text`, `line`, `shape`, `image_slot`, `kpi`); every other kind (`table`, `chart_placeholder`, future kinds) fails closed on that slide. Validation runs as `check_svg_previews` inside `scripts/validate_workspace.py` — see `references/svg-design-rules.md` and `references/quality-gates.md` for the exact gates. Automatic SVG repair (out-of-bounds clipping, font fallback, density thresholds) remains TODO.
 
 ## Adaptive planning
 
@@ -38,8 +45,9 @@ See `references/slide-contracts.md` and the schemas under `schemas/` for the aut
 ## Invariants
 
 - Stage `n` may not start until stage `n-1` has produced its output and that output has passed schema validation.
-- `deck_plan` must exist before any SVG work. Per-slide plans must exist before that slide's SVG.
-- SVG is the **only** path to PPTX. Direct PPTX construction from a slide plan is not allowed.
+- `deck_plan` must exist before any render-model or SVG work. Per-slide plans must exist before that slide's render model. A slide's render model must exist before that slide's SVG and before its PPTX shapes are emitted.
+- The render model is the **only** input to the SVG renderer and the PPTX exporter — neither stage may read `slide_plan.json` directly, so the controlled primitive contract cannot be bypassed.
+- SVG is a required **preview / inspection artifact and validation gate** for every slide, not the source language for PPTX. The PPTX exporter does **not** parse SVG; it builds native PowerPoint objects from the same `render_model.json` the SVG renderer consumed. This repo is intentionally not a broad SVG → PPTX converter.
 - The terminal output is an **editable** PPTX.
 
 ## Project workspace

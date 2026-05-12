@@ -37,5 +37,5 @@ The terminal output is an **editable** PPTX. Conversion is not implemented yet; 
 
 - Enumerate the allowed PPTX relationship allow-list.
 - Define palette → theme slot mapping.
-- Define SVG primitive → PPTX shape mapping.
+- Define `render_model` primitive → native PPTX object mapping (`text` → text frame, `shape` → native PPTX shape, `line` → native line / connector, `image_slot` → picture shape, `table` → native PPTX table, `kpi` → composite text frame, `chart_placeholder` → blank chart frame). The PPTX exporter consumes `render_model.json` directly; it does not parse SVG.
 - Decide whether speaker notes round-trip.

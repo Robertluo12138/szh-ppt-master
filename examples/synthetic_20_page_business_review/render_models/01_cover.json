@@ -1,0 +1,121 @@
+{
+  "index": 1,
+  "layout": "cover",
+  "canvas": {
+    "width_px": 1920,
+    "height_px": 1080
+  },
+  "source_refs": [
+    "synthetic_source_a"
+  ],
+  "primitives": [
+    {
+      "id": "title_divider",
+      "kind": "line",
+      "bounds": {
+        "x": 160,
+        "y": 290,
+        "w": 1280,
+        "h": 4
+      },
+      "style": {
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 4
+      },
+      "line": {
+        "stroke_style": "solid"
+      }
+    },
+    {
+      "id": "title",
+      "slot_id": "title",
+      "kind": "text",
+      "bounds": {
+        "x": 160,
+        "y": 320,
+        "w": 1280,
+        "h": 200
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.heading"
+      },
+      "text": {
+        "content": "Synthetic Quarterly Business Review",
+        "role": "heading"
+      }
+    },
+    {
+      "id": "subtitle",
+      "slot_id": "subtitle",
+      "kind": "text",
+      "bounds": {
+        "x": 160,
+        "y": 540,
+        "w": 1280,
+        "h": 80
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "Quarter placeholder",
+        "role": "subheading"
+      }
+    },
+    {
+      "id": "presenter",
+      "slot_id": "presenter",
+      "kind": "text",
+      "bounds": {
+        "x": 160,
+        "y": 860,
+        "w": 600,
+        "h": 60
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "Synthetic Team Lead",
+        "role": "body"
+      }
+    },
+    {
+      "id": "date",
+      "slot_id": "date",
+      "kind": "text",
+      "bounds": {
+        "x": 1160,
+        "y": 860,
+        "w": 600,
+        "h": 60
+      },
+      "style": {
+        "color_token": "palette.text",
+        "typography_token": "typography.body"
+      },
+      "text": {
+        "content": "<date-placeholder>",
+        "role": "body"
+      }
+    },
+    {
+      "id": "accent_image",
+      "slot_id": "accent",
+      "kind": "image_slot",
+      "bounds": {
+        "x": 1480,
+        "y": 200,
+        "w": 320,
+        "h": 320
+      },
+      "image_slot": {
+        "image_ref": "cover_accent",
+        "alt_text": "Synthetic geometric accent shape."
+      }
+    }
+  ]
+}

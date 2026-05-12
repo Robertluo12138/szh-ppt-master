@@ -3,7 +3,9 @@
 
 Stdlib-only scaffold check. Runs:
   - positive: every synthetic fixture under every example workspace
-    in examples/ validates against its schema
+    in examples/ validates against its schema (including any
+    render_models/*.json the workspace ships, against
+    render_model.schema.json)
   - negative: removing a required field makes validation fail
   - image_manifest path-safety: rejects ANY URI-like scheme prefix
     (http, https, file, s3, ftp, data, mailto, javascript, ...),
@@ -15,6 +17,21 @@ Stdlib-only scaffold check. Runs:
   - template / theme / layout cross-check: schemas validate, the
     template's declared layout list matches the files on disk; the
     theme load is gated in two stages and is fail-closed.
+  - render_model schema-level negatives: a clean baseline render_model
+    validates, and every mutation in the required categories
+    (unsupported kind, missing bounds, invalid token refs, external
+    URL / file:// / absolute path / path traversal in image_ref,
+    arbitrary SVG-like fields like transform / viewBox / href /
+    foreignObject / xmlns / defs) is rejected by the schema.
+  - svg_preview validation: if a workspace ships render_models, each
+    render_model must have a matching svg_previews/<stem>.svg, the SVG
+    must parse, the root <svg> viewBox must match the render_model
+    canvas, no <foreignObject> may appear, every href / xlink:href /
+    src must pass the same path-safety rule (no URI scheme, no
+    absolute, no '..'), every <image> href must name an image_manifest
+    local_path, and every element with explicit numeric geometry must
+    stay inside the canvas. Tempfixture negatives in
+    validate_workspace.py prove fail-closed on each forbidden mutation.
 
 Example workspaces are discovered dynamically: any subdirectory of
 examples/ that contains deck_plan.json and slide_plans/ is treated as
@@ -87,6 +104,10 @@ def positive_checks(workspace: Path) -> list[CheckResult]:
     ]
     for sp in sorted(plans_dir.glob("*.json")):
         cases.append(("slide_plan.schema.json", sp))
+    rm_dir = workspace / "render_models"
+    if rm_dir.is_dir():
+        for rm in sorted(rm_dir.glob("*.json")):
+            cases.append(("render_model.schema.json", rm))
     out: list[CheckResult] = []
     for schema_name, fixture in cases:
         errors = _schema_validate(_load(fixture), SCHEMAS / schema_name)
@@ -622,6 +643,195 @@ def template_negative_checks() -> list[CheckResult]:
     return out
 
 
+# Baseline render_model used as the clean starting point for every
+# negative mutation below. Anchored to the same 1920x1080 canvas the
+# business_review template's theme.json declares, but the test does NOT
+# couple to any specific template directory — the schema check is
+# independent of the workspace's chosen template.
+_BASELINE_RENDER_MODEL = {
+    "index": 1,
+    "layout": "cover",
+    "canvas": {"width_px": 1920, "height_px": 1080},
+    "source_refs": ["synthetic_src"],
+    "primitives": [
+        {
+            "id": "title",
+            "slot_id": "title",
+            "kind": "text",
+            "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200},
+            "style": {
+                "color_token": "palette.text",
+                "typography_token": "typography.heading",
+            },
+            "text": {"content": "Synthetic placeholder title", "role": "heading"},
+        }
+    ],
+}
+
+
+def _mutated_render_model(mutate) -> dict:
+    """Return a fresh deep-copy of the baseline render_model with mutate(rm)
+    applied. The baseline itself must remain unmutated so subsequent
+    cases start from a clean copy."""
+    import copy as _copy
+    rm = _copy.deepcopy(_BASELINE_RENDER_MODEL)
+    mutate(rm)
+    return rm
+
+
+def render_model_schema_checks() -> list[CheckResult]:
+    """Workspace-agnostic schema checks against render_model.schema.json.
+    Proves:
+      - the baseline render_model validates;
+      - every required negative mutation is rejected:
+        unsupported kind, missing bounds, invalid token refs, external
+        URL / file:// / absolute path / path traversal in image_ref, and
+        a sample of arbitrary SVG-like fields (transform, viewBox, href,
+        xmlns, defs, foreignObject, filter, xlink_href). The mutations
+        cover the categories the task asks the scaffold to fail on; the
+        full runtime cross-check surface (kind-payload mismatch, bounds
+        outside canvas, slot mismatch, image_ref vs manifest, palette
+        token resolution) is exercised by the workspace validator's
+        tempfixtures."""
+    out: list[CheckResult] = []
+
+    # Sanity: baseline must validate. Catches regressions in either the
+    # schema or the baseline writer.
+    baseline_errors = _schema_validate(
+        _BASELINE_RENDER_MODEL, SCHEMAS / "render_model.schema.json",
+    )
+    out.append(CheckResult(
+        "baseline render_model validates against render_model.schema.json",
+        not baseline_errors,
+        "; ".join(baseline_errors),
+    ))
+
+    def m_kind_svg(rm):
+        rm["primitives"][0]["kind"] = "svg"
+
+    def m_kind_foreign_object(rm):
+        rm["primitives"][0]["kind"] = "foreignObject"
+
+    def m_missing_bounds(rm):
+        rm["primitives"][0].pop("bounds")
+
+    def m_bad_token_no_prefix(rm):
+        rm["primitives"][0]["style"]["color_token"] = "raw_color"
+
+    def m_bad_token_wrong_domain(rm):
+        rm["primitives"][0]["style"]["color_token"] = "external.thing"
+
+    def m_bad_typography_token(rm):
+        rm["primitives"][0]["style"]["typography_token"] = "typography.unknown"
+
+    def _swap_image(rm, ref):
+        rm["primitives"][0] = {
+            "id": "pic",
+            "kind": "image_slot",
+            "bounds": {"x": 100, "y": 100, "w": 200, "h": 200},
+            "image_slot": {"image_ref": ref},
+        }
+
+    def m_image_ref_http(rm):
+        _swap_image(rm, "http://example.com/x.png")
+
+    def m_image_ref_https(rm):
+        _swap_image(rm, "https://example.com/x.png")
+
+    def m_image_ref_file(rm):
+        _swap_image(rm, "file:///etc/passwd")
+
+    def m_image_ref_data(rm):
+        _swap_image(rm, "data:image/png;base64,abc")
+
+    def m_image_ref_absolute(rm):
+        _swap_image(rm, "/etc/passwd")
+
+    def m_image_ref_traversal(rm):
+        _swap_image(rm, "../escape")
+
+    def m_image_ref_drive(rm):
+        _swap_image(rm, "C:/img.png")
+
+    def m_arbitrary_transform(rm):
+        rm["primitives"][0]["transform"] = "translate(10,20)"
+
+    def m_arbitrary_viewbox(rm):
+        rm["primitives"][0]["viewBox"] = "0 0 100 100"
+
+    def m_arbitrary_href(rm):
+        rm["primitives"][0]["href"] = "http://example.com"
+
+    def m_arbitrary_xlink_href(rm):
+        rm["primitives"][0]["xlink_href"] = "http://example.com"
+
+    def m_arbitrary_foreign_object_field(rm):
+        rm["primitives"][0]["foreignObject"] = {"html": "<div/>"}
+
+    def m_arbitrary_filter_field(rm):
+        rm["primitives"][0]["filter"] = "url(#blur)"
+
+    def m_arbitrary_xmlns(rm):
+        rm["xmlns"] = "http://www.w3.org/2000/svg"
+
+    def m_arbitrary_defs(rm):
+        rm["defs"] = []
+
+    def m_arbitrary_root_path(rm):
+        rm["path"] = "M0 0 L100 100"
+
+    def m_bad_id_pattern(rm):
+        rm["primitives"][0]["id"] = "Has Capitals!"
+
+    def m_bad_slot_id_pattern(rm):
+        rm["primitives"][0]["slot_id"] = "../slot"
+
+    def m_missing_source_refs(rm):
+        rm.pop("source_refs")
+
+    def m_empty_source_refs(rm):
+        rm["source_refs"] = []
+
+    cases = [
+        ("unsupported kind 'svg'",                       m_kind_svg),
+        ("unsupported kind 'foreignObject'",             m_kind_foreign_object),
+        ("missing bounds on primitive",                  m_missing_bounds),
+        ("color_token without 'palette.' prefix",        m_bad_token_no_prefix),
+        ("color_token in wrong domain 'external.thing'", m_bad_token_wrong_domain),
+        ("typography_token outside heading|body",        m_bad_typography_token),
+        ("image_ref carrying an http:// URL",            m_image_ref_http),
+        ("image_ref carrying an https:// URL",           m_image_ref_https),
+        ("image_ref carrying a file:// URL",             m_image_ref_file),
+        ("image_ref carrying a data: URI",               m_image_ref_data),
+        ("image_ref carrying a POSIX-absolute path",     m_image_ref_absolute),
+        ("image_ref carrying a path-traversal segment",  m_image_ref_traversal),
+        ("image_ref carrying a Windows drive prefix",    m_image_ref_drive),
+        ("arbitrary SVG-like field on primitive: transform",     m_arbitrary_transform),
+        ("arbitrary SVG-like field on primitive: viewBox",       m_arbitrary_viewbox),
+        ("arbitrary SVG-like field on primitive: href",          m_arbitrary_href),
+        ("arbitrary SVG-like field on primitive: xlink_href",    m_arbitrary_xlink_href),
+        ("arbitrary SVG-like field on primitive: foreignObject", m_arbitrary_foreign_object_field),
+        ("arbitrary SVG-like field on primitive: filter",        m_arbitrary_filter_field),
+        ("arbitrary SVG-like field at root: xmlns",              m_arbitrary_xmlns),
+        ("arbitrary SVG-like field at root: defs",               m_arbitrary_defs),
+        ("arbitrary SVG-like field at root: path",               m_arbitrary_root_path),
+        ("primitive id violates pattern",                m_bad_id_pattern),
+        ("slot_id with traversal characters",            m_bad_slot_id_pattern),
+        ("missing source_refs (now required, fail-closed)", m_missing_source_refs),
+        ("empty source_refs (minItems: 1)",              m_empty_source_refs),
+    ]
+    for label, mutate in cases:
+        rm = _mutated_render_model(mutate)
+        errors = _schema_validate(rm, SCHEMAS / "render_model.schema.json")
+        out.append(CheckResult(
+            f"render_model schema rejects: {label}",
+            bool(errors),
+            "no schema errors were reported",
+        ))
+
+    return out
+
+
 def _print(section: str, results: list[CheckResult]) -> int:
     print(f"\n== {section} ==")
     fails = 0
@@ -653,7 +863,7 @@ def main() -> int:
     # Lazy import to avoid the circular dependency: validate_workspace
     # already imports local_path_is_safe / _resolves_within /
     # _slide_plan_against_layout from this module at module load time.
-    from validate_workspace import check_planner_semantics
+    from validate_workspace import check_planner_semantics, check_svg_previews
 
     # Per-workspace positive + per-workspace negatives. The label embeds the
     # workspace path so failures point at a specific example.
@@ -672,6 +882,8 @@ def main() -> int:
              layout_aware_slide_plan_checks(DEFAULT_TEMPLATE, ws)),
             (f"planner semantics ({label})",
              check_planner_semantics(ws)),
+            (f"svg_preview validation ({label})",
+             check_svg_previews(ws, TEMPLATES)),
         ])
 
     # Layout-aware negative-mutation tests pick fixtures dynamically so we
@@ -685,6 +897,11 @@ def main() -> int:
     sections.extend([
         ("template / theme / layout cross-check", template_consistency_checks()),
         ("negative: template guards reject bad inputs", template_negative_checks()),
+        ("render_model schema: baseline + schema-level negatives "
+         "(unsupported kind, missing bounds, invalid token refs, "
+         "URL / file:// / absolute / path-traversal image_ref, "
+         "arbitrary SVG-like fields)",
+         render_model_schema_checks()),
     ])
 
     fails = 0
