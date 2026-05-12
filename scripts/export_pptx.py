@@ -1219,6 +1219,32 @@ def export_workspace(workspace: Path, output: Path) -> int:
             fatal_errors.append(f"{rel}: render_model.layout is not a string")
             continue
 
+        # Canonical filename gate (fail-closed).
+        #
+        # The exporter reads `render_models/*.json` via
+        # `sorted(rm_dir.glob("*.json"))` and treats that order as the
+        # deck's slide order. A render_model whose JSON declares
+        # `index=2 layout="agenda"` but whose on-disk filename is
+        # `99_agenda.json` would silently sort AFTER `20_conclusion.json`
+        # and land in the wrong slide position. The render-model
+        # generator always writes the canonical name, but a hand-edited
+        # or copied workspace can still ship a stale name that
+        # schema-validates. validate_workspace.check_render_model_filenames
+        # enforces the same rule out-of-band; we mirror it here so the
+        # primary export path is protected even when callers invoke the
+        # exporter without running the workspace validator first.
+        expected_name = f"{idx:02d}_{layout}.json"
+        if rm_file.name != expected_name:
+            fatal_errors.append(
+                f"{rel} (index={idx}, layout={layout!r}): on-disk filename "
+                f"{rm_file.name!r} disagrees with the render_model's own "
+                f"index + layout; expected {expected_name!r}. The exporter "
+                f"sorts render_models/*.json by file stem and would emit "
+                f"this slide out of order. Rename the file or re-run "
+                f"scripts/generate_render_models.py"
+            )
+            continue
+
         # Cross-check canvas vs. design_system.grid here so a stale
         # render_model that drifted from the grid cannot quietly emit a
         # mis-sized slide.
@@ -1795,24 +1821,32 @@ def _run_self_tests() -> list[CheckResult]:
         # on disk.
         unsupp_ws = td / "unsupported_layout"
         _write_synthetic_workspace(unsupp_ws)
-        (unsupp_ws / "render_models" / "01_cover.json").write_text(json.dumps({
-            "index": 1,
-            "layout": "comparison_table",
-            "canvas": {"width_px": 1920, "height_px": 1080},
-            "source_refs": ["synthetic_src"],
-            "primitives": [
-                {
-                    "id": "title",
-                    "kind": "text",
-                    "bounds": {"x": 100, "y": 100, "w": 1280, "h": 120},
-                    "style": {
-                        "color_token": "palette.text",
-                        "typography_token": "typography.heading",
+        # Replace the happy-path cover slide with a comparison_table
+        # slide at the same index. The render_model filename MUST be
+        # `01_comparison_table.json` (canonical-name gate fires first
+        # in the exporter preflight) so this scenario actually exercises
+        # the unsupported-layout gate rather than the filename gate.
+        (unsupp_ws / "render_models" / "01_cover.json").unlink()
+        (unsupp_ws / "render_models" / "01_comparison_table.json").write_text(
+            json.dumps({
+                "index": 1,
+                "layout": "comparison_table",
+                "canvas": {"width_px": 1920, "height_px": 1080},
+                "source_refs": ["synthetic_src"],
+                "primitives": [
+                    {
+                        "id": "title",
+                        "kind": "text",
+                        "bounds": {"x": 100, "y": 100, "w": 1280, "h": 120},
+                        "style": {
+                            "color_token": "palette.text",
+                            "typography_token": "typography.heading",
+                        },
+                        "text": {"content": "Comparison", "role": "heading"},
                     },
-                    "text": {"content": "Comparison", "role": "heading"},
-                },
-            ],
-        }))
+                ],
+            })
+        )
         unsupp_out = td / "unsupported.pptx"
         rc, _stdout, stderr = _run_capture(unsupp_ws, unsupp_out)
         msg = stderr + _stdout
@@ -1947,6 +1981,44 @@ def _run_self_tests() -> list[CheckResult]:
                 False,
                 "skipped — export failed",
             ))
+
+        # 11. NEGATIVE: render_model whose on-disk filename does not
+        # match `<index:02d>_<layout>.json` fails closed in the
+        # exporter's preflight. Codex review flagged that the workspace
+        # validator's filename gate did not protect the primary export
+        # path; the exporter sorts render_models/*.json by file stem
+        # and would otherwise place a mis-named slide out of order. The
+        # fixture takes a happy-path workspace, renames its first
+        # render_model from `01_cover.json` to `99_cover.json` (the
+        # JSON still says `index=1 layout="cover"`), runs the
+        # exporter, and asserts that the run aborts, the failure
+        # message names both the actual on-disk filename and the
+        # expected canonical filename, and no `.pptx` is written.
+        mis_named_ws = td / "mis_named_filename"
+        _write_synthetic_workspace(mis_named_ws)
+        (mis_named_ws / "render_models" / "01_cover.json").rename(
+            mis_named_ws / "render_models" / "99_cover.json",
+        )
+        mis_named_out = td / "mis_named.pptx"
+        rc, _stdout, stderr = _run_capture(mis_named_ws, mis_named_out)
+        msg = stderr + _stdout
+        results.append(CheckResult(
+            "selftest: render_model whose filename disagrees with its "
+            "own index + layout fails closed in the exporter preflight "
+            "(no partial deck written)",
+            (
+                rc != 0
+                and "99_cover.json" in msg
+                and "01_cover.json" in msg
+                and not mis_named_out.exists()
+            ),
+            (f"rc={rc}, missing '99_cover.json'/'01_cover.json' in "
+             f"messages, output_exists={mis_named_out.exists()}"
+             if rc == 0
+                or "99_cover.json" not in msg
+                or "01_cover.json" not in msg
+                or mis_named_out.exists() else ""),
+        ))
 
     return results
 

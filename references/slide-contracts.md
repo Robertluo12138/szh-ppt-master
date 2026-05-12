@@ -58,7 +58,7 @@ A `slide_plan` is valid against a layout when every `required` slot has a matchi
 
 ## Controlled render model (per slide)
 
-The `render_model` is the per-slide intermediate that the SVG preview renderer (implemented today for a subset of kinds; see below) and the expanded editable PPTX exporter (`scripts/export_pptx.py`, covering layouts `cover`, `kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `timeline`, `conclusion` with primitive kinds `text` / `line` / `shape` / `image_slot` / `kpi`; everything else fails closed) both consume. See `references/pptx-conversion-rules.md` for the PPTX exporter contract.
+The `render_model` is the per-slide intermediate that the SVG preview renderer (implemented today for a subset of kinds; see below) and the expanded editable PPTX exporter (`scripts/export_pptx.py`, **consumes** render_models for layouts `cover`, `kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `timeline`, `conclusion` with primitive kinds `text` / `line` / `shape` / `image_slot` / `kpi`; everything else fails closed) both consume. SVG is preview / inspection only — the PPTX exporter does not parse SVG, it builds native OOXML from the render_model directly. See `references/pptx-conversion-rules.md` for the PPTX exporter contract.
 
 Authoritative shape lives in `schemas/render_model.schema.json`. Key invariants:
 
@@ -73,7 +73,7 @@ The render_model is **not** itself a render of a slide — it carries no SVG pat
 
 ### Generator scope
 
-Today `scripts/generate_render_models.py` produces render models for every layout reachable from the controlled `text` / `line` / `shape` / `image_slot` / `kpi` primitive set: `cover`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `kpi_dashboard`, `timeline`, `conclusion`. The generator is deterministic and stdlib-only.
+Today `scripts/generate_render_models.py` produces render models for every layout reachable from the controlled `text` / `line` / `shape` / `image_slot` / `kpi` primitive set: `cover`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `kpi_dashboard`, `timeline`, `agenda`, `conclusion`. The generator is deterministic and stdlib-only. Keep two phrasings distinct: which layouts this stage **can produce end-to-end** from a slide_plan (above) and which layouts the **PPTX exporter can consume** (see `references/pptx-conversion-rules.md`) — today both sets are the same.
 
 - `cover`: emits a structural `line` (title divider, no slot), then `text` primitives for the required `title` and any present optional `subtitle` / `presenter` / `date`, then an `image_slot` for `accent` if the slide_plan has an `accent` block whose `image_ref` is declared in `image_manifest`. Bounds come from the layout slot when set; otherwise from the deterministic fallback table in the script.
 - `section_divider`: optional `text` for `section_number`, required `text` for `section_title`, a structural `line` (no slot) below the title, and an optional `text` for `subtitle`.
@@ -82,9 +82,10 @@ Today `scripts/generate_render_models.py` produces render models for every layou
 - `two_column`: required `text` for `title`, then per side an optional `text` heading plus one bulleted `text` per entry in the required content list, distributed vertically inside each column's content slot.
 - `kpi_dashboard`: emits a `text` primitive for `title`, a decorative `shape` (rounded_rectangle, no slot) sized to the `kpis` slot bounds, and one `kpi` primitive per entry in `slide_plan.blocks[id="kpis"].content`. Tiles are sized and positioned by a centered-row formula inside the `kpis` slot bounds.
 - `timeline`: required `text` for `title`, then one bulleted `text` per entry in the required `timeline_items` list, distributed vertically inside the slot's fallback bounds (the `timeline.json` layout does not declare bounds today; the generator's `LAYOUT_FALLBACK_BOUNDS` covers the gap).
+- `agenda`: required `text` for `title`, then one bulleted `text` per entry in the required `agenda_items` list, distributed vertically inside the slot's fallback bounds. The `agenda.json` layout does not declare bounds today; the generator's `LAYOUT_FALLBACK_BOUNDS` covers the gap — same shape as `timeline`.
 - `conclusion`: required `text` for `title`, optional `text` for `summary`, then one bulleted `text` per entry in the optional `call_to_action` list, distributed vertically inside the slot bounds.
 
-Layouts mapped to the `table` or `chart_placeholder` primitive kinds — `comparison_table`, `agenda` (today still unimplemented), and anything chart-bearing — are **not** generated. The script lists those slides as `[SKIP] … not implemented`. A run is `OK` when generation succeeds for every supported slide; skipped slides are surfaced in the output but never counted as success.
+Layouts mapped to the `table` or `chart_placeholder` primitive kinds — `comparison_table` and anything chart-bearing — are **not** generated. The script lists those slides as `[SKIP] … not implemented`. A run is `OK` when generation succeeds for every supported slide; skipped slides are surfaced in the output but never counted as success.
 
 The generator never invents source content. All text and KPI rows come from `slide_plan.blocks[].content`. The generator is fail-closed on missing / malformed inputs, unsafe `deck_plan.template`, unknown `image_ref`, malformed kpi entries, a missing required slide_plan block, **a stale / mismatched slide_plan** (matched by JSON index but whose `layout` or `title` disagrees with the deck_plan slide), schema-invalid output, or workspace cross-check failure — and re-runs the same `check_render_models` gate the workspace validator uses, so output drift fails immediately rather than after the next CI run.
 
@@ -121,6 +122,7 @@ Per-kind content shape is **TODO**; the scaffold schema accepts `content` as fre
 
 - Slide indices are 1-based.
 - The scaffold's `scripts/validate_workspace.py` looks for per-slide plans under `<workspace>/slide_plans/*.json` and matches by the JSON `index` field, not by filename. The full canonical workspace path layout (whether `slides/<index>/slide_plan.json`, `slide_plans/<index>_<layout>.json`, or something else) remains **TODO**.
+- **Render model filenames are canonical.** Every `render_models/*.json` file must be named `<index:02d>_<layout>.json`, where `index` and `layout` come from inside the JSON (zero-padded two-digit index + the layout token verbatim — e.g. `02_agenda.json`, `09_two_column.json`, `20_conclusion.json`). The PPTX exporter (`scripts/export_pptx.py`) sorts `render_models/*.json` by file stem and treats that order as the deck's slide order, so a file mis-named `99_agenda.json` whose JSON `index` is 2 would be exported as the last slide rather than slide 2. The workspace validator enforces this on disk (`check_render_model_filenames` / `render.filename` in `references/quality-gates.md`); the render-model generator always writes the canonical name. Schema-invalid files (no integer `index`, no string `layout`) are not double-flagged by this gate — `check_render_models` already rejects them. This naming rule is render-model-specific; the broader workspace path-layout TODO above is **not** resolved by it.
 
 ## TODOs
 

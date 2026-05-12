@@ -13,6 +13,7 @@ SUPPORTED LAYOUTS
     two_column         text + paired bulleted text lists per column
     kpi_dashboard      text + shape (decorative band) + kpi tiles
     timeline           text + bulleted text list (timeline_items)
+    agenda             text + bulleted text list (agenda_items)
     conclusion         text + bulleted text list (call_to_action)
 
 All supported layouts emit only the controlled primitive kinds the
@@ -38,14 +39,14 @@ DETERMINISM
     The generator never invents source content. Text and callout
     strings come from `slide_plan.blocks[].content`. List entries
     (key_points, left_content, right_content, call_to_action,
-    timeline_items) are read from the matching slide_plan list
-    block's content array and each entry becomes its own bulleted
-    text primitive distributed inside the slot's bounds. KPI rows
-    come from `slide_plan.blocks[id="kpis"].content`. Image refs
-    come from `slide_plan.blocks[id="accent"].content` and must be
-    declared in `image_manifest`. Bounds use the layout slot's
-    `bounds` when set, otherwise the deterministic fallback table
-    at the top of this file (LAYOUT_FALLBACK_BOUNDS).
+    timeline_items, agenda_items) are read from the matching
+    slide_plan list block's content array and each entry becomes
+    its own bulleted text primitive distributed inside the slot's
+    bounds. KPI rows come from `slide_plan.blocks[id="kpis"].content`.
+    Image refs come from `slide_plan.blocks[id="accent"].content`
+    and must be declared in `image_manifest`. Bounds use the layout
+    slot's `bounds` when set, otherwise the deterministic fallback
+    table at the top of this file (LAYOUT_FALLBACK_BOUNDS).
 
 PREFLIGHT GATES (run BEFORE render_models/ cleanup)
     Cleanup deletes every *.json under render_models/, so any check that
@@ -152,6 +153,7 @@ SUPPORTED_LAYOUTS = (
     "two_column",
     "kpi_dashboard",
     "timeline",
+    "agenda",
     "conclusion",
 )
 
@@ -219,6 +221,10 @@ LAYOUT_FALLBACK_BOUNDS = {
     "timeline": {
         "title":          (64, 80, 1792, 100),
         "timeline_items": (64, 260, 1792, 700),
+    },
+    "agenda": {
+        "title":         (64, 80, 1792, 100),
+        "agenda_items":  (64, 260, 1792, 700),
     },
 }
 
@@ -1094,6 +1100,60 @@ def _generate_timeline(
     }
 
 
+def _generate_agenda(
+    slide_plan: dict,
+    deck_slide: dict,
+    layout: dict,
+    design_system: dict,
+    manifest_ids: set[str],
+    manifest_alt_by_id: dict,
+) -> dict:
+    """agenda: required title + required agenda_items list. Items are
+    rendered as a vertically stacked bulleted list inside the
+    agenda_items slot, mirroring the timeline generator. The agenda
+    layout JSON in business_review does not declare bounds today; both
+    slots fall back to the table in LAYOUT_FALLBACK_BOUNDS."""
+    grid = design_system["grid"]
+    canvas = {"width_px": grid["width_px"], "height_px": grid["height_px"]}
+    slots_by_id = {
+        s["id"]: s for s in (_as_list(layout.get("slots")) or [])
+        if isinstance(s, dict) and isinstance(s.get("id"), str)
+    }
+    blocks_by_id = {
+        b["id"]: b for b in (_as_list(slide_plan.get("blocks")) or [])
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    }
+
+    primitives: list[dict] = []
+
+    primitives.append(_make_text_primitive(
+        "title", "title",
+        _bounds_for(slots_by_id, "agenda", "title"),
+        _text_block_content(blocks_by_id, "title"),
+        role="heading",
+        typography_token="typography.heading",
+    ))
+
+    items_bounds = _bounds_for(slots_by_id, "agenda", "agenda_items")
+    items = _list_block_content(blocks_by_id, "agenda_items")
+    for i, item in enumerate(items):
+        primitives.append(_make_text_primitive(
+            f"agenda_item_{i + 1:02d}", "agenda_items",
+            _list_item_bounds(items_bounds, len(items), i),
+            LIST_ITEM_BULLET_PREFIX + item,
+            role="body",
+            typography_token="typography.body",
+        ))
+
+    return {
+        "index": deck_slide["index"],
+        "layout": "agenda",
+        "canvas": canvas,
+        "source_refs": list(deck_slide.get("source_refs") or []),
+        "primitives": primitives,
+    }
+
+
 GENERATORS = {
     "cover": _generate_cover,
     "executive_summary": _generate_executive_summary,
@@ -1101,6 +1161,7 @@ GENERATORS = {
     "two_column": _generate_two_column,
     "kpi_dashboard": _generate_kpi_dashboard,
     "timeline": _generate_timeline,
+    "agenda": _generate_agenda,
     "conclusion": _generate_conclusion,
     "section_divider": _generate_section_divider,
 }
@@ -1112,9 +1173,10 @@ def main(argv: list[str]) -> int:
                     "controlled primitive set (text / line / shape / "
                     "image_slot / kpi). Supported layouts: cover, "
                     "section_divider, executive_summary, key_message, "
-                    "two_column, kpi_dashboard, timeline, conclusion. "
-                    "Layouts mapped to the table or chart_placeholder "
-                    "primitive kinds are skipped as not implemented.",
+                    "two_column, kpi_dashboard, timeline, agenda, "
+                    "conclusion. Layouts mapped to the table or "
+                    "chart_placeholder primitive kinds are skipped as "
+                    "not implemented.",
     )
     parser.add_argument("--workspace", required=True, type=Path,
                         help="Caller-supplied workspace directory.")

@@ -108,14 +108,16 @@ OUT OF SCOPE
     primitive kinds text / line / shape / image_slot / kpi across every
     layout the render-model generator emits — cover, section_divider,
     executive_summary, key_message, two_column, kpi_dashboard, timeline,
-    conclusion). Validation of the generated previews is performed here by
-    check_svg_previews above.
+    agenda, conclusion). Validation of the generated previews is performed
+    here by check_svg_previews above.
     PPTX export is implemented separately by scripts/export_pptx.py (today
     covering layouts cover, kpi_dashboard, agenda, section_divider,
     executive_summary, key_message, two_column, timeline, conclusion with
-    the same controlled primitive kinds); D-One image generation, Qoder
-    CLI integration, and any network behavior are NOT implemented in this
-    repo and remain out of scope until their scripts exist.
+    the same controlled primitive kinds — the generator-supported and
+    exporter-supported layout sets are the same today); D-One image
+    generation, Qoder CLI integration, and any network behavior are NOT
+    implemented in this repo and remain out of scope until their scripts
+    exist.
 """
 
 from __future__ import annotations
@@ -1317,6 +1319,175 @@ def check_render_models(workspace: Path, template_root: Path) -> list[CheckResul
                 not offending,
                 f"offending: {offending}",
             ))
+    return out
+
+
+def check_generator_render_model_coverage(
+    workspace: Path,
+    template_root: Path,
+) -> list[CheckResult]:
+    """Catch silent partial drift: a committed workspace ships
+    render_models/ for SOME but not all deck_plan slides whose layout
+    is in the render-model generator's supported set.
+
+    The check is adaptive and example-agnostic — it consults two
+    things: (1) the workspace's deck_plan.slides, and (2) the
+    generator's SUPPORTED_LAYOUTS tuple, imported lazily from
+    scripts/generate_render_models to avoid a top-level circular
+    import. It hardcodes no slide count, no example name, and no
+    template name.
+
+    Behavior:
+      - If render_models/ is absent or contains no *.json, no check
+        fires — the workspace simply has not been run through the
+        generator yet (mirrors check_render_models' policy).
+      - If render_models/ contains any *.json AND any deck_plan
+        slide has a generator-supported layout, then EVERY
+        generator-supported deck_plan slide must have a matching
+        render_model on disk. Missing files are FAILs that name the
+        slide index and layout so the maintainer can run the
+        generator (or correct the deck_plan).
+      - Slides whose layout is NOT in the supported set (today only
+        `comparison_table`) are allowed to have no render_model and
+        are not flagged here.
+
+    This stops a fixture from committing e.g. only `01_cover.json`
+    while the deck_plan declares twenty slides — the workspace would
+    otherwise pass every other check because check_render_models
+    only validates files that exist."""
+    out: list[CheckResult] = []
+    rm_dir = workspace / "render_models"
+    if not rm_dir.is_dir():
+        return out
+    rm_files = sorted(rm_dir.glob("*.json"))
+    if not rm_files:
+        return out
+
+    deck_raw, _ = _try_load(workspace / "deck_plan.json")
+    deck = _as_dict(deck_raw) if deck_raw is not None else None
+    if deck is None:
+        # check_schemas / check_template_chain already report this; we
+        # cannot decide coverage without a deck_plan, so don't double-fail.
+        return out
+
+    # Import the generator's authoritative supported-layout list lazily so
+    # this check stays in sync with what the generator can actually emit.
+    # The lazy import avoids a top-level circular dependency:
+    # generate_render_models imports validate_workspace at module load, so
+    # validate_workspace must not import generate_render_models at module
+    # load. By the time this check is called from main() or from a
+    # downstream caller, generate_render_models is safe to import.
+    import importlib
+    try:
+        gen_mod = importlib.import_module("generate_render_models")
+        supported = tuple(getattr(gen_mod, "SUPPORTED_LAYOUTS", ()))
+    except ImportError as exc:
+        out.append(CheckResult(
+            "generator render_model coverage: SUPPORTED_LAYOUTS importable",
+            False, f"could not import generate_render_models: {exc}",
+        ))
+        return out
+    if not supported:
+        out.append(CheckResult(
+            "generator render_model coverage: SUPPORTED_LAYOUTS is non-empty",
+            False, "generate_render_models.SUPPORTED_LAYOUTS is empty",
+        ))
+        return out
+
+    expected: list[tuple[int, str]] = []
+    for s in _as_list(deck.get("slides")) or []:
+        s_d = _as_dict(s)
+        if s_d is None:
+            continue
+        idx = s_d.get("index")
+        layout = s_d.get("layout")
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            continue
+        if not isinstance(layout, str):
+            continue
+        if layout in supported:
+            expected.append((idx, layout))
+
+    if not expected:
+        # Deck_plan has no generator-supported slides — nothing to gate.
+        return out
+
+    present_indices: set[int] = set()
+    for rm_file in rm_files:
+        data, _ = _try_load(rm_file)
+        d = _as_dict(data) if data is not None else None
+        if d is not None and isinstance(d.get("index"), int):
+            present_indices.add(d["index"])
+
+    missing = [(idx, layout) for idx, layout in expected if idx not in present_indices]
+    out.append(CheckResult(
+        f"render_models/ covers every deck_plan slide whose layout is "
+        f"in the generator's supported set "
+        f"({len(expected) - len(missing)}/{len(expected)} present)",
+        not missing,
+        (
+            f"missing render_models for: "
+            f"{', '.join(f'slide {i} ({l})' for i, l in missing)}; "
+            f"run scripts/generate_render_models.py or remove the slide "
+            f"from deck_plan.json"
+        ) if missing else "",
+    ))
+    return out
+
+
+def check_render_model_filenames(workspace: Path) -> list[CheckResult]:
+    """Enforce the canonical render_model filename pattern.
+
+    Every `render_models/*.json` file MUST be named
+    `<index:02d>_<layout>.json` where `index` and `layout` come from
+    inside the JSON. The exporter (`scripts/export_pptx.py`) reads
+    `render_models/*.json` sorted by file stem and treats that order as
+    the deck's slide order, so a file mis-named `99_agenda.json` whose
+    JSON `index` is 2 would be exported as slide N (last) rather than
+    slide 2. The render_model generator always writes the canonical
+    name, but a hand-edited or copied workspace could ship a stale
+    name that still schema-validates. This check is the on-disk gate.
+
+    Schema-invalid render_models (no integer `index`, no string
+    `layout`) are not double-flagged here — `check_render_models`
+    already surfaces those. Files whose JSON contract is intact but
+    whose filename disagrees fail closed with a clear FAIL naming the
+    expected filename."""
+    out: list[CheckResult] = []
+    rm_dir = workspace / "render_models"
+    if not rm_dir.is_dir():
+        return out
+    rm_files = sorted(rm_dir.glob("*.json"))
+    if not rm_files:
+        return out
+    for rm_file in rm_files:
+        data, _ = _try_load(rm_file)
+        d = _as_dict(data) if data is not None else None
+        if d is None:
+            continue  # check_render_models reports loadability/shape
+        idx = d.get("index")
+        layout = d.get("layout")
+        if (
+            not isinstance(idx, int)
+            or isinstance(idx, bool)
+            or not isinstance(layout, str)
+            or not layout
+        ):
+            continue  # check_render_models reports schema-level failures
+        expected_name = f"{idx:02d}_{layout}.json"
+        out.append(CheckResult(
+            f"render_model {rm_file.name}: filename matches "
+            f"<index:02d>_<layout>.json (expected {expected_name!r})",
+            rm_file.name == expected_name,
+            (
+                f"on-disk name {rm_file.name!r} disagrees with the "
+                f"render_model's own index={idx} layout={layout!r}; "
+                f"the exporter sorts render_models/*.json by file stem "
+                f"and would place this slide out of order. Rename to "
+                f"{expected_name!r} or re-run "
+                f"scripts/generate_render_models.py"
+            ) if rm_file.name != expected_name else "",
+        ))
     return out
 
 
@@ -2718,6 +2889,335 @@ def negative_render_model_tempfixture_checks() -> list[CheckResult]:
             "tempfixture: duplicate primitive id is detected",
             detected,
             "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    return out
+
+
+def _build_coverage_template(template_root: Path) -> None:
+    """Build a self-contained template that declares one generator-
+    supported layout (`cover`) and one unsupported one (`comparison_table`).
+    The cover layout's `title` slot mirrors the real business_review
+    cover slot so the test render_model can target it. The
+    comparison_table layout is deliberately included so the coverage
+    check can prove unsupported layouts are NOT flagged."""
+    _make_template_dir(
+        template_root,
+        "coverage_tmpl",
+        layout_files={
+            "cover": {
+                "name": "cover",
+                "slots": [
+                    {
+                        "id": "title", "type": "text", "required": True,
+                        "primitive_kind": "text",
+                        "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200},
+                    },
+                ],
+            },
+            "comparison_table": {
+                "name": "comparison_table",
+                "slots": [
+                    {
+                        "id": "table", "type": "table", "required": True,
+                        "primitive_kind": "table",
+                    },
+                ],
+            },
+        },
+        declared_layouts=["cover", "comparison_table"],
+    )
+
+
+def _build_coverage_workspace(
+    ws: Path,
+    *,
+    deck_slides: list[dict],
+    render_model_indices: list[int],
+) -> None:
+    """Build a deterministic workspace that declares `deck_slides` in
+    deck_plan.json and ships render_models only for the indices in
+    `render_model_indices`. The slide_plans/ directory and the render
+    models themselves use the minimum slot vocabulary the cover layout
+    above declares. Stdlib-only; nothing real referenced."""
+    ws.mkdir(parents=True, exist_ok=True)
+    src_refs = ["synthetic_src_cov"]
+    (ws / "deck_brief.json").write_text(json.dumps({
+        "title": "Coverage", "audience": "A", "objective": "O",
+        "source_refs": src_refs,
+    }))
+    sections = [{
+        "id": "only", "title": "Only", "summary": "x",
+        "slide_indices": [s["index"] for s in deck_slides],
+    }]
+    enriched_slides = [
+        {
+            **s,
+            "section_id": "only",
+            "summary": "x",
+            "density": "low",
+            "source_refs": src_refs,
+        }
+        for s in deck_slides
+    ]
+    (ws / "deck_plan.json").write_text(json.dumps({
+        "template": "coverage_tmpl",
+        "planning": {
+            "planned_slide_count": len(deck_slides),
+            "rationale": "synthetic coverage tempfixture",
+        },
+        "sections": sections,
+        "slides": enriched_slides,
+    }))
+    (ws / "design_system.json").write_text(json.dumps({
+        "palette": {
+            "primary":    "#111111",
+            "background": "#FFFFFF",
+            "text":       "#222222",
+        },
+        "typography": {
+            "heading": {"font_family": "Arial, sans-serif", "size_pt": 28},
+            "body":    {"font_family": "Arial, sans-serif", "size_pt": 14},
+        },
+        "grid": {"width_px": 1920, "height_px": 1080, "margin_px": 64},
+    }))
+    (ws / "image_manifest.json").write_text(json.dumps({"images": []}))
+
+    (ws / "slide_plans").mkdir(exist_ok=True)
+    for s in enriched_slides:
+        idx = s["index"]
+        (ws / "slide_plans" / f"{idx:02d}.json").write_text(json.dumps({
+            "index": idx,
+            "layout": s["layout"],
+            "title": s["title"],
+            "blocks": [
+                {"id": "title", "kind": "text", "content": s["title"]},
+            ],
+        }))
+
+    (ws / "render_models").mkdir(exist_ok=True)
+    for s in enriched_slides:
+        idx = s["index"]
+        if idx not in render_model_indices:
+            continue
+        (ws / "render_models" / f"{idx:02d}.json").write_text(json.dumps({
+            "index": idx,
+            "layout": s["layout"],
+            "canvas": {"width_px": 1920, "height_px": 1080},
+            "source_refs": src_refs,
+            "primitives": [
+                {
+                    "id": "title",
+                    "slot_id": "title",
+                    "kind": "text",
+                    "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200},
+                    "style": {
+                        "color_token": "palette.text",
+                        "typography_token": "typography.heading",
+                    },
+                    "text": {"content": s["title"], "role": "heading"},
+                },
+            ],
+        }))
+
+
+def negative_render_model_coverage_tempfixture_checks() -> list[CheckResult]:
+    """Negative tempfixtures proving check_generator_render_model_coverage
+    fails closed on a partially-covered workspace and is permissive of
+    unsupported-layout slides that have no render_model.
+
+    Cases:
+      A. Full coverage of two supported-layout slides PASSES the check.
+      B. Partial coverage (slide 1 has a render_model, slide 2 does not)
+         FAILS the check and names the missing index + layout.
+      C. A workspace whose deck_plan mixes a supported slide WITH a
+         render_model and an unsupported (`comparison_table`) slide
+         WITHOUT one PASSES the check — unsupported layouts are not
+         required to have render_models.
+      D. An empty render_models/ directory does NOT trigger the check
+         (matches check_render_models policy: an empty directory means
+         "not yet generated", not "drift")."""
+    import tempfile
+    out: list[CheckResult] = []
+
+    # A. Full coverage of two supported slides passes.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_coverage_template(tr)
+        ws = root / "ws"
+        _build_coverage_workspace(
+            ws,
+            deck_slides=[
+                {"index": 1, "layout": "cover", "title": "First"},
+                {"index": 2, "layout": "cover", "title": "Second"},
+            ],
+            render_model_indices=[1, 2],
+        )
+        results = check_generator_render_model_coverage(ws, tr)
+        out.append(CheckResult(
+            "tempfixture coverage: full coverage of supported slides passes",
+            all(r.ok for r in results),
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # B. Partial coverage flags the missing supported slide.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_coverage_template(tr)
+        ws = root / "ws"
+        _build_coverage_workspace(
+            ws,
+            deck_slides=[
+                {"index": 1, "layout": "cover", "title": "First"},
+                {"index": 2, "layout": "cover", "title": "Second"},
+            ],
+            render_model_indices=[1],
+        )
+        results = check_generator_render_model_coverage(ws, tr)
+        detected = any(
+            "covers every deck_plan slide" in r.name
+            and not r.ok
+            and "slide 2 (cover)" in r.detail
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture coverage: partial drift (1 of 2 supported "
+            "slides has a render_model) is detected and names the "
+            "missing index + layout",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # C. Unsupported-layout slide with no render_model does NOT fail.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_coverage_template(tr)
+        ws = root / "ws"
+        _build_coverage_workspace(
+            ws,
+            deck_slides=[
+                {"index": 1, "layout": "cover", "title": "First"},
+                {"index": 2, "layout": "comparison_table", "title": "Compare"},
+            ],
+            render_model_indices=[1],
+        )
+        results = check_generator_render_model_coverage(ws, tr)
+        out.append(CheckResult(
+            "tempfixture coverage: unsupported-layout slide with no "
+            "render_model is allowed (not flagged)",
+            all(r.ok for r in results),
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # D. Empty render_models/ is allowed (matches check_render_models
+    # policy: empty directory means "not yet generated", not "drift").
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_coverage_template(tr)
+        ws = root / "ws"
+        _build_coverage_workspace(
+            ws,
+            deck_slides=[
+                {"index": 1, "layout": "cover", "title": "First"},
+            ],
+            render_model_indices=[],
+        )
+        results = check_generator_render_model_coverage(ws, tr)
+        out.append(CheckResult(
+            "tempfixture coverage: empty render_models/ does not trigger "
+            "the coverage check",
+            not results,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    return out
+
+
+def _write_agenda_render_model(ws: Path, *, filename: str) -> None:
+    """Helper for the filename tempfixtures. Writes a schema-valid
+    agenda render_model at workspace/render_models/<filename> with
+    fixed `index=2` and `layout='agenda'` so the test can rename the
+    file independently of the JSON contract."""
+    rm_dir = ws / "render_models"
+    rm_dir.mkdir(parents=True, exist_ok=True)
+    (rm_dir / filename).write_text(json.dumps({
+        "index": 2,
+        "layout": "agenda",
+        "canvas": {"width_px": 1920, "height_px": 1080},
+        "source_refs": ["synthetic_src_x"],
+        "primitives": [
+            {
+                "id": "title",
+                "slot_id": "title",
+                "kind": "text",
+                "bounds": {"x": 64, "y": 80, "w": 1792, "h": 100},
+                "style": {
+                    "color_token": "palette.text",
+                    "typography_token": "typography.heading",
+                },
+                "text": {"content": "Agenda", "role": "heading"},
+            },
+        ],
+    }))
+
+
+def negative_render_model_filename_tempfixture_checks() -> list[CheckResult]:
+    """Negative tempfixture proving check_render_model_filenames fails
+    closed on a render_model whose on-disk filename disagrees with its
+    own JSON `index` + `layout`. The exporter sorts
+    `render_models/*.json` by file stem, so a mis-named file would
+    silently land in the wrong slide position. This is the on-disk
+    gate that the canonical-name contract is enforced even when the
+    JSON content itself is schema-valid.
+
+    Cases:
+      A. Canonical filename `02_agenda.json` whose JSON declares
+         `index=2 layout="agenda"` PASSES.
+      B. Renaming the same render_model to `99_agenda.json` (as
+         the Codex review scenario describes) FAILS, and the failure
+         message names the expected canonical filename so the
+         maintainer can fix it."""
+    import tempfile
+    out: list[CheckResult] = []
+
+    # A. Canonical name passes.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        ws.mkdir()
+        _write_agenda_render_model(ws, filename="02_agenda.json")
+        results = check_render_model_filenames(ws)
+        out.append(CheckResult(
+            "tempfixture filename: canonical 02_agenda.json passes",
+            results and all(r.ok for r in results),
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # B. Renaming to 99_agenda.json fails closed with a clear message.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        ws.mkdir()
+        _write_agenda_render_model(ws, filename="99_agenda.json")
+        results = check_render_model_filenames(ws)
+        detected = any(
+            "filename matches" in r.name
+            and not r.ok
+            and "02_agenda.json" in r.detail
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture filename: 99_agenda.json (renamed from "
+            "02_agenda.json) fails closed and names the expected "
+            "canonical filename",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
         ))
 
     return out
@@ -4539,6 +5039,13 @@ def main(argv: list[str]) -> int:
          check_image_manifest(args.workspace)),
         ("render_models: schema + cross-artifact controlled-primitive contract",
          check_render_models(args.workspace, args.template_root)),
+        ("render_models coverage: every generator-supported deck_plan "
+         "slide has a render_model (unsupported layouts may be absent)",
+         check_generator_render_model_coverage(args.workspace, args.template_root)),
+        ("render_models filename: every render_models/*.json file is "
+         "named <index:02d>_<layout>.json matching its own JSON "
+         "(protects exporter slide order, which sorts by file stem)",
+         check_render_model_filenames(args.workspace)),
         ("svg_previews: per-render_model SVG exists + canvas viewBox + "
          "no <foreignObject> + reference safety + bounds inside canvas",
          check_svg_previews(args.workspace, args.template_root)),
@@ -4562,6 +5069,18 @@ def main(argv: list[str]) -> int:
          "unknown palette token, source_refs cross-check fails closed when "
          "deck_brief is missing / malformed / empty, duplicate primitive ids",
          negative_render_model_tempfixture_checks()),
+        ("negative tempfixtures (render_model coverage): partial-drift "
+         "workspace (some generator-supported slides missing render_models) "
+         "is detected; full coverage and unsupported-layout-without-"
+         "render_model fixtures are allowed; empty render_models/ does not "
+         "trigger the check",
+         negative_render_model_coverage_tempfixture_checks()),
+        ("negative tempfixtures (render_model filename): a render_model "
+         "whose on-disk filename disagrees with its own JSON index + "
+         "layout fails closed (e.g. 02_agenda.json renamed to "
+         "99_agenda.json) so the exporter's file-stem-sorted slide "
+         "order is protected",
+         negative_render_model_filename_tempfixture_checks()),
         ("negative tempfixtures (svg_preview): missing svg_preview, "
          "malformed XML, wrong root, viewBox mismatch, <foreignObject>, "
          "href URL / file:// / absolute / '..' / data: / javascript:, "

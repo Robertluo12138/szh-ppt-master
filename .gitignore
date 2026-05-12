@@ -49,6 +49,9 @@ node_modules/
 *.swo
 *~
 
+# Claude Code worktrees and local agent metadata
+.claude/
+
 # Logs and temp
 *.log
 *.tmp
