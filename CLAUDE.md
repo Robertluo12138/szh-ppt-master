@@ -14,16 +14,17 @@ Claude Code's job is to implement the user's current prompt narrowly, preserve t
 
 ## Current Capability Surface
 
-The repo currently contains scaffold docs, JSON schemas, template skeletons, synthetic examples, stdlib-only validators, a deterministic render-model generator (`scripts/generate_render_models.py`), a deterministic SVG preview renderer (`scripts/generate_svg_previews.py`), and a deterministic native editable PPTX exporter (`scripts/export_pptx.py`). All three downstream stages consume `render_model.json` directly and cover the same minimal supported subset:
+The repo currently contains scaffold docs, JSON schemas, template skeletons, synthetic examples, stdlib-only validators, a deterministic render-model generator (`scripts/generate_render_models.py`), a deterministic SVG preview renderer (`scripts/generate_svg_previews.py`), and a deterministic native editable PPTX exporter (`scripts/export_pptx.py`). All three downstream stages consume `render_model.json` directly. Coverage today:
 
-- supported layouts: `cover` and `kpi_dashboard`;
-- supported primitive kinds: `text`, `line`, `shape`, `image_slot`, `kpi`.
+- render-model generator supported layouts: `cover`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `kpi_dashboard`, `timeline`, `conclusion` (every emit uses only the controlled primitive kinds below);
+- SVG preview supported primitive kinds: `text`, `line`, `shape`, `image_slot`, `kpi` — i.e. exactly the kinds the render-model generator emits today;
+- PPTX exporter supported layouts: `cover`, `kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `timeline`, `conclusion`, with the same `text` / `line` / `shape` / `image_slot` / `kpi` primitive set. The slide-body emitter is layout-agnostic — it walks the render_model's `primitives` list — so the allow-list is a contract gate, not per-shape logic. `comparison_table` is intentionally NOT in the allow-list because it requires the still-unsupported `table` primitive.
 
-`image_slot` is exported as a native PPTX placeholder shape carrying the `image_manifest` alt_text; media embedding (copying PNG / JPG / SVG bytes into `ppt/media/`) is intentionally TODO. Anything outside the supported subset must fail closed: `table` and `chart_placeholder` primitives, every other layout, malformed render_models, undeclared image refs, and unsafe manifest paths all abort the run with a clear per-slide error rather than producing a partial deck.
+`image_slot` is exported as a native PPTX placeholder shape carrying the `image_manifest` alt_text; media embedding (copying PNG / JPG / SVG bytes into `ppt/media/`) is intentionally TODO. Anything outside the supported subset must fail closed: `table` and `chart_placeholder` primitives, layouts outside the per-stage allow-lists above (including `comparison_table` everywhere), malformed render_models, undeclared image refs, and unsafe manifest paths all abort the run with a clear per-slide error rather than producing a partial deck.
 
-Full PPTX coverage (every layout, every primitive, embedded media, full editability inventory, relationship allow-list, theme palette mapping, determinism inventory), chart rendering, visual regression, D-One integration, and Qoder CLI integration are **not** implemented; SVG repair (clipping out-of-bounds shapes, font fallback) and glyph-level text-overflow detection also remain TODO.
+The PPTX contract validator (`scripts/validate_pptx_contract.py`) now enforces `relationships.allow_list` over the five canonical OOXML rel types the exporter emits today (`officeDocument`, `slide`, `slideMaster`, `slideLayout`, `theme`) and `minimal_evidence.every_slide_has_native_shape` alongside the earlier container, package, and minimal-evidence gates. Full PPTX coverage (every layout, every primitive, embedded media, full editability inventory, theme palette mapping, determinism inventory, layout/primitive-scope inspection of the produced PPTX, media inventory) remains **not** implemented; chart rendering, visual regression, D-One integration, Qoder CLI integration, arbitrary-SVG parsing, and full-slide raster fallback also remain TODO. SVG repair (clipping out-of-bounds shapes, font fallback) and glyph-level text-overflow detection are still TODO.
 
-Do not document unimplemented stages as working behavior, and do not claim end-to-end success — the pipeline now stops at the minimal native editable PPTX for the supported subset.
+Do not document unimplemented stages as working behavior, and do not claim end-to-end success — the pipeline now stops at the expanded native editable PPTX for the supported subset above.
 
 ## Architecture Notes
 

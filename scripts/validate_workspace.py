@@ -105,12 +105,17 @@ TRACEBACK SAFETY
 OUT OF SCOPE
     This validator does NOT generate SVG. SVG generation is a separate
     stage implemented by scripts/generate_svg_previews.py (today supporting
-    primitive kinds text / line / shape / image_slot / kpi for the cover
-    and kpi_dashboard layouts). Validation of the generated previews is
-    performed here by check_svg_previews above.
-    PPTX export, D-One image generation, Qoder CLI integration, and any
-    network behavior are NOT implemented in this repo and remain out of
-    scope until their scripts exist.
+    primitive kinds text / line / shape / image_slot / kpi across every
+    layout the render-model generator emits — cover, section_divider,
+    executive_summary, key_message, two_column, kpi_dashboard, timeline,
+    conclusion). Validation of the generated previews is performed here by
+    check_svg_previews above.
+    PPTX export is implemented separately by scripts/export_pptx.py (today
+    covering layouts cover, kpi_dashboard, agenda, section_divider,
+    executive_summary, key_message, two_column, timeline, conclusion with
+    the same controlled primitive kinds); D-One image generation, Qoder
+    CLI integration, and any network behavior are NOT implemented in this
+    repo and remain out of scope until their scripts exist.
 """
 
 from __future__ import annotations

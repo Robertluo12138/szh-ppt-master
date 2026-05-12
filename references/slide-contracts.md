@@ -58,7 +58,7 @@ A `slide_plan` is valid against a layout when every `required` slot has a matchi
 
 ## Controlled render model (per slide)
 
-The `render_model` is the per-slide intermediate that the SVG preview renderer (implemented today for a subset of kinds; see below) and the future editable PPTX exporter both consume. PPTX export is **not implemented yet**; the SVG preview stage is partially implemented and described under "SVG preview generator" below.
+The `render_model` is the per-slide intermediate that the SVG preview renderer (implemented today for a subset of kinds; see below) and the expanded editable PPTX exporter (`scripts/export_pptx.py`, covering layouts `cover`, `kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `timeline`, `conclusion` with primitive kinds `text` / `line` / `shape` / `image_slot` / `kpi`; everything else fails closed) both consume. See `references/pptx-conversion-rules.md` for the PPTX exporter contract.
 
 Authoritative shape lives in `schemas/render_model.schema.json`. Key invariants:
 
