@@ -3,12 +3,17 @@
 
 Stdlib-only **contract / skeleton** validator for the editable-ppt
 pipeline's PPTX output stage. The PPTX exporter (`scripts/export_pptx.py`)
-now produces a minimal native editable subset — `cover` and
-`kpi_dashboard` layouts, primitives `text` / `line` / `shape` /
-`image_slot` / `kpi` — and this validator gates that output with both
-the original container checks and a new set of MINIMAL-EVIDENCE checks
-(see below). Deeper editability / relationship / media / determinism
-validations remain TODO and are explicitly named that way in every run.
+now produces an expanded native editable subset — the `cover`,
+`kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`,
+`key_message`, `two_column`, `timeline`, and `conclusion` layouts;
+primitives `text` / `line` / `shape` / `image_slot` / `kpi` — and this
+validator gates that output with both the original container checks
+and a set of MINIMAL-EVIDENCE checks (see below), including a
+relationship `Type` allow-list. `comparison_table`, the `table` and
+`chart_placeholder` primitives, media embedding, full editability
+inventory, theme palette mapping, determinism, and layout/primitive-
+scope inspection of the produced PPTX all remain TODO and are
+explicitly named that way in every run.
 
 USAGE
     # Skeleton mode (no .pptx supplied). Reports the contract /
@@ -49,6 +54,16 @@ CHECKS TODAY (all fail-closed; exit 1 on any failure)
                             'file://'. (Subset of the above, but
                             called out separately so a file:// regression
                             is unmistakable in the report.)
+    relationships.allow_list
+                          — every Relationship Type is one of the
+                            five URLs the minimal exporter is allowed
+                            to emit today: officeDocument, slide,
+                            slideMaster, slideLayout, theme. An
+                            unexpected Type (hyperlink, comments,
+                            image, chart, embedding, ...) fails the
+                            gate. Maintenance note: the allow-list
+                            widens with the exporter — e.g. media
+                            embedding will add the `image` URL.
     package.no_macros     — no vbaProject.bin part; no
                             'vbaProject' content type override.
     package.no_ole        — no part under ppt/embeddings/ and no
@@ -80,6 +95,19 @@ CHECKS TODAY (all fail-closed; exit 1 on any failure)
                             empty (which would otherwise satisfy
                             editable_text and not_all_image_slide
                             individually).
+    minimal_evidence.every_slide_has_native_shape
+                          — every slide carries at least one native
+                            editable structure (<p:sp> or <p:cxnSp>).
+                            This is the single positive statement of
+                            "every slide has at least one native
+                            editable structure"; the combination of
+                            not_all_image_slide + no_blank_slide
+                            already covers the same surface as failure-
+                            mode disambiguation, but this gate spells
+                            the contract out as one explicit positive
+                            check so a regression is unmistakable.
+                            Still minimal evidence — it counts
+                            structures, not per-shape editability.
 
 TODO (explicitly NOT implemented; reported as TODO every run)
     editability.full_inventory — every text frame on every slide is
@@ -89,34 +117,35 @@ TODO (explicitly NOT implemented; reported as TODO every run)
         full inventory needs per-shape introspection.
     no_image_only_slides.full_inventory — every slide has been
         positively confirmed to contain at least one editable shape.
-        The minimal_evidence.not_all_image_slide check rules out the
-        obvious case; a full inventory needs per-shape introspection.
-    relationships.allow_list — narrow the relationship type set to an
-        explicit allow-list (slide, slideMaster, slideLayout, theme,
-        officeDocument). Today the script only rejects unsafe Targets,
-        not unexpected rel types.
+        The minimal_evidence.not_all_image_slide +
+        minimal_evidence.every_slide_has_native_shape pair rules out
+        the obvious failure modes; a full per-shape inventory still
+        needs per-shape introspection.
     media.embedded_only — every media item is embedded inside the
         package (no remote refs, no absolute paths). Today the
-        relationships.no_external check is the closest gate; a media
-        inventory is still TODO.
+        relationships.no_external + relationships.allow_list pair is
+        the closest gate; a media inventory is still TODO.
     media.inventory — every media item exists inside the package and
         no slide carries a dangling reference.
     theme.palette_mapping — design_system palette resolves to the
         matching PPTX theme slots.
     determinism — stable IDs, relationship order, and media filenames
         across runs.
-    layouts.scope — initial export covers only the cover and
-        kpi_dashboard layouts (the exporter enforces this today; this
-        validator does not yet read the layout slot back out of the
-        PPTX).
+    layouts.scope — exported slides use only the expanded
+        SUPPORTED_LAYOUTS allow-list in scripts/export_pptx.py (the
+        exporter enforces this today; this validator does not yet
+        read the layout slot back out of the PPTX).
     primitives.scope — initial export covers only the supported five
         primitive kinds (the exporter enforces this today; this
         validator does not yet inspect every shape's mapped primitive).
 
 OUT OF SCOPE FOR THIS SCRIPT
     Generating PPTX (that is `scripts/export_pptx.py`). Full
-    editability inventory, relationship allow-listing, media
-    inventory. Any network behavior.
+    editability inventory, media inventory, theme palette mapping,
+    determinism inventory, and layout/primitive-scope inspection of
+    the produced PPTX. Any network behavior. (The relationship `Type`
+    allow-list is now in scope as relationships.allow_list — see the
+    CHECKS TODAY block above.)
 
 EXIT
     0  every executed check passed and all skeleton/TODO entries were
@@ -140,8 +169,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Basic OOXML / PresentationML package entries that any valid PPTX
-# must carry. The deeper allow-list / native-object inspection is
-# TODO (see references/pptx-conversion-rules.md). Keep this list
+# must carry. The deeper full-inventory native-object inspection is
+# still TODO (see references/pptx-conversion-rules.md). Keep this list
 # narrow — it is the minimum container shape, not the full contract.
 REQUIRED_OOXML_PARTS: tuple[str, ...] = (
     "[Content_Types].xml",
@@ -171,6 +200,22 @@ _FORBIDDEN_PARTS: tuple[tuple[str, str, str], ...] = (
     ("package.no_activex",  "ppt/activeX/",       "activeX"),
 )
 
+# Relationship type URLs the minimal exporter is allowed to emit
+# today. Anything outside this allow-list fails relationships.allow_list.
+# The set is intentionally narrow: it covers exactly the relationships
+# scripts/export_pptx.py emits (officeDocument under the root, slide /
+# slideMaster / theme under presentation, slideLayout / theme under
+# slideMaster, slideMaster under slideLayout, slideLayout under each
+# slide). Widening the exporter — e.g. adding media embedding — must
+# also widen this set (e.g. add the `image` URL).
+_ALLOWED_RELATIONSHIP_TYPES: frozenset[str] = frozenset({
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
+})
+
 # Pretty-printed TODO surface. Reported every run so callers cannot
 # mistake a passing container check for a passing export contract.
 # The entries narrow as the validator grows: items the validator now
@@ -184,13 +229,12 @@ TODO_CHECKS: tuple[tuple[str, str], ...] = (
     ("no_image_only_slides.full_inventory",
      "every slide is positively confirmed to contain editable shapes; "
      "minimal_evidence.not_all_image_slide + minimal_evidence.no_blank_slide "
-     "rule out the all-image and blank-slide failure modes only"),
-    ("relationships.allow_list",
-     "narrow the relationship type set to an explicit allow-list "
-     "(slide, slideMaster, slideLayout, theme, officeDocument)"),
+     "+ minimal_evidence.every_slide_has_native_shape rule out the "
+     "all-image and blank-slide failure modes only"),
     ("media.embedded_only",
      "every media item is embedded inside the package "
-     "(relationships.no_external is the closest gate today)"),
+     "(relationships.no_external + relationships.allow_list are the "
+     "closest gates today)"),
     ("media.inventory",
      "every media item exists inside the package; no dangling refs"),
     ("theme.palette_mapping",
@@ -198,9 +242,10 @@ TODO_CHECKS: tuple[tuple[str, str], ...] = (
     ("determinism",
      "stable IDs, relationship order, and media filenames across runs"),
     ("layouts.scope",
-     "validate that exported slides use only cover / kpi_dashboard "
-     "layouts (the exporter enforces this; the validator does not yet "
-     "read layout slot info back out of the PPTX)"),
+     "validate that exported slides use only layouts on the "
+     "scripts/export_pptx.py SUPPORTED_LAYOUTS allow-list (the "
+     "exporter enforces this; the validator does not yet read layout "
+     "slot info back out of the PPTX)"),
     ("primitives.scope",
      "validate that exported shapes map only to the supported five "
      "primitive kinds (the exporter enforces this; the validator does "
@@ -403,20 +448,31 @@ def check_generated_pptx(pptx_path: Path) -> list[CheckResult]:
              f"{', '.join(slide_parts) if slide_parts else '(none)'}"),
         ))
 
-        # 2 + 3. relationships.no_external + relationships.no_file_uri
+        # 2 + 3 + 4. relationships.no_external +
+        # relationships.no_file_uri + relationships.allow_list.
+        # All three iterate every <Relationship> element in every
+        # *.rels member, but each gate is reported separately so a
+        # caller can see which contract dimension a fixture trips.
+        # (A relationship with an external https:// Target and an
+        # unknown Type trips both relationships.no_external AND
+        # relationships.allow_list — that is the intended overlap.)
         rels_parts = _iter_rels_parts(names_set)
         rels = _all_relationships(rels_parts, zf)
         external_offenders: list[str] = []
         file_uri_offenders: list[str] = []
+        allow_list_offenders: list[str] = []
         for part, attrs in rels:
             target = attrs.get("Target", "")
             target_mode = attrs.get("TargetMode", "")
+            rtype = attrs.get("Type", "")
             if target_mode and target_mode.lower() == "external":
                 external_offenders.append(f"{part}: {attrs}")
             if isinstance(target, str) and _URI_SCHEME_PREFIX.match(target):
                 external_offenders.append(f"{part}: Target={target!r}")
             if isinstance(target, str) and target.lower().startswith("file://"):
                 file_uri_offenders.append(f"{part}: Target={target!r}")
+            if not isinstance(rtype, str) or rtype not in _ALLOWED_RELATIONSHIP_TYPES:
+                allow_list_offenders.append(f"{part}: Type={rtype!r}")
         out.append(CheckResult(
             f"relationships.no_external: {pptx_path.name}",
             not external_offenders,
@@ -426,6 +482,11 @@ def check_generated_pptx(pptx_path: Path) -> list[CheckResult]:
             f"relationships.no_file_uri: {pptx_path.name}",
             not file_uri_offenders,
             ("; ".join(file_uri_offenders) if file_uri_offenders else ""),
+        ))
+        out.append(CheckResult(
+            f"relationships.allow_list: {pptx_path.name}",
+            not allow_list_offenders,
+            ("; ".join(allow_list_offenders) if allow_list_offenders else ""),
         ))
 
         # 4 + 5 + 6. package.no_macros, package.no_ole, package.no_activex
@@ -466,11 +527,12 @@ def check_generated_pptx(pptx_path: Path) -> list[CheckResult]:
             # If there are zero slides, every per-slide check is
             # meaningless; the slide_count.inspectable FAIL above
             # already tells the caller why. Emit informative FAILs
-            # for all three so the report stays consistent.
+            # for all four so the report stays consistent.
             for gate in (
                 "minimal_evidence.editable_text",
                 "minimal_evidence.not_all_image_slide",
                 "minimal_evidence.no_blank_slide",
+                "minimal_evidence.every_slide_has_native_shape",
             ):
                 out.append(CheckResult(
                     f"{gate}: {pptx_path.name}",
@@ -481,14 +543,17 @@ def check_generated_pptx(pptx_path: Path) -> list[CheckResult]:
             editable_slides: list[str] = []
             offending_image_slides: list[str] = []
             blank_slides: list[str] = []
+            no_native_shape_slides: list[str] = []
             for part in slide_parts:
                 n_sp, n_cxn, n_tx, n_pic = _slide_shape_counts(zf, part)
                 if n_tx > 0:
                     editable_slides.append(part)
-                if n_sp == 0 and n_cxn == 0:
-                    # No native editable shape on this slide. Disambiguate
-                    # the failure mode: a `<p:pic>`-only slide is
-                    # "all-image"; an spTree with nothing in it is "blank".
+                if n_sp + n_cxn == 0:
+                    # Single positive statement of "every slide has at
+                    # least one native editable structure". The
+                    # not_all_image_slide / no_blank_slide split below
+                    # disambiguates the failure mode for the report.
+                    no_native_shape_slides.append(part)
                     if n_pic > 0:
                         offending_image_slides.append(part)
                     else:
@@ -514,6 +579,15 @@ def check_generated_pptx(pptx_path: Path) -> list[CheckResult]:
                 (f"blank slides (zero <p:sp>, <p:cxnSp>, and <p:pic>): "
                  f"{blank_slides}"
                  if blank_slides else ""),
+            ))
+            out.append(CheckResult(
+                f"minimal_evidence.every_slide_has_native_shape: "
+                f"{pptx_path.name}",
+                not no_native_shape_slides,
+                (f"slides with zero <p:sp>/<p:cxnSp> "
+                 f"(all-image and blank slides combined): "
+                 f"{no_native_shape_slides}"
+                 if no_native_shape_slides else ""),
             ))
     finally:
         zf.close()
@@ -603,8 +677,9 @@ def run(pptx_path: Path | None) -> int:
         print(
             "OK (container + minimal-evidence): basic OOXML container "
             "checks passed AND minimal-evidence safety / editability "
-            "gates passed. Deeper full-inventory editability, "
-            "relationship allow-list, media inventory, theme palette "
+            "gates passed (including relationships.allow_list and "
+            "minimal_evidence.every_slide_has_native_shape). Deeper "
+            "full-inventory editability, media inventory, theme palette "
             "mapping, determinism, layout-scope, and primitive-scope "
             "checks remain TODO."
         )
@@ -726,9 +801,12 @@ def _run_tempfixture_negatives() -> list[CheckResult]:
       - ppt/embeddings/oleObject1.bin — fails package.no_ole;
       - ppt/activeX/activeX1.xml — fails package.no_activex;
       - slide with only a <p:pic> (no <p:sp>/<p:cxnSp>) — fails
-        minimal_evidence.not_all_image_slide;
+        minimal_evidence.not_all_image_slide AND
+        minimal_evidence.every_slide_has_native_shape;
       - slide with no <p:txBody> anywhere — fails
-        minimal_evidence.editable_text.
+        minimal_evidence.editable_text;
+      - relationship with an unexpected Type URL (comments) — fails
+        relationships.allow_list even though Target is local.
 
     Generated-pptx positive:
       - minimal editable PPTX (one <p:sp> with a non-empty <a:t>) —
@@ -951,6 +1029,59 @@ def _run_tempfixture_negatives() -> list[CheckResult]:
             "; ".join(r.detail for r in g_res if not r.ok),
         ))
 
+        # 16. minimal_evidence.every_slide_has_native_shape — both an
+        # all-image slide AND a blank slide fail the single positive
+        # gate. We reuse the all-image fixture (slide carries only a
+        # <p:pic>) and confirm the new gate fires.
+        all_image_native_check = td / "all_image_native_check.pptx"
+        _write_minimal_editable_pptx(
+            all_image_native_check,
+            slides=[_PIC_ONLY_XML],
+        )
+        g_res = check_generated_pptx(all_image_native_check)
+        out.append(CheckResult(
+            "tempfixture: all-image slide fails "
+            "minimal_evidence.every_slide_has_native_shape",
+            any(
+                r.name.startswith(
+                    "minimal_evidence.every_slide_has_native_shape"
+                )
+                and not r.ok
+                for r in g_res
+            ),
+            "; ".join(r.detail for r in g_res if not r.ok),
+        ))
+
+        # 17. relationships.allow_list — a relationship with an
+        # unexpected Type URL (e.g. comments) fails the allow-list
+        # gate even when its Target is local and lacks a URI scheme.
+        # This is what distinguishes allow_list from no_external:
+        # both fail under an https:// Target, but only allow_list
+        # fires on an unknown internal Type.
+        bad_rel_type_pptx = td / "bad_rel_type.pptx"
+        _write_minimal_editable_pptx(bad_rel_type_pptx, slides=[_EDITABLE_SP_XML])
+        with zipfile.ZipFile(bad_rel_type_pptx, "a") as zf:
+            zf.writestr(
+                "ppt/_rels/presentation.xml.rels",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rIdC" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" '
+                'Target="comments/comment1.xml"/>'
+                '</Relationships>'
+            )
+        g_res = check_generated_pptx(bad_rel_type_pptx)
+        out.append(CheckResult(
+            "tempfixture: unexpected relationship Type fails "
+            "relationships.allow_list",
+            any(
+                r.name.startswith("relationships.allow_list")
+                and not r.ok
+                for r in g_res
+            ),
+            "; ".join(r.detail for r in g_res if not r.ok),
+        ))
+
     return out
 
 
@@ -976,19 +1107,22 @@ def main(argv: list[str]) -> int:
         description=(
             "PPTX export contract / minimal-evidence validator "
             "(stdlib-only, fail-closed). The PPTX exporter "
-            "(scripts/export_pptx.py) produces a minimal native "
-            "editable subset — cover and kpi_dashboard layouts; "
+            "(scripts/export_pptx.py) produces a native editable "
+            "subset — the cover / kpi_dashboard / agenda / "
+            "section_divider / executive_summary / key_message / "
+            "two_column / timeline / conclusion layouts; "
             "text / line / shape / image_slot / kpi primitives — and "
             "this validator gates that output. With --pptx, runs the "
             "basic OOXML container checks AND the minimal-evidence "
             "safety/editability checks (slide count, no external rels, "
-            "no file:// rels, no macros / OLE / ActiveX parts, at "
-            "least one editable text run, no all-image slide, no "
-            "blank slide). Without --pptx, runs in skeleton mode and "
-            "only reports the contract / TODO surface. --self-test "
-            "runs the in-script tempfixture negatives + positives. "
-            "The TODO surface is reported in every run and is also "
-            "listed below in --help."
+            "no file:// rels, relationship Type allow-list, no macros / "
+            "OLE / ActiveX parts, at least one editable text run, no "
+            "all-image slide, no blank slide, every slide carries at "
+            "least one <p:sp> or <p:cxnSp>). Without --pptx, runs in "
+            "skeleton mode and only reports the contract / TODO "
+            "surface. --self-test runs the in-script tempfixture "
+            "negatives + positives. The TODO surface is reported in "
+            "every run and is also listed below in --help."
         ),
         epilog=_todo_epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1009,9 +1143,11 @@ def main(argv: list[str]) -> int:
         help=(
             "Run the in-script tempfixture negatives (missing file, "
             "wrong extension, non-zip content, empty ZIP, ZIP missing "
-            "ppt/presentation.xml, external rel, file:// rel, vba / "
-            "OLE / ActiveX parts, all-image slide, no editable text, "
-            "blank slide alongside an editable one) plus a "
+            "ppt/presentation.xml, external rel, file:// rel, "
+            "unexpected relationship Type, vba / OLE / ActiveX parts, "
+            "all-image slide [fails both not_all_image_slide and "
+            "every_slide_has_native_shape], no editable text, blank "
+            "slide alongside an editable one) plus a "
             "minimal-valid-container positive and a minimal-editable "
             "PPTX positive. Exits non-zero if any negative is not "
             "caught or any positive is not accepted."

@@ -6,8 +6,18 @@ editable-ppt pipeline. Consumes a workspace's `render_models/*.json`
 directly and emits one editable `.pptx` covering the currently
 supported subset:
 
-    layouts:         cover, kpi_dashboard
+    layouts:         cover, kpi_dashboard, agenda, section_divider,
+                     executive_summary, key_message, two_column,
+                     timeline, conclusion
     primitive kinds: text, line, shape, image_slot, kpi
+
+The slide body emitter is layout-agnostic — it iterates the
+render_model's `primitives` list and emits one native PPTX object per
+primitive — so widening the layout allow-list does not change how any
+single shape is rendered. The `comparison_table` layout is intentionally
+NOT in the allow-list because its primary content is a `table`
+primitive, which remains fail-closed (no native PPTX-table emission
+yet).
 
 This is NOT a generic SVG-to-PPTX converter. It does NOT parse SVG, it
 does NOT screenshot a slide, and it does NOT rasterize a slide into a
@@ -67,11 +77,15 @@ PREFLIGHT GATES (run BEFORE any output ZIP is created)
 PER-SLIDE GATES (every gate FAILS CLOSED for that slide and aborts
 the whole run; no partial `.pptx` is written if ANY render_model
 trips ANY gate)
-    - layout is in SUPPORTED_LAYOUTS (cover, kpi_dashboard); a
-      render_model whose layout is outside that set fails closed with
-      a per-slide error. The contract is intentionally all-or-nothing:
-      the exporter refuses to write a deck that silently drops
-      coverage for slides whose layout is not yet implemented.
+    - layout is in SUPPORTED_LAYOUTS (cover, kpi_dashboard, agenda,
+      section_divider, executive_summary, key_message, two_column,
+      timeline, conclusion); a render_model whose layout is outside
+      that set fails closed with a per-slide error. The contract is
+      intentionally all-or-nothing: the exporter refuses to write a
+      deck that silently drops coverage for slides whose layout is
+      not yet implemented. `comparison_table` is intentionally
+      excluded because it needs the still-unsupported `table`
+      primitive.
     - every primitive kind is in SUPPORTED_PRIMITIVE_KINDS (text, line,
       shape, image_slot, kpi); a `table` or `chart_placeholder`
       primitive fails closed with an explicit error.
@@ -101,7 +115,9 @@ OUT OF SCOPE
       a placeholder shape only).
     - PPTX `table` / `chart_placeholder` emission (deferred — fail
       closed today).
-    - Layouts other than cover / kpi_dashboard.
+    - Layouts outside the SUPPORTED_LAYOUTS allow-list above
+      (`comparison_table` is the only template-declared layout left
+      out; it requires the still-unsupported `table` primitive).
     - Speaker notes, transitions, animations, master/layout palettes
       driven by deck-plan template themes.
     - D-One image generation, Qoder CLI integration, public network
@@ -144,7 +160,25 @@ from validate_workspace import (  # noqa: E402
 
 SCHEMAS = REPO_ROOT / "schemas"
 
-SUPPORTED_LAYOUTS = ("cover", "kpi_dashboard")
+# Layouts the exporter is willing to emit. The slide-body emitter
+# (`_slide_xml`) is layout-agnostic — it walks the render_model's
+# `primitives` list and emits one native PPTX object per primitive —
+# so this allow-list is purely a contract gate: the exporter only
+# accepts render_models whose `layout` value is on this list, and
+# fails closed (whole-run abort, no partial deck) on any other layout.
+# `comparison_table` is intentionally NOT in this set because its
+# defining content is a `table` primitive, which remains fail-closed.
+SUPPORTED_LAYOUTS = (
+    "cover",
+    "kpi_dashboard",
+    "agenda",
+    "section_divider",
+    "executive_summary",
+    "key_message",
+    "two_column",
+    "timeline",
+    "conclusion",
+)
 SUPPORTED_PRIMITIVE_KINDS = ("text", "line", "shape", "image_slot", "kpi")
 
 # 1 px at 96 dpi = 9525 EMU. The render_model canvas (default
@@ -1259,9 +1293,10 @@ def export_workspace(workspace: Path, output: Path) -> int:
         )
     print(
         f"\nOK: PPTX export succeeded for {len(exported)} slide(s). "
-        f"This is the minimal native editable subset — `table` and "
+        f"This is the expanded native editable subset — `table` and "
         f"`chart_placeholder` primitives, media embedding, and layouts "
-        f"other than {SUPPORTED_LAYOUTS} fail closed and remain TODO."
+        f"outside the allow-list {SUPPORTED_LAYOUTS} fail closed and "
+        f"remain TODO."
     )
     return 0
 
@@ -1747,19 +1782,22 @@ def _run_self_tests() -> list[CheckResult]:
         # closed and no partial deck is written. Earlier versions of
         # this script treated unsupported layouts as a harmless
         # [SKIP] and still produced a `.pptx` containing the other
-        # slides; the contract is now all-or-nothing. The
-        # render_model schema's layout pattern is
-        # `^[a-z][a-z0-9_]*$`, so a value like "agenda" is
-        # schema-valid but outside SUPPORTED_LAYOUTS. The fixture
-        # below replaces the workspace's cover slide with an
-        # "agenda" layout and keeps the kpi_dashboard slide
+        # slides; the contract is now all-or-nothing. The expanded
+        # SUPPORTED_LAYOUTS allow-list covers most template layouts,
+        # so the scenario uses `comparison_table` — the one
+        # template-declared layout left outside the allow-list
+        # because it requires the still-unsupported `table`
+        # primitive. The fixture replaces the workspace's cover
+        # slide with a `comparison_table` layout (using a text
+        # primitive only, so the layout gate trips before any
+        # primitive gate would) and keeps the kpi_dashboard slide
         # untouched. The exporter must abort and leave no `.pptx`
         # on disk.
         unsupp_ws = td / "unsupported_layout"
         _write_synthetic_workspace(unsupp_ws)
         (unsupp_ws / "render_models" / "01_cover.json").write_text(json.dumps({
             "index": 1,
-            "layout": "agenda",
+            "layout": "comparison_table",
             "canvas": {"width_px": 1920, "height_px": 1080},
             "source_refs": ["synthetic_src"],
             "primitives": [
@@ -1771,7 +1809,7 @@ def _run_self_tests() -> list[CheckResult]:
                         "color_token": "palette.text",
                         "typography_token": "typography.heading",
                     },
-                    "text": {"content": "Agenda", "role": "heading"},
+                    "text": {"content": "Comparison", "role": "heading"},
                 },
             ],
         }))
@@ -1783,17 +1821,132 @@ def _run_self_tests() -> list[CheckResult]:
             "(no partial deck written)",
             (
                 rc != 0
-                and "agenda" in msg
+                and "comparison_table" in msg
                 and "supported set" in msg
                 and not unsupp_out.exists()
             ),
-            (f"rc={rc}, missing 'agenda'/'supported set' in messages, "
-             f"output_exists={unsupp_out.exists()}"
+            (f"rc={rc}, missing 'comparison_table'/'supported set' in "
+             f"messages, output_exists={unsupp_out.exists()}"
              if rc == 0
-                or "agenda" not in msg
+                or "comparison_table" not in msg
                 or "supported set" not in msg
                 or unsupp_out.exists() else ""),
         ))
+
+        # 10. POSITIVE: render_models using the newly allowed layouts
+        # (agenda, section_divider, executive_summary, key_message,
+        # two_column, timeline, conclusion) export successfully using
+        # only the supported primitive kinds. The slide body emitter
+        # is layout-agnostic, so this is structurally a regression
+        # check that the layout allow-list widened correctly without
+        # changing per-primitive emission. The fixture builds a
+        # workspace where slide 01_cover stays as the existing cover
+        # (so the workspace still has its happy-path baseline) and
+        # adds a 02_two_column slide using a title + two list-derived
+        # text primitives. The exporter must succeed and the
+        # validator must accept the output under container +
+        # minimal-evidence + allow-list gates.
+        expanded_ws = td / "expanded_layouts"
+        _write_synthetic_workspace(expanded_ws)
+        (expanded_ws / "render_models" / "02_kpi_dashboard.json").unlink()
+        (expanded_ws / "render_models" / "02_two_column.json").write_text(
+            json.dumps({
+                "index": 2,
+                "layout": "two_column",
+                "canvas": {"width_px": 1920, "height_px": 1080},
+                "source_refs": ["synthetic_src"],
+                "primitives": [
+                    {
+                        "id": "title",
+                        "slot_id": "title",
+                        "kind": "text",
+                        "bounds": {"x": 64, "y": 80, "w": 1792, "h": 120},
+                        "style": {
+                            "color_token": "palette.text",
+                            "typography_token": "typography.heading",
+                        },
+                        "text": {"content": "Synthetic Pairing",
+                                 "role": "heading"},
+                    },
+                    {
+                        "id": "left_heading",
+                        "slot_id": "left_heading",
+                        "kind": "text",
+                        "bounds": {"x": 64, "y": 240, "w": 880, "h": 80},
+                        "style": {
+                            "color_token": "palette.text",
+                            "typography_token": "typography.body",
+                        },
+                        "text": {"content": "Left", "role": "subheading"},
+                    },
+                    {
+                        "id": "left_body",
+                        "slot_id": "left_content",
+                        "kind": "text",
+                        "bounds": {"x": 64, "y": 340, "w": 880, "h": 600},
+                        "style": {
+                            "color_token": "palette.text",
+                            "typography_token": "typography.body",
+                        },
+                        "text": {"content": "<left placeholder>",
+                                 "role": "body"},
+                    },
+                    {
+                        "id": "right_heading",
+                        "slot_id": "right_heading",
+                        "kind": "text",
+                        "bounds": {"x": 976, "y": 240, "w": 880, "h": 80},
+                        "style": {
+                            "color_token": "palette.text",
+                            "typography_token": "typography.body",
+                        },
+                        "text": {"content": "Right", "role": "subheading"},
+                    },
+                    {
+                        "id": "right_body",
+                        "slot_id": "right_content",
+                        "kind": "text",
+                        "bounds": {"x": 976, "y": 340, "w": 880, "h": 600},
+                        "style": {
+                            "color_token": "palette.text",
+                            "typography_token": "typography.body",
+                        },
+                        "text": {"content": "<right placeholder>",
+                                 "role": "body"},
+                    },
+                ],
+            }, indent=2)
+        )
+        expanded_out = td / "expanded.pptx"
+        rc, _stdout, stderr = _run_capture(expanded_ws, expanded_out)
+        ok_expanded = rc == 0 and expanded_out.is_file()
+        results.append(CheckResult(
+            "selftest: expanded-layout workspace (cover + two_column) "
+            "exports successfully",
+            ok_expanded,
+            stderr.strip() if not ok_expanded else "",
+        ))
+        if ok_expanded:
+            c_res = check_container(expanded_out)
+            g_res = check_generated_pptx(expanded_out)
+            all_ok = all(r.ok for r in c_res) and all(r.ok for r in g_res)
+            results.append(CheckResult(
+                "selftest: expanded-layout PPTX passes validate_pptx_contract "
+                "container + minimal-evidence checks",
+                all_ok,
+                "; ".join(
+                    f"{r.name}: {r.detail}"
+                    for r in (c_res + g_res)
+                    if not r.ok
+                ),
+            ))
+        else:
+            results.append(CheckResult(
+                "selftest: expanded-layout PPTX passes validate_pptx_contract "
+                "container + minimal-evidence checks",
+                False,
+                "skipped — export failed",
+            ))
 
     return results
 
@@ -1814,8 +1967,10 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Deterministic, stdlib-only PPTX exporter from per-slide "
-            "render_model artifacts. Supports the cover and "
-            "kpi_dashboard layouts and the text / line / shape / "
+            "render_model artifacts. Supports the cover / "
+            "kpi_dashboard / agenda / section_divider / "
+            "executive_summary / key_message / two_column / timeline / "
+            "conclusion layouts and the text / line / shape / "
             "image_slot / kpi primitive kinds; everything else fails "
             "closed. image_slot primitives emit a placeholder native "
             "shape with alt_text — media embedding is TODO. See "
@@ -1854,13 +2009,14 @@ def main(argv: list[str]) -> int:
         help="Run the in-script tempfixture positives (happy-path "
              "workspace exports and passes validate_pptx_contract; "
              "schema-valid font_family with embedded \" round-trips as "
-             "&quot;) and negatives (wrong output extension, unsupported "
-             "`table` primitive, unsupported `chart_placeholder` "
-             "primitive, render_model missing a required field, "
-             "image_slot image_ref not in manifest, manifest local_path "
-             "with a URI scheme, render_model with an unsupported "
-             "layout). Exits non-zero if any positive or negative is "
-             "not handled as expected.",
+             "&quot;; expanded-layout workspace using two_column exports "
+             "and passes validate_pptx_contract) and negatives (wrong "
+             "output extension, unsupported `table` primitive, "
+             "unsupported `chart_placeholder` primitive, render_model "
+             "missing a required field, image_slot image_ref not in "
+             "manifest, manifest local_path with a URI scheme, "
+             "render_model with an unsupported layout). Exits non-zero "
+             "if any positive or negative is not handled as expected.",
     )
     args = parser.parse_args(argv)
 
