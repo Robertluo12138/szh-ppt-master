@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "source_manifest.schema.json",
+  "title": "Source Manifest",
+  "description": "Stage-1 (Intake) artifact. Records the single local source file an init'd workspace was seeded from. The source itself lives at source.local_path inside the workspace; this manifest never carries raw source text. Written by scripts/init_workspace.py; consumed by the agent producing the downstream deck_brief / deck_plan / design_system / slide_plans / image_manifest stages 2-6.",
+  "type": "object",
+  "required": ["schema_version", "source", "tool"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1"],
+      "description": "Manifest schema version. Bump only with a paired script change."
+    },
+    "source": {
+      "type": "object",
+      "required": ["id", "local_path", "kind", "byte_count", "line_count", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]*$",
+          "description": "Opaque identifier for this source. The agent must declare this id in deck_brief.source_refs so downstream slides can cite it. ASCII letters, digits, underscore, dot, hyphen; must not start with a separator."
+        },
+        "local_path": {
+          "type": "string",
+          "enum": ["input/source.md"],
+          "description": "Workspace-relative path to the source file. Locked to the canonical 'input/source.md' that scripts/init_workspace.py always writes. The enum lock is the path-safety gate: a 'type: string, minLength: 1' schema would let unsafe values like '../../etc/passwd', '/abs/path', or 'file:///etc/passwd' through with a schema-level false-green. A future intake variant that wants a different local path must bump schema_version and extend this enum (a paired change, like every other contract in this repo)."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["markdown", "text"],
+          "description": "How the source should be parsed by downstream stages. 'markdown' for .md files, 'text' for .txt files."
+        },
+        "byte_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Byte length of the UTF-8 source file. Zero-length sources are refused by init_workspace.py."
+        },
+        "line_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of lines in the source (count of '\\n' plus one if the file does not end in '\\n')."
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lowercase hex sha256 of the source bytes. Defense-in-depth: a downstream consumer can detect a mutated input/source.md by re-hashing and comparing."
+        }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": ["init_workspace"],
+          "description": "The intake tool that wrote this manifest. Closed enum; any other writer must add a paired schema bump."
+        },
+        "version": {
+          "type": "string",
+          "enum": ["1"],
+          "description": "Intake tool version, bumped only with a paired script change."
+        }
+      }
+    }
+  }
+}
