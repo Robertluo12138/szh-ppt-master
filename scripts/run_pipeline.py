@@ -41,6 +41,15 @@ Inputs:
                      svg_previews/ are runner-writable inside it).
     --self-test      run the in-script tempfixture scenarios (happy path,
                      wrong --output extension, --output inside workspace,
+                     --report-dir inside workspace, pre-existing regular
+                     file at --report-dir, pre-existing symlink at
+                     --report-dir, pre-existing read-only directory at
+                     --report-dir (writability probe; skipped under root),
+                     pre-existing symlink at <report-dir>/pipeline_report.json
+                     (target untouched), pre-existing read-only
+                     pipeline_report.txt (prior bytes preserved; skipped
+                     under root), happy-path --report-dir outside the
+                     workspace writes pipeline_report.{json,txt},
                      pre-existing symlink --output, pre-existing directory
                      named *.pptx, upstream validation failure skipping
                      downstream stages, pre-existing regular .pptx
@@ -62,6 +71,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -72,6 +82,15 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
+
+# The two files _write_reports() writes inside --report-dir. The
+# preflight gate probes BOTH of these names specifically, not just
+# the parent directory, because the parent-directory writability
+# probe does NOT catch a pre-existing pipeline_report.{json,txt}
+# that is itself a symlink (Path.write_text would follow it), a
+# directory (write_text → IsADirectoryError), or a read-only
+# regular file (write_text → PermissionError).
+_REPORT_FILENAMES = ("pipeline_report.json", "pipeline_report.txt")
 
 
 @dataclass
@@ -271,8 +290,9 @@ def _stage_json(s: StageResult) -> dict:
 
 def _write_reports(result: PipelineResult, report_dir: Path) -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
-    json_path = report_dir / "pipeline_report.json"
-    txt_path = report_dir / "pipeline_report.txt"
+    json_name, txt_name = _REPORT_FILENAMES
+    json_path = report_dir / json_name
+    txt_path = report_dir / txt_name
 
     payload = {
         "workspace": str(result.workspace),
@@ -523,6 +543,329 @@ def _scenario_report_dir_inside_workspace(
     )
 
 
+def _scenario_report_dir_is_regular_file(
+    td: Path, shared_ws: Path,
+) -> ScenarioResult:
+    """A regular file at --report-dir must fail closed BEFORE any
+    pipeline stage runs. Without the up-front gate, the runner would
+    validate / generate / export (writing the PPTX!) and only then
+    crash inside _write_reports() when mkdir() raises
+    FileExistsError — so the failure surface check must observe
+    *both* the exit-code path and the absence of any side-effect
+    .pptx."""
+    out = td / "report_is_file.pptx"
+    report_path = td / "reports_as_file"
+    prior_text = "PRIOR REPORT-PATH FILE BYTES"
+    report_path.write_text(prior_text)
+    rc, _sout, serr = _invoke_runner([
+        "--workspace", str(shared_ws),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+        "--report-dir", str(report_path),
+    ])
+    ok = (
+        rc == 2
+        and "--report-dir" in serr
+        and "not a directory" in serr
+        and not out.exists()
+        and report_path.is_file()
+        and report_path.read_text() == prior_text
+    )
+    return ScenarioResult(
+        "pre-existing regular file at --report-dir is refused BEFORE "
+        "any pipeline stage runs (no PPTX written; the prior file "
+        "is preserved byte-identical)",
+        ok,
+        (f"rc={rc}, report_dir_marker={'--report-dir' in serr}, "
+         f"not_dir_marker={'not a directory' in serr}, "
+         f"output_exists={out.exists()}, "
+         f"prior_preserved="
+         f"{report_path.is_file() and report_path.read_text() == prior_text}"
+         if not ok else ""),
+    )
+
+
+def _scenario_report_dir_is_symlink(
+    td: Path, shared_ws: Path,
+) -> ScenarioResult:
+    """A pre-existing symlink at --report-dir is refused for
+    consistency with --output. The symlink's target directory must
+    be untouched: no pipeline_report.{json,txt} written into it and
+    a canary file inside the target survives unchanged."""
+    out = td / "report_sym.pptx"
+    target = td / "real_report_target_dir"
+    target.mkdir()
+    canary = target / "canary.txt"
+    canary_text = "DO NOT TOUCH REPORT TARGET"
+    canary.write_text(canary_text)
+    sym = td / "reports_link"
+    sym.symlink_to(target)
+    rc, _sout, serr = _invoke_runner([
+        "--workspace", str(shared_ws),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+        "--report-dir", str(sym),
+    ])
+    ok = (
+        rc == 2
+        and "--report-dir" in serr
+        and "symlink" in serr
+        and not out.exists()
+        and sym.is_symlink()
+        and target.is_dir()
+        and canary.is_file()
+        and canary.read_text() == canary_text
+        and not (target / "pipeline_report.json").exists()
+        and not (target / "pipeline_report.txt").exists()
+    )
+    return ScenarioResult(
+        "pre-existing symlink at --report-dir is refused and the "
+        "symlink's target directory is untouched (no pipeline_report "
+        "files written; canary inside the target preserved)",
+        ok,
+        (f"rc={rc}, report_dir_marker={'--report-dir' in serr}, "
+         f"symlink_marker={'symlink' in serr}, "
+         f"output_exists={out.exists()}, "
+         f"sym_still_symlink={sym.is_symlink()}, "
+         f"canary_intact="
+         f"{canary.is_file() and canary.read_text() == canary_text}, "
+         f"no_report_json_in_target="
+         f"{not (target / 'pipeline_report.json').exists()}, "
+         f"no_report_txt_in_target="
+         f"{not (target / 'pipeline_report.txt').exists()}"
+         if not ok else ""),
+    )
+
+
+def _scenario_report_dir_readonly_dir(
+    td: Path, shared_ws: Path,
+) -> ScenarioResult:
+    """A pre-existing directory at --report-dir that exists but is
+    not writable by the current user must fail closed BEFORE any
+    pipeline stage runs. mkdir(parents=True, exist_ok=True) returns
+    success on an existing read-only directory without testing
+    write access — the runner therefore probes writability with a
+    NamedTemporaryFile inside the directory and refuses the run if
+    the probe cannot be created. Without this probe, the pipeline
+    would validate / generate / export (writing the PPTX!) and
+    only then crash inside _write_reports() on
+    pipeline_report.json's open()."""
+    import os
+    import stat
+
+    out = td / "readonly_report.pptx"
+    report_dir = td / "readonly_reports"
+    report_dir.mkdir()
+    original_mode = report_dir.stat().st_mode
+    if os.geteuid() == 0:
+        # chmod cannot meaningfully restrict root, so the probe
+        # would succeed and this scenario would mis-report. Mark
+        # the scenario as a no-op pass under root and return.
+        return ScenarioResult(
+            "pre-existing read-only directory at --report-dir is "
+            "refused BEFORE any pipeline stage runs (no PPTX "
+            "written; no report files written into the read-only "
+            "directory) — skipped under root because chmod cannot "
+            "restrict root",
+            True,
+            "",
+        )
+    try:
+        os.chmod(report_dir, stat.S_IRUSR | stat.S_IXUSR)
+        rc, _sout, serr = _invoke_runner([
+            "--workspace", str(shared_ws),
+            "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+            "--output", str(out),
+            "--report-dir", str(report_dir),
+        ])
+        ok = (
+            rc == 2
+            and "--report-dir" in serr
+            and "not writable" in serr
+            and not out.exists()
+            and not (report_dir / "pipeline_report.json").exists()
+            and not (report_dir / "pipeline_report.txt").exists()
+        )
+        detail = (
+            f"rc={rc}, report_dir_marker={'--report-dir' in serr}, "
+            f"not_writable_marker={'not writable' in serr}, "
+            f"output_exists={out.exists()}"
+            if not ok else ""
+        )
+    finally:
+        # Restore mode so the TemporaryDirectory cleanup at the end
+        # of _run_self_tests() can remove the directory.
+        os.chmod(report_dir, original_mode)
+    return ScenarioResult(
+        "pre-existing read-only directory at --report-dir is "
+        "refused BEFORE any pipeline stage runs (no PPTX written; "
+        "no report files written into the read-only directory)",
+        ok,
+        detail,
+    )
+
+
+def _scenario_report_file_is_symlink(
+    td: Path, shared_ws: Path,
+) -> ScenarioResult:
+    """A pre-existing pipeline_report.json that is a symlink at the
+    moment the runner starts must fail closed BEFORE any pipeline
+    stage runs. Without this gate, _write_reports() would follow
+    the symlink and overwrite the unrelated target — same
+    anti-pattern --output forbids. The symlink's target must be
+    untouched."""
+    out = td / "report_file_sym.pptx"
+    report_dir = td / "reports_with_symlink_inside"
+    report_dir.mkdir()
+    target = td / "report_symlink_target.txt"
+    target_bytes = b"DO NOT OVERWRITE THIS UNRELATED TARGET"
+    target.write_bytes(target_bytes)
+    sym = report_dir / "pipeline_report.json"
+    sym.symlink_to(target)
+    rc, _sout, serr = _invoke_runner([
+        "--workspace", str(shared_ws),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+        "--report-dir", str(report_dir),
+    ])
+    ok = (
+        rc == 2
+        and "pipeline_report.json" in serr
+        and "symlink" in serr
+        and not out.exists()
+        and sym.is_symlink()
+        and target.is_file()
+        and target.read_bytes() == target_bytes
+    )
+    return ScenarioResult(
+        "pre-existing symlink at <report-dir>/pipeline_report.json "
+        "is refused BEFORE any pipeline stage runs; no PPTX written, "
+        "the symlink's unrelated target is preserved byte-identical",
+        ok,
+        (f"rc={rc}, file_marker={'pipeline_report.json' in serr}, "
+         f"symlink_marker={'symlink' in serr}, "
+         f"output_exists={out.exists()}, "
+         f"sym_still_symlink={sym.is_symlink()}, "
+         f"target_bytes_match={target.read_bytes() == target_bytes}"
+         if not ok else ""),
+    )
+
+
+def _scenario_report_file_readonly(
+    td: Path, shared_ws: Path,
+) -> ScenarioResult:
+    """A pre-existing pipeline_report.txt that is a read-only
+    regular file must fail closed BEFORE any pipeline stage runs.
+    Path.write_text would otherwise raise PermissionError when
+    truncating the file — but only AFTER the PPTX has already been
+    written. The prior file content must be preserved."""
+    import stat
+
+    out = td / "report_file_readonly.pptx"
+    report_dir = td / "reports_with_readonly_file"
+    report_dir.mkdir()
+    if os.geteuid() == 0:
+        return ScenarioResult(
+            "pre-existing read-only pipeline_report.txt at "
+            "<report-dir>/pipeline_report.txt is refused BEFORE any "
+            "pipeline stage runs — skipped under root because chmod "
+            "cannot restrict root",
+            True,
+            "",
+        )
+    rp = report_dir / "pipeline_report.txt"
+    prior_text = "PRIOR READ-ONLY REPORT CONTENT"
+    rp.write_text(prior_text)
+    original_mode = rp.stat().st_mode
+    try:
+        os.chmod(rp, stat.S_IRUSR)  # r--, no write
+        rc, _sout, serr = _invoke_runner([
+            "--workspace", str(shared_ws),
+            "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+            "--output", str(out),
+            "--report-dir", str(report_dir),
+        ])
+        ok = (
+            rc == 2
+            and "pipeline_report.txt" in serr
+            and "not writable" in serr
+            and not out.exists()
+            and rp.is_file()
+            and rp.read_text() == prior_text
+        )
+        detail = (
+            f"rc={rc}, file_marker={'pipeline_report.txt' in serr}, "
+            f"not_writable_marker={'not writable' in serr}, "
+            f"output_exists={out.exists()}, "
+            f"prior_preserved="
+            f"{rp.is_file() and rp.read_text() == prior_text}"
+            if not ok else ""
+        )
+    finally:
+        os.chmod(rp, original_mode)
+    return ScenarioResult(
+        "pre-existing read-only pipeline_report.txt at "
+        "<report-dir>/pipeline_report.txt is refused BEFORE any "
+        "pipeline stage runs (no PPTX written; prior file content "
+        "preserved byte-identical)",
+        ok,
+        detail,
+    )
+
+
+def _scenario_report_dir_outside_writes_reports(td: Path) -> ScenarioResult:
+    """A happy-path run with --report-dir outside the workspace
+    actually writes pipeline_report.json + pipeline_report.txt.
+    Verifies that the new pre-create gate does not regress the
+    post-export report-writing path: the directory is created (if
+    it did not exist), both files exist, the JSON is loadable, and
+    the JSON's overall_ok matches the pipeline's success."""
+    ws = td / "ws_reports_outside"
+    _copy_synthetic_workspace(ws)
+    out = td / "happy_reports.pptx"
+    report_dir = td / "happy_reports_dir"
+    rc, sout, _serr = _invoke_runner([
+        "--workspace", str(ws),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+        "--report-dir", str(report_dir),
+    ])
+    json_path = report_dir / "pipeline_report.json"
+    txt_path = report_dir / "pipeline_report.txt"
+    ok = (
+        rc == 0
+        and out.is_file()
+        and out.stat().st_size > 0
+        and "OK: pipeline succeeded" in sout
+        and report_dir.is_dir()
+        and not report_dir.is_symlink()
+        and json_path.is_file()
+        and txt_path.is_file()
+        and txt_path.read_text().strip() != ""
+    )
+    if ok:
+        try:
+            payload = json.loads(json_path.read_text())
+            ok = (
+                payload.get("overall_ok") is True
+                and isinstance(payload.get("stages"), list)
+                and len(payload["stages"]) >= 5
+            )
+        except (json.JSONDecodeError, OSError):
+            ok = False
+    return ScenarioResult(
+        "happy-path --report-dir outside the workspace writes "
+        "pipeline_report.json + pipeline_report.txt; the JSON is "
+        "loadable with overall_ok=true and a populated stages list",
+        ok,
+        (f"rc={rc}, output_is_file={out.is_file()}, "
+         f"report_dir_is_dir={report_dir.is_dir()}, "
+         f"json_is_file={json_path.is_file()}, "
+         f"txt_is_file={txt_path.is_file()}"
+         if not ok else ""),
+    )
+
+
 def _scenario_symlink_output(
     td: Path, shared_ws: Path,
 ) -> ScenarioResult:
@@ -687,6 +1030,12 @@ def _run_self_tests() -> list[ScenarioResult]:
         results.append(_scenario_wrong_extension(td, shared_ws))
         results.append(_scenario_output_inside_workspace(td, shared_ws))
         results.append(_scenario_report_dir_inside_workspace(td, shared_ws))
+        results.append(_scenario_report_dir_is_regular_file(td, shared_ws))
+        results.append(_scenario_report_dir_is_symlink(td, shared_ws))
+        results.append(_scenario_report_dir_readonly_dir(td, shared_ws))
+        results.append(_scenario_report_file_is_symlink(td, shared_ws))
+        results.append(_scenario_report_file_readonly(td, shared_ws))
+        results.append(_scenario_report_dir_outside_writes_reports(td))
         results.append(_scenario_symlink_output(td, shared_ws))
         results.append(_scenario_directory_at_output(td, shared_ws))
         results.append(_scenario_upstream_failure_skips_downstream(td))
@@ -749,7 +1098,18 @@ def main(argv: list[str]) -> int:
             "Run the in-script tempfixture scenarios: happy path "
             "export+validation; wrong --output extension; --output "
             "landing inside the workspace; --report-dir landing "
-            "inside the workspace; pre-existing symlink at --output; "
+            "inside the workspace; pre-existing regular file at "
+            "--report-dir (refused before any stage runs, no PPTX "
+            "written); pre-existing symlink at --report-dir (refused, "
+            "symlink target untouched); pre-existing read-only "
+            "directory at --report-dir (writability probe; skipped "
+            "under root because chmod cannot restrict root); "
+            "pre-existing symlink at <report-dir>/pipeline_report.json "
+            "(refused, unrelated target untouched); pre-existing "
+            "read-only pipeline_report.txt (refused, prior content "
+            "preserved; skipped under root); happy-path --report-dir "
+            "outside the workspace writes pipeline_report.json + "
+            "pipeline_report.txt; pre-existing symlink at --output; "
             "pre-existing directory named *.pptx at --output; "
             "validate_workspace failure cascading [SKIP] across every "
             "downstream stage; pre-existing regular .pptx preserved "
@@ -869,6 +1229,138 @@ def main(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 2
+
+        # Refuse a pre-existing --report-dir that is anything other
+        # than a real directory, mirroring the gates --output applies
+        # to itself. Without these checks the runner would happily
+        # run validate / generate / export (writing the PPTX!) and
+        # only crash inside _write_reports() when mkdir() raises
+        # FileExistsError on the regular-file case — turning a
+        # report-path problem into a silent post-export failure that
+        # leaves the caller without the report they explicitly asked
+        # for. A symlink is refused for the same reason --output
+        # rejects one: a symlink can quietly redirect writes into an
+        # unrelated tree (or into the workspace via a target outside
+        # the resolve()-based inside-workspace gate's view), and the
+        # runner contract is "we own this directory; we write
+        # pipeline_report.{json,txt} into it" — not "we follow
+        # whatever the link points at."
+        if args.report_dir.is_symlink():
+            print(
+                f"FAIL: --report-dir {args.report_dir} is a symlink; "
+                f"refusing to follow it. Pass a regular directory "
+                f"path.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.report_dir.exists() and not args.report_dir.is_dir():
+            print(
+                f"FAIL: --report-dir {args.report_dir} exists and is "
+                f"not a directory (looks like a regular file); refusing "
+                f"to overwrite. Pass a directory path or a path that "
+                f"does not yet exist.",
+                file=sys.stderr,
+            )
+            return 2
+
+        # Pre-create the report directory up front, BEFORE any
+        # pipeline stage runs. After this point _write_reports() can
+        # assume the directory exists. (It still calls mkdir with
+        # exist_ok=True as defence-in-depth.)
+        try:
+            args.report_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"FAIL: --report-dir {args.report_dir} could not be "
+                f"created: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+
+        # mkdir(exist_ok=True) is necessary but NOT sufficient: on
+        # an existing read-only directory the runner does not own
+        # (or any other not-writable-by-us state — read-only mount,
+        # full filesystem, ACL block), mkdir(exist_ok=True) returns
+        # successfully WITHOUT proving the runner can actually
+        # create files inside the directory. Without this probe,
+        # the pipeline would validate / generate / export (writing
+        # the PPTX!) and only then crash inside _write_reports()
+        # when the pipeline_report.json open() raises
+        # PermissionError. The probe is a NamedTemporaryFile inside
+        # the directory: if we can create + close + delete a file
+        # there, the eventual pipeline_report writes will succeed
+        # too (modulo the irreducible TOCTOU window between
+        # preflight and _write_reports, which is acceptable for a
+        # CLI tool).
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=args.report_dir,
+                prefix=".run_pipeline_writable_check_",
+                suffix=".tmp",
+                delete=True,
+            ):
+                pass
+        except OSError as exc:
+            print(
+                f"FAIL: --report-dir {args.report_dir} is not "
+                f"writable by this user (cannot create files inside "
+                f"it): {exc}",
+                file=sys.stderr,
+            )
+            return 2
+
+        # The directory-level probe proves the runner can create
+        # SOME file in --report-dir but does not prove that
+        # pipeline_report.json and pipeline_report.txt SPECIFICALLY
+        # can be written. _write_reports() calls Path.write_text(),
+        # which opens with mode 'w' — that follows symlinks,
+        # truncates regular files, and fails on directories. So a
+        # pre-existing entry at either report-file path can still
+        # break the post-export write:
+        #   - a symlink would silently redirect the write to an
+        #     unrelated target (same anti-pattern --output forbids);
+        #   - a directory would raise IsADirectoryError;
+        #   - a read-only regular file would raise PermissionError.
+        # Each of these would let validate / generate / export
+        # (writing the PPTX!) succeed and only THEN crash inside
+        # _write_reports(). Refuse all three up-front. os.access is
+        # used for the read-only-regular-file case: it follows the
+        # standard Unix permission model (chmod-based), which is
+        # sufficient for the realistic failure modes and consistent
+        # with how the eventual write_text() will be denied. TOCTOU
+        # between preflight and _write_reports is acceptable for a
+        # CLI tool.
+        for rname in _REPORT_FILENAMES:
+            rp = args.report_dir / rname
+            if rp.is_symlink():
+                print(
+                    f"FAIL: report file {rp} is a symlink; refusing "
+                    f"to follow it (a symlink at this path would "
+                    f"redirect _write_reports() into an unrelated "
+                    f"target). Remove it or replace it with a "
+                    f"regular file path.",
+                    file=sys.stderr,
+                )
+                return 2
+            if rp.exists() and not rp.is_file():
+                print(
+                    f"FAIL: report file {rp} exists and is not a "
+                    f"regular file (looks like a directory); "
+                    f"refusing to overwrite.",
+                    file=sys.stderr,
+                )
+                return 2
+            if rp.exists() and not os.access(rp, os.W_OK):
+                print(
+                    f"FAIL: report file {rp} exists but is not "
+                    f"writable by this user; _write_reports() would "
+                    f"raise PermissionError after the PPTX has "
+                    f"already been written. Make the file writable "
+                    f"or remove it.",
+                    file=sys.stderr,
+                )
+                return 2
 
     # Refuse a pre-existing --output that is anything other than a
     # regular file. The exporter overwrites a regular file in place
