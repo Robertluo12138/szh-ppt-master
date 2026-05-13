@@ -56,10 +56,14 @@ does NOT:
     workspace the helper reads, and only the resolved
     ``template.json`` / theme file inside it).
 
-After this script succeeds, stages 5-6 (``slide_plans/*.json``,
-``image_manifest.json``) remain agent-driven per the schemas under
-``schemas/`` before ``scripts/run_pipeline.py`` can take over for
-stages 7-10.
+After this script succeeds, Stage 5 has narrow contract support
+via ``scripts/init_slide_plans.py`` (the caller supplies
+``--specs-dir`` of slide_plan JSON candidates plus
+``--template-root``; this helper, init_design_system.py, does NOT
+itself generate any ``slide_plans/*.json``). After that helper
+succeeds, Stage 6 (``image_manifest.json``) remains agent-driven
+per the schema under ``schemas/`` before
+``scripts/run_pipeline.py`` can take over for stages 7-10.
 
 Stdlib-only. Deterministic — given the same workspace + (spec or
 theme), the produced ``design_system.json`` is byte-identical. The

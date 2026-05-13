@@ -1346,8 +1346,10 @@ def main(argv: list[str]) -> int:
             "Stage-1 (Intake) workspace initializer. Seeds a new "
             "workspace from a local Markdown or text source by writing "
             "input/source.md + source_manifest.json. Does NOT plan a "
-            "deck — stages 2-6 (deck_brief / deck_plan / design_system "
-            "/ slide_plans / image_manifest) remain agent-driven before "
+            "deck — stages 2-5 each have a narrow contract helper "
+            "(scripts/init_deck_brief.py / init_deck_plan.py / "
+            "init_design_system.py / init_slide_plans.py); Stage 6 "
+            "(image_manifest.json) remains agent-driven before "
             "scripts/run_pipeline.py can take over."
         ),
     )

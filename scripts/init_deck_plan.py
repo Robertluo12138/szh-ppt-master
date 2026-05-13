@@ -8,17 +8,23 @@ workspace ships ``source_manifest.json`` + ``input/source.md`` +
 whose ``slides[].source_refs`` are all declared in
 ``deck_brief.source_refs``.
 
-Source-id traceability is **deck-level, not per-slide**: the
-Stage-1/Stage-2 bridge gate guarantees
-``source_manifest.source.id`` appears in ``deck_brief.source_refs``,
-and this helper guarantees every ``slide.source_refs`` value is in
-``deck_brief.source_refs``, so the manifest's source id is part of
-the deck-bundle every slide draws from. **It does NOT follow** that
-every individual slide cites ``source_manifest.source.id`` — when
-``deck_brief.source_refs`` declares multiple ids, a slide may pick
-a non-manifest id from that set. The contract proven here is the
-chain *manifest -> deck_brief -> deck_plan source bundle*, not
-*manifest -> every slide*.
+The Stage-3 source_refs contract has four parts:
+
+  (1) ``deck_brief.source_refs`` is the required allow-list of
+      source ids for the deck.
+  (2) ``deck_plan.json`` carries source_refs only on its per-slide
+      entries (``slides[].source_refs``); there is no document-
+      root source_refs field on the plan (the schema declares
+      none and ``additionalProperties: false`` would refuse one
+      if added).
+  (3) deck_plan lineage is per-slide only: every
+      ``slides[].source_refs`` must be non-empty and a subset of
+      ``deck_brief.source_refs``.
+  (4) The bridge gate places ``source_manifest.source.id`` in
+      ``deck_brief.source_refs``, but that does NOT imply every
+      slide cites ``source_manifest.source.id`` — when the brief
+      declares multiple ids, a slide may legitimately pick another
+      id from the allow-list.
 
 This is **Stage-3 contract support only**. It is NOT a full
 prompt/report/Markdown-to-PPTX automation. The helper deliberately
@@ -37,13 +43,19 @@ does NOT:
     external service;
   - mutate or inspect any file outside ``--workspace``.
 
-After this script succeeds, Stage 4 now has narrow contract
+After this script succeeds, Stage 4 has narrow contract
 support via ``scripts/init_design_system.py`` (writes
 ``design_system.json`` only from an explicit caller spec or a
-template theme); stages 5-6 (``slide_plans/*.json``,
-``image_manifest.json``) remain agent-driven per the schemas under
-``schemas/`` before ``scripts/run_pipeline.py`` can take over for
-stages 7-10.
+template theme — it does NOT itself generate any
+``slide_plans/*.json``); Stage 5 has narrow contract support via
+``scripts/init_slide_plans.py`` (writes
+``<workspace>/slide_plans/<idx:02d>_<layout>.json`` only from a
+caller-supplied ``--specs-dir`` of slide_plan JSON candidates +
+``--template-root`` — this helper, init_deck_plan.py, does NOT
+itself generate slide_plans either); Stage 6
+(``image_manifest.json``) remains agent-driven per the schema
+under ``schemas/`` before ``scripts/run_pipeline.py`` can take
+over for stages 7-10.
 
 The plan-spec contract is: a JSON object whose shape is exactly the
 deck_plan candidate the caller wants written. The helper validates
@@ -506,12 +518,17 @@ def init_deck_plan(
         f"  template: {template_name!r}\n"
         f"  planned_slide_count: {n_slides}\n"
         f"  sections: {n_sections}\n"
-        f"  source_refs lineage: deck_brief.source_refs "
-        f"{brief_refs!r} (each slide.source_refs is a subset)\n"
-        f"Next stages (init_deck_plan.py does not automate them):\n"
+        f"  source_refs allow-list: deck_brief.source_refs "
+        f"{brief_refs!r} (per-slide only on slides[].source_refs; "
+        f"each entry non-empty and a subset of the allow-list)\n"
+        f"Next stages (init_deck_plan.py does not automate them; "
+        f"it does NOT itself generate any slide_plans):\n"
         f"  4. design_system.json (narrow contract support via "
-        f"scripts/init_design_system.py)\n"
-        f"  5. slide_plans/*.json (agent-driven)\n"
+        f"scripts/init_design_system.py — does NOT itself generate "
+        f"slide_plans either)\n"
+        f"  5. slide_plans/*.json (narrow contract support via "
+        f"scripts/init_slide_plans.py — caller supplies "
+        f"--specs-dir + --template-root)\n"
         f"  6. image_manifest.json (agent-driven)\n"
         f"Once those exist, scripts/run_pipeline.py can take over "
         f"for stages 7-10."
@@ -1281,17 +1298,30 @@ def main(argv: list[str]) -> int:
             "initialized workspace (source_manifest.json + "
             "input/source.md + deck_brief.json) into a minimal, "
             "schema-valid deck_plan.json whose slide.source_refs are "
-            "all declared in deck_brief.source_refs. Source-id "
-            "traceability is deck-level, not per-slide: "
-            "source_manifest.source.id is in deck_brief.source_refs "
-            "(bridge gate) and every slide.source_refs is a subset "
-            "of deck_brief.source_refs (helper gate), but a slide "
-            "may pick a non-manifest id when the brief declares "
-            "multiple. Does NOT extract business content from the "
-            "source body. Stage 4 now has narrow contract support "
-            "via scripts/init_design_system.py (writes "
-            "design_system.json only); stages 5-6 (slide_plans, "
-            "image_manifest) remain agent-driven."
+            "all declared in deck_brief.source_refs. The Stage-3 "
+            "source_refs contract has four parts: (1) "
+            "deck_brief.source_refs is the required allow-list of "
+            "source ids for the deck; (2) deck_plan.json carries "
+            "source_refs only on its per-slide entries "
+            "(slides[].source_refs) — no document-root source_refs "
+            "field on the plan; (3) deck_plan lineage is per-slide "
+            "only — every slides[].source_refs must be non-empty "
+            "and a subset of deck_brief.source_refs; (4) the bridge "
+            "gate places source_manifest.source.id in "
+            "deck_brief.source_refs, but that does NOT imply every "
+            "slide cites source_manifest.source.id — a slide may "
+            "legitimately pick another id from the allow-list when "
+            "the brief declares multiple. Does NOT extract business "
+            "content from the source body. Stage 4 has narrow "
+            "contract support via scripts/init_design_system.py "
+            "(writes design_system.json only — does NOT itself "
+            "generate any slide_plans); Stage 5 has narrow contract "
+            "support via scripts/init_slide_plans.py (writes "
+            "slide_plans/*.json only from a caller-supplied "
+            "--specs-dir + --template-root — this helper, "
+            "init_deck_plan.py, does NOT itself generate slide_plans "
+            "either); Stage 6 (image_manifest.json) remains "
+            "agent-driven."
         ),
     )
     parser.add_argument(
