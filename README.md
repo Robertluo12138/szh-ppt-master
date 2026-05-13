@@ -39,7 +39,7 @@ projects/               # generated workspaces (not committed; created by users)
 
 ## Verification today
 
-Seven stdlib-only Python commands are wired up — four validators (`validate_artifacts.py`, `validate_scaffold.py`, `validate_workspace.py`, `validate_pptx_contract.py`), two deterministic generators (`generate_render_models.py`, `generate_svg_previews.py`), and a deterministic PPTX exporter (`export_pptx.py`). No third-party dependencies are required. `validate_pptx_contract.py` now gates the produced `.pptx` at the container level **and** with a minimal-evidence safety / editability layer (slide count, no external rels, no `file://` rels, relationship `Type` allow-list over the canonical OOXML rel URLs, no macros / OLE / ActiveX parts, at least one editable `<a:t>` run, no all-image slide, no blank slide, every slide carries at least one `<p:sp>` or `<p:cxnSp>`); full-inventory editability, the media inventory, theme palette mapping, determinism, and validator-side layout / primitive scope all remain TODO and are explicitly named that way in every run.
+Eight stdlib-only Python commands are wired up — four validators (`validate_artifacts.py`, `validate_scaffold.py`, `validate_workspace.py`, `validate_pptx_contract.py`), two deterministic generators (`generate_render_models.py`, `generate_svg_previews.py`), a deterministic PPTX exporter (`export_pptx.py`), and a deterministic local pipeline runner (`run_pipeline.py`) that chains validate → generate render_models → generate SVG previews → export PPTX → validate the produced PPTX for a prepared workspace. No third-party dependencies are required. `validate_pptx_contract.py` now gates the produced `.pptx` at the container level **and** with a minimal-evidence safety / editability layer (slide count, no external rels, no `file://` rels, relationship `Type` allow-list over the canonical OOXML rel URLs, no macros / OLE / ActiveX parts, at least one editable `<a:t>` run, no all-image slide, no blank slide, every slide carries at least one `<p:sp>` or `<p:cxnSp>`); full-inventory editability, the media inventory, theme palette mapping, determinism, and validator-side layout / primitive scope all remain TODO and are explicitly named that way in every run.
 
 ### Single-artifact structural validation
 
@@ -206,6 +206,43 @@ python3 scripts/validate_pptx_contract.py --self-test
 ```
 
 The four `minimal_evidence.*` checks are explicitly named MINIMAL EVIDENCE in the per-check output: they prove *one* slide has an editable `<a:t>` run, they rule out the obvious one-big-PNG failure mode, they reject any slide whose `<p:spTree>` is structurally empty, and they require every slide to carry at least one native editable `<p:sp>` / `<p:cxnSp>` structure. They do not constitute a full per-shape editability inventory. The `relationships.allow_list` gate restricts every package `Relationship` `Type` URL to the canonical OOXML set (`officeDocument`, `slide`, `slideMaster`, `slideLayout`, `theme`); widening the exporter to embed media will widen this set. Full-inventory editability, the media inventory, theme palette mapping, determinism, and validator-side layout / primitive scope all remain TODO and are reported in every run.
+
+### Local end-to-end pipeline runner (prepared workspaces)
+
+`scripts/run_pipeline.py` is a stdlib-only orchestrator that chains the five existing scripts above into a single command for a workspace that **already** ships `deck_brief.json`, `deck_plan.json`, `slide_plans/*.json`, `design_system.json`, and `image_manifest.json`. The runner does **not** plan a deck from a raw prompt — intake → brief → plan from source is still TODO. It runs each stage as a subprocess against the same `python3` that started it (so each stage's existing fail-closed gates and self-tests are the source of truth — no logic is duplicated):
+
+1. `scripts/validate_workspace.py` — contract gate on the inputs;
+2. `scripts/generate_render_models.py` — regenerate `render_models/*.json`;
+3. `scripts/generate_svg_previews.py` — regenerate `svg_previews/*.svg`;
+4. `scripts/export_pptx.py` — write the native editable `.pptx`;
+5. `scripts/validate_pptx_contract.py --pptx <output> --expected-slide-count <len(deck_plan.slides)>` — container + minimal-evidence gates on the exported file, including the slide-count gate the per-stage validator exposes.
+
+A non-zero exit code from any stage stops the pipeline; downstream stages are skipped with a `[SKIP] earlier stage failed` note rather than silently passing. Workspace mutability: the runner **regenerates** `<workspace>/render_models/*.json` and `<workspace>/svg_previews/*.svg` in place (each generator owns its subdirectory and sweeps stale files before regenerating). The prepared-input artifacts (`deck_brief.json`, `deck_plan.json`, `slide_plans/`, `design_system.json`, `image_manifest.json`) and any other files under the workspace are read-only. The final `--output` PPTX **must live OUTSIDE** the workspace, and **so must `--report-dir`** when supplied — a stray `.pptx` or report directory under the workspace tree would otherwise be picked up by `validate_workspace` on a later run.
+
+The runner fails closed before invoking any stage if `--workspace` or `--template-root` is not a directory, if `--output` does not end in `.pptx`, if `--output` would land inside the workspace tree, if `--report-dir` (when supplied) would land inside the workspace tree, if `--output` already exists as a symlink (refused — not silently followed), or if `--output` already exists and is not a regular file (e.g. a directory named `Documents.pptx/`; refused so the runner never recursively touches arbitrary content). A pre-existing regular `.pptx` at `--output` is **not** deleted up-front — that prior artifact is overwritten in place by the export stage only when (and only when) the pipeline reaches that stage. An earlier-stage failure therefore leaves the caller's prior good `.pptx` untouched on disk, and the runner's report records the failure surface explicitly. A partial `.pptx` left by a crash inside the export stage itself is not cleaned up by this runner; full atomic-write semantics for the export stage remain a TODO on `scripts/export_pptx.py`, not on this runner.
+
+`scripts/run_pipeline.py --self-test` builds tempfile-based synthetic workspaces (copied from `examples/synthetic_8_page_product_brief/`) and asserts the eight scenarios above: happy-path export+validation, wrong `--output` extension, `--output` inside the workspace, `--report-dir` inside the workspace, pre-existing symlink at `--output`, pre-existing directory at `--output`, `validate_workspace` failure cascading `[SKIP]` across every downstream stage, and a pre-existing regular `.pptx` preserved (byte-identical) when `validate_workspace` fails before export. Exits non-zero if any scenario does not behave as expected.
+
+```
+python3 scripts/run_pipeline.py \
+  --workspace examples/synthetic_8_page_product_brief \
+  --template-root templates/layouts \
+  --output /tmp/szh-ppt-master-smoke/8_page.pptx \
+  --report-dir /tmp/szh-ppt-master-smoke/reports_8
+
+python3 scripts/run_pipeline.py \
+  --workspace examples/synthetic_20_page_business_review \
+  --template-root templates/layouts \
+  --output /tmp/szh-ppt-master-smoke/20_page.pptx \
+  --report-dir /tmp/szh-ppt-master-smoke/reports_20
+```
+
+When `--report-dir` is supplied, the runner writes:
+
+- `pipeline_report.json` — machine-readable: workspace / template_root / output / expected_slide_count / overall_ok / per-stage `{name, command, ok, skipped, exit_code, duration_s, stdout, stderr}` (stdout / stderr are truncated to 4 KB with an elision marker so the JSON stays bounded);
+- `pipeline_report.txt` — short human-readable summary: workspace inputs, overall status, and per-stage PASS / FAIL / SKIP lines with the failing stage's stderr / stdout tail.
+
+This is **not** the end-to-end "prompt → editable PPTX" experience. The runner only composes the existing prepared-workspace stages; everything outside that scope (raw-source ingestion, brief / plan generation from a prompt, `chart_placeholder` rendering, embedded media, full PPTX inventory, D-One image assets, Qoder CLI) remains TODO.
 
 All other tools — full PPTX coverage (every layout, every primitive, embedded media, `chart_placeholder`), security scan, visual regression, image manifest population from real assets, D-One integration, Qoder CLI — are still **not implemented**. Do not document them as available. Render-model generation for layouts mapped to the `chart_placeholder` primitive kind, and SVG rendering / PPTX emission of primitive kinds outside `text` / `line` / `shape` / `image_slot` / `kpi` / `table`, are also not implemented.
 
