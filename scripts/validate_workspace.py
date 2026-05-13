@@ -1766,6 +1766,64 @@ def check_render_model_filenames(workspace: Path) -> list[CheckResult]:
     return out
 
 
+def check_slide_plan_filenames(workspace: Path) -> list[CheckResult]:
+    """Enforce the canonical slide_plan filename pattern.
+
+    Every `slide_plans/*.json` file MUST be named
+    `<index:02d>_<layout>.json` where `index` and `layout` come from
+    inside the JSON. `scripts/init_slide_plans.py` writes that canonical
+    name (Stage-5 producer-side commitment), but a hand-edited or
+    migrated workspace could ship a stale name that still schema-
+    validates. This is the on-disk gate that catches the drift.
+
+    Schema-invalid slide_plans (missing `index` / `layout`, wrong types,
+    empty layout) are not double-flagged here — `check_schemas` and
+    `check_slide_plan_coverage` already surface those. Files whose JSON
+    contract is intact but whose filename disagrees fail closed with a
+    clear FAIL naming the expected filename. Duplicate-index detection
+    (two files declaring the same JSON `index`) remains in
+    `check_slide_plan_coverage`; this gate adds the filename-shape
+    requirement, so a duplicate canonical/non-canonical pair surfaces
+    both as a coverage FAIL (duplicate index) and a filename FAIL on
+    the non-canonical sibling."""
+    out: list[CheckResult] = []
+    plans_dir = workspace / "slide_plans"
+    if not plans_dir.is_dir():
+        return out
+    plan_files = sorted(plans_dir.glob("*.json"))
+    if not plan_files:
+        return out
+    for plan_file in plan_files:
+        data, _ = _try_load(plan_file)
+        d = _as_dict(data) if data is not None else None
+        if d is None:
+            continue  # check_schemas reports loadability/shape
+        idx = d.get("index")
+        layout = d.get("layout")
+        if (
+            not isinstance(idx, int)
+            or isinstance(idx, bool)
+            or not isinstance(layout, str)
+            or not layout
+        ):
+            continue  # check_schemas / check_slide_plan_coverage report these
+        expected_name = f"{idx:02d}_{layout}.json"
+        out.append(CheckResult(
+            f"slide_plan {plan_file.name}: filename matches "
+            f"<index:02d>_<layout>.json (expected {expected_name!r})",
+            plan_file.name == expected_name,
+            (
+                f"on-disk name {plan_file.name!r} disagrees with the "
+                f"slide_plan's own index={idx} layout={layout!r}; "
+                f"scripts/init_slide_plans.py writes the canonical "
+                f"<idx:02d>_<layout>.json name, so this file would drift "
+                f"from the producer-side shape. Rename to "
+                f"{expected_name!r} or re-run scripts/init_slide_plans.py"
+            ) if plan_file.name != expected_name else "",
+        ))
+    return out
+
+
 SVG_NS = "http://www.w3.org/2000/svg"
 
 
@@ -3496,6 +3554,177 @@ def negative_render_model_filename_tempfixture_checks() -> list[CheckResult]:
             "canonical filename",
             detected,
             "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    return out
+
+
+def _write_slide_plan(
+    ws: Path,
+    *,
+    filename: str,
+    index: int | None = 2,
+    layout: object = "agenda",
+    title: str = "Agenda",
+) -> None:
+    """Helper for the slide_plan filename tempfixtures. Writes a
+    schema-valid slide_plan at workspace/slide_plans/<filename> with
+    caller-controllable `index` / `layout` / `title` so a test can
+    independently exercise the filename rule, the filename/index
+    mismatch path, the filename/layout mismatch path, and the schema-
+    invalid path. When `index` is None the field is omitted (drives the
+    schema-invalid scenario)."""
+    plans_dir = ws / "slide_plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    payload: dict = {
+        "layout": layout,
+        "title": title,
+        "blocks": [
+            {"kind": "text", "id": "title", "content": title},
+        ],
+    }
+    if index is not None:
+        payload["index"] = index
+    (plans_dir / filename).write_text(json.dumps(payload))
+
+
+def negative_slide_plan_filename_tempfixture_checks() -> list[CheckResult]:
+    """Negative tempfixture proving check_slide_plan_filenames fails
+    closed when a slide_plan's on-disk filename drifts from its own
+    JSON `index` + `layout`. `scripts/init_slide_plans.py` always
+    writes the canonical `<idx:02d>_<layout>.json` name; this gate is
+    what catches a hand-edited or migrated workspace whose filename
+    no longer matches.
+
+    Cases:
+      A. Canonical `02_agenda.json` (index=2, layout='agenda') PASSES.
+      B. Renamed to `slide_two.json` (misnamed entirely) FAILS, message
+         names the expected canonical filename.
+      C. Filename index mismatch — `99_agenda.json` but JSON index=2
+         FAILS, message names the expected canonical filename.
+      D. Filename layout mismatch — `02_cover.json` but JSON
+         layout='agenda' FAILS, message names the expected canonical
+         filename.
+      E. Duplicate canonical/non-canonical pair (`02_agenda.json` +
+         `99_agenda.json` both declaring index=2 layout='agenda') —
+         the filename gate flags only the non-canonical sibling
+         (canonical entry PASSES). Note: duplicate-by-index is the
+         separate concern of check_slide_plan_coverage; this gate
+         intentionally enforces the filename shape, not uniqueness.
+      F. Schema-invalid slide_plan (missing `index`) — the filename
+         gate emits ZERO rows for that file (no double-reporting with
+         check_schemas / check_slide_plan_coverage)."""
+    import tempfile
+    out: list[CheckResult] = []
+
+    # A. Canonical filename passes.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        ws.mkdir()
+        _write_slide_plan(ws, filename="02_agenda.json")
+        results = check_slide_plan_filenames(ws)
+        out.append(CheckResult(
+            "tempfixture slide_plan filename: canonical 02_agenda.json passes",
+            len(results) == 1 and results[0].ok,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # B. Misnamed file fails closed with the expected canonical filename.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        ws.mkdir()
+        _write_slide_plan(ws, filename="slide_two.json")
+        results = check_slide_plan_filenames(ws)
+        detected = any(
+            "filename matches" in r.name
+            and not r.ok
+            and "02_agenda.json" in r.detail
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture slide_plan filename: misnamed slide_two.json "
+            "fails closed and names the expected canonical filename",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # C. Filename index mismatch.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        ws.mkdir()
+        _write_slide_plan(ws, filename="99_agenda.json", index=2)
+        results = check_slide_plan_filenames(ws)
+        detected = any(
+            "filename matches" in r.name
+            and not r.ok
+            and "02_agenda.json" in r.detail
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture slide_plan filename: index mismatch "
+            "(99_agenda.json declaring index=2) fails closed",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # D. Filename layout mismatch.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        ws.mkdir()
+        _write_slide_plan(ws, filename="02_cover.json", index=2, layout="agenda")
+        results = check_slide_plan_filenames(ws)
+        detected = any(
+            "filename matches" in r.name
+            and not r.ok
+            and "02_agenda.json" in r.detail
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture slide_plan filename: layout mismatch "
+            "(02_cover.json declaring layout='agenda') fails closed",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # E. Duplicate canonical/non-canonical pair for the same index.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        ws.mkdir()
+        _write_slide_plan(ws, filename="02_agenda.json", index=2, layout="agenda")
+        _write_slide_plan(ws, filename="99_agenda.json", index=2, layout="agenda")
+        results = check_slide_plan_filenames(ws)
+        # The canonical sibling passes; the non-canonical sibling fails.
+        canonical_pass = any(
+            r.ok and "02_agenda.json" in r.name and "filename matches" in r.name
+            for r in results
+        )
+        non_canonical_fail = any(
+            not r.ok and "99_agenda.json" in r.name and "filename matches" in r.name
+            and "02_agenda.json" in r.detail
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture slide_plan filename: duplicate canonical + "
+            "non-canonical for the same JSON index flags only the "
+            "non-canonical sibling (canonical sibling passes)",
+            canonical_pass and non_canonical_fail and len(results) == 2,
+            f"results: {[(r.name, r.ok) for r in results]}",
+        ))
+
+    # F. Schema-invalid slide_plan (missing `index`) — no row from
+    #    the filename gate, so the maintainer sees the schema error
+    #    once (from check_schemas) without confusing duplicate noise.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws"
+        ws.mkdir()
+        _write_slide_plan(ws, filename="02_agenda.json", index=None, layout="agenda")
+        results = check_slide_plan_filenames(ws)
+        out.append(CheckResult(
+            "tempfixture slide_plan filename: schema-invalid file "
+            "(missing index) emits zero rows from the filename gate "
+            "(no double-reporting)",
+            len(results) == 0,
+            f"unexpected rows: {[r.name for r in results]}",
         ))
 
     return out
@@ -5786,6 +6015,11 @@ def main(argv: list[str]) -> int:
          "(protects the exporter's deck_plan-driven 1:1 coverage gate "
          "from mis-named files appearing orphan)",
          check_render_model_filenames(args.workspace)),
+        ("slide_plans filename: every slide_plans/*.json file is "
+         "named <index:02d>_<layout>.json matching its own JSON "
+         "(commits hand-edited workspaces to the same canonical shape "
+         "scripts/init_slide_plans.py writes)",
+         check_slide_plan_filenames(args.workspace)),
         ("svg_previews: per-render_model SVG exists + canvas viewBox + "
          "no <foreignObject> + reference safety + bounds inside canvas",
          check_svg_previews(args.workspace, args.template_root)),
@@ -5822,6 +6056,15 @@ def main(argv: list[str]) -> int:
          "coverage gate cannot mistake the canonical name for missing "
          "and the renamed file for orphan",
          negative_render_model_filename_tempfixture_checks()),
+        ("negative tempfixtures (slide_plan filename): canonical "
+         "02_agenda.json passes; misnamed file, filename index "
+         "mismatch, and filename layout mismatch each fail closed and "
+         "name the expected canonical filename; a duplicate canonical "
+         "+ non-canonical pair for the same JSON index flags only the "
+         "non-canonical sibling; a schema-invalid slide_plan (missing "
+         "index) emits zero rows from the filename gate so the "
+         "maintainer sees the schema error once, not twice",
+         negative_slide_plan_filename_tempfixture_checks()),
         ("negative tempfixtures (source_manifest bridge): positive match "
          "between manifest and on-disk source.md plus deck_brief "
          "cross-check; missing input/source.md; sha256 mismatch; bad "
