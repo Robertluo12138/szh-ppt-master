@@ -37,10 +37,13 @@ does NOT:
     external service;
   - mutate or inspect any file outside ``--workspace``.
 
-After this script succeeds, stages 4-6 (``design_system.json``,
-``slide_plans/*.json``, ``image_manifest.json``) remain agent-driven
-per the schemas under ``schemas/`` before ``scripts/run_pipeline.py``
-can take over for stages 7-10.
+After this script succeeds, Stage 4 now has narrow contract
+support via ``scripts/init_design_system.py`` (writes
+``design_system.json`` only from an explicit caller spec or a
+template theme); stages 5-6 (``slide_plans/*.json``,
+``image_manifest.json``) remain agent-driven per the schemas under
+``schemas/`` before ``scripts/run_pipeline.py`` can take over for
+stages 7-10.
 
 The plan-spec contract is: a JSON object whose shape is exactly the
 deck_plan candidate the caller wants written. The helper validates
@@ -505,11 +508,11 @@ def init_deck_plan(
         f"  sections: {n_sections}\n"
         f"  source_refs lineage: deck_brief.source_refs "
         f"{brief_refs!r} (each slide.source_refs is a subset)\n"
-        f"Next stages (agent-driven; init_deck_plan.py does not "
-        f"automate them):\n"
-        f"  4. design_system.json\n"
-        f"  5. slide_plans/*.json\n"
-        f"  6. image_manifest.json\n"
+        f"Next stages (init_deck_plan.py does not automate them):\n"
+        f"  4. design_system.json (narrow contract support via "
+        f"scripts/init_design_system.py)\n"
+        f"  5. slide_plans/*.json (agent-driven)\n"
+        f"  6. image_manifest.json (agent-driven)\n"
         f"Once those exist, scripts/run_pipeline.py can take over "
         f"for stages 7-10."
     )
@@ -1285,7 +1288,10 @@ def main(argv: list[str]) -> int:
             "of deck_brief.source_refs (helper gate), but a slide "
             "may pick a non-manifest id when the brief declares "
             "multiple. Does NOT extract business content from the "
-            "source body — stages 4-6 remain agent-driven."
+            "source body. Stage 4 now has narrow contract support "
+            "via scripts/init_design_system.py (writes "
+            "design_system.json only); stages 5-6 (slide_plans, "
+            "image_manifest) remain agent-driven."
         ),
     )
     parser.add_argument(
