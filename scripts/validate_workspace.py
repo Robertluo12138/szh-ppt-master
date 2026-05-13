@@ -124,6 +124,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import sys
 from dataclasses import dataclass
@@ -165,6 +166,13 @@ CORE_ARTIFACT_SCHEMAS = {
     "design_system.json":  "design_system.schema.json",
     "image_manifest.json": "image_manifest.schema.json",
 }
+
+# Stage-1 (Intake) artifact. Optional: a workspace prepared before
+# init_workspace.py existed may not ship it, in which case the bridge
+# check below is a no-op. When present, it must validate against the
+# schema AND match the on-disk source file.
+SOURCE_MANIFEST_FILENAME = "source_manifest.json"
+SOURCE_MANIFEST_LOCAL_PATH = "input/source.md"
 
 
 @dataclass
@@ -263,6 +271,232 @@ def check_schemas(workspace: Path) -> list[CheckResult]:
             f"slide_plans/{plan_file.name} validates against slide_plan.schema.json",
             not errors,
             "; ".join(errors),
+        ))
+    return out
+
+
+def _count_lines(raw: bytes) -> int:
+    """Same line-count rule init_workspace.py uses to populate the
+    manifest: number of '\\n' bytes, plus one if the file does not end
+    in '\\n'. Empty bytes -> 0 (init_workspace.py refuses an empty
+    source upstream)."""
+    if not raw:
+        return 0
+    n = raw.count(b"\n")
+    if not raw.endswith(b"\n"):
+        n += 1
+    return n
+
+
+def check_source_manifest_bridge(workspace: Path) -> list[CheckResult]:
+    """Stage-1 (Intake) -> Stage-2+ bridge.
+
+    When ``<workspace>/source_manifest.json`` is present, validate it
+    against ``schemas/source_manifest.schema.json`` and confirm the
+    on-disk source file matches every recorded counter / digest. When
+    ``deck_brief.json`` is present in the same workspace, also confirm
+    its ``source_refs`` lists the manifest's ``source.id`` so every
+    slide can cite the source bundle.
+
+    The manifest is **optional**: workspaces prepared before
+    ``init_workspace.py`` existed may not ship one, and we do not want
+    to break those examples. When the file is missing this check is a
+    no-op (returns no rows).
+
+    Concrete gates when the manifest IS present:
+      1. Schema-validates against source_manifest.schema.json (the
+         schema enum-locks ``source.local_path`` to "input/source.md",
+         so an unsafe local_path is rejected at the schema layer).
+      2. ``source.local_path`` resolves inside the workspace (defense-
+         in-depth: the schema already locks the value).
+      3. The resolved path is a regular file (refuses a symlink so a
+         caller cannot redirect the on-disk source through a symlink
+         after init_workspace.py wrote the canonical file).
+      4. The file's bytes decode as valid UTF-8.
+      5. ``source.byte_count`` equals the on-disk byte count.
+      6. ``source.line_count`` equals the on-disk line count (same rule
+         init_workspace.py used to build the manifest).
+      7. ``source.sha256`` equals the on-disk lowercase-hex sha256.
+      8. ``source.kind`` is one of the schema's documented values
+         (``"markdown"`` for a .md-original source, ``"text"`` for a
+         .txt-original source). The on-disk filename is normalized
+         to ``input/source.md`` regardless of the original extension,
+         so this row is a defense-in-depth check on the schema enum
+         (which already enforces it).
+      9. When ``deck_brief.json`` is present, ``deck_brief.source_refs``
+         must include ``source.id``.
+
+    The check is workspace-path agnostic: nothing about ``workspace``
+    other than the artifact files inside it is consulted.
+    """
+    out: list[CheckResult] = []
+    manifest_path = workspace / SOURCE_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        return out
+
+    manifest_raw, err = _try_load(manifest_path)
+    if manifest_raw is None:
+        out.append(CheckResult(
+            f"{SOURCE_MANIFEST_FILENAME} loadable", False, err,
+        ))
+        return out
+    manifest = _as_dict(manifest_raw)
+    if manifest is None:
+        out.append(CheckResult(
+            f"{SOURCE_MANIFEST_FILENAME} root is an object",
+            False, f"got {type(manifest_raw).__name__}",
+        ))
+        return out
+
+    schema_errs = _schema_validate(
+        manifest, SCHEMAS / "source_manifest.schema.json",
+    )
+    out.append(CheckResult(
+        f"{SOURCE_MANIFEST_FILENAME} validates against "
+        f"source_manifest.schema.json",
+        not schema_errs,
+        "; ".join(schema_errs),
+    ))
+    if schema_errs:
+        # The schema enum-locks local_path / kind / version, so a
+        # schema failure already names the unsafe field. Don't proceed
+        # to the on-disk cross-check against fields the schema rejected.
+        return out
+
+    source = _as_dict(manifest.get("source")) or {}
+    local_path = source.get("local_path")
+    # Defense-in-depth: schema enum-locks this to "input/source.md", so
+    # any other value would already have failed schema validation. The
+    # explicit check below makes the cross-check requirement visible to
+    # a reader and surfaces a clear FAIL if the schema ever drifts.
+    out.append(CheckResult(
+        f"source_manifest.source.local_path is "
+        f"{SOURCE_MANIFEST_LOCAL_PATH!r}",
+        local_path == SOURCE_MANIFEST_LOCAL_PATH,
+        f"got {local_path!r}",
+    ))
+    if local_path != SOURCE_MANIFEST_LOCAL_PATH:
+        return out
+
+    ok, resolved, reason = _safe_load_inside(workspace, local_path)
+    out.append(CheckResult(
+        f"source_manifest.source.local_path resolves inside the workspace",
+        ok, reason,
+    ))
+    if not ok or resolved is None:
+        return out
+
+    source_file = workspace / local_path
+    if source_file.is_symlink():
+        out.append(CheckResult(
+            f"source_manifest source file {local_path!r} is not a symlink",
+            False, f"symlink at {source_file}",
+        ))
+        return out
+    if not resolved.is_file():
+        out.append(CheckResult(
+            f"source_manifest source file {local_path!r} exists as a regular file",
+            False, f"missing {resolved}",
+        ))
+        return out
+    out.append(CheckResult(
+        f"source_manifest source file {local_path!r} is a regular file",
+        True,
+    ))
+
+    try:
+        raw = resolved.read_bytes()
+    except OSError as exc:
+        out.append(CheckResult(
+            f"source_manifest source file {local_path!r} is readable",
+            False, f"{exc}",
+        ))
+        return out
+
+    try:
+        raw.decode("utf-8")
+        utf8_ok, utf8_reason = True, ""
+    except UnicodeDecodeError as exc:
+        utf8_ok, utf8_reason = False, str(exc)
+    out.append(CheckResult(
+        f"source_manifest source file {local_path!r} is valid UTF-8",
+        utf8_ok, utf8_reason,
+    ))
+
+    declared_bytes = source.get("byte_count")
+    actual_bytes = len(raw)
+    out.append(CheckResult(
+        f"source_manifest source.byte_count matches on-disk file",
+        declared_bytes == actual_bytes,
+        f"declared={declared_bytes}, actual={actual_bytes}",
+    ))
+
+    declared_lines = source.get("line_count")
+    actual_lines = _count_lines(raw)
+    out.append(CheckResult(
+        f"source_manifest source.line_count matches on-disk file",
+        declared_lines == actual_lines,
+        f"declared={declared_lines}, actual={actual_lines}",
+    ))
+
+    declared_sha = source.get("sha256")
+    actual_sha = hashlib.sha256(raw).hexdigest()
+    out.append(CheckResult(
+        f"source_manifest source.sha256 matches on-disk file",
+        declared_sha == actual_sha,
+        f"declared={declared_sha!r}, actual={actual_sha!r}",
+    ))
+
+    # source.kind reflects how downstream stages should parse the
+    # source (`markdown` for an original .md, `text` for an original
+    # .txt). init_workspace.py normalizes the on-disk filename to
+    # input/source.md regardless of the original extension, so the
+    # bridge CANNOT recover the original extension from disk — both
+    # 'markdown' and 'text' are legitimate kinds against an
+    # input/source.md file. This row is a defense-in-depth gate that
+    # the schema enum has not drifted (the schema check at the top of
+    # the function already enforces this, so a kind outside the enum
+    # fails the schema row first and short-circuits before we get
+    # here).
+    declared_kind = source.get("kind")
+    allowed_kinds = ("markdown", "text")
+    out.append(CheckResult(
+        f"source_manifest source.kind is one of {allowed_kinds!r}",
+        declared_kind in allowed_kinds,
+        f"got {declared_kind!r}",
+    ))
+
+    # deck_brief cross-check, only when deck_brief.json is present. A
+    # workspace that has source_manifest.json but no deck_brief.json
+    # has not yet completed stage 2 — we do NOT fail that case here;
+    # check_schemas already reports the missing deck_brief if the
+    # caller expected stages 2-6 to be present.
+    brief_path = workspace / "deck_brief.json"
+    if brief_path.is_file():
+        brief_raw, brief_err = _try_load(brief_path)
+        if brief_raw is None:
+            out.append(CheckResult(
+                f"deck_brief.json loadable for source_manifest cross-check",
+                False, brief_err,
+            ))
+            return out
+        brief = _as_dict(brief_raw)
+        if brief is None:
+            out.append(CheckResult(
+                f"deck_brief.json root is an object for "
+                f"source_manifest cross-check",
+                False, f"got {type(brief_raw).__name__}",
+            ))
+            return out
+        source_id = source.get("id")
+        refs_raw = brief.get("source_refs")
+        refs_list = _as_list(refs_raw) or []
+        string_refs = [r for r in refs_list if isinstance(r, str)]
+        out.append(CheckResult(
+            f"deck_brief.source_refs declares "
+            f"source_manifest.source.id {source_id!r}",
+            isinstance(source_id, str) and source_id in string_refs,
+            f"deck_brief.source_refs: {sorted(string_refs)}",
         ))
     return out
 
@@ -3233,6 +3467,284 @@ def negative_render_model_filename_tempfixture_checks() -> list[CheckResult]:
     return out
 
 
+_SYNTH_SOURCE_MD = (
+    "# Synthetic Source\n\n"
+    "This is a synthetic .md source used only by the source_manifest "
+    "bridge tempfixture tests.\n"
+    "Line three.\n"
+)
+
+
+def _write_source_manifest_workspace(
+    ws: Path,
+    *,
+    body: bytes | None = None,
+    source_id: str = "synthetic_src",
+    kind: str = "markdown",
+    local_path: str = SOURCE_MANIFEST_LOCAL_PATH,
+    byte_count: int | None = None,
+    line_count: int | None = None,
+    sha256: str | None = None,
+    write_source_file: bool = True,
+    deck_brief: dict | object | None = ...,
+) -> Path:
+    """Build a synthetic workspace mirroring what init_workspace.py
+    would have produced, with optional one-field mutations driving each
+    negative bridge scenario. ``body`` defaults to ``_SYNTH_SOURCE_MD``.
+
+    Mutation knobs (defaulting to a clean, matching workspace):
+      - ``body``: bytes written to ``input/source.md``.
+      - ``source_id`` / ``kind`` / ``local_path``: manifest values.
+      - ``byte_count`` / ``line_count`` / ``sha256``: when ``None``
+        they're derived from ``body`` (so the manifest matches the
+        on-disk file).
+      - ``write_source_file``: when False, ``input/source.md`` is NOT
+        written even though the manifest still declares it.
+      - ``deck_brief``: ``...`` (sentinel) means write a deck_brief
+        whose ``source_refs`` contains ``source_id``. Pass ``None`` to
+        omit deck_brief.json entirely. Pass a ``dict`` to write that
+        dict verbatim (used to omit the source_id from source_refs).
+    """
+    if body is None:
+        body = _SYNTH_SOURCE_MD.encode("utf-8")
+    ws.mkdir(parents=True, exist_ok=True)
+    if write_source_file:
+        (ws / "input").mkdir(parents=True, exist_ok=True)
+        (ws / "input" / "source.md").write_bytes(body)
+    bc = len(body) if byte_count is None else byte_count
+    if line_count is None:
+        lc = _count_lines(body)
+    else:
+        lc = line_count
+    if sha256 is None:
+        sha = hashlib.sha256(body).hexdigest()
+    else:
+        sha = sha256
+    manifest = {
+        "schema_version": "1",
+        "source": {
+            "id": source_id,
+            "local_path": local_path,
+            "kind": kind,
+            "byte_count": bc,
+            "line_count": lc,
+            "sha256": sha,
+        },
+        "tool": {"name": "init_workspace", "version": "1"},
+    }
+    (ws / SOURCE_MANIFEST_FILENAME).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+    )
+    if deck_brief is ...:
+        deck_brief = {
+            "title": "T",
+            "audience": "A",
+            "objective": "O",
+            "source_refs": [source_id],
+        }
+    if deck_brief is not None:
+        (ws / "deck_brief.json").write_text(json.dumps(deck_brief))
+    return ws
+
+
+def negative_source_manifest_bridge_tempfixture_checks() -> list[CheckResult]:
+    """Tempfixture coverage for check_source_manifest_bridge.
+
+    Scenarios (one mutation per case against an otherwise-clean
+    workspace built by _write_source_manifest_workspace):
+
+      1. positive: manifest matches the on-disk source file and the
+         deck_brief.source_refs contains source.id;
+      2. missing source file (manifest present, input/source.md absent);
+      3. sha256 mismatch (manifest claims a stale digest);
+      4. bad local_path (schema enum-locked, so the schema row FAILs
+         and the on-disk cross-check rows are skipped);
+      5. invalid UTF-8 in the on-disk source file (binary bytes);
+      6. kind mismatch: a schema-invalid kind value (``'binary'``) is
+         rejected at the schema layer. ``'text'`` is NOT a mismatch —
+         init_workspace.py legitimately persists ``kind='text'`` for
+         a .txt original while normalizing the on-disk filename to
+         ``input/source.md``, so both schema-valid kinds are accepted
+         (see case 6b);
+      6b. .txt-intake positive: a manifest with ``kind='text'``
+         against the canonical ``input/source.md`` is accepted (this
+         case guards against the earlier ``expected_kind='markdown'``
+         regression that rejected valid .txt intakes);
+      7. deck_brief present but its source_refs omits source.id.
+
+    Workspaces without source_manifest.json must remain valid — this
+    case is the no-op return path of the bridge function and is
+    covered separately by the existing scaffold / example workspaces
+    that have not yet been re-seeded through init_workspace.py.
+    """
+    import tempfile
+    out: list[CheckResult] = []
+
+    # 1. positive
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_positive"
+        _write_source_manifest_workspace(ws)
+        results = check_source_manifest_bridge(ws)
+        out.append(CheckResult(
+            "tempfixture: positive source_manifest matches on-disk file "
+            "and deck_brief.source_refs declares the source.id",
+            bool(results) and all(r.ok for r in results),
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 2. missing source file
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_missing_source"
+        _write_source_manifest_workspace(ws, write_source_file=False)
+        results = check_source_manifest_bridge(ws)
+        detected = any(
+            "exists as a regular file" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: missing input/source.md is detected "
+            "(manifest present, file absent)",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 3. sha256 mismatch
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_sha_mismatch"
+        stale_sha = hashlib.sha256(b"different bytes").hexdigest()
+        _write_source_manifest_workspace(ws, sha256=stale_sha)
+        results = check_source_manifest_bridge(ws)
+        detected = any(
+            "source.sha256 matches" in r.name and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: sha256 mismatch between manifest and on-disk "
+            "source.md is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 4. bad local_path -> schema rejects (enum lock). The bridge then
+    # short-circuits before the on-disk cross-check rows, so we only
+    # assert the schema row FAILed.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_bad_local_path"
+        _write_source_manifest_workspace(
+            ws, local_path="../../etc/passwd",
+        )
+        results = check_source_manifest_bridge(ws)
+        schema_failed = any(
+            "validates against source_manifest.schema.json" in r.name
+            and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: bad local_path is rejected at the schema "
+            "layer (enum lock catches '../../etc/passwd')",
+            schema_failed,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 5. invalid UTF-8 in source.md
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_invalid_utf8"
+        bad_bytes = b"\x00\x01\xff garbage \xfe"
+        _write_source_manifest_workspace(ws, body=bad_bytes)
+        results = check_source_manifest_bridge(ws)
+        detected = any(
+            "is valid UTF-8" in r.name and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: invalid UTF-8 in input/source.md is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 6. kind mismatch: a schema-invalid kind (`'binary'`) is rejected.
+    # init_workspace.py legitimately writes either 'markdown' (from a
+    # .md source) or 'text' (from a .txt source) against a normalized
+    # input/source.md filename, so 'text' is NOT a mismatch — the
+    # canonical mismatch is a value outside the schema enum. The
+    # schema check at the top of the bridge surfaces this first and
+    # short-circuits the per-counter rows.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_kind_mismatch"
+        _write_source_manifest_workspace(ws, kind="binary")
+        results = check_source_manifest_bridge(ws)
+        detected = any(
+            "validates against source_manifest.schema.json" in r.name
+            and not r.ok
+            and "kind" in r.detail
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: kind mismatch (schema-invalid 'binary') is "
+            "detected at the schema layer",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 6b. .txt-intake positive: init_workspace.py writes kind='text'
+    # against the normalized input/source.md when the original
+    # --source was a .txt file. The bridge must accept this — the
+    # earlier hardcode of expected_kind='markdown' rejected valid
+    # .txt-intake workspaces and is the regression this case guards
+    # against.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_txt_intake"
+        _write_source_manifest_workspace(ws, kind="text")
+        results = check_source_manifest_bridge(ws)
+        out.append(CheckResult(
+            "tempfixture: .txt-intake workspace (kind='text' against "
+            "input/source.md) passes the bridge — both schema-valid "
+            "kinds are accepted",
+            bool(results) and all(r.ok for r in results),
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 7. deck_brief.source_refs omits the source id
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_brief_missing_id"
+        bad_brief = {
+            "title": "T",
+            "audience": "A",
+            "objective": "O",
+            "source_refs": ["some_other_source"],
+        }
+        _write_source_manifest_workspace(
+            ws, source_id="synthetic_src", deck_brief=bad_brief,
+        )
+        results = check_source_manifest_bridge(ws)
+        detected = any(
+            "deck_brief.source_refs declares" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: deck_brief.source_refs omitting "
+            "source_manifest.source.id is detected",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 8. workspace WITHOUT source_manifest.json must produce zero rows
+    # (no-op): the bridge function is opt-in for stage-1-prepared
+    # workspaces only. This proves prepared examples without an intake
+    # manifest remain valid.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_no_manifest"
+        ws.mkdir()
+        results = check_source_manifest_bridge(ws)
+        out.append(CheckResult(
+            "tempfixture: workspace without source_manifest.json "
+            "produces no bridge rows (opt-in, prepared examples "
+            "remain valid)",
+            results == [],
+            f"got {len(results)} rows: "
+            f"{[(r.name, r.ok) for r in results]}",
+        ))
+
+    return out
+
+
 def _write_baseline_svg_preview(ws: Path) -> Path:
     """Write a minimal SVG preview that passes check_svg_previews for the
     render_model the _baseline_render_model_workspace builder produced.
@@ -5043,6 +5555,11 @@ def main(argv: list[str]) -> int:
 
     sections: list[tuple[str, list[CheckResult]]] = [
         ("schemas: every artifact validates", check_schemas(args.workspace)),
+        ("stage-1 (intake) bridge: source_manifest.json validates and "
+         "matches the on-disk input/source.md; when deck_brief.json is "
+         "present, deck_brief.source_refs declares source.id (optional: "
+         "no rows when source_manifest.json is absent)",
+         check_source_manifest_bridge(args.workspace)),
         ("template chain: deck_plan.template + layout declarations",
          check_template_chain(args.workspace, args.template_root)),
         ("template files: template.json + theme + every declared layout",
@@ -5100,6 +5617,17 @@ def main(argv: list[str]) -> int:
          "coverage gate cannot mistake the canonical name for missing "
          "and the renamed file for orphan",
          negative_render_model_filename_tempfixture_checks()),
+        ("negative tempfixtures (source_manifest bridge): positive match "
+         "between manifest and on-disk source.md plus deck_brief "
+         "cross-check; missing input/source.md; sha256 mismatch; bad "
+         "local_path rejected at the schema layer; invalid UTF-8 in "
+         "source.md; kind mismatch (schema-invalid value rejected at "
+         "the schema layer); .txt-intake positive (kind='text' against "
+         "the normalized input/source.md is accepted — both schema-"
+         "valid kinds pass the bridge); deck_brief.source_refs omitting "
+         "the manifest's source.id; no-manifest workspace produces "
+         "zero bridge rows (opt-in, prepared examples remain valid)",
+         negative_source_manifest_bridge_tempfixture_checks()),
         ("negative tempfixtures (svg_preview): missing svg_preview, "
          "malformed XML, wrong root, viewBox mismatch, <foreignObject>, "
          "href URL / file:// / absolute / '..' / data: / javascript:, "

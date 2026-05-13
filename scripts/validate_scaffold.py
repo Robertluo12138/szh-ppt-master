@@ -863,7 +863,11 @@ def main() -> int:
     # Lazy import to avoid the circular dependency: validate_workspace
     # already imports local_path_is_safe / _resolves_within /
     # _slide_plan_against_layout from this module at module load time.
-    from validate_workspace import check_planner_semantics, check_svg_previews
+    from validate_workspace import (
+        check_planner_semantics,
+        check_source_manifest_bridge,
+        check_svg_previews,
+    )
 
     # Per-workspace positive + per-workspace negatives. The label embeds the
     # workspace path so failures point at a specific example.
@@ -882,6 +886,12 @@ def main() -> int:
              layout_aware_slide_plan_checks(DEFAULT_TEMPLATE, ws)),
             (f"planner semantics ({label})",
              check_planner_semantics(ws)),
+            (f"stage-1 (intake) bridge ({label}): source_manifest.json "
+             f"validates and matches on-disk input/source.md when "
+             f"present; deck_brief.source_refs declares source.id; "
+             f"absent manifest is a no-op so prepared examples without "
+             f"intake stay valid",
+             check_source_manifest_bridge(ws)),
             (f"svg_preview validation ({label})",
              check_svg_previews(ws, TEMPLATES)),
         ])

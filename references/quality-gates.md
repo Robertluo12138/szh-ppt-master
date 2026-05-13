@@ -4,6 +4,7 @@ The gates a deck must pass before the skill reports success. Each gate maps to a
 
 | Gate | Stage | Status |
 |---|---|---|
+| `source_manifest.bridge` — when `source_manifest.json` is present in the workspace, it validates against `schemas/source_manifest.schema.json`; `source.local_path` (enum-locked to `input/source.md`) resolves inside the workspace and exists as a regular file (symlinks refused); the file is valid UTF-8; `source.byte_count` / `line_count` / `sha256` match the on-disk source; and `source.kind` is one of the schema-documented values (`markdown` for a .md-original source, `text` for a .txt-original source — `init_workspace.py` normalizes the on-disk filename to `input/source.md` regardless of the original extension, so both kinds are legitimate). When `deck_brief.json` is present in the same workspace, `deck_brief.source_refs` must include `source_manifest.source.id`. Workspaces without `source_manifest.json` are a no-op (existing prepared examples that pre-date `init_workspace.py` remain valid) | Intake → Brief | scaffold + workspace (`check_source_manifest_bridge` + tempfixture `negative_source_manifest_bridge_tempfixture_checks`) |
 | `brief.schema` — `deck_brief.json` validates | Brief | scaffold + workspace (subset validator) |
 | `plan.schema` — `deck_plan.json` validates | Plan | scaffold + workspace (subset validator) |
 | `design.schema` — `design_system.json` validates | Design system | scaffold + workspace (subset validator) |
