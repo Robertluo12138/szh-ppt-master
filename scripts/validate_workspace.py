@@ -303,7 +303,18 @@ def check_source_manifest_bridge(workspace: Path) -> list[CheckResult]:
     to break those examples. When the file is missing this check is a
     no-op (returns no rows).
 
-    Concrete gates when the manifest IS present:
+    A pre-existing **symlink** at ``source_manifest.json`` — broken or
+    resolvable — is refused outright (returns one FAIL row) BEFORE the
+    is_file / read_text / _try_load gates run. ``Path.is_file()``
+    follows symlinks and returns False for a dangling target, so a
+    broken symlink would otherwise be indistinguishable from the
+    legacy "no source_manifest.json present" no-op; a resolvable
+    symlink would let ``read_text()`` follow the link and read
+    manifest bytes from outside the workspace. The symlink gate is
+    the only gate that fires here on a missing-target path; a missing
+    manifest (no path entry at all) is still the legacy no-op.
+
+    Concrete gates when the manifest IS present as a regular file:
       1. Schema-validates against source_manifest.schema.json (the
          schema enum-locks ``source.local_path`` to "input/source.md",
          so an unsafe local_path is rejected at the schema layer).
@@ -331,6 +342,29 @@ def check_source_manifest_bridge(workspace: Path) -> list[CheckResult]:
     """
     out: list[CheckResult] = []
     manifest_path = workspace / SOURCE_MANIFEST_FILENAME
+    # Symlink at source_manifest.json (broken OR resolvable) is refused
+    # BEFORE the is_file / _try_load / read_text gates below. A
+    # resolvable symlink would otherwise let _try_load's read_text()
+    # follow the link and read manifest bytes from outside the
+    # workspace; a broken symlink would slip past Path.is_file() (which
+    # follows links and returns False for a dangling target) and look
+    # indistinguishable from the legacy "no source_manifest.json
+    # present" no-op path — silently turning a fail-closed contract
+    # violation into a no-op. Mirrors the same anti-pattern
+    # init_deck_brief.py rejects at its write path and run_pipeline.py
+    # rejects at --output / --report-dir. A missing manifest (no path
+    # entry at all) is still the legacy no-op.
+    if manifest_path.is_symlink():
+        try:
+            target = str(manifest_path.readlink())
+        except OSError:
+            target = "<unreadable>"
+        out.append(CheckResult(
+            f"{SOURCE_MANIFEST_FILENAME} is a regular in-workspace file "
+            f"(symlinks refused, broken or resolvable)",
+            False, f"symlink at {manifest_path} -> {target}",
+        ))
+        return out
     if not manifest_path.is_file():
         return out
 
@@ -3570,12 +3604,34 @@ def negative_source_manifest_bridge_tempfixture_checks() -> list[CheckResult]:
          against the canonical ``input/source.md`` is accepted (this
          case guards against the earlier ``expected_kind='markdown'``
          regression that rejected valid .txt intakes);
-      7. deck_brief present but its source_refs omits source.id.
-
-    Workspaces without source_manifest.json must remain valid — this
-    case is the no-op return path of the bridge function and is
-    covered separately by the existing scaffold / example workspaces
-    that have not yet been re-seeded through init_workspace.py.
+      7. deck_brief present but its source_refs omits source.id;
+      8. workspace WITHOUT source_manifest.json (legacy / pre-Stage-1
+         example) — the bridge is a no-op and emits zero rows, proving
+         the existing prepared examples that pre-date ``init_workspace.py``
+         remain valid;
+      9. malformed source_manifest.json (non-JSON bytes) is reported
+         as a structured loadability FAIL — the validator must NOT
+         traceback when a hand-edited manifest carries garbage bytes;
+      10. source_manifest.json whose JSON root is a list (not an
+          object) fails closed on the shape gate without traceback;
+      11. Stage-1-only workspace: source_manifest + input/source.md
+          present, deck_brief.json ABSENT — the bridge passes every
+          on-disk counter / digest row and SKIPS the deck_brief
+          cross-check row (it does not emit a FAIL for the missing
+          brief; the brief's absence is reported by check_schemas if
+          a caller expected stages 2-6 to be present);
+      12. BROKEN symlink at source_manifest.json fails closed at the
+          new symlink preflight gate and the dangling target is never
+          created (proves Path.is_file()'s false-False for a dangling
+          link does not silently demote the workspace to the legacy
+          "no manifest" no-op);
+      13. RESOLVABLE symlink at source_manifest.json (target is a
+          real file outside the workspace) fails closed at the same
+          preflight BEFORE _try_load / read_text can follow the link
+          and read manifest bytes from outside the workspace; the
+          outside target's bytes are preserved byte-identical and no
+          schema-validate row is emitted (the preflight short-
+          circuits before schema validation runs).
     """
     import tempfile
     out: list[CheckResult] = []
@@ -3740,6 +3796,155 @@ def negative_source_manifest_bridge_tempfixture_checks() -> list[CheckResult]:
             results == [],
             f"got {len(results)} rows: "
             f"{[(r.name, r.ok) for r in results]}",
+        ))
+
+    # 9. malformed source_manifest.json (non-JSON bytes) is reported as
+    # a structured loadability FAIL — NOT a traceback. The earlier
+    # "bad local_path" case (#4) exercises the schema-layer enum lock;
+    # this case exercises the json.loads layer that runs BEFORE the
+    # schema-validate path, proving _try_load surfaces a clean row
+    # rather than crashing the validator.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_bad_json"
+        ws.mkdir()
+        (ws / SOURCE_MANIFEST_FILENAME).write_text("{ not valid json")
+        results = check_source_manifest_bridge(ws)
+        detected = any(
+            "loadable" in r.name and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: malformed source_manifest.json (non-JSON "
+            "bytes) is reported as a structured loadability FAIL "
+            "without traceback",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 10. source_manifest.json whose JSON root is a list, not an
+    # object, must FAIL closed at the shape gate. Without the explicit
+    # _as_dict shape check the validator would NOT traceback (it would
+    # call .get() on the list and silently produce confusing rows).
+    # The bridge's "root is an object" gate is what closes this hole.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_list_root"
+        ws.mkdir()
+        (ws / SOURCE_MANIFEST_FILENAME).write_text("[1, 2, 3]")
+        results = check_source_manifest_bridge(ws)
+        detected = any(
+            "root is an object" in r.name and not r.ok for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: source_manifest.json with a list root (not "
+            "an object) fails closed on the shape gate without "
+            "traceback",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 11. Manifest present but deck_brief.json ABSENT: the bridge must
+    # report the on-disk source / counter / sha rows but skip the
+    # deck_brief cross-check row entirely — it is a Stage-1-only
+    # workspace and the cross-check is gated on deck_brief presence.
+    # This is the (1) + (6) contract from the goal: a workspace with
+    # source_manifest.json + input/source.md is valid on its own;
+    # missing deck_brief.json is not a failure of the bridge itself,
+    # only of any downstream gate that expects the brief.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_brief_absent"
+        _write_source_manifest_workspace(ws, deck_brief=None)
+        results = check_source_manifest_bridge(ws)
+        all_ok = bool(results) and all(r.ok for r in results)
+        cross_check_skipped = not any(
+            "deck_brief.source_refs declares" in r.name for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: source_manifest present + deck_brief absent "
+            "is a valid Stage-1-only workspace (bridge passes, "
+            "deck_brief cross-check row is skipped, NOT emitted as a "
+            "FAIL)",
+            all_ok and cross_check_skipped,
+            f"all_ok={all_ok}, cross_check_skipped={cross_check_skipped}; "
+            + "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 12. BROKEN symlink at source_manifest.json must fail closed at
+    # the new symlink preflight gate BEFORE _try_load / read_text runs.
+    # Without the gate, Path.is_file() (which follows symlinks and
+    # returns False for a dangling target) would make a broken-link
+    # workspace look indistinguishable from the legacy "no manifest"
+    # no-op path — the bridge would silently emit zero rows and the
+    # contract violation would never surface. The fixture builds the
+    # symlink AFTER _write_source_manifest_workspace populates the
+    # canonical manifest, by deleting that file and replacing it with
+    # a symlink to a path that does not exist.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_manifest_broken_symlink"
+        _write_source_manifest_workspace(ws, source_id="synthetic_src")
+        manifest_path = ws / SOURCE_MANIFEST_FILENAME
+        manifest_path.unlink()
+        dangling_target = Path(td) / "no_such_manifest_target.json"
+        assert not dangling_target.exists()
+        manifest_path.symlink_to(dangling_target)
+        results = check_source_manifest_bridge(ws)
+        detected = any(
+            "symlinks refused" in r.name and not r.ok for r in results
+        )
+        # The dangling target must remain absent — the bridge must
+        # never have followed the link.
+        target_absent = not dangling_target.exists()
+        out.append(CheckResult(
+            "tempfixture: BROKEN symlink at source_manifest.json fails "
+            "closed at the symlink preflight (not silently treated as "
+            "the legacy no-manifest no-op); dangling target is never "
+            "created",
+            detected and target_absent,
+            f"detected={detected}, target_absent={target_absent}; "
+            + "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # 13. RESOLVABLE symlink at source_manifest.json (link points at a
+    # real file outside the workspace) must ALSO fail closed at the
+    # symlink preflight, BEFORE _try_load's read_text() can follow the
+    # link and read manifest bytes from outside the workspace. The
+    # outside file's bytes must be preserved byte-identical (the
+    # bridge is verification-only and must never mutate anything; we
+    # also assert no bridge row claims the manifest "validates" — the
+    # preflight must short-circuit before schema validation runs).
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "ws_manifest_live_symlink"
+        ws.mkdir()
+        outside_manifest = Path(td) / "outside_manifest.json"
+        outside_bytes = (
+            b'{"schema_version": "1", '
+            b'"source": {"id": "outside_src", '
+            b'"local_path": "input/source.md", "kind": "markdown", '
+            b'"byte_count": 1, "line_count": 1, '
+            b'"sha256": "' + b"0" * 64 + b'"}, '
+            b'"tool": {"name": "init_workspace", "version": "1"}}\n'
+        )
+        outside_manifest.write_bytes(outside_bytes)
+        (ws / SOURCE_MANIFEST_FILENAME).symlink_to(outside_manifest)
+        results = check_source_manifest_bridge(ws)
+        detected = any(
+            "symlinks refused" in r.name and not r.ok for r in results
+        )
+        validate_row_emitted = any(
+            "validates against source_manifest.schema.json" in r.name
+            for r in results
+        )
+        outside_preserved = outside_manifest.read_bytes() == outside_bytes
+        out.append(CheckResult(
+            "tempfixture: RESOLVABLE symlink at source_manifest.json "
+            "fails closed at the symlink preflight BEFORE _try_load / "
+            "read_text can follow the link; outside target bytes "
+            "preserved byte-identical and no schema-validate row is "
+            "emitted",
+            detected
+            and outside_preserved
+            and not validate_row_emitted,
+            f"detected={detected}, outside_preserved={outside_preserved}, "
+            f"validate_row_emitted={validate_row_emitted}; "
+            + "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
         ))
 
     return out
@@ -5626,7 +5831,19 @@ def main(argv: list[str]) -> int:
          "the normalized input/source.md is accepted — both schema-"
          "valid kinds pass the bridge); deck_brief.source_refs omitting "
          "the manifest's source.id; no-manifest workspace produces "
-         "zero bridge rows (opt-in, prepared examples remain valid)",
+         "zero bridge rows (opt-in, prepared examples remain valid); "
+         "malformed source_manifest.json (non-JSON bytes) reported as "
+         "structured loadability FAIL without traceback; list-rooted "
+         "source_manifest.json fails closed on the shape gate; "
+         "Stage-1-only workspace (manifest + source.md, no "
+         "deck_brief.json) passes the bridge and the deck_brief "
+         "cross-check row is skipped rather than emitted as a FAIL; "
+         "broken symlink at source_manifest.json fails closed at the "
+         "symlink preflight (dangling target never created); "
+         "resolvable symlink at source_manifest.json fails closed at "
+         "the same preflight BEFORE read_text can follow the link "
+         "(outside target bytes preserved, no schema-validate row "
+         "emitted)",
          negative_source_manifest_bridge_tempfixture_checks()),
         ("negative tempfixtures (svg_preview): missing svg_preview, "
          "malformed XML, wrong root, viewBox mismatch, <foreignObject>, "

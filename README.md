@@ -39,7 +39,7 @@ projects/               # generated workspaces (not committed; created by users)
 
 ## Verification today
 
-Nine stdlib-only Python commands are wired up — four validators (`validate_artifacts.py`, `validate_scaffold.py`, `validate_workspace.py`, `validate_pptx_contract.py`), two deterministic generators (`generate_render_models.py`, `generate_svg_previews.py`), a deterministic PPTX exporter (`export_pptx.py`), a deterministic stage-1 (Intake) workspace initializer (`init_workspace.py`), and a deterministic local pipeline runner (`run_pipeline.py`) that chains validate → generate render_models → generate SVG previews → export PPTX → validate the produced PPTX for a prepared workspace. No third-party dependencies are required. `validate_pptx_contract.py` now gates the produced `.pptx` at the container level **and** with a minimal-evidence safety / editability layer (slide count, no external rels, no `file://` rels, relationship `Type` allow-list over the canonical OOXML rel URLs, no macros / OLE / ActiveX parts, at least one editable `<a:t>` run, no all-image slide, no blank slide, every slide carries at least one `<p:sp>` or `<p:cxnSp>`); full-inventory editability, the media inventory, theme palette mapping, determinism, and validator-side layout / primitive scope all remain TODO and are explicitly named that way in every run.
+Eleven stdlib-only Python commands are wired up — four validators (`validate_artifacts.py`, `validate_scaffold.py`, `validate_workspace.py`, `validate_pptx_contract.py`), two deterministic generators (`generate_render_models.py`, `generate_svg_previews.py`), a deterministic PPTX exporter (`export_pptx.py`), a deterministic stage-1 (Intake) workspace initializer (`init_workspace.py`), a deterministic stage-2 (Brief) contract helper (`init_deck_brief.py`), a deterministic stage-3 (Plan) contract helper (`init_deck_plan.py`), and a deterministic local pipeline runner (`run_pipeline.py`) that chains validate → generate render_models → generate SVG previews → export PPTX → validate the produced PPTX for a prepared workspace. No third-party dependencies are required. `validate_pptx_contract.py` now gates the produced `.pptx` at the container level **and** with a minimal-evidence safety / editability layer (slide count, no external rels, no `file://` rels, relationship `Type` allow-list over the canonical OOXML rel URLs, no macros / OLE / ActiveX parts, at least one editable `<a:t>` run, no all-image slide, no blank slide, every slide carries at least one `<p:sp>` or `<p:cxnSp>`); full-inventory editability, the media inventory, theme palette mapping, determinism, and validator-side layout / primitive scope all remain TODO and are explicitly named that way in every run.
 
 ### Stage-1 (Intake): workspace initialization from a local source
 
@@ -71,6 +71,97 @@ Fail-closed gates (every gate aborts before any file is written under `--workspa
 ```
 python3 scripts/init_workspace.py --self-test
 ```
+
+### Stage-2 (Brief): minimal deck_brief contract helper
+
+`scripts/init_deck_brief.py` is the stdlib-only, deterministic Stage-2 helper that bridges an already-stage-1-initialized workspace (`source_manifest.json` + `input/source.md`, the artifacts `init_workspace.py` writes) into a minimal, schema-valid `<workspace>/deck_brief.json` whose `source_refs` declares the manifest's `source.id`. **This is Stage-2 contract support only — it is not a full prompt/report/Markdown-to-PPTX automation.** The helper writes only the four fields the deck_brief schema *requires* (`title`, `audience`, `objective`, `source_refs`) plus any optional metadata (`tone`, `language`, `approximate_slide_count`) the caller explicitly supplied. It does NOT read or parse `input/source.md` for headings, bullets, key messages, or constraints; it does NOT invent `key_messages` or `constraints` even when the source contains obvious candidates; and it does NOT plan a deck or produce `deck_plan` / `design_system` / `slide_plans` / `image_manifest`. Two runs from the same workspace + metadata produce a byte-identical brief.
+
+```
+python3 scripts/init_deck_brief.py \
+  --workspace path/to/new/workspace \
+  --title "Deck title" \
+  --audience "Audience label" \
+  --objective "What the deck is for" \
+  [--tone neutral] \
+  [--language en] \
+  [--approximate-slide-count 8]
+```
+
+Fail-closed gates (every gate aborts before any file is written under `--workspace`):
+
+- `--workspace` must be an existing directory whose string form does NOT start with a URI-like scheme matching `^[A-Za-z][A-Za-z0-9+.\-]*:` (same regex `init_workspace.py` applies to `--source` / `--workspace`);
+- `--workspace` must NOT be a symlink and must NOT be a regular file;
+- the workspace must already ship `source_manifest.json` as a **regular in-workspace file**: a symlink at that path (broken or resolvable) is refused outright by a symlink preflight that runs BEFORE the is_file check and BEFORE `check_source_manifest_bridge` / `read_text`, so neither a dangling target masquerading as the legacy "no manifest" no-op nor a resolvable link reading manifest bytes from outside the workspace can slip through (otherwise the agent has not yet completed Stage 1 and there's no `source.id` to reference);
+- the manifest must be loadable and schema-valid against `schemas/source_manifest.schema.json`;
+- `input/source.md` must exist as a regular UTF-8 file whose `byte_count` / `line_count` / `sha256` match the manifest (the same `check_source_manifest_bridge` gate the workspace validator runs — every counter mismatch / digest mismatch / missing source / malformed manifest / list-rooted manifest / manifest-symlink case is reported there and re-used here);
+- `deck_brief.json` must NOT already exist in the workspace. A pre-existing **symlink** at that path (broken or resolvable) is refused outright, BEFORE the regular file-existence check, so `write_text()` cannot silently follow a dangling link and clobber its target — `Path.exists()` returns False for a broken symlink, so a bare existence gate would otherwise let that happen (same anti-pattern `run_pipeline.py` forbids at `--output` / `--report-dir`). A pre-existing regular file at the same path is also refused (rename or remove it first);
+- `--title` / `--audience` / `--objective` are required, must each be non-empty after `.strip()`, and must each be single-line — a value containing a newline or carriage return is refused so the helper cannot be used as a content-extraction tool;
+- `--tone` / `--language` are optional and subject to the same single-line constraint when supplied;
+- `--approximate-slide-count` is optional and must be a positive integer;
+- the brief is schema-validated **in memory** against `schemas/deck_brief.schema.json` before any write, and **re-validated on disk** via `scripts/validate_artifacts.py` after the write.
+
+**Rollback contract:** preflight failures leave the workspace untouched. A post-write re-validation failure (the validator returns errors OR raises) removes the just-written `deck_brief.json` so the workspace returns to its pre-call state. The catch clause is explicitly `(Exception, SystemExit)` — `validate_artifact` raises `SystemExit` on its own read-error branch, and `SystemExit` does not inherit from `Exception`, so a bare `except Exception:` would let the rollback be bypassed. `KeyboardInterrupt` is deliberately not caught.
+
+`scripts/init_deck_brief.py --self-test` exercises 29 in-script tempfixture scenarios under `tempfile.TemporaryDirectory()` — happy path (minimum-required metadata emits no invented optional fields), optional fields included only when supplied, byte-for-byte determinism between two independent runs, missing `source_manifest.json` (no silent fallback to an invented id), **broken symlink at `source_manifest.json` refused at the preflight (dangling target never created, no `deck_brief.json` written)**, **resolvable symlink at `source_manifest.json` refused at the same preflight (outside target bytes preserved byte-identical, no `deck_brief.json` written)**, missing `input/source.md`, malformed `source_manifest.json` (non-JSON), schema-invalid `source_manifest.json` (missing required key), sha256 mismatch between manifest and on-disk source, pre-existing regular-file `deck_brief.json` refused with prior bytes preserved, **broken symlink at `deck_brief.json` refused before any write — the dangling target is never created (proves `Path.exists()`'s false-False for a broken link does not bypass the gate)**, **resolvable symlink at `deck_brief.json` refused with the link target's bytes preserved byte-identical**, missing / regular-file / URI-shaped `--workspace`, empty / multi-line `--title` / `--audience` / `--objective`, empty `--tone`, non-positive `--approximate-slide-count`, on-disk re-validation via `validate_artifact`, mocked post-write rollback (return errors), mocked post-write rollback (raise `SystemExit`), source-body marker phrase NEVER copied into the brief (proves no content extraction), `source_refs` is exactly `[source.id]` (the (3) contract gate), and a mutated brief that drops `source.id` from `source_refs` is caught fail-closed by `check_source_manifest_bridge` (the (4) contract gate).
+
+```
+python3 scripts/init_deck_brief.py --self-test
+```
+
+After Stage 2 succeeds, **stage 3** has narrow contract support via `scripts/init_deck_plan.py` (see next section); after that helper succeeds, **stages 4–6** (`design_system.json`, `slide_plans/*.json`, `image_manifest.json`) remain agent-driven. Once those exist, `scripts/run_pipeline.py` can take over for stages 7–10.
+
+### Stage-3 (Plan): minimal deck_plan contract helper
+
+`scripts/init_deck_plan.py` is the stdlib-only, deterministic Stage-3 helper that bridges an already-stage-2-initialized workspace (`source_manifest.json` + `input/source.md` + `deck_brief.json`) plus a caller-supplied `--plan-spec` JSON file into a minimal, schema-valid `<workspace>/deck_plan.json`. **This is Stage-3 contract support only — it is not a full prompt/report/Markdown-to-PPTX automation.** The helper validates the caller-supplied plan-spec against `schemas/deck_plan.schema.json` and the planner-semantics cross-checks (planned-count equality, slide indices unique + contiguous 1..N, section coverage 1:1 with deck_plan slides, every `slide.section_id` resolves to a declared section, every `slide.source_refs` value is declared in `deck_brief.source_refs`), and writes the result deterministically. It does NOT read or parse `input/source.md` for any business content; it does NOT invent `template` / `rationale` / `slides` / `sections` when the caller does not supply them (the caller passes the plan content via `--plan-spec`); and it does NOT produce `design_system.json` / `slide_plans/*.json` / `image_manifest.json` / `render_models/*` / `svg_previews/*` / any `.pptx`. Two runs from the same workspace + spec produce a byte-identical plan.
+
+The plan-spec contract is a JSON object whose shape is exactly the deck_plan candidate to be written:
+
+```
+{
+  "template": "<template name under templates/layouts/>",
+  "planning": {
+    "planned_slide_count": <integer; helper enforces == len(slides)>,
+    "rationale": "<short reason for length / structure>"
+  },
+  "sections": [
+    {"id": "<stable id>", "title": "...", "summary": "...",
+     "slide_indices": [<1-based indices the section covers>]}
+  ],
+  "slides": [
+    {"index": <1-based, unique, contiguous from 1>, "layout": "...",
+     "title": "...", "section_id": "<must resolve to sections[].id>",
+     "summary": "...", "density": "low|medium|high",
+     "source_refs": [<each value must be in deck_brief.source_refs>]}
+  ]
+}
+```
+
+```
+python3 scripts/init_deck_plan.py \
+  --workspace path/to/stage2/workspace \
+  --plan-spec path/to/plan_spec.json
+```
+
+Fail-closed gates (every gate aborts before any file is written under `--workspace`):
+
+- `--workspace` must be an existing directory whose string form does NOT start with a URI-like scheme (same regex `init_workspace.py` / `init_deck_brief.py` apply);
+- `--workspace` must NOT be a symlink and must NOT be a regular file;
+- the workspace must already ship `source_manifest.json` AND `deck_brief.json` as **regular in-workspace files**: symlinks at either path (broken or resolvable) are refused outright by symlink preflights that run BEFORE the is_file / read_text / bridge gates;
+- the existing `check_source_manifest_bridge` must pass (manifest schema-valid, `input/source.md` matches counters / digest, `deck_brief.source_refs` declares `source_manifest.source.id`);
+- `--plan-spec` must be an existing regular file (symlink refused at the preflight, broken or resolvable), must parse as JSON, must decode to an object, and must validate against `schemas/deck_plan.schema.json`;
+- the spec must satisfy the planner-semantics cross-checks: `planning.planned_slide_count == len(slides)`; `slides[].index` is unique AND contiguous 1..N (the schema only requires `index >= 1`, so contiguity is enforced at the helper layer to match what stages 7–10 assume); `sections[].slide_indices` cover every `slides[].index` exactly once (no duplicates, no missing, no orphans); every `slides[].section_id` resolves to a declared section AND that section's `slide_indices` lists the slide's index; every `slides[].source_refs` value is declared in `deck_brief.source_refs`;
+- `deck_plan.json` must NOT already exist in the workspace. A pre-existing symlink at that path (broken or resolvable) is refused outright, BEFORE the regular file-existence check, so `write_text()` cannot silently follow a dangling link and clobber its target. A pre-existing regular file at the same path is also refused (rename or remove it first);
+- the plan is schema-validated **in memory** against `schemas/deck_plan.schema.json` before any write, and **re-validated on disk** via `scripts/validate_artifacts.py` after the write.
+
+**Rollback contract:** preflight failures leave the workspace untouched. A post-write re-validation failure (the validator returns errors OR raises) removes the just-written `deck_plan.json` so the workspace returns to its pre-call state. The catch clause is explicitly `(Exception, SystemExit)` — `validate_artifact` raises `SystemExit` on its own read-error branch, and `SystemExit` does not inherit from `Exception`, so a bare `except Exception:` would let the rollback be bypassed. `KeyboardInterrupt` is deliberately not caught.
+
+`scripts/init_deck_plan.py --self-test` exercises 29 in-script tempfixture scenarios under `tempfile.TemporaryDirectory()` — happy path (1-slide / 3-slide), byte-for-byte determinism between two independent runs, missing `deck_brief.json` (no silent fallback), malformed deck_brief, deck_brief whose `source_refs` omits `source_manifest.source.id` (refused at the bridge), `planning.planned_slide_count != len(slides)`, duplicate slide indices, **non-contiguous slide indices (e.g. `[1, 2, 4]`)**, section coverage that omits a slide, section coverage that lists an orphan slide_index, unknown `slide.section_id`, `slide.source_refs` value not declared in `deck_brief.source_refs`, no-source_manifest legacy workspace refused (the helper requires Stage-1; the existing prepared examples that pre-date `init_workspace.py` simply do not run this helper — their workspace-validator runs remain valid because the bridge is a no-op when the manifest is absent), pre-existing regular-file `deck_plan.json` refused with prior bytes preserved, **broken symlink at `deck_plan.json` refused before any write — the dangling target is never created**, **resolvable symlink at `deck_plan.json` refused with the link target's bytes preserved**, broken symlink at `source_manifest.json` refused (no deck_plan written, dangling target never created), `--plan-spec` symlink (broken or resolvable) / malformed JSON / list-rooted / schema-invalid, missing / regular-file / URI-shaped `--workspace`, source-body marker phrase NEVER copied into the plan (proves no content extraction), mocked post-write rollback (return errors), mocked post-write rollback (raise `SystemExit`), and on-disk re-validation via `validate_artifact`.
+
+```
+python3 scripts/init_deck_plan.py --self-test
+```
+
+After Stage 3 succeeds, **stages 4–6** (`design_system.json`, `slide_plans/*.json`, `image_manifest.json`) remain agent-driven. Once those exist, `scripts/run_pipeline.py` can take over for stages 7–10.
 
 ### Single-artifact structural validation
 
@@ -123,7 +214,7 @@ python3 scripts/validate_workspace.py \
 It runs (every check is fail-closed; exit 1 on any failure):
 
 - **Schemas:** every artifact in the workspace (`deck_brief.json`, `deck_plan.json`, `design_system.json`, `image_manifest.json`, and every `slide_plans/*.json`) loads and validates against its schema. Missing or malformed artifacts produce a `[FAIL]` line — never a Python traceback.
-- **Stage-1 (Intake) bridge (when `source_manifest.json` is present):** the manifest validates against `schemas/source_manifest.schema.json`; `source.local_path` (enum-locked to `input/source.md`) resolves inside the workspace and the file exists as a regular UTF-8 file (symlinks refused) whose `byte_count`, `line_count`, and `sha256` match the manifest, and `source.kind` is one of the schema-documented values (`markdown` for a .md-original source, `text` for a .txt-original source — `init_workspace.py` normalizes the on-disk filename to `input/source.md` regardless of the original extension, so both kinds are legitimate against the canonical filename). When `deck_brief.json` is also present, `deck_brief.source_refs` must declare `source_manifest.source.id`. Workspaces without `source_manifest.json` are a no-op (the prepared examples below pre-date `init_workspace.py` and remain valid). The bridge is verification-only — it does not plan a deck, mutate the workspace, or call any external service. The same `check_source_manifest_bridge` is invoked per-workspace by `scripts/validate_scaffold.py`. Tempfixture negatives cover the positive match, missing `input/source.md`, sha256 mismatch, bad `local_path` (schema enum lock), invalid UTF-8, schema-invalid `kind` rejected at the schema layer, a `.txt`-intake positive (`kind="text"` against `input/source.md` is accepted), and a deck_brief whose `source_refs` omits the manifest's `source.id`.
+- **Stage-1 (Intake) bridge (when `source_manifest.json` is present):** the manifest must be a **regular in-workspace file** — a symlink at that path (broken or resolvable) is refused outright by a symlink preflight that runs BEFORE `_try_load` / `read_text`, so neither a dangling link silently demoting the workspace to the legacy "no manifest" no-op nor a resolvable link reading manifest bytes from outside the workspace can slip through; the manifest validates against `schemas/source_manifest.schema.json`; `source.local_path` (enum-locked to `input/source.md`) resolves inside the workspace and the file exists as a regular UTF-8 file (symlinks refused) whose `byte_count`, `line_count`, and `sha256` match the manifest, and `source.kind` is one of the schema-documented values (`markdown` for a .md-original source, `text` for a .txt-original source — `init_workspace.py` normalizes the on-disk filename to `input/source.md` regardless of the original extension, so both kinds are legitimate against the canonical filename). When `deck_brief.json` is also present, `deck_brief.source_refs` must declare `source_manifest.source.id`. Workspaces without `source_manifest.json` are a no-op (the prepared examples below pre-date `init_workspace.py` and remain valid). The bridge is verification-only — it does not plan a deck, mutate the workspace, or call any external service. The same `check_source_manifest_bridge` is invoked per-workspace by `scripts/validate_scaffold.py`. Tempfixture negatives cover the positive match, missing `input/source.md`, sha256 mismatch, bad `local_path` (schema enum lock), invalid UTF-8, schema-invalid `kind` rejected at the schema layer, a `.txt`-intake positive (`kind="text"` against `input/source.md` is accepted), a deck_brief whose `source_refs` omits the manifest's `source.id`, **malformed `source_manifest.json` (non-JSON bytes) reported as a structured loadability FAIL without traceback**, **list-rooted `source_manifest.json` failing closed on the shape gate without traceback**, a **Stage-1-only workspace (manifest + source.md present, `deck_brief.json` absent) passing the bridge with the deck_brief cross-check row skipped rather than emitted as a FAIL**, a **broken symlink at `source_manifest.json` failing closed at the symlink preflight (dangling target never created — proves `Path.is_file()`'s false-False does not demote the workspace to the legacy no-op)**, and a **resolvable symlink at `source_manifest.json` failing closed at the same preflight BEFORE `read_text` can follow the link (outside target bytes preserved byte-identical, no schema-validate row emitted)** — these five cases are what `scripts/init_deck_brief.py` relies on to fail closed before writing anything.
 - **Template chain:** `deck_plan.template` is path-safe **and** resolves inside `--template-root`; every `deck_plan` slide layout is declared by the template's `layouts` list.
 - **Template files (full):** the selected template's `template.json` validates against its schema; `template.name` matches its directory; `theme_ref` passes the two-stage path-safety + within-template-dir gate, the theme file exists, and `theme.json` validates against `schemas/theme.schema.json`; every declared layout has a `layouts/<name>.json` file that validates against `schemas/layout.schema.json` and whose file stem matches `layout["name"]`.
 - **Slide-plan coverage (strict 1:1):** `deck_plan` slide indices must be unique (duplicates in `deck_plan.slides[].index` `[FAIL]` before any further analysis); every `deck_plan` slide has exactly one matching `slide_plan` file (matched by JSON `index`); duplicate `slide_plan` indices, orphan `slide_plan` indices (no deck_plan entry), and missing indices (deck_plan slide with no `slide_plan`) all `[FAIL]`. Every `slide_plan` agrees with its deck_plan entry on `index`/`layout`/`title`, and every required layout slot is covered by a matching `slide_plan` block (`block.id == slot.id`, `block.kind == slot.type`).
