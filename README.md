@@ -39,7 +39,7 @@ projects/               # generated workspaces (not committed; created by users)
 
 ## Verification today
 
-Fourteen stdlib-only Python commands are wired up — four validators (`validate_artifacts.py`, `validate_scaffold.py`, `validate_workspace.py`, `validate_pptx_contract.py`), two deterministic generators (`generate_render_models.py`, `generate_svg_previews.py`), a deterministic PPTX exporter (`export_pptx.py`), a deterministic stage-1 (Intake) workspace initializer (`init_workspace.py`), a deterministic stage-2 (Brief) contract helper (`init_deck_brief.py`), a deterministic stage-3 (Plan) contract helper (`init_deck_plan.py`), a deterministic stage-4 (Design System) contract helper (`init_design_system.py`), a deterministic stage-5 (Per-slide Plan) contract helper (`init_slide_plans.py`), a deterministic stage-6 (Image Manifest) contract helper (`init_image_manifest.py`), and a deterministic local pipeline runner (`run_pipeline.py`) that chains validate → generate render_models → generate SVG previews → export PPTX → validate the produced PPTX for a prepared workspace. No third-party dependencies are required. `validate_pptx_contract.py` now gates the produced `.pptx` at the container level **and** with a minimal-evidence safety / editability layer (slide count, no external rels, no `file://` rels, relationship `Type` allow-list over the canonical OOXML rel URLs, no macros / OLE / ActiveX parts, at least one editable `<a:t>` run, no all-image slide, no blank slide, every slide carries at least one `<p:sp>` or `<p:cxnSp>`); full-inventory editability, the media inventory, theme palette mapping, determinism, and validator-side layout / primitive scope all remain TODO and are explicitly named that way in every run.
+Sixteen stdlib-only Python commands are wired up — four validators (`validate_artifacts.py`, `validate_scaffold.py`, `validate_workspace.py`, `validate_pptx_contract.py`), two deterministic generators (`generate_render_models.py`, `generate_svg_previews.py`), a deterministic PPTX exporter (`export_pptx.py`), a deterministic stage-1 (Intake) workspace initializer (`init_workspace.py`), a deterministic stage-2 (Brief) contract helper (`init_deck_brief.py`), a deterministic stage-3 (Plan) contract helper (`init_deck_plan.py`), a deterministic stage-4 (Design System) contract helper (`init_design_system.py`), a deterministic stage-5 (Per-slide Plan) contract helper (`init_slide_plans.py`), a deterministic stage-6 (Image Manifest) contract helper (`init_image_manifest.py`), a deterministic Stage-1-to-6 local orchestration helper (`prepare_workspace.py`) that chains the six stage helpers above from explicit caller-supplied inputs (explicit-input orchestration only — does NOT plan a deck, extract source content, generate render_models / SVG / PPTX / reports, or call any external service), a deterministic local pipeline runner (`run_pipeline.py`) that chains validate → generate render_models → generate SVG previews → export PPTX → validate the produced PPTX for a prepared workspace, and a deterministic Stage-1-to-10 end-to-end runner (`run_explicit_pipeline.py`) that chains `prepare_workspace.py` (Stage 1-6, in-process) with `run_pipeline.py` (Stage 7-10, subprocess) into one command (explicit-input end-to-end orchestration only — does NOT plan a deck, extract source content, generate plan/spec/slide/image content, or call any external service). No third-party dependencies are required. `validate_pptx_contract.py` now gates the produced `.pptx` at the container level **and** with a minimal-evidence safety / editability layer (slide count, no external rels, no `file://` rels, relationship `Type` allow-list over the canonical OOXML rel URLs, no macros / OLE / ActiveX parts, at least one editable `<a:t>` run, no all-image slide, no blank slide, every slide carries at least one `<p:sp>` or `<p:cxnSp>`); full-inventory editability, the media inventory, theme palette mapping, determinism, and validator-side layout / primitive scope all remain TODO and are explicitly named that way in every run.
 
 ### Stage-1 (Intake): workspace initialization from a local source
 
@@ -259,6 +259,34 @@ python3 scripts/init_image_manifest.py --self-test
 
 After Stage 6 succeeds, `scripts/run_pipeline.py` can take over for stages 7–10.
 
+### Stage-1-to-6 local orchestration helper
+
+`scripts/prepare_workspace.py` is the stdlib-only, deterministic local orchestrator that chains the six existing per-stage contract helpers — `init_workspace.py` → `init_deck_brief.py` → `init_deck_plan.py` → `init_design_system.py` → `init_slide_plans.py` → `init_image_manifest.py` — in canonical order from explicit caller-supplied inputs into a workspace that `scripts/run_pipeline.py` can later consume. **This is explicit-input orchestration only — it is NOT a full prompt/report/Markdown-to-PPTX automation.** Every stage's content comes from the caller (CLI flags or JSON spec files); the orchestrator never parses `input/source.md` for business content, never invents `deck_brief` / `deck_plan` / `design_system` / `slide_plans` / `image_manifest` content, never generates any image asset / `render_models/*` / `svg_previews/*` / `.pptx` / pipeline report, never calls D-One / Qoder / any public network / image generation / telemetry / external service, and never modifies files outside `--workspace`.
+
+```
+python3 scripts/prepare_workspace.py \
+  --workspace /path/to/new/workspace \
+  --source /path/to/source.md \
+  --title "Deck title" \
+  --audience "Internal review" \
+  --objective "Show X and Y" \
+  --plan-spec /path/to/plan_spec.json \
+  --theme-from-template \
+  --template-root templates/layouts \
+  --slide-specs-dir /path/to/slide_specs \
+  --image-manifest-spec /path/to/image_manifest_spec.json
+```
+
+`--design-system-spec <path>` is accepted in place of `--theme-from-template` (mutually exclusive; exactly one must be supplied). Optional flags `--source-id`, `--tone`, `--language`, and `--approximate-slide-count` are forwarded to the matching stage helpers. Fail-closed semantics: the first stage that returns a non-zero exit code halts the run; every downstream stage is marked SKIPPED and is NOT invoked, so no half-baked workspace advances into a later stage. Each stage helper owns its own rollback contract — the orchestrator does NOT roll back earlier-stage artifacts when a later stage fails (the same as running the helpers manually one at a time). A caller who needs a clean retry should delete the workspace directory and rerun with corrected inputs.
+
+`scripts/prepare_workspace.py --self-test` exercises tempfixture scenarios under `tempfile.TemporaryDirectory()` covering: happy path through Stage 6 with a two-slide `cover` + `key_message` fixture against the `business_review` template (every Stage-1-through-6 artifact lands on disk; canonical stage order is observed), per-stage failure short-circuit (each of the six stages, in turn, is forced to fail with a minimal targeted-bad input — empty source, empty title, malformed plan_spec, mutually-exclusive design-system arguments, missing specs-dir, malformed image-manifest spec — and every downstream stage is verified SKIPPED), pre-existing unsafe workspace refused at Stage 1 (symlink at `--workspace`; the symlink target directory is verified untouched), pre-existing non-empty workspace refused at Stage 1 with prior contents preserved byte-identical, the source-body marker phrase appears in `input/source.md` only and never in any generated artifact, determinism between two independent runs from byte-identical inputs into two different empty workspaces (every Stage-1-through-6 artifact is byte-identical across the two runs), and an end-to-end check that the prepared workspace passes `scripts/validate_workspace.py` against the `business_review` template (the same gate `scripts/run_pipeline.py` applies up front).
+
+```
+python3 scripts/prepare_workspace.py --self-test
+```
+
+After `prepare_workspace.py` succeeds, `scripts/run_pipeline.py` can take over for stages 7–10.
+
 ### Single-artifact structural validation
 
 ```
@@ -463,7 +491,35 @@ When `--report-dir` is supplied, the runner writes:
 - `pipeline_report.json` — machine-readable: workspace / template_root / output / expected_slide_count / overall_ok / per-stage `{name, command, ok, skipped, exit_code, duration_s, stdout, stderr}` (stdout / stderr are truncated to 4 KB with an elision marker so the JSON stays bounded);
 - `pipeline_report.txt` — short human-readable summary: workspace inputs, overall status, and per-stage PASS / FAIL / SKIP lines with the failing stage's stderr / stdout tail.
 
-This is **not** the end-to-end "prompt → editable PPTX" experience. The runner only composes the existing prepared-workspace stages; everything outside that scope (raw-source ingestion, brief / plan generation from a prompt, `chart_placeholder` rendering, embedded media, full PPTX inventory, D-One image assets, Qoder CLI) remains TODO.
+This is **not** the end-to-end "prompt → editable PPTX" experience. The runner only composes the existing prepared-workspace stages; everything outside that scope (raw-source ingestion, brief / plan generation from a prompt, `chart_placeholder` rendering, embedded media, full PPTX inventory, D-One image assets, Qoder CLI) remains TODO. Callers who already have explicit source + spec inputs can chain Stage 1-6 (`scripts/prepare_workspace.py`) with this runner in one command via `scripts/run_explicit_pipeline.py` (see next section).
+
+### Local end-to-end pipeline runner (explicit-input source/spec → PPTX)
+
+`scripts/run_explicit_pipeline.py` is a stdlib-only orchestrator that chains `scripts/prepare_workspace.py` (Stage 1-6 explicit-input orchestration; invoked in-process so the structured per-stage result is preserved for reporting) and `scripts/run_pipeline.py` (Stage 7-10 prepared-workspace pipeline; invoked as a subprocess so its existing fail-closed gates, `[PASS]/[SKIP]/[FAIL]` cascade, and optional `--report-dir` writes are reused verbatim — no stage logic is duplicated) into one local, deterministic command that takes explicit caller-supplied source + spec files in and produces a validated editable `.pptx` out. **This is explicit-input end-to-end orchestration only — it is NOT a full prompt/report/Markdown-to-PPTX automation.** Every Stage-1-to-6 artifact's content comes from the caller (CLI flags or JSON spec files); Stage 7-10 consumes only what Stage 1-6 wrote. The orchestrator never parses `input/source.md` for business content, never invents `deck_brief` / `deck_plan` / `design_system` / `slide_plans` / `image_manifest` content, never generates any image / spec / slide body, never calls D-One / Qoder / any public network / image generation / telemetry / external service, never duplicates per-stage logic, and never modifies files outside `--workspace` apart from the final `--output` PPTX and (if supplied) `--report-dir`.
+
+Fail-closed semantics: if Stage-1-to-6 preparation fails at any stage (non-zero exit), the Stage-7-to-10 pipeline is NOT invoked at all — no `render_models/`, `svg_previews/`, `.pptx`, or `pipeline_report.{json,txt}` is produced; if Stage-7-to-10 fails, the failing stage is reported clearly via the pipeline subprocess's own `[FAIL] <stage>` / `[SKIP] <stage>` cascade plus stderr tail. The orchestrator owns three up-front gates only — required-args check, the Stage-4 mode-selection gate (`--design-system-spec` XOR `--theme-from-template`), and the `--output` extension check (`.pptx`) — to fail fast on obvious user errors before a six-stage prep run is wasted; every other `--output` / `--report-dir` safety gate (inside-workspace, symlink, non-regular-file, pre-existing report-file paths) is delegated to `scripts/run_pipeline.py` for defense in depth, so a caller who passes `--output <workspace>/foo.pptx`, a symlink, or a directory at the output path sees exactly the same diagnostic `scripts/run_pipeline.py` would have produced on its own.
+
+`scripts/run_explicit_pipeline.py --self-test` exercises tempfixture scenarios under `tempfile.TemporaryDirectory()`: happy path (explicit source/spec inputs produce a validated PPTX with every Stage-1-to-6 stage PASS and every Stage-7-to-10 stage PASS), preparation failure short-circuiting the pipeline (empty source → `init_workspace` fails → no `render_models/` / `svg_previews/` / PPTX produced, every downstream prep stage SKIP, pipeline never invoked), pipeline failure reported clearly (a pre-existing directory at `--output` is caught by `run_pipeline`'s gate after prep succeeds; the orchestrator surfaces the diagnostic and the directory's canary file is untouched), wrong `--output` extension failing fast in the orchestrator before any prep stage runs (no workspace is created), `--output` inside the workspace refused by `run_pipeline`'s delegated gate (no `.pptx` written inside the workspace tree), the source-body marker phrase never copied into any artifact beyond `<workspace>/input/source.md` (source_manifest / deck_brief / deck_plan / design_system / slide_plans / image_manifest / render_models / svg_previews / the PPTX bytes are all checked), and deterministic repeated runs from byte-identical inputs both passing validation with byte-identical Stage-1-through-6 artifacts across the two runs.
+
+```
+python3 scripts/run_explicit_pipeline.py \
+  --workspace /tmp/szh-explicit-ws \
+  --source /path/to/source.md \
+  --title "Quarterly Review" \
+  --audience "Executive team" \
+  --objective "Summarize Q3 results and decisions" \
+  --plan-spec /path/to/plan_spec.json \
+  --theme-from-template \
+  --template-root templates/layouts \
+  --slide-specs-dir /path/to/slide_specs/ \
+  --image-manifest-spec /path/to/image_manifest_spec.json \
+  --output /tmp/szh-explicit-out/quarterly.pptx \
+  --report-dir /tmp/szh-explicit-out/reports
+
+python3 scripts/run_explicit_pipeline.py --self-test
+```
+
+Raw-source-to-PPTX automation — extracting `deck_brief` / `deck_plan` / `design_system` / `slide_plans` / `image_manifest` content from `input/source.md` directly, without explicit caller-supplied spec files — remains TODO. The implemented explicit-input runtime pipeline (the six per-stage helpers `init_workspace.py` / `init_deck_brief.py` / `init_deck_plan.py` / `init_design_system.py` / `init_slide_plans.py` / `init_image_manifest.py`, the Stage-1-to-6 orchestrator `scripts/prepare_workspace.py`, the Stage-7-to-10 runner `scripts/run_pipeline.py`, and the Stage-1-to-10 end-to-end orchestrator `scripts/run_explicit_pipeline.py`) does **not** implement it: every script in that pipeline is intentionally explicit-input. The work of reading `input/source.md` plus the user's request and **authoring** the five spec inputs the runtime pipeline consumes is the agent's responsibility; the authoring contract (per-stage fields, source-fidelity rules, image-safety rules, and the pre-pipeline quality loop) lives in [`references/authoring-workflow.md`](references/authoring-workflow.md), kept as a separate document so the authoring workflow is never read as runtime code. A passing `scripts/run_explicit_pipeline.py` (or per-stage chain) run is evidence that the authored specs round-trip to a validated editable PPTX, **not** evidence of automatic prompt-to-PPTX behavior, of D-One image generation, of Qoder runtime packaging, or of any model API call — none of those are implemented anywhere in this repo.
 
 All other tools — full PPTX coverage (every layout, every primitive, embedded media, `chart_placeholder`), security scan, visual regression, image manifest population from real assets, D-One integration, Qoder CLI — are still **not implemented**. Do not document them as available. Render-model generation for layouts mapped to the `chart_placeholder` primitive kind, and SVG rendering / PPTX emission of primitive kinds outside `text` / `line` / `shape` / `image_slot` / `kpi` / `table`, are also not implemented.
 
