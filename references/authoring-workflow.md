@@ -326,6 +326,27 @@ python3 scripts/run_pipeline.py        --workspace <ws> --template-root <tr> \
 
 Each step's exit code gates the next: if `init_deck_plan.py` fails, the agent fixes the `--plan-spec` and reruns just that step. All three forms run the same scripts; the orchestrators add no behavior beyond chaining the per-stage helpers and threading exit codes.
 
+## Post-generation visual review
+
+After the pipeline writes `render_models/` and `svg_previews/` (Stages 7–8 of `run_pipeline.py`, or the equivalent stages inside `run_explicit_pipeline.py`), the agent (or the user) may want a quick visual / structural sanity check on the generated deck before opening the `.pptx`. `scripts/validate_visual_quality.py` is that pass — a stdlib-only, **non-mutating** review gate that inspects only the workspace's `render_models/*.json` and `svg_previews/*.svg`, never plans, never regenerates, never exports, and never calls any external service:
+
+```
+# Human-readable summary (per-slide findings + aggregate counters)
+python3 scripts/validate_visual_quality.py --workspace <prepared workspace>
+
+# Machine-readable JSON report
+python3 scripts/validate_visual_quality.py \
+  --workspace <prepared workspace> \
+  --output <path/to/report.json>
+
+# Self-contained HTML contact sheet (inline SVG; no remote refs)
+python3 scripts/validate_visual_quality.py \
+  --workspace <prepared workspace> \
+  --output <path/to/contact_sheet.html>
+```
+
+What the gate flags (per slide): missing SVG preview, blank slide (zero primitives), near-empty slide (primitive count < 2 AND text chars < 32), image-only slide, all-placeholder text slide, no native editable primitive, out-of-canvas render_model bounds, out-of-canvas SVG geometry, text density floor / ceiling. Aggregate counters: slide count vs `deck_plan.slides[]`, layout distribution, missing-preview count, per-slide primitive-kind histogram. `--strict` promotes every `WARN` to `ERROR`. `--output` must live OUTSIDE `--workspace`; the HTML contact sheet inlines each SVG **with sanitize-by-rejection** — any SVG carrying `<script>` / `<foreignObject>` / `<use>` / `<a>` / `<style>`, any SMIL/timing/filter-image element (`<animate>` / `<animateMotion>` / `<animateTransform>` / `<set>` / `<discard>` / `<mpath>` / `<feImage>`), an `on*` event-handler attribute, a `style="..."` attribute, any attribute value containing a CSS `url(...)` reference (`fill` / `stroke` / `mask` / `clip-path` / `filter` / `cursor` / `marker-*` would otherwise fetch the referenced external paint server / filter / mask / cursor), an `xml:base` attribute on any element (would rewrite the document's base URL so an otherwise-safe relative href resolves against an attacker-controlled base), or a `href` / `src` / `xlink:href` whose value either has surrounding whitespace (`" https://attacker/x"` — browsers strip leading/trailing whitespace before URL resolution, so the whitespace gate catches the bypass that the bare URI-scheme regex would miss) OR does not pass `validate_scaffold.local_path_is_safe` (URI schemes, POSIX-absolute, leading backslash, **protocol-relative `//host/x`**, `..` traversal, empty) is replaced by a textual `SVG not embedded (unsafe for inline): <reason>` notice rather than spliced into the page, and safe SVGs are re-serialized from the parsed tree so XML declarations, DOCTYPEs, processing instructions, and comments cannot leak into the HTML host. **Second layer (strip-by-removal):** even after the sanitize-by-rejection gate accepts the SVG, every `href` / `src` / `xlink:href` / `*href` attribute is stripped from the re-serialized tree before inlining — including legitimate workspace-relative paths like `<image href="generated_assets/cover.png">` that pass `local_path_is_safe`. Such paths still fetch against the HTML host directory when the contact sheet is opened (the output gate requires that directory to live OUTSIDE the workspace by design, so the path 404s on disk anyway), so the fetchable surface is removed entirely. Geometry (`x` / `y` / `width` / `height`) survives. The produced contact sheet contains no `file://` URLs, no scheme-relative references, no `href` / `src` / `xlink:href` attribute of any value, no `url(...)` CSS references, no `xml:base`, no SMIL/animation elements, and no JavaScript — it never reaches the network OR the filesystem when opened in a browser. The gate does **not** replace `scripts/validate_workspace.py` (which is stricter — schemas, coverage, layout, bounds, SVG safety) or `scripts/validate_pptx_contract.py` (which validates the produced PPTX). It is an additional inspection-time signal so the agent can eyeball the deck structurally without re-running the pipeline.
+
 ## What this workflow does NOT do
 
 Out of scope for this document AND for the deterministic pipeline:

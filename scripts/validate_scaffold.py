@@ -164,6 +164,29 @@ UNSAFE_IMAGE_PATHS = [
     "../escape/img.png",
     "assets/../../escape/img.png",
     "",
+    # Whitespace-prefixed / suffixed / wrapped variants. The anchored
+    # ^[A-Za-z][A-Za-z0-9+.-]*: URI-scheme regex misses these because
+    # the first byte is whitespace, not a letter — and downstream
+    # consumers (browser URL parsers, OS path normalizers) strip
+    # surrounding whitespace before resolving the value, so a leading
+    # space + 'https://attacker/x' would otherwise sneak past the
+    # gate and trigger a remote fetch.
+    " https://example.com/img.png",
+    "\thttps://example.com/img.png",
+    "\nhttps://example.com/img.png",
+    "\rhttps://example.com/img.png",
+    " //example.com/img.png",
+    "\t//example.com/img.png",
+    " /etc/passwd",
+    "\t/etc/passwd",
+    " \\windows\\system32\\img.png",
+    "assets/cover.svg ",
+    "assets/cover.svg\t",
+    "assets/cover.svg\n",
+    " assets/cover.svg",
+    " assets/cover.svg ",
+    "   ",
+    "\t\t",
 ]
 SAFE_IMAGE_PATHS = [
     "assets/cover_accent.svg",
@@ -180,6 +203,16 @@ def local_path_is_safe(p: str) -> bool:
     """Workspace-relative path. Rejects (fail-closed):
 
       - empty strings;
+      - ANY surrounding whitespace (leading or trailing space, tab,
+        newline, carriage-return, Unicode NBSP, ...) — downstream
+        consumers strip leading/trailing whitespace before resolving
+        the value: browser URL parsers do this per the HTML5 / WHATWG
+        URL spec, ``str.strip()``-style OS path utilities behave
+        similarly. Without this gate a value like
+        ``" https://attacker/x"`` (leading space) would slip past the
+        URI-scheme regex below (which is anchored at the start of the
+        string and expects ``[A-Za-z]``, not whitespace) and still
+        get fetched / resolved by whoever consumes the path next;
       - POSIX-absolute ('/...'), leading backslash ('\\...'), and
         protocol-relative ('//host/...');
       - ANY URI-like scheme prefix matching ^[A-Za-z][A-Za-z0-9+.-]*:
@@ -189,8 +222,24 @@ def local_path_is_safe(p: str) -> bool:
         followed by ':' matches the same shape;
       - any path containing a '..' segment.
 
-    Reused for both image_manifest.local_path and template.theme_ref."""
+    Reused for image_manifest.local_path, template.theme_ref, every
+    init_*.py spec input, the SVG-preview generator's image_ref gate,
+    the workspace validator's reference-attribute walker, the visual
+    quality HTML contact-sheet sanitizer, and the PPTX exporter's
+    media-resolution gate. A single tightening of this helper closes
+    the corresponding gap in every consumer."""
     if not p:
+        return False
+    # Whitespace gate runs BEFORE the rest of the checks so a leading
+    # space / tab / newline cannot push the dangerous bytes outside
+    # the anchored URI-scheme / leading-slash / leading-backslash
+    # checks below. Trailing whitespace is refused too — both forms
+    # would be stripped by downstream consumers, and the resulting
+    # post-strip value would either be one of the cases below (and
+    # then refused via a different code path) or would be a legitimate
+    # relative path that we'd rather see authored cleanly without
+    # surrounding whitespace.
+    if p != p.strip():
         return False
     if p.startswith("/") or p.startswith("\\"):
         return False

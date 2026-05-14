@@ -1948,6 +1948,45 @@ def check_svg_previews(workspace: Path, template_root: Path) -> list[CheckResult
             continue
         out.append(CheckResult(f"{label}: parses as XML", True))
 
+        # Duplicate case-folded attribute names on ANY element refuse
+        # the SVG outright. The geometry walker below already enforces
+        # this rule on non-root elements via its per-element scan, but
+        # a duplicate `VIEWBOX="..." viewBox="..."` (or any other
+        # case-collision) on the root `<svg>` would otherwise slip:
+        # the viewBox check below does a case-sensitive
+        # `attrib.get("viewBox")` lookup and only sees the safe value,
+        # while an HTML host that case-folds attribute names with
+        # first-wins resolution renders with whichever variant
+        # appeared first in the source — potentially an attacker-
+        # controlled canvas size that turns out-of-canvas geometry
+        # into in-canvas geometry. The legitimate generator never
+        # emits duplicate-case attributes on any element, so any
+        # collision is suspicious by construction.
+        duplicate_root_attrs: list[tuple[str, list[str]]] = []
+        for el in _iter_elements(tree_root):
+            if not isinstance(el.tag, str):
+                continue
+            seen: set[str] = set()
+            dup_keys: list[str] = []
+            for k in el.attrib:
+                if not isinstance(k, str):
+                    continue
+                folded = _strip_ns(k).lower()
+                if folded in seen:
+                    dup_keys.append(folded)
+                seen.add(folded)
+            if dup_keys:
+                duplicate_root_attrs.append(
+                    (_strip_ns(el.tag).lower(), sorted(set(dup_keys))),
+                )
+        out.append(CheckResult(
+            f"{label}: no element carries duplicate case-folded attribute "
+            f"names (rules out HTML5 first-wins vs validator last-wins "
+            f"divergence on viewBox / width / height / geometry attrs)",
+            not duplicate_root_attrs,
+            f"offending: {duplicate_root_attrs}",
+        ))
+
         root_tag = _strip_ns(tree_root.tag)
         out.append(CheckResult(
             f"{label}: root element is <svg> in the SVG namespace",
@@ -1964,9 +2003,24 @@ def check_svg_previews(workspace: Path, template_root: Path) -> list[CheckResult
                 f"viewBox={viewbox!r}, expected={expected_viewbox!r}",
             ))
 
+        # Element-tag comparisons are case-folded throughout this
+        # walker. SVG is case-sensitive when served as image/svg+xml,
+        # but the HTML5 parser's SVG element-name adjustment table
+        # case-corrects every variant (<FOREIGNOBJECT>, <foreignobject>,
+        # <ForeignObject>, etc.) back to the canonical camelCase form
+        # before the inline-SVG renders. A case-sensitive compare here
+        # would let an attacker drop a lowercase <foreignobject> into a
+        # workspace's svg_previews/ and bypass the validator, then have
+        # the contained <script> execute when the SVG is opened in a
+        # browser. Same threat applies to the geometry walk below
+        # (<RECT> would skip the bounds check). Same threat applies to
+        # the attribute walk's "ends with href" rule (`XLINK:HREF` or
+        # `Href` would slip through). The HTML5 SVG attribute-name
+        # adjustment table case-corrects those too.
         foreign_objects = [
             el for el in _iter_elements(tree_root)
-            if _strip_ns(el.tag) == "foreignObject"
+            if isinstance(el.tag, str)
+            and _strip_ns(el.tag).lower() == "foreignobject"
         ]
         out.append(CheckResult(
             f"{label}: contains no <foreignObject>",
@@ -1978,9 +2032,12 @@ def check_svg_previews(workspace: Path, template_root: Path) -> list[CheckResult
         offending_refs: list[tuple[str, str, str]] = []
         undeclared_refs: list[tuple[str, str]] = []
         for el in _iter_elements(tree_root):
-            local_tag = _strip_ns(el.tag)
+            if not isinstance(el.tag, str):
+                # Processing instructions / comments — no SVG semantics.
+                continue
+            local_tag = _strip_ns(el.tag).lower()
             for attr_name, attr_value in el.attrib.items():
-                local_attr = _strip_ns(attr_name)
+                local_attr = _strip_ns(attr_name).lower()
                 if not isinstance(attr_value, str):
                     continue
                 is_ref_attr = (
@@ -2034,33 +2091,86 @@ def check_svg_previews(workspace: Path, template_root: Path) -> list[CheckResult
             for el in _iter_elements(tree_root):
                 if el is tree_root:
                     continue
-                tag = _strip_ns(el.tag)
-                a = el.attrib
+                if not isinstance(el.tag, str):
+                    continue
+                # Case-fold so a renamed <RECT> / <Image> / <LINE>
+                # still triggers the bounds check (see foreign-content
+                # rationale above).
+                tag = _strip_ns(el.tag).lower()
+                # Build a case-folded attribute map. HTML5's SVG
+                # attribute-name adjustment table lowercases most
+                # geometry attribute names (`X` / `WIDTH` / `Cx` →
+                # `x` / `width` / `cx`) before the SVG renders. A
+                # case-sensitive `a["x"]` lookup would raise KeyError
+                # on an uppercase-attribute SVG, the except branch
+                # would skip the element, and an out-of-canvas
+                # rectangle would slip the gate. The local name is
+                # what HTML5 case-corrects, so we strip any
+                # namespace prefix and lowercase before keying.
+                #
+                # **Duplicate-case detection.** A naive `dict[k.lower()] = v`
+                # write loop would let the SECOND case-variant of a
+                # geometry attribute overwrite the first — and the
+                # browser uses the OPPOSITE rule (HTML5 keeps the
+                # first case-folded attribute and ignores the rest).
+                # An attacker could author `<rect X="3000" Y="3000"
+                # WIDTH="5000" HEIGHT="5000" x="0" y="0" width="100"
+                # height="100"/>` where ET's items() iteration ends
+                # on the safe values; the validator would call the
+                # rect on-canvas while the browser renders it
+                # off-canvas (because HTML5's first-wins resolution
+                # picks the uppercase values). To rule that out we
+                # collect ALL values for each case-folded key. If a
+                # single element has two attributes that collapse to
+                # the same case-folded name, we record the duplicate
+                # and the geometry walk fails closed for that slide
+                # — the legitimate generator never emits duplicates,
+                # so any occurrence is suspicious by construction.
+                duplicate_attrs: list[str] = []
+                seen_lower: set[str] = set()
+                a_lower: dict[str, str] = {}
+                for k, v in el.attrib.items():
+                    if not isinstance(k, str) or not isinstance(v, str):
+                        continue
+                    folded = _strip_ns(k).lower()
+                    if folded in seen_lower:
+                        duplicate_attrs.append(folded)
+                    seen_lower.add(folded)
+                    a_lower[folded] = v
+                if duplicate_attrs:
+                    outside.append((
+                        tag,
+                        f"duplicate case-folded attribute(s) "
+                        f"{sorted(set(duplicate_attrs))} — refused "
+                        f"so an HTML host's first-wins resolution "
+                        f"cannot diverge from the validator's view",
+                    ))
+                    continue
                 try:
                     if tag in ("rect", "image"):
-                        x = float(a["x"]); y = float(a["y"])
-                        w = float(a["width"]); h = float(a["height"])
+                        x = float(a_lower["x"]); y = float(a_lower["y"])
+                        w = float(a_lower["width"]); h = float(a_lower["height"])
                         if x < 0 or y < 0 or x + w > canvas_w or y + h > canvas_h:
                             outside.append((tag, f"x={x},y={y},w={w},h={h}"))
                     elif tag == "ellipse":
-                        cx = float(a["cx"]); cy = float(a["cy"])
-                        rx = float(a["rx"]); ry = float(a["ry"])
+                        cx = float(a_lower["cx"]); cy = float(a_lower["cy"])
+                        rx = float(a_lower["rx"]); ry = float(a_lower["ry"])
                         if (cx - rx) < 0 or (cy - ry) < 0 or (cx + rx) > canvas_w or (cy + ry) > canvas_h:
                             outside.append((tag, f"cx={cx},cy={cy},rx={rx},ry={ry}"))
                     elif tag == "circle":
-                        cx = float(a["cx"]); cy = float(a["cy"])
-                        r = float(a["r"])
+                        cx = float(a_lower["cx"]); cy = float(a_lower["cy"])
+                        r = float(a_lower["r"])
                         if (cx - r) < 0 or (cy - r) < 0 or (cx + r) > canvas_w or (cy + r) > canvas_h:
                             outside.append((tag, f"cx={cx},cy={cy},r={r}"))
                     elif tag == "line":
-                        x1 = float(a["x1"]); y1 = float(a["y1"])
-                        x2 = float(a["x2"]); y2 = float(a["y2"])
+                        x1 = float(a_lower["x1"]); y1 = float(a_lower["y1"])
+                        x2 = float(a_lower["x2"]); y2 = float(a_lower["y2"])
                         for cx_, cy_ in ((x1, y1), (x2, y2)):
                             if cx_ < 0 or cy_ < 0 or cx_ > canvas_w or cy_ > canvas_h:
                                 outside.append((tag, f"x1={x1},y1={y1},x2={x2},y2={y2}"))
                                 break
                     elif tag == "text":
-                        x = float(a["x"]); y = float(a["y"])
+                        x = float(a_lower["x"]); y = float(a_lower["y"])
                         if x < 0 or y < 0 or x > canvas_w or y > canvas_h:
                             outside.append((tag, f"x={x},y={y}"))
                 except (KeyError, ValueError):
@@ -4346,6 +4456,42 @@ def negative_svg_preview_tempfixture_checks() -> list[CheckResult]:
             "; ".join(f"{r.name}" for r in results if not r.ok),
         ))
 
+    # E2. Case-variant <foreignObject> bypass (lowercase / UPPERCASE
+    # / wacky-case). The HTML5 parser's SVG element-name adjustment
+    # table case-corrects each variant back to the canonical
+    # camelCase form before rendering, so a case-sensitive validator
+    # would miss the bypass while the browser would still render
+    # whatever <script> the foreign-object hosts. Each variant must
+    # be detected here.
+    for case_variant in ("foreignobject", "FOREIGNOBJECT", "ForEignObJecT"):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tr = root / "templates"
+            tr.mkdir()
+            _build_render_model_template(tr)
+            ws = root / "ws"
+            _baseline_render_model_workspace(ws)
+            out_path = _write_baseline_svg_preview(ws)
+            out_path.write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+                '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+                f'  <{case_variant} x="0" y="0" width="100" height="100"/>\n'
+                '</svg>\n'
+            )
+            results = check_svg_previews(ws, tr)
+            detected = any(
+                "contains no <foreignObject>" in r.name and not r.ok
+                for r in results
+            )
+            out.append(CheckResult(
+                f"tempfixture svg_preview: case-variant <{case_variant}> "
+                f"is detected as a <foreignObject> bypass",
+                detected,
+                "; ".join(f"{r.name}" for r in results if not r.ok),
+            ))
+
     # F. href with URI scheme (http://).
     for bad_ref, label in (
         ("http://example.com/x.png",     "http URL"),
@@ -4474,6 +4620,131 @@ def negative_svg_preview_tempfixture_checks() -> list[CheckResult]:
             detected,
             "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
         ))
+
+    # I1a. Root-level duplicate-case attribute bypass. The geometry
+    # walker explicitly skips the root <svg> element, so without a
+    # dedicated check a duplicate `VIEWBOX="..." viewBox="..."` (or
+    # any other case-collision) on the root would slip the validator:
+    # the viewBox check below does a case-sensitive
+    # attrib.get("viewBox") lookup and only sees the safe value,
+    # while an HTML host with first-wins case-fold resolution renders
+    # with whichever variant appeared first in the source — letting
+    # an attacker effectively set the SVG canvas to 99999x99999 and
+    # absorb any out-of-canvas geometry.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        out_path = _write_baseline_svg_preview(ws)
+        out_path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'VIEWBOX="0 0 99999 99999" viewBox="0 0 1920 1080" '
+            'width="1920" height="1080">\n'
+            '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+            '</svg>\n'
+        )
+        results = check_svg_previews(ws, tr)
+        detected = any(
+            "duplicate case-folded attribute names" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture svg_preview: root-level duplicate case-folded "
+            "attributes (VIEWBOX + viewBox on <svg>) are refused "
+            "(rules out HTML5 first-wins resolution sneaking past the "
+            "viewBox-vs-canvas check)",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # I1b. Duplicate-case geometry attribute bypass. An attacker
+    # could author `<rect X="3000" Y="3000" WIDTH="5000" HEIGHT="5000"
+    # x="0" y="0" width="100" height="100"/>` — XML preserves both
+    # the uppercase and lowercase attributes (case-sensitive), but
+    # when the SVG is inlined into an HTML host the parser
+    # lowercases attribute names and "ignores subsequent duplicates",
+    # i.e. the FIRST case-folded attribute wins. A naive
+    # `attrib[k.lower()] = v` write loop in the validator does the
+    # OPPOSITE (the last write wins), so the validator would see the
+    # safe values while the browser renders the unsafe ones. The
+    # geometry walk now refuses any element that carries two
+    # attributes collapsing to the same case-folded name.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        out_path = _write_baseline_svg_preview(ws)
+        out_path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+            '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+            '  <rect X="3000" Y="3000" WIDTH="5000" HEIGHT="5000" '
+            'x="0" y="0" width="100" height="100" fill="#000000"/>\n'
+            '</svg>\n'
+        )
+        results = check_svg_previews(ws, tr)
+        detected = any(
+            "stays inside the canvas" in r.name and not r.ok
+            and "duplicate case-folded" in (r.detail or "")
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture svg_preview: duplicate case-folded geometry "
+            "attributes (e.g. <rect X=\"...\" x=\"...\" />) are refused "
+            "(rules out HTML5 first-wins vs validator last-wins divergence)",
+            detected,
+            "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+        ))
+
+    # I2. Case-variant geometry attribute bypass. An attacker could
+    # author <rect X="3000" Y="3000" WIDTH="5000" HEIGHT="5000"/> —
+    # SVG attribute names are case-sensitive when parsed as XML, but
+    # the HTML5 parser's SVG attribute-name adjustment table
+    # lowercases most geometry attributes so the rectangle still
+    # renders out-of-canvas when the SVG is inlined into an HTML host.
+    # A case-sensitive `a["x"]` lookup would raise KeyError and the
+    # geometry walker would silently skip the element. Each
+    # attribute-case variant must therefore still trigger the
+    # bounds-inside-canvas FAIL.
+    for case_variant_label, attrs in (
+        ("UPPERCASE", 'X="3000" Y="3000" WIDTH="5000" HEIGHT="5000"'),
+        ("MixedCase", 'X="3000" y="3000" Width="5000" HEIGHT="5000"'),
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tr = root / "templates"
+            tr.mkdir()
+            _build_render_model_template(tr)
+            ws = root / "ws"
+            _baseline_render_model_workspace(ws)
+            out_path = _write_baseline_svg_preview(ws)
+            out_path.write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'viewBox="0 0 1920 1080" width="1920" height="1080">\n'
+                '  <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>\n'
+                f'  <rect {attrs} fill="#000000"/>\n'
+                '</svg>\n'
+            )
+            results = check_svg_previews(ws, tr)
+            detected = any(
+                "stays inside the canvas" in r.name and not r.ok
+                for r in results
+            )
+            out.append(CheckResult(
+                f"tempfixture svg_preview: case-variant ({case_variant_label}) "
+                f"geometry attributes still trip the out-of-canvas gate",
+                detected,
+                "; ".join(f"{r.name}: {r.detail}" for r in results if not r.ok),
+            ))
 
     # J. <text> anchor beyond the right / bottom edge of the canvas.
     #    Covers the second half of the rule (x > width / y > height).
