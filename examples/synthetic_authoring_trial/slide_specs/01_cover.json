@@ -7,7 +7,7 @@
     { "id": "title",     "kind": "text", "content": "Synthetic Authoring Trial" },
     { "id": "subtitle",  "kind": "text", "content": "Smoke test of the explicit-input authoring bundle" },
     { "id": "presenter", "kind": "text", "content": "Synthetic Pipeline Reviewer" },
-    { "id": "date",      "kind": "text", "content": "<placeholder-date>" }
+    { "id": "date",      "kind": "text", "content": "Season 24 review window" }
   ],
   "notes": "All values are synthetic placeholders."
 }
