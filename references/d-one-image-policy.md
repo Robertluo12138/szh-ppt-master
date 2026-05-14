@@ -2,6 +2,8 @@
 
 "D-One" stands for the local image-generation integration that may, in a future phase, populate small image assets used inside slides. The integration is **not implemented**. This file is the policy that any such integration must satisfy before it ships.
 
+Stage 6 today is covered only by the narrow contract helper `scripts/init_image_manifest.py`, which validates a caller-supplied `--spec` JSON against `schemas/image_manifest.schema.json`, cross-checks every `slide_plan.image_refs[*]` against `images[].id`, and requires every `images[].local_path` to resolve inside the workspace to a regular non-symlink file. The helper does **not** generate any image asset, does **not** call D-One, and does **not** call any public network — assets must already exist locally inside the workspace before the helper runs.
+
 ## Allowed use
 
 - D-One (or any image generator) produces **local image assets only**: spot illustrations, icons, decorative artwork, small textures.

@@ -39,7 +39,7 @@ projects/               # generated workspaces (not committed; created by users)
 
 ## Verification today
 
-Thirteen stdlib-only Python commands are wired up — four validators (`validate_artifacts.py`, `validate_scaffold.py`, `validate_workspace.py`, `validate_pptx_contract.py`), two deterministic generators (`generate_render_models.py`, `generate_svg_previews.py`), a deterministic PPTX exporter (`export_pptx.py`), a deterministic stage-1 (Intake) workspace initializer (`init_workspace.py`), a deterministic stage-2 (Brief) contract helper (`init_deck_brief.py`), a deterministic stage-3 (Plan) contract helper (`init_deck_plan.py`), a deterministic stage-4 (Design System) contract helper (`init_design_system.py`), a deterministic stage-5 (Per-slide Plan) contract helper (`init_slide_plans.py`), and a deterministic local pipeline runner (`run_pipeline.py`) that chains validate → generate render_models → generate SVG previews → export PPTX → validate the produced PPTX for a prepared workspace. No third-party dependencies are required. `validate_pptx_contract.py` now gates the produced `.pptx` at the container level **and** with a minimal-evidence safety / editability layer (slide count, no external rels, no `file://` rels, relationship `Type` allow-list over the canonical OOXML rel URLs, no macros / OLE / ActiveX parts, at least one editable `<a:t>` run, no all-image slide, no blank slide, every slide carries at least one `<p:sp>` or `<p:cxnSp>`); full-inventory editability, the media inventory, theme palette mapping, determinism, and validator-side layout / primitive scope all remain TODO and are explicitly named that way in every run.
+Fourteen stdlib-only Python commands are wired up — four validators (`validate_artifacts.py`, `validate_scaffold.py`, `validate_workspace.py`, `validate_pptx_contract.py`), two deterministic generators (`generate_render_models.py`, `generate_svg_previews.py`), a deterministic PPTX exporter (`export_pptx.py`), a deterministic stage-1 (Intake) workspace initializer (`init_workspace.py`), a deterministic stage-2 (Brief) contract helper (`init_deck_brief.py`), a deterministic stage-3 (Plan) contract helper (`init_deck_plan.py`), a deterministic stage-4 (Design System) contract helper (`init_design_system.py`), a deterministic stage-5 (Per-slide Plan) contract helper (`init_slide_plans.py`), a deterministic stage-6 (Image Manifest) contract helper (`init_image_manifest.py`), and a deterministic local pipeline runner (`run_pipeline.py`) that chains validate → generate render_models → generate SVG previews → export PPTX → validate the produced PPTX for a prepared workspace. No third-party dependencies are required. `validate_pptx_contract.py` now gates the produced `.pptx` at the container level **and** with a minimal-evidence safety / editability layer (slide count, no external rels, no `file://` rels, relationship `Type` allow-list over the canonical OOXML rel URLs, no macros / OLE / ActiveX parts, at least one editable `<a:t>` run, no all-image slide, no blank slide, every slide carries at least one `<p:sp>` or `<p:cxnSp>`); full-inventory editability, the media inventory, theme palette mapping, determinism, and validator-side layout / primitive scope all remain TODO and are explicitly named that way in every run.
 
 ### Stage-1 (Intake): workspace initialization from a local source
 
@@ -52,7 +52,7 @@ python3 scripts/init_workspace.py \
   [--source-id custom_id]            # defaults to --source filename stem
 ```
 
-`init_workspace.py` does **NOT** plan a deck, does **NOT** call any public network / D-One / Qoder / image generation / external service, does **NOT** inspect any file outside `--workspace`, and does **NOT** log the source body text anywhere except the verbatim copy at `<workspace>/input/source.md`. After it succeeds, **stage 2** has narrow contract support via `scripts/init_deck_brief.py`, **stage 3** has narrow contract support via `scripts/init_deck_plan.py`, **stage 4** has narrow contract support via `scripts/init_design_system.py`, **stage 5** has narrow contract support via `scripts/init_slide_plans.py` (see the matching sections below); after those helpers succeed, **stage 6** (`image_manifest.json`) remains agent-driven and must be produced according to the schema under `schemas/` before `scripts/run_pipeline.py` can take over for stages 7–10. The agent must declare the manifest's `source.id` in `deck_brief.source_refs`, which is the deck's required allow-list of source ids; every `slides[].source_refs` entry must be a non-empty subset of that allow-list.
+`init_workspace.py` does **NOT** plan a deck, does **NOT** call any public network / D-One / Qoder / image generation / external service, does **NOT** inspect any file outside `--workspace`, and does **NOT** log the source body text anywhere except the verbatim copy at `<workspace>/input/source.md`. After it succeeds, **stage 2** has narrow contract support via `scripts/init_deck_brief.py`, **stage 3** has narrow contract support via `scripts/init_deck_plan.py`, **stage 4** has narrow contract support via `scripts/init_design_system.py`, **stage 5** has narrow contract support via `scripts/init_slide_plans.py` (see the matching sections below); after those helpers succeed, **stage 6** has narrow contract support via `scripts/init_image_manifest.py` (see the matching section below). Once that succeeds, `scripts/run_pipeline.py` can take over for stages 7–10. The agent must declare the manifest's `source.id` in `deck_brief.source_refs`, which is the deck's required allow-list of source ids; every `slides[].source_refs` entry must be a non-empty subset of that allow-list.
 
 Fail-closed gates (every gate aborts before any file is written under `--workspace`):
 
@@ -108,7 +108,7 @@ Fail-closed gates (every gate aborts before any file is written under `--workspa
 python3 scripts/init_deck_brief.py --self-test
 ```
 
-After Stage 2 succeeds, **stage 3** has narrow contract support via `scripts/init_deck_plan.py` (see next section); after that helper succeeds, **stage 4** has narrow contract support via `scripts/init_design_system.py` (see the section after); after that helper succeeds, **stage 5** has narrow contract support via `scripts/init_slide_plans.py` (see the section two below); after that helper succeeds, **stage 6** (`image_manifest.json`) remains agent-driven. Once it exists, `scripts/run_pipeline.py` can take over for stages 7–10.
+After Stage 2 succeeds, **stage 3** has narrow contract support via `scripts/init_deck_plan.py` (see next section); after that helper succeeds, **stage 4** has narrow contract support via `scripts/init_design_system.py` (see the section after); after that helper succeeds, **stage 5** has narrow contract support via `scripts/init_slide_plans.py` (see the section two below); after that helper succeeds, **stage 6** has narrow contract support via `scripts/init_image_manifest.py` (see the matching section below). Once that succeeds, `scripts/run_pipeline.py` can take over for stages 7–10.
 
 ### Stage-3 (Plan): minimal deck_plan contract helper
 
@@ -161,7 +161,7 @@ Fail-closed gates (every gate aborts before any file is written under `--workspa
 python3 scripts/init_deck_plan.py --self-test
 ```
 
-After Stage 3 succeeds, **stage 4** has narrow contract support via `scripts/init_design_system.py` (see next section); after that helper succeeds, **stage 5** has narrow contract support via `scripts/init_slide_plans.py` (see the section after); after that helper succeeds, **stage 6** (`image_manifest.json`) remains agent-driven. Once it exists, `scripts/run_pipeline.py` can take over for stages 7–10.
+After Stage 3 succeeds, **stage 4** has narrow contract support via `scripts/init_design_system.py` (see next section); after that helper succeeds, **stage 5** has narrow contract support via `scripts/init_slide_plans.py` (see the section after); after that helper succeeds, **stage 6** has narrow contract support via `scripts/init_image_manifest.py` (see the matching section below). Once that succeeds, `scripts/run_pipeline.py` can take over for stages 7–10.
 
 ### Stage-4 (Design System): minimal design_system contract helper
 
@@ -198,7 +198,7 @@ The candidate is schema-validated **in memory** before any write, and **re-valid
 python3 scripts/init_design_system.py --self-test
 ```
 
-After Stage 4 succeeds, **stage 5** has narrow contract support via `scripts/init_slide_plans.py` (see next section); after that helper succeeds, **stage 6** (`image_manifest.json`) remains agent-driven. Once it exists, `scripts/run_pipeline.py` can take over for stages 7–10.
+After Stage 4 succeeds, **stage 5** has narrow contract support via `scripts/init_slide_plans.py` (see next section); after that helper succeeds, **stage 6** has narrow contract support via `scripts/init_image_manifest.py` (see the matching section below). Once that succeeds, `scripts/run_pipeline.py` can take over for stages 7–10.
 
 ### Local Stage 5 (Per-slide Plan) — narrow contract support
 
@@ -226,7 +226,38 @@ Fail-closed gates (every gate aborts the run and writes nothing):
 python3 scripts/init_slide_plans.py --self-test
 ```
 
-After Stage 5 succeeds, **stage 6** (`image_manifest.json`) remains agent-driven. Once it exists, `scripts/run_pipeline.py` can take over for stages 7–10.
+After Stage 5 succeeds, **stage 6** has narrow contract support via `scripts/init_image_manifest.py` (see the next section). Once that succeeds, `scripts/run_pipeline.py` can take over for stages 7–10.
+
+### Local Stage 6 (Image Manifest) — narrow contract support
+
+`scripts/init_image_manifest.py` is the stdlib-only, deterministic Stage-6 helper that bridges an already-stage-5-initialized workspace (`source_manifest.json` + `input/source.md` + `deck_brief.json` + `deck_plan.json` + `design_system.json` + a non-empty `slide_plans/` directory whose every `*.json` file is a regular file and validates against `schemas/slide_plan.schema.json`) plus a caller-supplied `--spec` JSON file whose shape is exactly the image_manifest candidate the caller wants written into a schema-valid `<workspace>/image_manifest.json`. **This is Stage-6 contract support only — it is not a full prompt/report/Markdown-to-PPTX automation.** The helper validates the `--spec` against `schemas/image_manifest.schema.json`, refuses duplicate `images[].id`, refuses unsafe `images[].local_path` (URI scheme / POSIX-absolute / `..` traversal / protocol-relative), refuses asset symlinks (the leaf-symlink check runs BEFORE the within-workspace check so an asset symlink pointing outside the workspace surfaces with the clear "symlink" diagnostic), and requires every declared `local_path` to resolve inside the workspace to an existing regular file. The helper re-runs the Stage-5 slide-plan coverage gate `init_slide_plans.py` applies — the union of `slide_plan.index` values must exactly cover `deck_plan.slides[].index` (no duplicate indices across slide_plan files, no missing slides, no orphan slide_plans) and each pair's `layout` / `title` must agree with the deck_plan slide — so a hand-edited `slide_plans/` that drifts from `deck_plan` is refused before Stage-6 advances. Slot coverage against the per-layout file is NOT re-run here (it needs the template root, and Stage-5 already enforced it on the producer side; Stage-6 only catches caller-side drift in the deck_plan ↔ slide_plan pairing). The helper cross-checks every `slide_plan.image_refs[*]` value across the workspace against `images[].id`; an empty `images[]` list is accepted ONLY when no slide_plan references any image. The helper itself never opens `input/source.md` — it invokes the Stage-1/Stage-2 bridge (`check_source_manifest_bridge`), which reads the source bytes ONLY for byte-level integrity checks (UTF-8 decode validity, byte_count / line_count / sha256 match against the manifest) and discards the decoded string. The helper does NOT generate any image asset, does NOT call D-One / Qoder / any public network / image generation / external service, does NOT extract image refs from raw source text, and does NOT produce `render_models/*` / `svg_previews/*` / any `.pptx`. Two runs from the same workspace + spec produce a byte-identical manifest.
+
+```
+python3 scripts/init_image_manifest.py \
+  --workspace path/to/stage5/workspace \
+  --spec path/to/image_manifest_spec.json
+```
+
+Fail-closed gates (every gate aborts the run and writes nothing):
+
+- `--workspace` must be an existing directory whose string form does NOT start with a URI-like scheme (same regex as the other `init_*` helpers) and must not itself be a symlink;
+- the workspace must already ship `source_manifest.json` + `deck_brief.json` + `deck_plan.json` + `design_system.json` as regular in-workspace files (symlinks refused), and must ship a non-empty `slide_plans/` directory whose every `*.json` file is a regular file (symlinks refused) and validates against `schemas/slide_plan.schema.json`;
+- the Stage-1/Stage-2 bridge (`check_source_manifest_bridge`) must pass; `deck_brief.json` / `deck_plan.json` / `design_system.json` each validate against their schema; `deck_plan.json` must additionally pass EXACTLY the planner-semantics cross-checks `init_deck_plan.py` applies before writing a Stage-3 artifact;
+- Stage-5 slide-plan coverage must hold: the union of `slide_plan.index` values exactly covers `deck_plan.slides[].index` (no duplicate indices across slide_plan files, no missing slides, no orphan slide_plans), and each pair's `layout` / `title` agree with the deck_plan slide. Slot coverage against the per-layout file is NOT re-run here (Stage-5 already enforced it on the producer side);
+- `--spec` must be an existing regular file (symlinks, URI-shaped values, malformed JSON, list-rooted JSON all refused at the preflight) and must validate against `schemas/image_manifest.schema.json`;
+- no two `images[].id` values may be equal; every `images[].local_path` passes `validate_scaffold.local_path_is_safe`, the leaf is not a symlink, the path resolves inside `--workspace`, and the resolved target is an existing regular file;
+- every `slide_plan.image_refs[*]` value is declared in `images[].id`; an empty `images[]` list is accepted ONLY when no slide_plan references any image;
+- `image_manifest.json` must NOT already exist as a symlink (broken or resolvable) AND must NOT already exist as a regular file (no overwrite; rename or remove the prior manifest first).
+
+The candidate manifest is schema-validated in memory before any write and re-validated on disk afterwards via `scripts/validate_artifacts.py`; a post-write re-validation failure (return errors OR raise) rolls back the just-written manifest so the workspace returns to its pre-call state. The catch clause is `(Exception, SystemExit)` so `validate_artifact`'s `SystemExit` branch on read-errors still routes through rollback.
+
+`scripts/init_image_manifest.py --self-test` exercises 28 in-script tempfixture scenarios under `tempfile.TemporaryDirectory()` covering: happy path with one local asset, happy path with empty `images[]` + no `image_refs`, determinism between two independent runs, missing `--spec`, symlink `--spec`, malformed `--spec` (non-JSON), schema-invalid `--spec` (missing required `images`), list-rooted `--spec`, duplicate `images[].id`, three unsafe `local_path` variants (URI / POSIX-absolute / `..` traversal), missing image asset, symlinked image asset, undeclared `slide_plan.image_refs` id, pre-existing `image_manifest.json` refused with prior bytes preserved, broken symlink at `image_manifest.json` (dangling target never created), resolvable symlink at `image_manifest.json` (outside target bytes preserved), empty `slide_plans/` rejected as a Stage-5 prerequisite failure, URI-shaped `--workspace`, source-body marker phrase NEVER copied into the manifest (proves no content extraction), mocked post-write rollback (return errors / raise `SystemExit`), the "empty images + non-empty refs" cross-check diagnostic, and the Stage-5 coverage gates (missing slide_plan whose index `deck_plan` declares, orphan slide_plan whose index `deck_plan` does not declare, duplicate slide_plan indices across two files, slide_plan/deck_plan title mismatch).
+
+```
+python3 scripts/init_image_manifest.py --self-test
+```
+
+After Stage 6 succeeds, `scripts/run_pipeline.py` can take over for stages 7–10.
 
 ### Single-artifact structural validation
 
