@@ -1,0 +1,18 @@
+{
+  "index": 2,
+  "layout": "executive_summary",
+  "title": "Trial Overview",
+  "blocks": [
+    { "id": "title",   "kind": "text", "content": "Trial Overview" },
+    { "id": "summary", "kind": "text", "content": "Qualitative overview of the synthetic trial: seven adaptive slides, one source file, no real data, empty image manifest." },
+    {
+      "id": "key_points",
+      "kind": "list",
+      "content": [
+        "Synthetic source narrative",
+        "Adaptive deck length of seven slides",
+        "Empty image manifest; no rastered slides"
+      ]
+    }
+  ]
+}

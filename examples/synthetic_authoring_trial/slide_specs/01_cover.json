@@ -1,0 +1,13 @@
+{
+  "index": 1,
+  "layout": "cover",
+  "title": "Synthetic Authoring Trial",
+  "subtitle": "Smoke test of the explicit-input authoring bundle",
+  "blocks": [
+    { "id": "title",     "kind": "text", "content": "Synthetic Authoring Trial" },
+    { "id": "subtitle",  "kind": "text", "content": "Smoke test of the explicit-input authoring bundle" },
+    { "id": "presenter", "kind": "text", "content": "Synthetic Pipeline Reviewer" },
+    { "id": "date",      "kind": "text", "content": "<placeholder-date>" }
+  ],
+  "notes": "All values are synthetic placeholders."
+}

@@ -1,0 +1,110 @@
+{
+  "template": "business_review",
+  "planning": {
+    "planned_slide_count": 7,
+    "rationale": "Synthetic seven-slide trial: six short sections (overview, idea, comparison, counters, milestones, close) exercise the explicit-input authoring bundle without copying the source body into any slide field."
+  },
+  "sections": [
+    {
+      "id": "overview",
+      "title": "Overview",
+      "summary": "Cover and trial overview.",
+      "slide_indices": [1, 2]
+    },
+    {
+      "id": "idea",
+      "title": "Core Idea",
+      "summary": "Single-statement key message.",
+      "slide_indices": [3]
+    },
+    {
+      "id": "comparison",
+      "title": "Comparison",
+      "summary": "Before vs after the authoring gate.",
+      "slide_indices": [4]
+    },
+    {
+      "id": "counters",
+      "title": "Counters",
+      "summary": "Three placeholder counters for the trial.",
+      "slide_indices": [5]
+    },
+    {
+      "id": "milestones",
+      "title": "Milestones",
+      "summary": "Placeholder trial steps as a timeline.",
+      "slide_indices": [6]
+    },
+    {
+      "id": "close",
+      "title": "Close",
+      "summary": "Trial outcome and synthetic next steps.",
+      "slide_indices": [7]
+    }
+  ],
+  "slides": [
+    {
+      "index": 1,
+      "layout": "cover",
+      "title": "Synthetic Authoring Trial",
+      "section_id": "overview",
+      "summary": "Title and presenter placeholders for the trial.",
+      "density": "low",
+      "source_refs": ["synthetic_trial_source"]
+    },
+    {
+      "index": 2,
+      "layout": "executive_summary",
+      "title": "Trial Overview",
+      "section_id": "overview",
+      "summary": "Qualitative description of the synthetic trial.",
+      "density": "medium",
+      "source_refs": ["synthetic_trial_source"]
+    },
+    {
+      "index": 3,
+      "layout": "key_message",
+      "title": "Core Idea",
+      "section_id": "idea",
+      "summary": "Single placeholder statement about the authoring gate.",
+      "density": "low",
+      "source_refs": ["synthetic_trial_source"]
+    },
+    {
+      "index": 4,
+      "layout": "two_column",
+      "title": "Before vs After",
+      "section_id": "comparison",
+      "summary": "Two-column comparison of authoring before and after the gate.",
+      "density": "medium",
+      "source_refs": ["synthetic_trial_source"]
+    },
+    {
+      "index": 5,
+      "layout": "kpi_dashboard",
+      "title": "Trial Counters",
+      "section_id": "counters",
+      "summary": "Three placeholder counters for this trial.",
+      "density": "medium",
+      "source_refs": ["synthetic_trial_source"]
+    },
+    {
+      "index": 6,
+      "layout": "timeline",
+      "title": "Trial Steps",
+      "section_id": "milestones",
+      "summary": "Four placeholder trial steps as a timeline.",
+      "density": "medium",
+      "source_refs": ["synthetic_trial_source"]
+    },
+    {
+      "index": 7,
+      "layout": "conclusion",
+      "title": "Trial Outcome",
+      "section_id": "close",
+      "summary": "Synthetic smoke test outcome and two placeholder next steps.",
+      "density": "low",
+      "source_refs": ["synthetic_trial_source"]
+    }
+  ]
+}

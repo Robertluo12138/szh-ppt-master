@@ -1,0 +1,26 @@
+{
+  "index": 4,
+  "layout": "two_column",
+  "title": "Before vs After",
+  "blocks": [
+    { "id": "title",         "kind": "text", "content": "Before vs After" },
+    { "id": "left_heading",  "kind": "text", "content": "Before the gate" },
+    {
+      "id": "left_content",
+      "kind": "list",
+      "content": [
+        "Bundle errors surface after a six-stage prep run",
+        "Workspace artifacts already written when a spec breaks"
+      ]
+    },
+    { "id": "right_heading", "kind": "text", "content": "After the gate" },
+    {
+      "id": "right_content",
+      "kind": "list",
+      "content": [
+        "Bundle errors surface before any workspace is created",
+        "Authoring fixes happen offline, on the spec files"
+      ]
+    }
+  ]
+}

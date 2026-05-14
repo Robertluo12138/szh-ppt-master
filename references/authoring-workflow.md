@@ -235,7 +235,17 @@ Required fields per entry are `id`, `local_path`, and `source`. The `source` enu
 
 Before invoking the deterministic pipeline, the agent runs through this loop. Each item maps to a machine-checked gate downstream (so the loop is also a "fail fast at authoring time" trick), or to a source-fidelity / safety rule the machine cannot check on its own.
 
-Machine-checkable (the deterministic pipeline will enforce these — running them at authoring time saves a six-stage retry):
+Machine-checkable (the deterministic pipeline will enforce these — running them at authoring time saves a six-stage retry). The bundled helper `scripts/validate_authoring_bundle.py` runs items 1–12 plus the curated forbidden-token / full-slide raster / raw-source-leakage scans in one shot, without creating a workspace or generating any artifact:
+
+```
+python3 scripts/validate_authoring_bundle.py \
+  --source S --title T --audience A --objective O \
+  --plan-spec P {--design-system-spec D | --theme-from-template} \
+  --template-root TR --slide-specs-dir SP --image-manifest-spec IM \
+  [--strict]                              # promote every WARN to ERROR
+```
+
+The gate emits `ERROR` findings (exit 1) and `WARN` findings (informational; exit 0 unless `--strict`). A clean run is `OK: no findings — bundle passed the structural gate.` The list below stays as the source of truth for what each check covers; reach for the helper when an agent wants the bundled pre-flight in one command.
 
 1. Each spec parses as JSON. `python3 -c "import json; json.load(open(p))"` is sufficient.
 2. Each spec validates against its schema. Use `python3 scripts/validate_artifacts.py --schema schemas/<artifact>.schema.json <path>` per spec.

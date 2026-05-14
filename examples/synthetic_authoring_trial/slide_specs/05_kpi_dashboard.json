@@ -1,0 +1,18 @@
+{
+  "index": 5,
+  "layout": "kpi_dashboard",
+  "title": "Trial Counters",
+  "blocks": [
+    { "id": "title", "kind": "text", "content": "Trial Counters" },
+    {
+      "id": "kpis",
+      "kind": "kpi",
+      "content": [
+        { "label": "slides",   "value": "7" },
+        { "label": "sections", "value": "6" },
+        { "label": "images",   "value": "0" }
+      ]
+    }
+  ],
+  "notes": "All counters reflect this synthetic trial only."
+}

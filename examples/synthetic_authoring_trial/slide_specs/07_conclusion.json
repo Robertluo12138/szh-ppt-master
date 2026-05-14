@@ -1,0 +1,17 @@
+{
+  "index": 7,
+  "layout": "conclusion",
+  "title": "Trial Outcome",
+  "blocks": [
+    { "id": "title",   "kind": "text", "content": "Trial Outcome" },
+    { "id": "summary", "kind": "text", "content": "Synthetic smoke test only; not production readiness." },
+    {
+      "id": "call_to_action",
+      "kind": "list",
+      "content": [
+        "Use this fixture only as a synthetic smoke test",
+        "Do not derive product defaults from this fixture"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "index": 3,
+  "layout": "key_message",
+  "title": "Core Idea",
+  "blocks": [
+    { "id": "title",           "kind": "text",    "content": "Core Idea" },
+    { "id": "message",         "kind": "callout", "content": "The authoring bundle gate can refuse a bad spec before any workspace is created." },
+    { "id": "supporting_text", "kind": "text",    "content": "Qualitative supporting context only; no figures or real names." }
+  ]
+}

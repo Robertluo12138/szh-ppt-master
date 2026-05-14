@@ -1,0 +1,18 @@
+{
+  "index": 6,
+  "layout": "timeline",
+  "title": "Trial Steps",
+  "blocks": [
+    { "id": "title", "kind": "text", "content": "Trial Steps" },
+    {
+      "id": "timeline_items",
+      "kind": "list",
+      "content": [
+        "Author the spec bundle",
+        "Run the authoring gate",
+        "Run the explicit pipeline",
+        "Validate the produced PPTX"
+      ]
+    }
+  ]
+}
