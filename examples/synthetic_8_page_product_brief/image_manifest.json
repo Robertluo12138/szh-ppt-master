@@ -1,3 +1,13 @@
 {
-  "images": []
+  "images": [
+    {
+      "id": "synthetic_marker",
+      "local_path": "assets/synthetic_marker.png",
+      "source": "synthetic",
+      "alt_text": "Synthetic 1x1 PNG marker exercising the local PNG embed path.",
+      "intended_use": "icon",
+      "width_px": 1,
+      "height_px": 1
+    }
+  ]
 }
