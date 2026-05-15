@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deterministic local end-to-end pipeline runner for prepared workspaces.
 
-Chains the five existing per-stage scripts in a single command:
+Chains the existing per-stage scripts in a single command:
 
     1. scripts/validate_workspace.py     (input contract gate)
     2. scripts/generate_render_models.py (render_model regeneration —
@@ -13,6 +13,15 @@ Chains the five existing per-stage scripts in a single command:
                                           the workspace)
     5. scripts/validate_pptx_contract.py (PPTX container + minimal-evidence
                                           gate with expected slide count)
+    6. scripts/inspect_pptx_inventory.py (deterministic OOXML structure
+                                          readback — only invoked when
+                                          --report-dir is supplied; writes
+                                          <report-dir>/inventory.json after
+                                          validate_pptx_contract has passed.
+                                          Evidence only: OOXML structure
+                                          counts, media / relationship
+                                          report, and findings — NOT proof
+                                          of full PowerPoint editability)
 
 Workspace contract:
 
@@ -34,11 +43,14 @@ Inputs:
     --template-root  templates/ root containing the deck_plan.template.
     --output         path of the .pptx artifact to write (.pptx required;
                      MUST be outside --workspace).
-    --report-dir     optional directory under which `pipeline_report.json`
-                     and `pipeline_report.txt` are written. MUST be
-                     outside --workspace (the workspace contract above
-                     applies to reports too — only render_models/ and
-                     svg_previews/ are runner-writable inside it).
+    --report-dir     optional directory under which `pipeline_report.json`,
+                     `pipeline_report.txt`, and `inventory.json` are
+                     written. When omitted, no inventory is produced (the
+                     inspect_pptx_inventory stage is not added at all).
+                     MUST be outside --workspace (the workspace contract
+                     above applies to reports + inventory too — only
+                     render_models/ and svg_previews/ are runner-writable
+                     inside it).
     --self-test      run the in-script tempfixture scenarios (happy path,
                      wrong --output extension, --output inside workspace,
                      --report-dir inside workspace, pre-existing regular
@@ -50,6 +62,21 @@ Inputs:
                      pipeline_report.txt (prior bytes preserved; skipped
                      under root), happy-path --report-dir outside the
                      workspace writes pipeline_report.{json,txt},
+                     happy-path --report-dir writes inventory.json,
+                     happy-path WITHOUT --report-dir produces no
+                     inventory anywhere, pre-existing symlink at
+                     <report-dir>/inventory.json refused, validate
+                     failure with --report-dir cascades [SKIP] to
+                     inspect_pptx_inventory, stale inventory.json
+                     from a prior successful run is removed before
+                     a later failing rerun's stages execute, a LATE
+                     preflight failure (--output is a symlink) with
+                     the same --report-dir preserves the prior
+                     inventory.json byte-identical (the destructive
+                     unlink only runs AFTER every preflight gate),
+                     --output parent path blocked by a regular file
+                     returns rc=2 with a clean FAIL diagnostic and no
+                     Python traceback,
                      pre-existing symlink --output, pre-existing directory
                      named *.pptx, upstream validation failure skipping
                      downstream stages, pre-existing regular .pptx
@@ -91,6 +118,20 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 # directory (write_text → IsADirectoryError), or a read-only
 # regular file (write_text → PermissionError).
 _REPORT_FILENAMES = ("pipeline_report.json", "pipeline_report.txt")
+
+# Inventory file written into --report-dir by the
+# inspect_pptx_inventory stage AFTER validate_pptx_contract has
+# passed. Only produced when --report-dir is supplied — a no-report-dir
+# invocation neither adds the stage nor creates the file. The preflight
+# gate probes this name the same way it probes the pipeline_report.*
+# files because the inventory subprocess uses Path.write_text(), which
+# follows symlinks (silently redirecting writes), raises
+# IsADirectoryError on a directory, and PermissionError on a read-only
+# regular file. Without the up-front gate the pipeline would validate
+# / generate / export (writing the PPTX!) and only then crash inside
+# the inspect_pptx_inventory subprocess. Catching all three states
+# up-front keeps the failure surface observable BEFORE any stage runs.
+_INVENTORY_FILENAME = "inventory.json"
 
 
 @dataclass
@@ -226,6 +267,23 @@ def run_pipeline(
     if expected is not None:
         pptx_cmd += ["--expected-slide-count", str(expected)]
     stages.append(("validate_pptx_contract", pptx_cmd))
+
+    # Optional inventory readback. Only added to the stage list when
+    # --report-dir is supplied — a no-report-dir run must not create
+    # extra repo artifacts. The aborted-cascade below treats this like
+    # any other stage: if any upstream stage fails, the inventory stage
+    # is recorded as [SKIP] and the subprocess is NOT invoked, so the
+    # inventory subprocess only runs after the .pptx has been written
+    # AND validate_pptx_contract has passed. A non-zero exit from the
+    # inventory subprocess (invocation error OR findings present) fails
+    # the pipeline closed — there is no fail-open path.
+    if report_dir is not None:
+        inventory_cmd = [
+            py, str(SCRIPTS_DIR / "inspect_pptx_inventory.py"),
+            "--pptx", str(output),
+            "--out", str(report_dir / _INVENTORY_FILENAME),
+        ]
+        stages.append(("inspect_pptx_inventory", inventory_cmd))
 
     aborted = False
     for name, cmd in stages:
@@ -866,6 +924,483 @@ def _scenario_report_dir_outside_writes_reports(td: Path) -> ScenarioResult:
     )
 
 
+def _scenario_inventory_written_with_report_dir(td: Path) -> ScenarioResult:
+    """Happy-path run with --report-dir actually writes
+    <report-dir>/inventory.json alongside the pipeline_report.*
+    files. The JSON must be loadable, declare `ok=true`, carry the
+    evidence_basis line, and include the slides / media_parts /
+    relationships / findings keys this side-output contracts on. We
+    also assert the [PASS] inspect_pptx_inventory stage marker so a
+    regression that drops the stage from the list (instead of just
+    its file) is caught."""
+    ws = td / "ws_inv_happy"
+    _copy_synthetic_workspace(ws)
+    out = td / "inv_happy.pptx"
+    report_dir = td / "inv_happy_reports_dir"
+    rc, sout, _serr = _invoke_runner([
+        "--workspace", str(ws),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+        "--report-dir", str(report_dir),
+    ])
+    inv_path = report_dir / "inventory.json"
+    ok = (
+        rc == 0
+        and out.is_file()
+        and "OK: pipeline succeeded" in sout
+        and "[PASS] inspect_pptx_inventory" in sout
+        and inv_path.is_file()
+        and not inv_path.is_symlink()
+        and "OOXML structure only; not proof of full PowerPoint editability"
+        in sout
+    )
+    if ok:
+        try:
+            inv = json.loads(inv_path.read_text())
+            ok = (
+                inv.get("ok") is True
+                and inv.get("evidence_basis") == (
+                    "OOXML structure only; not proof of full "
+                    "PowerPoint editability"
+                )
+                and isinstance(inv.get("slides"), list)
+                and isinstance(inv.get("media_parts"), list)
+                and isinstance(inv.get("relationships"), list)
+                and isinstance(inv.get("findings"), list)
+                and inv.get("findings") == []
+                and isinstance(inv.get("slide_count"), int)
+                and inv["slide_count"] == len(inv["slides"])
+            )
+        except (json.JSONDecodeError, OSError):
+            ok = False
+    return ScenarioResult(
+        "happy-path --report-dir writes inventory.json with ok=true, "
+        "the evidence_basis framing line, and the slides / media_parts "
+        "/ relationships / findings keys; the inspect_pptx_inventory "
+        "stage reports [PASS] and the runner mentions the inventory "
+        "path with the evidence-only caveat",
+        ok,
+        (f"rc={rc}, inv_is_file={inv_path.is_file()}, "
+         f"pass_marker={'[PASS] inspect_pptx_inventory' in sout}, "
+         f"caveat_marker={'not proof of full PowerPoint editability' in sout}"
+         if not ok else ""),
+    )
+
+
+def _scenario_no_inventory_without_report_dir(td: Path) -> ScenarioResult:
+    """Happy-path run WITHOUT --report-dir must NOT create any
+    inventory.json. The inspect_pptx_inventory stage is not even
+    added to the stage list so no [PASS]/[SKIP]/[FAIL]
+    inspect_pptx_inventory line appears. We scope the rglob to a
+    dedicated subdir under `td` because other scenarios share `td`
+    and DO produce inventory.json — a parent-wide rglob would
+    misattribute their files to this scenario."""
+    scenario_root = td / "no_inv_scenario_root"
+    scenario_root.mkdir()
+    ws = scenario_root / "ws"
+    _copy_synthetic_workspace(ws)
+    out = scenario_root / "no_inv.pptx"
+    rc, sout, _serr = _invoke_runner([
+        "--workspace", str(ws),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+    ])
+    inventory_anywhere = list(scenario_root.rglob("inventory.json"))
+    ok = (
+        rc == 0
+        and out.is_file()
+        and "OK: pipeline succeeded" in sout
+        and "inspect_pptx_inventory" not in sout
+        and not inventory_anywhere
+    )
+    return ScenarioResult(
+        "no --report-dir means no inventory: the inspect_pptx_inventory "
+        "stage is not added to the stage list and no inventory.json is "
+        "created anywhere under the dedicated scenario root",
+        ok,
+        (f"rc={rc}, output_is_file={out.is_file()}, "
+         f"stage_absent={'inspect_pptx_inventory' not in sout}, "
+         f"inventory_files={inventory_anywhere}"
+         if not ok else ""),
+    )
+
+
+def _scenario_inventory_path_is_symlink(td: Path) -> ScenarioResult:
+    """A pre-existing symlink at <report-dir>/inventory.json must
+    fail closed BEFORE any pipeline stage runs. Without the gate the
+    inventory subprocess would follow the link and overwrite an
+    unrelated target — same anti-pattern --output and pipeline_report.*
+    forbid. The symlink's target must be byte-identical after the
+    refused run."""
+    ws = td / "ws_inv_sym"
+    _copy_synthetic_workspace(ws)
+    out = td / "inv_sym.pptx"
+    report_dir = td / "inv_sym_reports_dir"
+    report_dir.mkdir()
+    target = td / "inventory_symlink_target.txt"
+    target_bytes = b"DO NOT OVERWRITE THIS UNRELATED INVENTORY TARGET"
+    target.write_bytes(target_bytes)
+    sym = report_dir / "inventory.json"
+    sym.symlink_to(target)
+    rc, _sout, serr = _invoke_runner([
+        "--workspace", str(ws),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+        "--report-dir", str(report_dir),
+    ])
+    ok = (
+        rc == 2
+        and "inventory.json" in serr
+        and "symlink" in serr
+        and not out.exists()
+        and sym.is_symlink()
+        and target.is_file()
+        and target.read_bytes() == target_bytes
+    )
+    return ScenarioResult(
+        "pre-existing symlink at <report-dir>/inventory.json is "
+        "refused BEFORE any pipeline stage runs; no PPTX written, "
+        "the symlink's unrelated target is preserved byte-identical",
+        ok,
+        (f"rc={rc}, file_marker={'inventory.json' in serr}, "
+         f"symlink_marker={'symlink' in serr}, "
+         f"output_exists={out.exists()}, "
+         f"sym_still_symlink={sym.is_symlink()}, "
+         f"target_bytes_match={target.read_bytes() == target_bytes}"
+         if not ok else ""),
+    )
+
+
+def _scenario_stale_inventory_removed_on_failed_rerun(td: Path) -> ScenarioResult:
+    """Stale-inventory hygiene across reruns.
+
+    Run 1: a happy path with --report-dir succeeds and leaves a
+    fresh inventory.json on disk. Run 2: the same --report-dir is
+    reused but the workspace is tampered so validate_workspace
+    fails — the inspect_pptx_inventory stage MUST be [SKIP]'d for
+    that run. Without the pre-stage cleanup of inventory.json, the
+    Run-1 inventory.json would survive Run 2 untouched and the
+    caller would see a fresh pipeline_report.{json,txt} marked
+    FAIL alongside a stale inventory.json from Run 1 — easy to
+    misread as evidence about the current (failing) run.
+
+    We assert that after Run 2:
+      - the pipeline returned non-zero;
+      - the inspect_pptx_inventory stage is [SKIP]'d;
+      - inventory.json does NOT exist in --report-dir;
+      - pipeline_report.json and pipeline_report.txt DO exist and
+        reflect the failing Run 2 (overall_ok=false).
+    """
+    ws_good = td / "ws_stale_good"
+    _copy_synthetic_workspace(ws_good)
+    out = td / "stale.pptx"
+    report_dir = td / "stale_reports_dir"
+    rc1, sout1, _serr1 = _invoke_runner([
+        "--workspace", str(ws_good),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+        "--report-dir", str(report_dir),
+    ])
+    inv_path = report_dir / "inventory.json"
+    run1_ok = (
+        rc1 == 0
+        and "OK: pipeline succeeded" in sout1
+        and inv_path.is_file()
+    )
+    if not run1_ok:
+        return ScenarioResult(
+            "stale inventory hygiene: prior --report-dir run prep",
+            False,
+            f"run1 rc={rc1}, inv_present={inv_path.is_file()}",
+        )
+    run1_inv_bytes = inv_path.read_bytes()
+
+    # Now mutate the workspace so Run 2 fails at validate_workspace.
+    ws_bad = td / "ws_stale_bad"
+    _copy_synthetic_workspace(ws_bad)
+    _tamper_planned_slide_count(ws_bad)
+    rc2, sout2, _serr2 = _invoke_runner([
+        "--workspace", str(ws_bad),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+        "--report-dir", str(report_dir),
+    ])
+    report_json = report_dir / "pipeline_report.json"
+    report_txt = report_dir / "pipeline_report.txt"
+    ok = (
+        rc2 == 1
+        and "[FAIL] validate_workspace" in sout2
+        and "[SKIP] inspect_pptx_inventory" in sout2
+        and not inv_path.exists()
+        and report_json.is_file()
+        and report_txt.is_file()
+    )
+    if ok:
+        try:
+            payload = json.loads(report_json.read_text())
+            ok = payload.get("overall_ok") is False
+        except (json.JSONDecodeError, OSError):
+            ok = False
+    # Belt-and-braces: the Run-1 inventory bytes must not be
+    # discoverable anywhere under report_dir after Run 2 (catches a
+    # regression that moved the stale file elsewhere instead of
+    # removing it).
+    if ok:
+        for p in report_dir.rglob("*"):
+            if p.is_file() and p.read_bytes() == run1_inv_bytes:
+                ok = False
+                break
+    return ScenarioResult(
+        "stale inventory.json from a prior successful --report-dir "
+        "run is removed BEFORE Run 2's stages execute, so a later "
+        "failing rerun cannot leave a fresh FAIL pipeline_report "
+        "next to a stale inventory.json the caller could misread",
+        ok,
+        (f"rc2={rc2}, "
+         f"fail_marker={'[FAIL] validate_workspace' in sout2}, "
+         f"skip_inv={'[SKIP] inspect_pptx_inventory' in sout2}, "
+         f"inv_absent_after_rerun={not inv_path.exists()}, "
+         f"report_json_present={report_json.is_file()}"
+         if not ok else ""),
+    )
+
+
+def _scenario_output_parent_blocked_returns_rc2(td: Path) -> ScenarioResult:
+    """args.output.parent.mkdir() must return rc=2 with a clean
+    diagnostic, never traceback, when the parent path is blocked.
+
+    The mkdir call is `mkdir(parents=True, exist_ok=True)`, whose
+    Python semantics are: if the FINAL path component already
+    exists as a NON-directory, raise FileExistsError (a subclass
+    of OSError) even with exist_ok=True. Without an explicit
+    try/except + return 2, that exception propagates and Python
+    exits with rc=1 and a traceback — breaking the rc=2-on-every-
+    preflight-refusal contract every other gate honors. CI / a
+    review surface checking for rc=2 would silently miss the
+    refusal class.
+
+    Scenario:
+      - Place a regular file at `td / "blocker"` (its name has no
+        ".pptx" suffix so the --output-extension gate accepts it).
+      - Pass `--output <blocker>/run.pptx` so the would-be parent
+        directory IS that regular file.
+      - The runner must (a) exit 2, (b) print a FAIL line to
+        stderr naming the parent path and the OSError detail, AND
+        (c) NOT emit a Python "Traceback (most recent call last):"
+        in stderr.
+
+    Additionally we add a --report-dir with a pre-existing
+    inventory.json from a prior happy run and assert the inventory
+    survives the refused run byte-identical — defense-in-depth
+    that the destructive stale-inventory unlink still sits AFTER
+    this preflight gate (so a guarded refusal here does not strand
+    the caller without their prior evidence). The blocker file is
+    also asserted byte-identical so the runner never tries to
+    remove or overwrite arbitrary content at that path.
+    """
+    # Set up a prior good inventory.json under --report-dir.
+    ws_prior = td / "ws_parent_prior"
+    _copy_synthetic_workspace(ws_prior)
+    good_out = td / "parent_good.pptx"
+    report_dir = td / "parent_reports_dir"
+    rc1, sout1, _serr1 = _invoke_runner([
+        "--workspace", str(ws_prior),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(good_out),
+        "--report-dir", str(report_dir),
+    ])
+    inv_path = report_dir / "inventory.json"
+    if rc1 != 0 or "OK: pipeline succeeded" not in sout1 or not inv_path.is_file():
+        return ScenarioResult(
+            "output-parent blocked: Run 1 prep",
+            False,
+            f"rc1={rc1}, inv_present={inv_path.is_file()}",
+        )
+    prior_inv_bytes = inv_path.read_bytes()
+
+    # Run 2: regular file at the would-be parent path.
+    blocker = td / "blocker_for_parent"
+    blocker_bytes = b"NOT A DIRECTORY - DO NOT MODIFY OR REMOVE"
+    blocker.write_bytes(blocker_bytes)
+    bad_out = blocker / "run.pptx"  # parent is a regular file
+    ws_bad = td / "ws_parent_bad"
+    _copy_synthetic_workspace(ws_bad)
+    rc2, _sout2, serr2 = _invoke_runner([
+        "--workspace", str(ws_bad),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(bad_out),
+        "--report-dir", str(report_dir),
+    ])
+    ok = (
+        rc2 == 2
+        and "parent directory" in serr2
+        and str(blocker) in serr2
+        and "Traceback (most recent call last):" not in serr2
+        and blocker.is_file()
+        and blocker.read_bytes() == blocker_bytes
+        and inv_path.is_file()
+        and not inv_path.is_symlink()
+        and inv_path.read_bytes() == prior_inv_bytes
+    )
+    return ScenarioResult(
+        "--output parent path blocked by a regular file returns "
+        "rc=2 with a clean FAIL diagnostic naming the parent path "
+        "and the OSError detail — never a Python traceback. The "
+        "blocker file and the prior --report-dir's inventory.json "
+        "are both preserved byte-identical (the destructive "
+        "stale-inventory unlink stays correctly placed AFTER this "
+        "gate, so a guarded refusal here cannot strand the caller "
+        "without their prior evidence)",
+        ok,
+        (f"rc2={rc2}, "
+         f"parent_marker={'parent directory' in serr2}, "
+         f"path_marker={str(blocker) in serr2}, "
+         f"no_traceback={'Traceback (most recent call last):' not in serr2}, "
+         f"blocker_intact="
+         f"{blocker.is_file() and blocker.read_bytes() == blocker_bytes}, "
+         f"inv_intact="
+         f"{inv_path.is_file() and inv_path.read_bytes() == prior_inv_bytes}"
+         if not ok else ""),
+    )
+
+
+def _scenario_late_preflight_failure_preserves_prior_inventory(
+    td: Path,
+) -> ScenarioResult:
+    """Stale-inventory unlink ordering vs preflight gates.
+
+    The destructive `unlink(<report-dir>/inventory.json)` step
+    must run AFTER every preflight gate, never before. Several
+    preflight gates fire AFTER the --report-dir checks — in
+    particular the --output symlink gate and the --output
+    non-regular-file gate. If the unlink ran inside the
+    --report-dir block (before those later gates), a late
+    preflight failure would return 2 without invoking
+    run_pipeline() yet still have destroyed the caller's prior
+    inventory.json — leaving them with no fresh run AND no prior
+    evidence.
+
+    Scenario:
+      Run 1: happy path with --report-dir writes inventory.json.
+      Run 2: SAME --report-dir, but --output is now a symlink (a
+             preflight gate that fires AFTER the --report-dir
+             checks). The runner must refuse the run with rc=2,
+             AND inventory.json from Run 1 must remain
+             byte-identical on disk.
+    """
+    ws = td / "ws_late_preflight"
+    _copy_synthetic_workspace(ws)
+    out = td / "late_preflight.pptx"
+    report_dir = td / "late_preflight_reports_dir"
+    # Run 1: happy path.
+    rc1, sout1, _serr1 = _invoke_runner([
+        "--workspace", str(ws),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+        "--report-dir", str(report_dir),
+    ])
+    inv_path = report_dir / "inventory.json"
+    run1_ok = (
+        rc1 == 0
+        and "OK: pipeline succeeded" in sout1
+        and inv_path.is_file()
+    )
+    if not run1_ok:
+        return ScenarioResult(
+            "stale-inventory unlink ordering: Run 1 prep",
+            False,
+            f"rc1={rc1}, inv_present={inv_path.is_file()}",
+        )
+    run1_inv_bytes = inv_path.read_bytes()
+
+    # Run 2: replace --output with a symlink so the late
+    # --output-is-symlink preflight gate fires AFTER the
+    # --report-dir checks. The symlink target deliberately points
+    # at an unrelated file outside the workspace so the gate
+    # message is unmistakable.
+    sym_target = td / "sym_output_target.pptx"
+    sym_target_bytes = b"DO NOT OVERWRITE THIS UNRELATED SYM TARGET"
+    sym_target.write_bytes(sym_target_bytes)
+    out.unlink()
+    out.symlink_to(sym_target)
+    rc2, _sout2, serr2 = _invoke_runner([
+        "--workspace", str(ws),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+        "--report-dir", str(report_dir),
+    ])
+    ok = (
+        rc2 == 2
+        and "symlink" in serr2
+        and inv_path.is_file()
+        and not inv_path.is_symlink()
+        and inv_path.read_bytes() == run1_inv_bytes
+        and sym_target.is_file()
+        and sym_target.read_bytes() == sym_target_bytes
+    )
+    return ScenarioResult(
+        "late preflight failure (--output is a symlink) preserves "
+        "the prior --report-dir's inventory.json byte-identical: "
+        "the destructive stale-inventory unlink only runs AFTER "
+        "every preflight gate, so a late preflight refusal does "
+        "not strand the caller without their prior evidence",
+        ok,
+        (f"rc2={rc2}, symlink_marker={'symlink' in serr2}, "
+         f"inv_present={inv_path.is_file()}, "
+         f"inv_bytes_match="
+         f"{inv_path.is_file() and inv_path.read_bytes() == run1_inv_bytes}, "
+         f"sym_target_intact="
+         f"{sym_target.is_file() and sym_target.read_bytes() == sym_target_bytes}"
+         if not ok else ""),
+    )
+
+
+def _scenario_upstream_failure_skips_inventory(td: Path) -> ScenarioResult:
+    """validate_workspace failure cascading [SKIP] across every
+    downstream stage must include the inspect_pptx_inventory stage
+    when --report-dir is supplied — otherwise a regression that
+    bypassed the aborted-cascade for the new stage would silently
+    invoke the inventory subprocess against a missing or
+    half-exported PPTX. No inventory.json must exist after the
+    refused run."""
+    ws = td / "ws_inv_skip"
+    _copy_synthetic_workspace(ws)
+    _tamper_planned_slide_count(ws)
+    out = td / "inv_skip.pptx"
+    report_dir = td / "inv_skip_reports_dir"
+    rc, sout, _serr = _invoke_runner([
+        "--workspace", str(ws),
+        "--template-root", str(_SELF_TEST_TEMPLATE_ROOT),
+        "--output", str(out),
+        "--report-dir", str(report_dir),
+    ])
+    expected_skips = [
+        "[SKIP] generate_render_models",
+        "[SKIP] generate_svg_previews",
+        "[SKIP] export_pptx",
+        "[SKIP] validate_pptx_contract",
+        "[SKIP] inspect_pptx_inventory",
+    ]
+    inventory_anywhere = list(report_dir.rglob("inventory.json"))
+    ok = (
+        rc == 1
+        and "[FAIL] validate_workspace" in sout
+        and all(line in sout for line in expected_skips)
+        and not out.exists()
+        and not inventory_anywhere
+    )
+    return ScenarioResult(
+        "validate_workspace failure with --report-dir cascades [SKIP] "
+        "to inspect_pptx_inventory too; no inventory.json is created",
+        ok,
+        (f"rc={rc}, fail_marker={'[FAIL] validate_workspace' in sout}, "
+         f"all_skips_present={all(line in sout for line in expected_skips)}, "
+         f"output_exists={out.exists()}, "
+         f"inventory_files={inventory_anywhere}"
+         if not ok else ""),
+    )
+
+
 def _scenario_symlink_output(
     td: Path, shared_ws: Path,
 ) -> ScenarioResult:
@@ -1036,6 +1571,13 @@ def _run_self_tests() -> list[ScenarioResult]:
         results.append(_scenario_report_file_is_symlink(td, shared_ws))
         results.append(_scenario_report_file_readonly(td, shared_ws))
         results.append(_scenario_report_dir_outside_writes_reports(td))
+        results.append(_scenario_inventory_written_with_report_dir(td))
+        results.append(_scenario_no_inventory_without_report_dir(td))
+        results.append(_scenario_inventory_path_is_symlink(td))
+        results.append(_scenario_upstream_failure_skips_inventory(td))
+        results.append(_scenario_stale_inventory_removed_on_failed_rerun(td))
+        results.append(_scenario_late_preflight_failure_preserves_prior_inventory(td))
+        results.append(_scenario_output_parent_blocked_returns_rc2(td))
         results.append(_scenario_symlink_output(td, shared_ws))
         results.append(_scenario_directory_at_output(td, shared_ws))
         results.append(_scenario_upstream_failure_skips_downstream(td))
@@ -1088,8 +1630,15 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--report-dir", type=Path, default=None,
         help=(
-            "Optional directory under which pipeline_report.json and "
-            "pipeline_report.txt will be written. Created if missing."
+            "Optional directory under which pipeline_report.json, "
+            "pipeline_report.txt, and inventory.json will be written. "
+            "Created if missing. The inventory.json file is the "
+            "deterministic OOXML structure readback produced by "
+            "scripts/inspect_pptx_inventory.py — OOXML structure "
+            "counts, media / relationship report, and findings; "
+            "evidence only, not proof of full PowerPoint editability. "
+            "When omitted, no inventory stage is added (no inventory "
+            "file is produced)."
         ),
     )
     parser.add_argument(
@@ -1109,14 +1658,32 @@ def main(argv: list[str]) -> int:
             "read-only pipeline_report.txt (refused, prior content "
             "preserved; skipped under root); happy-path --report-dir "
             "outside the workspace writes pipeline_report.json + "
-            "pipeline_report.txt; pre-existing symlink at --output; "
+            "pipeline_report.txt; happy-path --report-dir produces "
+            "inventory.json with the expected structure and "
+            "evidence_basis line; happy-path WITHOUT --report-dir "
+            "produces no inventory file anywhere; pre-existing "
+            "symlink at <report-dir>/inventory.json refused before "
+            "any stage runs; stale inventory.json from a prior "
+            "successful --report-dir run is removed BEFORE a later "
+            "failing rerun's stages execute, so the caller never "
+            "sees a fresh FAIL pipeline_report next to a stale "
+            "inventory.json; a LATE preflight failure (--output is "
+            "a symlink) with the same --report-dir preserves the "
+            "prior inventory.json byte-identical because the "
+            "destructive stale-inventory unlink only runs AFTER "
+            "every preflight gate; --output parent path blocked by "
+            "a regular file returns rc=2 with a clean FAIL "
+            "diagnostic (no Python traceback) and the blocker file "
+            "AND any prior inventory.json are preserved byte-"
+            "identical; pre-existing symlink at --output; "
             "pre-existing directory named *.pptx at --output; "
             "validate_workspace failure cascading [SKIP] across every "
-            "downstream stage; pre-existing regular .pptx preserved "
-            "when validate_workspace fails before export. Exits "
-            "non-zero if any scenario does not behave as expected. "
-            "Mutually exclusive with --workspace / --template-root / "
-            "--output / --report-dir."
+            "downstream stage (including the inspect_pptx_inventory "
+            "stage when --report-dir is set); pre-existing regular "
+            ".pptx preserved when validate_workspace fails before "
+            "export. Exits non-zero if any scenario does not behave "
+            "as expected. Mutually exclusive with --workspace / "
+            "--template-root / --output / --report-dir."
         ),
     )
     args = parser.parse_args(argv)
@@ -1312,34 +1879,35 @@ def main(argv: list[str]) -> int:
 
         # The directory-level probe proves the runner can create
         # SOME file in --report-dir but does not prove that
-        # pipeline_report.json and pipeline_report.txt SPECIFICALLY
-        # can be written. _write_reports() calls Path.write_text(),
-        # which opens with mode 'w' — that follows symlinks,
-        # truncates regular files, and fails on directories. So a
-        # pre-existing entry at either report-file path can still
-        # break the post-export write:
+        # pipeline_report.json, pipeline_report.txt, and inventory.json
+        # SPECIFICALLY can be written. _write_reports() and the
+        # inspect_pptx_inventory subprocess both ultimately call
+        # Path.write_text(), which opens with mode 'w' — that follows
+        # symlinks, truncates regular files, and fails on directories.
+        # So a pre-existing entry at any of the three report-file paths
+        # can still break the post-export write:
         #   - a symlink would silently redirect the write to an
         #     unrelated target (same anti-pattern --output forbids);
         #   - a directory would raise IsADirectoryError;
         #   - a read-only regular file would raise PermissionError.
         # Each of these would let validate / generate / export
         # (writing the PPTX!) succeed and only THEN crash inside
-        # _write_reports(). Refuse all three up-front. os.access is
-        # used for the read-only-regular-file case: it follows the
-        # standard Unix permission model (chmod-based), which is
-        # sufficient for the realistic failure modes and consistent
-        # with how the eventual write_text() will be denied. TOCTOU
-        # between preflight and _write_reports is acceptable for a
-        # CLI tool.
-        for rname in _REPORT_FILENAMES:
+        # _write_reports() or the inspect_pptx_inventory subprocess.
+        # Refuse all three up-front. os.access is used for the
+        # read-only-regular-file case: it follows the standard Unix
+        # permission model (chmod-based), which is sufficient for the
+        # realistic failure modes and consistent with how the
+        # eventual write_text() will be denied. TOCTOU between
+        # preflight and the actual write is acceptable for a CLI tool.
+        for rname in _REPORT_FILENAMES + (_INVENTORY_FILENAME,):
             rp = args.report_dir / rname
             if rp.is_symlink():
                 print(
                     f"FAIL: report file {rp} is a symlink; refusing "
                     f"to follow it (a symlink at this path would "
-                    f"redirect _write_reports() into an unrelated "
-                    f"target). Remove it or replace it with a "
-                    f"regular file path.",
+                    f"redirect the post-export report / inventory "
+                    f"write into an unrelated target). Remove it or "
+                    f"replace it with a regular file path.",
                     file=sys.stderr,
                 )
                 return 2
@@ -1354,10 +1922,10 @@ def main(argv: list[str]) -> int:
             if rp.exists() and not os.access(rp, os.W_OK):
                 print(
                     f"FAIL: report file {rp} exists but is not "
-                    f"writable by this user; _write_reports() would "
-                    f"raise PermissionError after the PPTX has "
-                    f"already been written. Make the file writable "
-                    f"or remove it.",
+                    f"writable by this user; the post-export report "
+                    f"/ inventory write would raise PermissionError "
+                    f"after the PPTX has already been written. Make "
+                    f"the file writable or remove it.",
                     file=sys.stderr,
                 )
                 return 2
@@ -1393,8 +1961,68 @@ def main(argv: list[str]) -> int:
         return 2
 
     # Pre-create the output's parent so a downstream export failure is
-    # never confused with a missing-directory error.
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    # never confused with a missing-directory error. Wrap the mkdir in
+    # a try/except OSError + return 2 so a blocked parent path (a
+    # regular file sitting where the parent dir would be — mkdir
+    # raises FileExistsError, a subclass of OSError; permission denied;
+    # read-only mount; etc.) surfaces as the same rc=2 + clean
+    # diagnostic every other preflight gate produces, not as a Python
+    # traceback that would otherwise exit with rc=1 and confuse a
+    # caller / CI surface that expects the rc=2 contract for all
+    # preflight refusals.
+    try:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(
+            f"FAIL: --output {args.output} parent directory "
+            f"{args.output.parent} could not be created (or exists "
+            f"as a non-directory): {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Stale-inventory hygiene: destructive pre-stage cleanup of a
+    # prior run's inventory.json. The pipeline_report.{json,txt}
+    # files are unconditionally overwritten by _write_reports() at
+    # end of run, so they always reflect the current run (even on
+    # failure). inventory.json is different — it is only written
+    # when the inspect_pptx_inventory stage actually runs to
+    # completion, and the stage is [SKIP]'d whenever any upstream
+    # stage fails. Without this cleanup, a successful prior run
+    # leaves an inventory.json on disk that a later failing run
+    # does NOT overwrite, so the caller would see a fresh
+    # pipeline_report.{json,txt} marked FAIL alongside a stale
+    # inventory.json from the earlier successful run — the
+    # inventory could easily be misread as evidence about the
+    # current (failing) run.
+    #
+    # Ordering matters: this unlink is DESTRUCTIVE — it removes a
+    # prior good artifact from disk — so it MUST run AFTER every
+    # preflight gate. The earlier --output symlink / non-regular-
+    # file gates and the output-parent mkdir can all still fail
+    # and return 2 without ever invoking run_pipeline(); if we
+    # unlinked before those gates fired, a late preflight failure
+    # would destroy the caller's prior inventory.json even though
+    # no stage ran. The per-report-file loop above has already
+    # proved this path is a regular writable file (no symlink, no
+    # directory) so the unlink call itself is safe. If the
+    # inventory stage runs in this invocation, it writes its own
+    # inventory.json (ok=true OR with findings, but always
+    # reflecting the current PPTX); if the stage is [SKIP]'d, no
+    # inventory.json exists on disk after this run — the truthful
+    # state.
+    if args.report_dir is not None:
+        stale_inventory = args.report_dir / _INVENTORY_FILENAME
+        if stale_inventory.is_file():
+            try:
+                stale_inventory.unlink()
+            except OSError as exc:
+                print(
+                    f"FAIL: could not remove stale inventory at "
+                    f"{stale_inventory} before this run: {exc}",
+                    file=sys.stderr,
+                )
+                return 2
 
     result = run_pipeline(
         workspace=args.workspace,
@@ -1420,6 +2048,25 @@ def main(argv: list[str]) -> int:
             f"\nReport written to {args.report_dir / 'pipeline_report.json'} "
             f"and {args.report_dir / 'pipeline_report.txt'}."
         )
+        # The inventory.json side-output is only produced by the
+        # inspect_pptx_inventory stage when every upstream stage
+        # passed. Surface its path only when the stage actually ran
+        # and reported its own [PASS] — otherwise the file does not
+        # exist (the stage was skipped because validate_pptx_contract
+        # or an earlier gate failed). The framing string mirrors
+        # inspect_pptx_inventory's EVIDENCE_BASIS to keep callers
+        # honest about what the inventory does and does not prove.
+        inv_stage = next(
+            (s for s in result.stages if s.name == "inspect_pptx_inventory"),
+            None,
+        )
+        if inv_stage is not None and inv_stage.ok:
+            print(
+                f"Inventory written to "
+                f"{args.report_dir / _INVENTORY_FILENAME} "
+                f"(OOXML structure only; not proof of full PowerPoint "
+                f"editability)."
+            )
 
     _print_summary(result)
 

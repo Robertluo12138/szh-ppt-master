@@ -13,10 +13,15 @@ source / spec files:
        per-stage result is preserved for reporting.
     2. scripts/run_pipeline.py      — Stage 7-10 prepared-workspace
        pipeline (validate_workspace -> generate_render_models ->
-       generate_svg_previews -> export_pptx -> validate_pptx_contract),
-       invoked as a subprocess so its existing fail-closed gates,
-       reporting, and (optional) ``--report-dir`` writes are reused
-       verbatim — no stage logic is duplicated.
+       generate_svg_previews -> export_pptx -> validate_pptx_contract,
+       plus inspect_pptx_inventory when --report-dir is supplied so
+       the deterministic OOXML readback lands at
+       ``<report-dir>/inventory.json``), invoked as a subprocess so
+       its existing fail-closed gates, reporting, and (optional)
+       ``--report-dir`` writes are reused verbatim — no stage logic
+       is duplicated. The inventory side-output is evidence only:
+       OOXML structure counts, media / relationship report, and
+       findings — NOT proof of full PowerPoint editability.
 
 **This is explicit-input end-to-end orchestration only — it is NOT a
 full prompt/report/Markdown-to-PPTX automation.** Every Stage-1-to-6
@@ -339,7 +344,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--report-dir", type=Path, default=None,
         help="Optional directory under which run_pipeline will write "
-             "pipeline_report.{json,txt}. MUST live outside --workspace. "
+             "pipeline_report.{json,txt} AND inventory.json (the "
+             "deterministic OOXML structure readback from "
+             "scripts/inspect_pptx_inventory.py — evidence only, not "
+             "proof of full PowerPoint editability). When omitted, no "
+             "inventory file is produced. MUST live outside --workspace. "
              "Same pre-existing-path gates apply as run_pipeline.",
     )
     parser.add_argument(
@@ -350,8 +359,12 @@ def main(argv: list[str]) -> int:
              "--output inside the workspace refused by the pipeline "
              "gate, source-body marker phrase never copied outside "
              "input/source.md or into the PPTX, deterministic repeated "
-             "runs from byte-identical inputs both pass validation). "
-             "Mutually exclusive with the orchestration flags.",
+             "runs from byte-identical inputs both pass validation, "
+             "happy-path --report-dir produces "
+             "<report-dir>/inventory.json with ok=true and the "
+             "evidence_basis line and the marker phrase is NOT "
+             "embedded in the inventory). Mutually exclusive with "
+             "the orchestration flags.",
     )
     args = parser.parse_args(argv)
 
@@ -953,6 +966,76 @@ def _scenario_determinism(td: Path) -> ScenarioResult:
     )
 
 
+def _scenario_inventory_written_with_report_dir(td: Path) -> ScenarioResult:
+    """Happy-path run with --report-dir actually writes
+    ``<report-dir>/inventory.json`` via the inspect_pptx_inventory
+    stage delegated by run_pipeline. The orchestrator does not
+    duplicate inventory logic — it just forwards --report-dir — so
+    this scenario gates the wiring contract: when the caller asks
+    for a report-dir, the inventory file shows up alongside the
+    pipeline_report.* files.
+
+    We assert:
+      - the happy path completes (rc=0, PPTX written);
+      - the [PASS] inspect_pptx_inventory marker appears in
+        run_pipeline's relayed stdout (catches a regression that
+        silently dropped the stage);
+      - <report-dir>/inventory.json is a regular file (not a
+        symlink) with `ok=true`, the evidence_basis framing line,
+        and the slides / media_parts / relationships / findings keys
+        the side-output contracts on;
+      - the marker phrase from the source body is NOT embedded in
+        the inventory.json (the orchestrator's marker-phrase
+        isolation invariant extends to this new side-output)."""
+    fx = _build_fixture(td / "fx_inv_dir")
+    ws = td / "ws_inv"
+    out = td / "inv.pptx"
+    report_dir = td / "inv_reports_dir"
+    rc, sout, _serr = _invoke_runner(
+        _args_from_fixture(fx, workspace=ws, output=out, report_dir=report_dir)
+    )
+    inv_path = report_dir / "inventory.json"
+    ok = (
+        rc == 0
+        and out.is_file()
+        and "OK: explicit-input end-to-end run succeeded" in sout
+        and "[PASS] inspect_pptx_inventory" in sout
+        and inv_path.is_file()
+        and not inv_path.is_symlink()
+    )
+    if ok:
+        try:
+            inv = json.loads(inv_path.read_text())
+            ok = (
+                inv.get("ok") is True
+                and inv.get("evidence_basis") == (
+                    "OOXML structure only; not proof of full "
+                    "PowerPoint editability"
+                )
+                and isinstance(inv.get("slides"), list)
+                and isinstance(inv.get("media_parts"), list)
+                and isinstance(inv.get("relationships"), list)
+                and isinstance(inv.get("findings"), list)
+                and inv.get("findings") == []
+                and isinstance(inv.get("slide_count"), int)
+                and inv["slide_count"] == len(inv["slides"])
+                and _MARKER_PHRASE not in inv_path.read_text()
+            )
+        except (json.JSONDecodeError, OSError):
+            ok = False
+    return ScenarioResult(
+        "explicit pipeline forwards --report-dir so inspect_pptx_inventory "
+        "runs after Stage 10: <report-dir>/inventory.json is written "
+        "with ok=true, evidence_basis line, and the expected keys; the "
+        "source-body marker phrase never appears in the inventory",
+        ok,
+        (f"rc={rc}, inv_is_file={inv_path.is_file()}, "
+         f"pass_marker={'[PASS] inspect_pptx_inventory' in sout}, "
+         f"ok_marker={'OK: explicit-input end-to-end run succeeded' in sout}"
+         if not ok else ""),
+    )
+
+
 def _run_self_tests() -> list[ScenarioResult]:
     results: list[ScenarioResult] = []
     template_root = REPO_ROOT / "templates" / "layouts"
@@ -972,6 +1055,7 @@ def _run_self_tests() -> list[ScenarioResult]:
         results.append(_scenario_output_inside_workspace(td))
         results.append(_scenario_marker_phrase_isolation(td))
         results.append(_scenario_determinism(td))
+        results.append(_scenario_inventory_written_with_report_dir(td))
     return results
 
 
