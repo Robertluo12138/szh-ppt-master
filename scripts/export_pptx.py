@@ -22,10 +22,15 @@ directly editable in PowerPoint without media embedding.
 
 This is NOT a generic SVG-to-PPTX converter. It does NOT parse SVG, it
 does NOT screenshot a slide, and it does NOT rasterize a slide into a
-single picture. It also does NOT embed media — image_slot primitives
-are emitted as native PPTX placeholder shapes carrying the
-image_manifest alt_text. SVG / PNG / JPG embedding (and the PNG
-fallback PowerPoint needs for SVG) remain TODO.
+single picture. The exporter embeds local PNG / JPG / JPEG assets
+referenced by `image_slot` primitives — the bytes are copied into
+`ppt/media/imageN.<ext>`, registered with the matching `image/png` or
+`image/jpeg` content-type Default, and wired up via per-slide `image`
+relationships. SVG / GIF / WebP and any other extension are NOT
+embedded today: an `image_slot` whose manifest entry resolves to a
+non-PNG/JPG file falls back to the original placeholder shape that
+carries the `image_manifest` alt_text. Unsafe / missing / symlinked /
+undeclared image references all fail closed at preflight.
 
 INPUTS (all workspace-relative; the same artifacts validate_workspace
 exercises today)
@@ -56,6 +61,10 @@ OUTPUT
       ppt/slideMasters/slideMaster1.xml
       ppt/slideMasters/_rels/slideMaster1.xml.rels
       ppt/theme/theme1.xml
+      ppt/media/imageN.<ext>              (one per embedded PNG / JPG /
+                                           JPEG manifest entry, indexed
+                                           in the manifest's declared
+                                           order; binary-byte-stable)
 
 PRIMITIVE -> NATIVE PPTX OBJECT MAPPING
     text         <p:sp> textBox with <p:txBody> and one <a:r> run
@@ -63,8 +72,18 @@ PRIMITIVE -> NATIVE PPTX OBJECT MAPPING
     shape        <p:sp> with prstGeom prst in {rect, roundRect, ellipse}
     kpi          <p:sp> textBox with stacked <a:p> paragraphs
                  (label / value / optional delta) — fully editable
-    image_slot   <p:sp> placeholder rectangle whose <a:txBody> carries
-                 the image_manifest alt_text. Media embedding is TODO.
+    image_slot   PNG / JPG / JPEG manifest entries -> native <p:pic>
+                 with <p:blipFill r:embed="rIdN"/>; the bytes are
+                 embedded under ppt/media/imageN.<ext>. Manifest
+                 entries with a non-PNG/JPG/JPEG extension (SVG, GIF,
+                 WebP, ...) silently demote to a <p:sp> placeholder
+                 rectangle whose <a:txBody> carries the
+                 image_manifest alt_text. A PNG/JPG/JPEG entry whose
+                 path is unsafe / escapes the workspace / is a
+                 symlink / is missing or not a regular file / exceeds
+                 the 10 MiB embed cap / fails the magic-byte check
+                 fails CLOSED at the media preflight and aborts the
+                 run before any output is written.
     table        <p:graphicFrame> wrapping <a:tbl> with one <a:gridCol>
                  per column and a bold header row of <a:tc> cells, each
                  cell carrying an editable <a:txBody> with its declared
@@ -82,7 +101,12 @@ PREFLIGHT GATES (run BEFORE any output ZIP is created)
       schemas/design_system.schema.json;
     - image_manifest.json schema-validates against
       schemas/image_manifest.schema.json and every declared
-      images[].local_path passes local_path_is_safe;
+      images[].local_path passes local_path_is_safe AND, for entries
+      whose extension is .png / .jpg / .jpeg (case-insensitive), the
+      resolved path stays inside the workspace, is NOT a symlink
+      (broken or resolvable), is a regular file, and is small enough
+      to read once into memory. Any of those gates failing aborts
+      the run before any output is written;
     - deck_plan.json schema-validates against
       schemas/deck_plan.schema.json, planning.planned_slide_count
       equals len(slides), every slides[] entry has integer `index`
@@ -132,8 +156,8 @@ DETERMINISM
     - Every ZIP entry is written with a fixed timestamp (1980-01-01).
 
 OUT OF SCOPE
-    - SVG / PNG / JPG / GIF media embedding (deferred — image_slot is
-      a placeholder shape only).
+    - SVG / GIF / WebP media embedding (deferred — these manifest
+      entries fall back to the placeholder shape).
     - PPTX `chart_placeholder` emission (deferred — fail closed today).
     - Layouts outside the SUPPORTED_LAYOUTS allow-list above. Every
       layout declared by the business_review template skeleton is
@@ -151,7 +175,7 @@ import argparse
 import re
 import sys
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
@@ -276,6 +300,40 @@ REL_SLIDE_MASTER = (
 REL_THEME = (
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme"
 )
+REL_IMAGE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+)
+
+# PNG / JPG / JPEG embedding map. The exporter only embeds these
+# extensions today; manifest entries with any other extension fall back
+# to the placeholder shape (see _render_image_slot_sp). Keys are the
+# lower-cased extension WITHOUT a leading dot; values are the OOXML
+# Default `ContentType` we register for that extension and the file
+# extension we use inside `ppt/media/`.
+EMBEDDABLE_IMAGE_EXTENSIONS: dict[str, tuple[str, str]] = {
+    "png":  ("image/png",  "png"),
+    "jpg":  ("image/jpeg", "jpg"),
+    "jpeg": ("image/jpeg", "jpeg"),
+}
+
+# Magic-byte signatures used as a defense-in-depth check that the file
+# behind a manifest entry is actually the format its extension claims
+# to be. We refuse to embed (and fall back to the placeholder shape) if
+# the file's leading bytes do not match the expected signature for its
+# extension. This catches a `.png`-named text file before the bytes
+# ever land in the PPTX. JPEG covers JFIF / EXIF / SPIFF leading bytes
+# that all start `FF D8 FF`; PNG always starts with the 8-byte
+# `\x89PNG\r\n\x1a\n` signature.
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_JPEG_SIGNATURE_PREFIX = b"\xff\xd8\xff"
+
+# Hard cap on the per-asset byte size we are willing to read into
+# memory. The pipeline targets spot illustrations / icons / decorative
+# artwork, so a 10 MiB ceiling is a generous upper bound. Anything
+# larger is refused at preflight rather than silently embedded — this
+# keeps the deterministic ZIP under control and makes a regression
+# (someone wiring up a full-slide screenshot) loud.
+_MAX_EMBEDDED_BYTES = 10 * 1024 * 1024
 
 _XML_HEADER = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
 
@@ -297,9 +355,213 @@ class CheckResult:
     detail: str = ""
 
 
+@dataclass
+class MediaResolution:
+    """Resolved media information for an image_manifest entry the
+    exporter is willing to embed.
+
+    Built once at preflight in `_build_media_plan`. Only PNG / JPG /
+    JPEG entries that pass every safety gate (path-safety, no symlink,
+    inside the workspace, regular file, magic bytes match, file size
+    under the embed cap) get a MediaResolution; every other manifest
+    entry stays out of the plan and falls back to the placeholder shape
+    in `_render_image_slot_sp`.
+
+    `media_filename` is deterministic and follows the manifest's
+    declared order so the resulting PPTX bytes are stable across runs:
+    the first embeddable manifest entry is `image1.<ext>`, the second
+    `image2.<ext>`, and so on. The leading number is shared across
+    extensions; an embedded mix of PNG and JPG keeps a single counter."""
+    image_id: str
+    local_path: str
+    abs_path: Path
+    extension: str  # lower-cased, no leading dot, e.g. "png"
+    content_type: str  # e.g. "image/png"
+    media_filename: str  # e.g. "image1.png"
+    bytes_payload: bytes = field(default=b"", repr=False)
+
+
 def _fatal(msg: str) -> int:
     print(f"FAIL: {msg}", file=sys.stderr)
     return 1
+
+
+def _embeddable_extension(local_path: str) -> str | None:
+    """Return the lower-cased extension WITHOUT the leading dot if the
+    path's extension is in EMBEDDABLE_IMAGE_EXTENSIONS, else None.
+
+    The check is purely on the string suffix — the caller handles the
+    filesystem checks separately so a fail-closed gate can report the
+    exact reason (extension vs. symlink vs. magic bytes vs. ...)."""
+    suffix = Path(local_path).suffix.lower().lstrip(".")
+    if suffix in EMBEDDABLE_IMAGE_EXTENSIONS:
+        return suffix
+    return None
+
+
+def _matches_image_signature(extension: str, payload: bytes) -> bool:
+    """True iff `payload` starts with the magic bytes for `extension`.
+
+    Defense-in-depth alongside `_embeddable_extension` so a `.png`-
+    named text file (or a `.jpg`-named SVG document) cannot be embedded
+    even when its name and the manifest pass every other gate."""
+    if extension == "png":
+        return payload.startswith(_PNG_SIGNATURE)
+    if extension in ("jpg", "jpeg"):
+        return payload.startswith(_JPEG_SIGNATURE_PREFIX)
+    return False
+
+
+def _resolve_inside_workspace(workspace: Path, local_path: str) -> Path | None:
+    """Resolve `local_path` against `workspace` and confirm the result
+    stays under `workspace` after resolution.
+
+    Returns the resolved absolute Path on success, or None if the
+    resolution escapes the workspace (the caller must already have
+    confirmed the string-level safety via `local_path_is_safe`).
+    Reused for the per-asset symlink-escape gate below."""
+    base_resolved = workspace.resolve()
+    candidate = (workspace / local_path).resolve()
+    try:
+        candidate.relative_to(base_resolved)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _build_media_plan(
+    workspace: Path, manifest: dict,
+) -> tuple[dict[str, MediaResolution], list[str]]:
+    """Walk image_manifest.images[] and return the (media_plan, errors)
+    pair the exporter uses to decide which entries embed and which
+    fall back to the placeholder shape.
+
+    Per-entry gates (each a fail-closed reason; the FIRST failure for an
+    entry is recorded and the entry stays out of the plan):
+
+      0. id and local_path are already string-validated by the caller's
+         path-safety preflight; this function trusts the caller's prior
+         pass on those (it still re-checks `local_path_is_safe` because
+         the cost is minimal).
+      1. extension is in EMBEDDABLE_IMAGE_EXTENSIONS — otherwise the
+         entry is silently demoted to placeholder (NOT an error: the
+         contract permits SVG / GIF / WebP placeholders).
+      2. asset path is NOT a symlink (broken or resolvable) — a
+         symlink at the asset path would otherwise let the exporter
+         embed bytes outside the workspace. Checked BEFORE the
+         resolve gate so the symlink-specific error message fires
+         even when the symlink target sits outside the workspace
+         (which would also trip gate 3). Mirrors the symlink gate the
+         workspace validator already enforces on
+         `source_manifest.json`.
+      3. resolved path stays inside the workspace after Path.resolve()
+         (defense in depth against a path that passed the string-level
+         path-safety check but resolves outside via a symlink in a
+         parent directory).
+      4. resolved path is a regular file (not a directory, not a
+         device, not missing).
+      5. file size is under `_MAX_EMBEDDED_BYTES`.
+      6. magic bytes match the declared extension.
+
+    Gates 2-6 are fail-closed errors recorded in the returned list and
+    the export aborts. Gate 1 (extension) silently demotes to
+    placeholder — the entry is intentionally NOT in the plan and the
+    placeholder branch in `_render_image_slot_sp` handles it. The
+    manifest's declared order drives the deterministic
+    `image1.<ext>`, `image2.<ext>`, ... numbering."""
+    plan: dict[str, MediaResolution] = {}
+    errors: list[str] = []
+    media_index = 0
+    for img in _as_list(manifest.get("images")) or []:
+        img_d = _as_dict(img)
+        if img_d is None:
+            continue
+        image_id = img_d.get("id")
+        local_path = img_d.get("local_path")
+        if not isinstance(image_id, str) or not image_id:
+            continue
+        if not isinstance(local_path, str) or not local_path:
+            continue
+        if not local_path_is_safe(local_path):
+            errors.append(
+                f"image_manifest entry {image_id!r}: local_path "
+                f"{local_path!r} fails path-safety; refusing to embed"
+            )
+            continue
+        ext = _embeddable_extension(local_path)
+        if ext is None:
+            # Non-PNG/JPG entries fall back to the placeholder shape.
+            # This is intentional behavior, NOT an error.
+            continue
+        # Symlink gate fires BEFORE resolve. Path.is_symlink() does
+        # NOT follow the link, so it catches the case where the
+        # symlink itself sits inside the workspace but points
+        # anywhere — inside or outside.
+        unresolved_asset = workspace / local_path
+        if unresolved_asset.is_symlink():
+            errors.append(
+                f"image_manifest entry {image_id!r}: local_path "
+                f"{local_path!r} is a symlink (refused; broken or "
+                f"resolvable)"
+            )
+            continue
+        resolved = _resolve_inside_workspace(workspace, local_path)
+        if resolved is None:
+            errors.append(
+                f"image_manifest entry {image_id!r}: local_path "
+                f"{local_path!r} resolves outside the workspace; "
+                f"refusing to embed"
+            )
+            continue
+        if not resolved.is_file():
+            errors.append(
+                f"image_manifest entry {image_id!r}: local_path "
+                f"{local_path!r} does not resolve to a regular file"
+            )
+            continue
+        try:
+            size = resolved.stat().st_size
+        except OSError as exc:
+            errors.append(
+                f"image_manifest entry {image_id!r}: cannot stat "
+                f"{local_path!r}: {exc}"
+            )
+            continue
+        if size > _MAX_EMBEDDED_BYTES:
+            errors.append(
+                f"image_manifest entry {image_id!r}: local_path "
+                f"{local_path!r} is {size} bytes, exceeds the "
+                f"{_MAX_EMBEDDED_BYTES}-byte embed cap"
+            )
+            continue
+        try:
+            payload = resolved.read_bytes()
+        except OSError as exc:
+            errors.append(
+                f"image_manifest entry {image_id!r}: cannot read "
+                f"{local_path!r}: {exc}"
+            )
+            continue
+        if not _matches_image_signature(ext, payload):
+            errors.append(
+                f"image_manifest entry {image_id!r}: local_path "
+                f"{local_path!r} does not start with the expected "
+                f"{ext.upper()} magic bytes; refusing to embed"
+            )
+            continue
+        media_index += 1
+        content_type, ext_used = EMBEDDABLE_IMAGE_EXTENSIONS[ext]
+        media_filename = f"image{media_index}.{ext_used}"
+        plan[image_id] = MediaResolution(
+            image_id=image_id,
+            local_path=local_path,
+            abs_path=resolved,
+            extension=ext,
+            content_type=content_type,
+            media_filename=media_filename,
+            bytes_payload=payload,
+        )
+    return (plan, errors)
 
 
 def _load_required_object(path: Path, label: str) -> tuple[dict | None, str]:
@@ -692,22 +954,75 @@ def _render_kpi_sp(prim: dict, design: dict, shape_id: int) -> str:
     )
 
 
+def _render_image_slot_pic(
+    prim: dict,
+    shape_id: int,
+    alt_text: str,
+    image_ref: str,
+    media_rel_id: str,
+) -> str:
+    """image_slot primitive -> native <p:pic> with <p:blipFill> pointing
+    at an embedded media relationship.
+
+    Used when `_build_media_plan` resolved a PNG / JPG / JPEG file for
+    the manifest entry. The bounds are mapped 1:1 from the
+    render_model's pixel canvas to EMU just like every other primitive
+    so the picture lands exactly where the SVG preview shows it.
+
+    `media_rel_id` is the per-slide relationship Id (e.g. `rId2`) that
+    the slide's `_rels/slideN.xml.rels` will resolve to
+    `../media/imageM.<ext>` — callers assemble that rels file
+    separately. The picture carries the manifest's `alt_text` as
+    `descr=`, which screen readers use AND PowerPoint preserves when
+    the picture is edited."""
+    bounds = prim["bounds"]
+    off_x, off_y, ext_cx, ext_cy = _bounds_to_xfrm(bounds)
+    pid = prim.get("id") or "image_slot"
+    return (
+        f'<p:pic>'
+        f'<p:nvPicPr>'
+        f'<p:cNvPr id="{shape_id}" name="{_attr(f"image_slot:{pid}")}" '
+        f'descr="{_attr(alt_text)}"/>'
+        f'<p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr>'
+        f'<p:nvPr/>'
+        f'</p:nvPicPr>'
+        f'<p:blipFill>'
+        f'<a:blip r:embed="{media_rel_id}"/>'
+        f'<a:stretch><a:fillRect/></a:stretch>'
+        f'</p:blipFill>'
+        f'<p:spPr>{_xfrm_xml(off_x, off_y, ext_cx, ext_cy)}'
+        f'<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+        f'</p:spPr>'
+        f'</p:pic>'
+    )
+
+
 def _render_image_slot_sp(
     prim: dict,
     design: dict,
     shape_id: int,
     manifest_alts: dict,
     manifest_paths: dict,
+    media_plan: dict,
+    slide_media_uses: list[str],
 ) -> str:
-    """image_slot primitive -> placeholder rectangle whose txBody carries
-    the image_manifest alt_text. Media embedding is intentionally
-    deferred: PowerPoint's SVG support needs a PNG fallback and a
-    matching SVGBlip extension, and JPG/PNG embedding adds media
-    relationships, neither of which is in this minimal slice. The
-    image_ref is still validated against image_manifest so unsafe
-    references fail closed."""
-    bounds = prim["bounds"]
-    off_x, off_y, ext_cx, ext_cy = _bounds_to_xfrm(bounds)
+    """image_slot primitive -> editable native shape.
+
+    Two cases:
+      - `image_ref` resolves to an entry in `media_plan` (PNG / JPG /
+        JPEG passed every embed gate): we emit a `<p:pic>` carrying the
+        embedded media relationship. The slide's per-slide rels list
+        records the use through `slide_media_uses` so the caller can
+        build `_rels/slideN.xml.rels` deterministically.
+      - otherwise: we emit a `<p:sp>` placeholder rectangle whose
+        `<a:txBody>` carries the manifest's `alt_text`. This is the
+        SVG / GIF / WebP / missing-asset fallback. The placeholder
+        contract is unchanged from earlier versions — the test suite's
+        baseline placeholder fixture still passes.
+
+    Defense in depth: the manifest path-safety preflight has already
+    run, but we re-check `local_path_is_safe` at use time so a later
+    regression cannot leak an unsafe path through the alt-text branch."""
     payload = _as_dict(prim.get("image_slot")) or {}
     image_ref = payload.get("image_ref")
     if not isinstance(image_ref, str) or not image_ref:
@@ -717,9 +1032,6 @@ def _render_image_slot_sp(
             f"image_slot primitive references image id {image_ref!r} "
             f"that is not declared in image_manifest"
         )
-    # Defense in depth: manifest path-safety has been preflight-checked,
-    # but re-check at use time so a later regression cannot leak an
-    # unsafe path into the alt text (or a future media-embed branch).
     local_path = manifest_paths[image_ref]
     if not local_path_is_safe(local_path):
         raise ExportError(
@@ -727,13 +1039,34 @@ def _render_image_slot_sp(
             f"{local_path!r} for image id {image_ref!r}"
         )
     alt_text = payload.get("alt_text") or manifest_alts.get(image_ref) or image_ref
-    # Use a thin neutral stroke and no fill so the placeholder is
-    # visible during editing but does not overpaint slide content.
+
+    media = media_plan.get(image_ref)
+    if media is not None:
+        # Embed branch: record the use (deterministic per-slide order,
+        # de-duplicated so two image_slots referencing the same asset
+        # share a single relationship) and emit a <p:pic>.
+        if image_ref in slide_media_uses:
+            slot_index = slide_media_uses.index(image_ref)
+        else:
+            slot_index = len(slide_media_uses)
+            slide_media_uses.append(image_ref)
+        # rId1 is reserved for the slideLayout relationship; image rels
+        # start at rId2.
+        media_rel_id = f"rId{2 + slot_index}"
+        return _render_image_slot_pic(
+            prim, shape_id, alt_text, image_ref, media_rel_id,
+        )
+
+    # Placeholder branch (SVG / GIF / WebP / non-embeddable extension):
+    # exactly the prior behavior. Thin neutral stroke + no fill keeps
+    # the placeholder visible during editing without overpainting slide
+    # content.
+    bounds = prim["bounds"]
+    off_x, off_y, ext_cx, ext_cy = _bounds_to_xfrm(bounds)
     text_family_chain, text_pt = _resolve_typography(design, "typography.body")
     text_family = _font_first(text_family_chain)
     text_color = _resolve_palette(design, "palette.text")
     body_cp = _sz_centipoints(text_pt)
-    # Always render the alt text deterministically.
     placeholder_label = f"[image: {alt_text}]"
     pid = prim.get("id") or "image_slot"
     return (
@@ -891,6 +1224,8 @@ def _render_primitive(
     shape_id: int,
     manifest_alts: dict,
     manifest_paths: dict,
+    media_plan: dict,
+    slide_media_uses: list[str],
 ) -> str:
     kind = prim.get("kind")
     if kind == "text":
@@ -904,6 +1239,7 @@ def _render_primitive(
     if kind == "image_slot":
         return _render_image_slot_sp(
             prim, design, shape_id, manifest_alts, manifest_paths,
+            media_plan, slide_media_uses,
         )
     if kind == "table":
         return _render_table_graphicframe(prim, design, shape_id)
@@ -923,12 +1259,22 @@ def _slide_xml(
     design: dict,
     manifest_alts: dict,
     manifest_paths: dict,
-) -> str:
-    """Build the per-slide XML for a supported render_model. Shape ids
-    start at 2 because id=1 is reserved for the spTree group root."""
+    media_plan: dict,
+) -> tuple[str, list[str]]:
+    """Build the per-slide XML for a supported render_model.
+
+    Returns (xml, slide_media_uses) where `slide_media_uses` is the
+    ordered list of `image_id` values the slide embeds via `<p:pic>`
+    (one per referenced asset, de-duplicated). The caller turns that
+    list into per-slide `image` relationships in the slide's
+    `_rels/slideN.xml.rels`.
+
+    Shape ids start at 2 because id=1 is reserved for the spTree group
+    root."""
     primitives = _as_list(render_model.get("primitives")) or []
     bg_hex = _resolve_palette(design, "palette.background")
     shape_xml_parts: list[str] = []
+    slide_media_uses: list[str] = []
     next_id = 2
     for prim in primitives:
         if not isinstance(prim, dict):
@@ -945,7 +1291,10 @@ def _slide_xml(
                 f"in this exporter"
             )
         shape_xml_parts.append(
-            _render_primitive(prim, design, next_id, manifest_alts, manifest_paths)
+            _render_primitive(
+                prim, design, next_id, manifest_alts, manifest_paths,
+                media_plan, slide_media_uses,
+            )
         )
         next_id += 1
 
@@ -975,7 +1324,7 @@ def _slide_xml(
         f'</p:cSld>'
         f'<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>'
         f'</p:sld>'
-    )
+    ), slide_media_uses
 
 
 def _slide_master_xml() -> str:
@@ -1156,12 +1505,29 @@ def _rels_xml(rels: list[tuple[str, str, str]]) -> str:
     )
 
 
-def _content_types_xml(slide_count: int) -> str:
+def _content_types_xml(
+    slide_count: int,
+    embedded_image_extensions: set[str] | None = None,
+) -> str:
     """[Content_Types].xml.
 
-    Defaults declare the well-known extensions (`rels` + `xml`); every
+    Defaults declare the well-known extensions (`rels` + `xml`) and one
+    extra Default per embedded image extension (png / jpg / jpeg). Every
     document part is registered via an explicit Override so the package
-    is unambiguous."""
+    is unambiguous; embedded media parts under `ppt/media/` are
+    recognised through the matching Default rather than per-file
+    Overrides — that is the conventional OOXML pattern PowerPoint
+    consumes."""
+    extensions = embedded_image_extensions or set()
+    extra_defaults: list[tuple[str, str]] = []
+    # Sort so the rendered XML is deterministic across runs.
+    for ext in sorted(extensions):
+        ct, _ = EMBEDDABLE_IMAGE_EXTENSIONS[ext]
+        extra_defaults.append((ext, ct))
+    extra_default_xml = "".join(
+        f'<Default Extension="{ext}" ContentType="{ct}"/>'
+        for ext, ct in extra_defaults
+    )
     overrides = [
         ("/ppt/presentation.xml", CT_PRESENTATION),
         ("/ppt/slideMasters/slideMaster1.xml", CT_SLIDE_MASTER),
@@ -1179,6 +1545,7 @@ def _content_types_xml(slide_count: int) -> str:
         f'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
         f'<Default Extension="rels" ContentType="{CT_RELS}"/>'
         f'<Default Extension="xml" ContentType="{CT_XML}"/>'
+        f'{extra_default_xml}'
         f'{override_xml}'
         f'</Types>'
     )
@@ -1187,22 +1554,50 @@ def _content_types_xml(slide_count: int) -> str:
 # --- Package assembly ------------------------------------------------------
 
 def _build_package_parts(
-    slides: list[tuple[dict, str]],
+    slides: list[tuple[dict, str, list[str]]],
     design: dict,
     canvas_w_px: int,
     canvas_h_px: int,
-) -> dict[str, str]:
-    """Assemble every package part as a dict of {member_path: utf-8 text}.
-    Returns the dict; the caller writes it to a ZIP. Member paths are
-    POSIX style (forward slashes) — that is what zipfile expects."""
-    slide_count = len(slides)
-    parts: dict[str, str] = {}
+    media_plan: dict,
+) -> tuple[dict[str, str], dict[str, bytes]]:
+    """Assemble every package part for the PPTX ZIP.
 
-    parts["[Content_Types].xml"] = _content_types_xml(slide_count)
-    parts["_rels/.rels"] = _rels_xml([
+    Returns `(text_parts, binary_parts)` — both keyed by POSIX member
+    path. `text_parts` carries the OOXML / rels XML payloads (UTF-8
+    strings); `binary_parts` carries the embedded media bytes (PNG /
+    JPG / JPEG). The caller writes both into the ZIP.
+
+    Each entry in `slides` is `(render_model, slide_xml, media_uses)`.
+    `media_uses` is the per-slide ordered list of `image_id` values the
+    slide embeds; we turn it into per-slide `image` relationships
+    deterministically — the first image used on a slide gets `rId2`
+    (rId1 is reserved for the slideLayout relationship), the second
+    `rId3`, and so on. The slide XML emitted by `_slide_xml` already
+    references those rId values."""
+    slide_count = len(slides)
+
+    # Collect the embedded extensions actually in use so the
+    # [Content_Types].xml emits matching `<Default>` entries.
+    referenced_image_ids: set[str] = set()
+    for _, _, uses in slides:
+        for image_id in uses:
+            referenced_image_ids.add(image_id)
+    embedded_extensions: set[str] = set()
+    for image_id in referenced_image_ids:
+        media = media_plan.get(image_id)
+        if media is not None:
+            embedded_extensions.add(media.extension)
+
+    text_parts: dict[str, str] = {}
+    binary_parts: dict[str, bytes] = {}
+
+    text_parts["[Content_Types].xml"] = _content_types_xml(
+        slide_count, embedded_extensions,
+    )
+    text_parts["_rels/.rels"] = _rels_xml([
         ("rId1", REL_OFFICE_DOCUMENT, "ppt/presentation.xml"),
     ])
-    parts["ppt/presentation.xml"] = _presentation_xml(
+    text_parts["ppt/presentation.xml"] = _presentation_xml(
         slide_count, canvas_w_px, canvas_h_px,
     )
     # Presentation-level relationships: rId1=slideMaster, rId2..N=slides,
@@ -1219,36 +1614,67 @@ def _build_package_parts(
     pres_rels.append(
         (f"rId{2 + slide_count}", REL_THEME, "theme/theme1.xml")
     )
-    parts["ppt/_rels/presentation.xml.rels"] = _rels_xml(pres_rels)
+    text_parts["ppt/_rels/presentation.xml.rels"] = _rels_xml(pres_rels)
 
-    parts["ppt/slideMasters/slideMaster1.xml"] = _slide_master_xml()
-    parts["ppt/slideMasters/_rels/slideMaster1.xml.rels"] = _rels_xml([
+    text_parts["ppt/slideMasters/slideMaster1.xml"] = _slide_master_xml()
+    text_parts["ppt/slideMasters/_rels/slideMaster1.xml.rels"] = _rels_xml([
         ("rId1", REL_SLIDE_LAYOUT, "../slideLayouts/slideLayout1.xml"),
         ("rId2", REL_THEME, "../theme/theme1.xml"),
     ])
-    parts["ppt/slideLayouts/slideLayout1.xml"] = _slide_layout_xml()
-    parts["ppt/slideLayouts/_rels/slideLayout1.xml.rels"] = _rels_xml([
+    text_parts["ppt/slideLayouts/slideLayout1.xml"] = _slide_layout_xml()
+    text_parts["ppt/slideLayouts/_rels/slideLayout1.xml.rels"] = _rels_xml([
         ("rId1", REL_SLIDE_MASTER, "../slideMasters/slideMaster1.xml"),
     ])
-    parts["ppt/theme/theme1.xml"] = _theme_xml(design)
+    text_parts["ppt/theme/theme1.xml"] = _theme_xml(design)
 
-    for i, (rm, slide_xml) in enumerate(slides, start=1):
-        parts[f"ppt/slides/slide{i}.xml"] = slide_xml
-        parts[f"ppt/slides/_rels/slide{i}.xml.rels"] = _rels_xml([
+    for i, (rm, slide_xml, media_uses) in enumerate(slides, start=1):
+        text_parts[f"ppt/slides/slide{i}.xml"] = slide_xml
+        slide_rels: list[tuple[str, str, str]] = [
             ("rId1", REL_SLIDE_LAYOUT, "../slideLayouts/slideLayout1.xml"),
-        ])
+        ]
+        for j, image_id in enumerate(media_uses):
+            media = media_plan[image_id]  # KeyError would trip _slide_xml first
+            slide_rels.append(
+                (f"rId{2 + j}", REL_IMAGE, f"../media/{media.media_filename}")
+            )
+        text_parts[f"ppt/slides/_rels/slide{i}.xml.rels"] = _rels_xml(slide_rels)
 
-    return parts
+    # Embed the media bytes once per unique referenced asset. The plan
+    # already pre-loaded the bytes at preflight; we just hand them to
+    # the ZIP writer here.
+    for image_id in sorted(referenced_image_ids):
+        media = media_plan.get(image_id)
+        if media is None:
+            continue
+        binary_parts[f"ppt/media/{media.media_filename}"] = media.bytes_payload
+
+    return (text_parts, binary_parts)
 
 
-def _write_pptx(output_path: Path, parts: dict[str, str]) -> None:
-    """Write parts (sorted by member path) into a deterministic ZIP."""
+def _write_pptx(
+    output_path: Path,
+    text_parts: dict[str, str],
+    binary_parts: dict[str, bytes] | None = None,
+) -> None:
+    """Write text + binary parts (sorted by member path) into a
+    deterministic ZIP. Text parts are written as UTF-8; binary parts
+    (PPTX media: PNG / JPG / JPEG bytes) are written verbatim with the
+    same fixed timestamp so the ZIP byte-stable property still holds."""
+    binary_parts = binary_parts or {}
+    overlap = set(text_parts) & set(binary_parts)
+    if overlap:
+        raise ExportError(
+            f"text and binary part names overlap: {sorted(overlap)!r}"
+        )
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for name in sorted(parts):
+        for name in sorted(set(text_parts) | set(binary_parts)):
             info = zipfile.ZipInfo(name)
             info.date_time = _ZIP_TIMESTAMP
             info.compress_type = zipfile.ZIP_DEFLATED
-            zf.writestr(info, parts[name])
+            if name in text_parts:
+                zf.writestr(info, text_parts[name])
+            else:
+                zf.writestr(info, binary_parts[name])
 
 
 # --- Workspace orchestration ----------------------------------------------
@@ -1316,6 +1742,22 @@ def export_workspace(workspace: Path, output: Path) -> int:
             alt = img_d.get("alt_text")
             if isinstance(alt, str):
                 manifest_alts[img_id] = alt
+
+    # Media-embed preflight: walk the manifest and build the
+    # `media_plan` (PNG / JPG / JPEG entries that pass every embed
+    # gate). Manifest entries with a non-PNG/JPG extension are
+    # intentionally NOT errors — they fall back to the placeholder
+    # shape (`_render_image_slot_sp` handles that). Any embed-gate
+    # error (escapes workspace, symlink, missing file, oversize, magic
+    # mismatch) aborts the run before any output is written.
+    media_plan, media_errors = _build_media_plan(workspace, manifest)
+    if media_errors:
+        for err in media_errors:
+            print(f"  [FAIL] {err}", file=sys.stderr)
+        return _fatal(
+            f"image_manifest media embed preflight failed "
+            f"({len(media_errors)} error(s)); refusing to export"
+        )
 
     # deck_plan.json is the source of truth for slide count and order.
     # The exporter does NOT just glob render_models/*.json: a workspace
@@ -1444,7 +1886,7 @@ def export_workspace(workspace: Path, output: Path) -> int:
             "design_system.grid.width_px/height_px must be positive integers"
         )
 
-    exported: list[tuple[dict, str]] = []
+    exported: list[tuple[dict, str, list[str]]] = []
     fatal_errors: list[str] = []
 
     for rm_file in rm_files:
@@ -1533,11 +1975,13 @@ def export_workspace(workspace: Path, output: Path) -> int:
             continue
 
         try:
-            xml = _slide_xml(rm, design, manifest_alts, manifest_paths)
+            xml, slide_media_uses = _slide_xml(
+                rm, design, manifest_alts, manifest_paths, media_plan,
+            )
         except ExportError as exc:
             fatal_errors.append(f"{rel} (index={idx}, {layout}): {exc}")
             continue
-        exported.append((rm, xml))
+        exported.append((rm, xml, slide_media_uses))
 
     if fatal_errors:
         for err in fatal_errors:
@@ -1563,22 +2007,30 @@ def export_workspace(workspace: Path, output: Path) -> int:
     # create workspace-internal output directories.
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    parts = _build_package_parts(exported, design, canvas_w, canvas_h)
-    _write_pptx(output, parts)
+    text_parts, binary_parts = _build_package_parts(
+        exported, design, canvas_w, canvas_h, media_plan,
+    )
+    _write_pptx(output, text_parts, binary_parts)
 
+    embedded_count = len(binary_parts)
     print(f"Exported {len(exported)} slide(s) to {output}:")
-    for i, (rm, _) in enumerate(exported, start=1):
+    for i, (rm, _, media_uses) in enumerate(exported, start=1):
+        media_note = (
+            f" [media: {', '.join(media_uses)}]" if media_uses else ""
+        )
         print(
             f"  [EXPORT] slide {i:>2} (render_model index "
             f"{rm.get('index'):>2}, layout {rm.get('layout')!r}) "
-            f"-> ppt/slides/slide{i}.xml"
+            f"-> ppt/slides/slide{i}.xml{media_note}"
         )
     print(
         f"\nOK: PPTX export succeeded for {len(exported)} slide(s). "
-        f"This is the expanded native editable subset — "
-        f"`chart_placeholder` primitives, media embedding, and layouts "
-        f"outside the allow-list {SUPPORTED_LAYOUTS} fail closed and "
-        f"remain TODO."
+        f"Embedded {embedded_count} unique image asset(s) under "
+        f"ppt/media/ (PNG / JPG / JPEG only); SVG / GIF / WebP "
+        f"manifest entries fall back to the placeholder shape. "
+        f"`chart_placeholder` primitives and layouts outside the "
+        f"allow-list {SUPPORTED_LAYOUTS} still fail closed and remain "
+        f"TODO."
     )
     return 0
 
@@ -1624,6 +2076,19 @@ def export_single_render_model(rm_path: Path, design_path: Path, manifest_path: 
             alt = img_d.get("alt_text")
             if isinstance(alt, str):
                 manifest_alts[img_id] = alt
+    # Single-render-model debug mode resolves the media plan against
+    # the manifest's parent directory (the workspace it lives in) so
+    # the same PNG / JPG / JPEG embed branch as workspace mode applies.
+    media_plan, media_errors = _build_media_plan(
+        manifest_path.parent, manifest,
+    )
+    if media_errors:
+        for err in media_errors:
+            print(f"  [FAIL] {err}", file=sys.stderr)
+        return _fatal(
+            f"image_manifest media embed preflight failed "
+            f"({len(media_errors)} error(s)); refusing to export"
+        )
     raw, load_err = _try_load(rm_path)
     if raw is None:
         return _fatal(f"{rm_path}: not loadable: {load_err}")
@@ -1651,15 +2116,21 @@ def export_single_render_model(rm_path: Path, design_path: Path, manifest_path: 
             f"{rm_path}: canvas does not match design_system.grid"
         )
     try:
-        xml = _slide_xml(rm, design, manifest_alts, manifest_paths)
+        xml, slide_media_uses = _slide_xml(
+            rm, design, manifest_alts, manifest_paths, media_plan,
+        )
     except ExportError as exc:
         return _fatal(f"{rm_path}: {exc}")
     output.parent.mkdir(parents=True, exist_ok=True)
-    parts = _build_package_parts([(rm, xml)], design, canvas_w, canvas_h)
-    _write_pptx(output, parts)
+    text_parts, binary_parts = _build_package_parts(
+        [(rm, xml, slide_media_uses)], design, canvas_w, canvas_h,
+        media_plan,
+    )
+    _write_pptx(output, text_parts, binary_parts)
     print(
         f"OK (single render_model): exported {rm_path} -> {output} "
-        f"(one slide). Workspace mode is the primary entry point."
+        f"(one slide; {len(binary_parts)} embedded media asset(s)). "
+        f"Workspace mode is the primary entry point."
     )
     return 0
 
@@ -1834,6 +2305,32 @@ def _write_synthetic_workspace(ws: Path) -> None:
     }, indent=2))
 
 
+_TINY_PNG_BYTES = bytes([
+    # Minimal 1x1 transparent PNG. Hand-rolled (stdlib-only — no
+    # `from PIL` dependency) and exercised in the media-embed self-test
+    # scenarios below. Confirmed to start with the PNG magic
+    # `\x89PNG\r\n\x1a\n` so `_matches_image_signature` accepts it.
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,             # signature
+    0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,             # IHDR len + tag
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,             # 1x1
+    0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89,        # bit depth, color, ...
+    0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54,             # IDAT len + tag
+    0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, # zlib stream
+    0x0D, 0x0A, 0x2D, 0xB4,                                     # IDAT crc
+    0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,             # IEND len + tag
+    0xAE, 0x42, 0x60, 0x82,                                     # IEND crc
+])
+
+_TINY_JPEG_BYTES = bytes([
+    # Minimal-shape JPEG buffer for the magic-byte gate exercises. The
+    # file is intentionally not a complete decodeable JPEG — the embed
+    # path inside this exporter only checks the 3-byte SOI / marker
+    # prefix, so a 4-byte payload starting `FF D8 FF E0` is enough to
+    # exercise the JPEG branch without pulling in a JPEG encoder.
+    0xFF, 0xD8, 0xFF, 0xE0,
+])
+
+
 def _run_self_tests() -> list[CheckResult]:
     """Build a synthetic workspace under TemporaryDirectory and exercise
     the exporter's positive + fail-closed paths. Returns one
@@ -1858,7 +2355,33 @@ def _run_self_tests() -> list[CheckResult]:
         deck_plan/render_models 1:1 coverage gate);
       - deck_plan declares N slides but one render_model is missing;
       - render_model on disk not declared by deck_plan (orphan);
-      - deck_plan.planning.planned_slide_count != len(slides)."""
+      - deck_plan.planning.planned_slide_count != len(slides);
+      - PNG manifest entry whose .png file is missing on disk;
+      - PNG manifest entry whose magic bytes do not match the
+        declared extension;
+      - PNG manifest entry whose local_path is a symlink (refused).
+
+    Media-embed positives:
+      - PNG manifest entry: image_slot exports as a native
+        `<p:pic>` referencing `ppt/media/image1.png`; the PNG bytes
+        appear inside the package; the slide's rels file carries the
+        `image` relationship type and an internal `../media/image1.png`
+        Target;
+      - JPG manifest entry: image_slot exports as a native `<p:pic>`
+        referencing `ppt/media/image1.jpg`; the JPEG bytes appear
+        inside the package; `[Content_Types].xml` registers
+        `<Default Extension="jpg" ContentType="image/jpeg"/>`; the
+        slide's rels file carries an internal `../media/image1.jpg`
+        Target;
+      - JPEG manifest entry (the `.jpeg` spelling): same as the JPG
+        scenario but the on-disk media filename uses `.jpeg` and
+        `[Content_Types].xml` registers
+        `<Default Extension="jpeg" ContentType="image/jpeg"/>` so a
+        regression that collapses `.jpeg` to `.jpg` (or vice versa)
+        in the media filename is unmistakable;
+      - SVG manifest entry: image_slot still falls back to the
+        placeholder `<p:sp>` (the SVG branch remains TODO), and
+        `ppt/media/` carries no entry."""
     import io
     import json
     import tempfile
@@ -2505,6 +3028,588 @@ def _run_self_tests() -> list[CheckResult]:
                 or bad_plan_out.exists() else ""),
         ))
 
+        # 15. POSITIVE: PNG manifest entry exports as embedded
+        # <p:pic> + ppt/media/image1.png. The fixture is a standard
+        # happy-path workspace plus a tiny on-disk PNG and an
+        # image_manifest entry pointing at it; the cover render_model
+        # gains an image_slot referencing the new entry. The exporter
+        # must:
+        #   - copy the PNG bytes into ppt/media/image1.png;
+        #   - register `<Default Extension="png" ContentType="image/png"/>`
+        #     in [Content_Types].xml;
+        #   - emit `<p:pic>` (NOT the placeholder `[image: ...]` text)
+        #     inside slide1.xml referencing the rId of the image rel;
+        #   - emit a per-slide rels file with the matching `image`
+        #     relationship type and an internal Target
+        #     `../media/image1.png` (no TargetMode="External", no
+        #     URI scheme).
+        png_ws = td / "png_embed"
+        _write_synthetic_workspace(png_ws)
+        (png_ws / "assets").mkdir(exist_ok=True)
+        (png_ws / "assets" / "tiny.png").write_bytes(_TINY_PNG_BYTES)
+        (png_ws / "image_manifest.json").write_text(json.dumps({
+            "images": [
+                {
+                    "id": "tiny",
+                    "local_path": "assets/tiny.png",
+                    "source": "synthetic",
+                    "alt_text": "Tiny synthetic PNG fixture.",
+                    "intended_use": "icon",
+                    "width_px": 1,
+                    "height_px": 1,
+                },
+            ],
+        }, indent=2))
+        # Replace 01_cover with one carrying an image_slot.
+        (png_ws / "render_models" / "01_cover.json").write_text(json.dumps({
+            "index": 1,
+            "layout": "cover",
+            "canvas": {"width_px": 1920, "height_px": 1080},
+            "source_refs": ["synthetic_src"],
+            "primitives": [
+                {
+                    "id": "title",
+                    "slot_id": "title",
+                    "kind": "text",
+                    "bounds": {"x": 160, "y": 320, "w": 1280, "h": 100},
+                    "style": {
+                        "color_token": "palette.text",
+                        "typography_token": "typography.heading",
+                    },
+                    "text": {"content": "PNG Embed", "role": "heading"},
+                },
+                {
+                    "id": "tiny_image",
+                    "kind": "image_slot",
+                    "bounds": {"x": 100, "y": 600, "w": 200, "h": 200},
+                    "image_slot": {"image_ref": "tiny",
+                                   "alt_text": "tiny PNG"},
+                },
+            ],
+        }))
+        png_out = td / "png.pptx"
+        rc, _stdout, stderr = _run_capture(png_ws, png_out)
+        png_embedded = False
+        png_pic_in_slide = False
+        png_default_ct = False
+        png_image_rel_internal = False
+        no_placeholder_text = False
+        if rc == 0 and png_out.is_file():
+            with _zipfile.ZipFile(png_out) as _zf:
+                names = _zf.namelist()
+                png_embedded = "ppt/media/image1.png" in names
+                # PNG bytes round-trip verbatim
+                if png_embedded:
+                    png_embedded = (
+                        _zf.read("ppt/media/image1.png") == _TINY_PNG_BYTES
+                    )
+                slide_xml = _zf.read("ppt/slides/slide1.xml").decode("utf-8")
+                png_pic_in_slide = (
+                    "<p:pic>" in slide_xml
+                    and 'r:embed="rId2"' in slide_xml
+                )
+                no_placeholder_text = "[image: tiny PNG]" not in slide_xml
+                ct_xml = _zf.read("[Content_Types].xml").decode("utf-8")
+                png_default_ct = (
+                    '<Default Extension="png" ContentType="image/png"/>' in ct_xml
+                )
+                rels_xml = _zf.read(
+                    "ppt/slides/_rels/slide1.xml.rels"
+                ).decode("utf-8")
+                png_image_rel_internal = (
+                    "/relationships/image" in rels_xml
+                    and "../media/image1.png" in rels_xml
+                    and "TargetMode" not in rels_xml
+                    and "file://" not in rels_xml
+                )
+        results.append(CheckResult(
+            "selftest: PNG manifest entry exports as embedded "
+            "<p:pic> + ppt/media/image1.png + image relationship",
+            (
+                rc == 0
+                and png_embedded
+                and png_pic_in_slide
+                and png_default_ct
+                and png_image_rel_internal
+                and no_placeholder_text
+            ),
+            (f"rc={rc}, png_embedded={png_embedded}, "
+             f"png_pic_in_slide={png_pic_in_slide}, "
+             f"png_default_ct={png_default_ct}, "
+             f"png_image_rel_internal={png_image_rel_internal}, "
+             f"no_placeholder_text={no_placeholder_text}; "
+             f"{stderr.strip()}"
+             if not (
+                rc == 0
+                and png_embedded
+                and png_pic_in_slide
+                and png_default_ct
+                and png_image_rel_internal
+                and no_placeholder_text
+             ) else ""),
+        ))
+
+        # 16. POSITIVE: SVG manifest entry stays a placeholder.
+        # Even with the PNG embed branch in place, an SVG manifest
+        # entry must still produce the placeholder `<p:sp>` (alt-text
+        # carrying) shape — there is no SVG embed in this slice. The
+        # package therefore carries NO `ppt/media/` entries.
+        svg_ws = td / "svg_placeholder"
+        _write_synthetic_workspace(svg_ws)
+        (svg_ws / "assets").mkdir(exist_ok=True)
+        (svg_ws / "assets" / "icon.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 16 16"><rect width="16" height="16"/></svg>'
+        )
+        (svg_ws / "image_manifest.json").write_text(json.dumps({
+            "images": [
+                {
+                    "id": "icon",
+                    "local_path": "assets/icon.svg",
+                    "source": "synthetic",
+                    "alt_text": "Tiny synthetic SVG.",
+                    "intended_use": "icon",
+                    "width_px": 16,
+                    "height_px": 16,
+                },
+            ],
+        }, indent=2))
+        (svg_ws / "render_models" / "01_cover.json").write_text(json.dumps({
+            "index": 1,
+            "layout": "cover",
+            "canvas": {"width_px": 1920, "height_px": 1080},
+            "source_refs": ["synthetic_src"],
+            "primitives": [
+                {
+                    "id": "title",
+                    "slot_id": "title",
+                    "kind": "text",
+                    "bounds": {"x": 160, "y": 320, "w": 1280, "h": 100},
+                    "style": {
+                        "color_token": "palette.text",
+                        "typography_token": "typography.heading",
+                    },
+                    "text": {"content": "SVG fallback", "role": "heading"},
+                },
+                {
+                    "id": "icon_image",
+                    "kind": "image_slot",
+                    "bounds": {"x": 100, "y": 600, "w": 200, "h": 200},
+                    "image_slot": {"image_ref": "icon",
+                                   "alt_text": "icon SVG"},
+                },
+            ],
+        }))
+        svg_out = td / "svg.pptx"
+        rc, _stdout, stderr = _run_capture(svg_ws, svg_out)
+        no_media_dir = False
+        placeholder_in_slide = False
+        no_pic_in_slide = False
+        if rc == 0 and svg_out.is_file():
+            with _zipfile.ZipFile(svg_out) as _zf:
+                names = _zf.namelist()
+                no_media_dir = not any(
+                    n.startswith("ppt/media/") for n in names
+                )
+                slide_xml = _zf.read("ppt/slides/slide1.xml").decode("utf-8")
+                placeholder_in_slide = "[image: icon SVG]" in slide_xml
+                no_pic_in_slide = "<p:pic>" not in slide_xml
+        results.append(CheckResult(
+            "selftest: SVG manifest entry falls back to the "
+            "placeholder <p:sp> (no ppt/media/ entry, no <p:pic>)",
+            (
+                rc == 0
+                and no_media_dir
+                and placeholder_in_slide
+                and no_pic_in_slide
+            ),
+            (f"rc={rc}, no_media_dir={no_media_dir}, "
+             f"placeholder_in_slide={placeholder_in_slide}, "
+             f"no_pic_in_slide={no_pic_in_slide}; {stderr.strip()}"
+             if not (
+                rc == 0
+                and no_media_dir
+                and placeholder_in_slide
+                and no_pic_in_slide
+             ) else ""),
+        ))
+
+        # 17. NEGATIVE: PNG manifest entry whose .png file is missing
+        # on disk fails closed at the embed preflight before any PPTX
+        # is written. This is the "manifest declares an image, but the
+        # asset never landed in the workspace" case — `_build_media_plan`
+        # must refuse it (regular-file gate) rather than silently
+        # demoting to placeholder; placeholder-only fallback is reserved
+        # for non-embeddable extensions.
+        miss_png_ws = td / "missing_png"
+        _write_synthetic_workspace(miss_png_ws)
+        (miss_png_ws / "image_manifest.json").write_text(json.dumps({
+            "images": [
+                {
+                    "id": "ghost",
+                    "local_path": "assets/missing.png",
+                    "source": "synthetic",
+                    "alt_text": "Asset never written to disk.",
+                    "intended_use": "icon",
+                    "width_px": 1,
+                    "height_px": 1,
+                },
+            ],
+        }, indent=2))
+        miss_png_out = td / "missing_png.pptx"
+        rc, _stdout, stderr = _run_capture(miss_png_ws, miss_png_out)
+        msg = stderr + _stdout
+        results.append(CheckResult(
+            "selftest: PNG manifest entry whose file is missing on disk "
+            "fails closed at media preflight",
+            (
+                rc != 0
+                and "missing.png" in msg
+                and "regular file" in msg
+                and not miss_png_out.exists()
+            ),
+            (f"rc={rc}, missing 'missing.png'/'regular file' in messages, "
+             f"output_exists={miss_png_out.exists()}; {stderr.strip()}"
+             if rc == 0
+                or "missing.png" not in msg
+                or "regular file" not in msg
+                or miss_png_out.exists() else ""),
+        ))
+
+        # 18. NEGATIVE: PNG manifest entry whose magic bytes do not
+        # match the declared extension fails closed. This catches the
+        # "rename a text file `.png` to sneak it past the extension
+        # gate" attack.
+        bad_magic_ws = td / "bad_magic_png"
+        _write_synthetic_workspace(bad_magic_ws)
+        (bad_magic_ws / "assets").mkdir(exist_ok=True)
+        (bad_magic_ws / "assets" / "fake.png").write_text(
+            "this is not a PNG"
+        )
+        (bad_magic_ws / "image_manifest.json").write_text(json.dumps({
+            "images": [
+                {
+                    "id": "fake",
+                    "local_path": "assets/fake.png",
+                    "source": "synthetic",
+                    "alt_text": "Not actually a PNG.",
+                    "intended_use": "icon",
+                    "width_px": 1,
+                    "height_px": 1,
+                },
+            ],
+        }, indent=2))
+        bad_magic_out = td / "bad_magic.pptx"
+        rc, _stdout, stderr = _run_capture(bad_magic_ws, bad_magic_out)
+        msg = stderr + _stdout
+        results.append(CheckResult(
+            "selftest: PNG manifest entry whose magic bytes mismatch "
+            "fails closed at media preflight",
+            (
+                rc != 0
+                and "fake.png" in msg
+                and "magic bytes" in msg
+                and not bad_magic_out.exists()
+            ),
+            (f"rc={rc}, missing 'fake.png'/'magic bytes' in messages, "
+             f"output_exists={bad_magic_out.exists()}; {stderr.strip()}"
+             if rc == 0
+                or "fake.png" not in msg
+                or "magic bytes" not in msg
+                or bad_magic_out.exists() else ""),
+        ))
+
+        # 19. NEGATIVE: PNG manifest entry whose local_path is a
+        # symlink fails closed. Mirrors the symlink gate the workspace
+        # validator already enforces on source_manifest.json. Without
+        # this gate, an attacker could redirect the embedded bytes to
+        # a file outside the workspace.
+        sym_ws = td / "symlink_png"
+        _write_synthetic_workspace(sym_ws)
+        (sym_ws / "assets").mkdir(exist_ok=True)
+        # Real PNG sits OUTSIDE the workspace; the symlink inside the
+        # workspace would otherwise let the exporter follow it and
+        # embed the external bytes.
+        outside_png = td / "outside.png"
+        outside_png.write_bytes(_TINY_PNG_BYTES)
+        try:
+            (sym_ws / "assets" / "linked.png").symlink_to(outside_png)
+            symlink_supported = True
+        except (OSError, NotImplementedError):
+            # Some platforms (Windows non-admin) refuse symlinks; skip
+            # the negative entirely so the suite still passes there.
+            symlink_supported = False
+        if symlink_supported:
+            (sym_ws / "image_manifest.json").write_text(json.dumps({
+                "images": [
+                    {
+                        "id": "linked",
+                        "local_path": "assets/linked.png",
+                        "source": "synthetic",
+                        "alt_text": "Symlink to a PNG.",
+                        "intended_use": "icon",
+                        "width_px": 1,
+                        "height_px": 1,
+                    },
+                ],
+            }, indent=2))
+            sym_out = td / "symlink.pptx"
+            rc, _stdout, stderr = _run_capture(sym_ws, sym_out)
+            msg = stderr + _stdout
+            results.append(CheckResult(
+                "selftest: PNG manifest entry whose local_path is a "
+                "symlink fails closed at media preflight",
+                (
+                    rc != 0
+                    and "linked.png" in msg
+                    and "symlink" in msg
+                    and not sym_out.exists()
+                ),
+                (f"rc={rc}, missing 'linked.png'/'symlink' in messages, "
+                 f"output_exists={sym_out.exists()}; {stderr.strip()}"
+                 if rc == 0
+                    or "linked.png" not in msg
+                    or "symlink" not in msg
+                    or sym_out.exists() else ""),
+            ))
+        else:
+            results.append(CheckResult(
+                "selftest: PNG manifest entry whose local_path is a "
+                "symlink fails closed at media preflight",
+                True,
+                "skipped — platform refused symlink creation",
+            ))
+
+        # 20. POSITIVE: JPG manifest entry exports as embedded
+        # <p:pic> + ppt/media/image1.jpg. Same shape as the PNG
+        # positive (#15), but exercises the second EMBEDDABLE_IMAGE_-
+        # EXTENSIONS row: extension `jpg` -> ContentType image/jpeg
+        # and a JPEG magic-byte signature. Without this scenario the
+        # JPG branch would only be exercised by the negative magic-
+        # byte test, which would let a regression in the JPG embed
+        # path (e.g. wrong ContentType, wrong target extension) ship
+        # silently.
+        jpg_ws = td / "jpg_embed"
+        _write_synthetic_workspace(jpg_ws)
+        (jpg_ws / "assets").mkdir(exist_ok=True)
+        (jpg_ws / "assets" / "tiny.jpg").write_bytes(_TINY_JPEG_BYTES)
+        (jpg_ws / "image_manifest.json").write_text(json.dumps({
+            "images": [
+                {
+                    "id": "tiny_jpg",
+                    "local_path": "assets/tiny.jpg",
+                    "source": "synthetic",
+                    "alt_text": "Tiny synthetic JPG fixture.",
+                    "intended_use": "icon",
+                    "width_px": 1,
+                    "height_px": 1,
+                },
+            ],
+        }, indent=2))
+        (jpg_ws / "render_models" / "01_cover.json").write_text(json.dumps({
+            "index": 1,
+            "layout": "cover",
+            "canvas": {"width_px": 1920, "height_px": 1080},
+            "source_refs": ["synthetic_src"],
+            "primitives": [
+                {
+                    "id": "title",
+                    "slot_id": "title",
+                    "kind": "text",
+                    "bounds": {"x": 160, "y": 320, "w": 1280, "h": 100},
+                    "style": {
+                        "color_token": "palette.text",
+                        "typography_token": "typography.heading",
+                    },
+                    "text": {"content": "JPG Embed", "role": "heading"},
+                },
+                {
+                    "id": "tiny_jpg_image",
+                    "kind": "image_slot",
+                    "bounds": {"x": 100, "y": 600, "w": 200, "h": 200},
+                    "image_slot": {"image_ref": "tiny_jpg",
+                                   "alt_text": "tiny JPG"},
+                },
+            ],
+        }))
+        jpg_out = td / "jpg.pptx"
+        rc, _stdout, stderr = _run_capture(jpg_ws, jpg_out)
+        jpg_embedded = False
+        jpg_pic_in_slide = False
+        jpg_default_ct = False
+        jpg_image_rel_internal = False
+        no_jpg_placeholder_text = False
+        if rc == 0 and jpg_out.is_file():
+            with _zipfile.ZipFile(jpg_out) as _zf:
+                names = _zf.namelist()
+                jpg_embedded = "ppt/media/image1.jpg" in names
+                if jpg_embedded:
+                    jpg_embedded = (
+                        _zf.read("ppt/media/image1.jpg") == _TINY_JPEG_BYTES
+                    )
+                slide_xml = _zf.read("ppt/slides/slide1.xml").decode("utf-8")
+                jpg_pic_in_slide = (
+                    "<p:pic>" in slide_xml
+                    and 'r:embed="rId2"' in slide_xml
+                )
+                no_jpg_placeholder_text = "[image: tiny JPG]" not in slide_xml
+                ct_xml = _zf.read("[Content_Types].xml").decode("utf-8")
+                jpg_default_ct = (
+                    '<Default Extension="jpg" ContentType="image/jpeg"/>'
+                    in ct_xml
+                )
+                rels_xml = _zf.read(
+                    "ppt/slides/_rels/slide1.xml.rels"
+                ).decode("utf-8")
+                jpg_image_rel_internal = (
+                    "/relationships/image" in rels_xml
+                    and "../media/image1.jpg" in rels_xml
+                    and "TargetMode" not in rels_xml
+                    and "file://" not in rels_xml
+                )
+        results.append(CheckResult(
+            "selftest: JPG manifest entry exports as embedded "
+            "<p:pic> + ppt/media/image1.jpg + image relationship",
+            (
+                rc == 0
+                and jpg_embedded
+                and jpg_pic_in_slide
+                and jpg_default_ct
+                and jpg_image_rel_internal
+                and no_jpg_placeholder_text
+            ),
+            (f"rc={rc}, jpg_embedded={jpg_embedded}, "
+             f"jpg_pic_in_slide={jpg_pic_in_slide}, "
+             f"jpg_default_ct={jpg_default_ct}, "
+             f"jpg_image_rel_internal={jpg_image_rel_internal}, "
+             f"no_jpg_placeholder_text={no_jpg_placeholder_text}; "
+             f"{stderr.strip()}"
+             if not (
+                rc == 0
+                and jpg_embedded
+                and jpg_pic_in_slide
+                and jpg_default_ct
+                and jpg_image_rel_internal
+                and no_jpg_placeholder_text
+             ) else ""),
+        ))
+
+        # 21. POSITIVE: JPEG manifest entry (the `.jpeg` spelling)
+        # exports as embedded <p:pic> + ppt/media/image1.jpeg. Same
+        # shape as #20 but covers the THIRD EMBEDDABLE_IMAGE_EXTEN-
+        # SIONS row: extension `jpeg` (5-char spelling) ALSO maps to
+        # ContentType image/jpeg, but the on-disk media filename uses
+        # `.jpeg` (not `.jpg`) so the deterministic media name follows
+        # the manifest's declared extension. Without this scenario a
+        # regression that collapses `.jpeg` to `.jpg` (or vice versa)
+        # in the media filename would not be caught by #15 or #20.
+        jpeg_ws = td / "jpeg_embed"
+        _write_synthetic_workspace(jpeg_ws)
+        (jpeg_ws / "assets").mkdir(exist_ok=True)
+        (jpeg_ws / "assets" / "tiny.jpeg").write_bytes(_TINY_JPEG_BYTES)
+        (jpeg_ws / "image_manifest.json").write_text(json.dumps({
+            "images": [
+                {
+                    "id": "tiny_jpeg",
+                    "local_path": "assets/tiny.jpeg",
+                    "source": "synthetic",
+                    "alt_text": "Tiny synthetic JPEG fixture.",
+                    "intended_use": "icon",
+                    "width_px": 1,
+                    "height_px": 1,
+                },
+            ],
+        }, indent=2))
+        (jpeg_ws / "render_models" / "01_cover.json").write_text(json.dumps({
+            "index": 1,
+            "layout": "cover",
+            "canvas": {"width_px": 1920, "height_px": 1080},
+            "source_refs": ["synthetic_src"],
+            "primitives": [
+                {
+                    "id": "title",
+                    "slot_id": "title",
+                    "kind": "text",
+                    "bounds": {"x": 160, "y": 320, "w": 1280, "h": 100},
+                    "style": {
+                        "color_token": "palette.text",
+                        "typography_token": "typography.heading",
+                    },
+                    "text": {"content": "JPEG Embed", "role": "heading"},
+                },
+                {
+                    "id": "tiny_jpeg_image",
+                    "kind": "image_slot",
+                    "bounds": {"x": 100, "y": 600, "w": 200, "h": 200},
+                    "image_slot": {"image_ref": "tiny_jpeg",
+                                   "alt_text": "tiny JPEG"},
+                },
+            ],
+        }))
+        jpeg_out = td / "jpeg.pptx"
+        rc, _stdout, stderr = _run_capture(jpeg_ws, jpeg_out)
+        jpeg_embedded = False
+        jpeg_pic_in_slide = False
+        jpeg_default_ct = False
+        jpeg_image_rel_internal = False
+        no_jpeg_placeholder_text = False
+        if rc == 0 and jpeg_out.is_file():
+            with _zipfile.ZipFile(jpeg_out) as _zf:
+                names = _zf.namelist()
+                jpeg_embedded = "ppt/media/image1.jpeg" in names
+                if jpeg_embedded:
+                    jpeg_embedded = (
+                        _zf.read("ppt/media/image1.jpeg") == _TINY_JPEG_BYTES
+                    )
+                slide_xml = _zf.read("ppt/slides/slide1.xml").decode("utf-8")
+                jpeg_pic_in_slide = (
+                    "<p:pic>" in slide_xml
+                    and 'r:embed="rId2"' in slide_xml
+                )
+                no_jpeg_placeholder_text = (
+                    "[image: tiny JPEG]" not in slide_xml
+                )
+                ct_xml = _zf.read("[Content_Types].xml").decode("utf-8")
+                jpeg_default_ct = (
+                    '<Default Extension="jpeg" ContentType="image/jpeg"/>'
+                    in ct_xml
+                )
+                rels_xml = _zf.read(
+                    "ppt/slides/_rels/slide1.xml.rels"
+                ).decode("utf-8")
+                jpeg_image_rel_internal = (
+                    "/relationships/image" in rels_xml
+                    and "../media/image1.jpeg" in rels_xml
+                    and "TargetMode" not in rels_xml
+                    and "file://" not in rels_xml
+                )
+        results.append(CheckResult(
+            "selftest: JPEG manifest entry exports as embedded "
+            "<p:pic> + ppt/media/image1.jpeg + image relationship",
+            (
+                rc == 0
+                and jpeg_embedded
+                and jpeg_pic_in_slide
+                and jpeg_default_ct
+                and jpeg_image_rel_internal
+                and no_jpeg_placeholder_text
+            ),
+            (f"rc={rc}, jpeg_embedded={jpeg_embedded}, "
+             f"jpeg_pic_in_slide={jpeg_pic_in_slide}, "
+             f"jpeg_default_ct={jpeg_default_ct}, "
+             f"jpeg_image_rel_internal={jpeg_image_rel_internal}, "
+             f"no_jpeg_placeholder_text={no_jpeg_placeholder_text}; "
+             f"{stderr.strip()}"
+             if not (
+                rc == 0
+                and jpeg_embedded
+                and jpeg_pic_in_slide
+                and jpeg_default_ct
+                and jpeg_image_rel_internal
+                and no_jpeg_placeholder_text
+             ) else ""),
+        ))
+
     return results
 
 
@@ -2529,10 +3634,14 @@ def main(argv: list[str]) -> int:
             "executive_summary / key_message / two_column / timeline / "
             "conclusion / comparison_table layouts and the text / line "
             "/ shape / image_slot / kpi / table primitive kinds; "
-            "everything else fails closed. image_slot primitives emit a "
-            "placeholder native shape with alt_text — media embedding "
-            "is TODO. See references/pptx-conversion-rules.md for the "
-            "full contract."
+            "everything else fails closed. image_slot primitives whose "
+            "manifest entry resolves to a local PNG / JPG / JPEG file "
+            "embed as a native <p:pic> referencing ppt/media/imageN.<ext>; "
+            "SVG / GIF / WebP and other extensions fall back to the "
+            "placeholder native shape carrying the alt_text. Unsafe / "
+            "missing / symlinked / undeclared / oversized / magic-byte-"
+            "mismatched media all fail closed. See "
+            "references/pptx-conversion-rules.md for the full contract."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2570,16 +3679,27 @@ def main(argv: list[str]) -> int:
              "&quot;; expanded-layout workspace using two_column exports "
              "and passes validate_pptx_contract; comparison_table "
              "workspace exports a native <p:graphicFrame>/<a:tbl> with "
-             "editable cells) and negatives (wrong output extension, "
-             "unsupported `chart_placeholder` primitive, render_model "
-             "missing a required field, image_slot image_ref not in "
-             "manifest, manifest local_path with a URI scheme, "
-             "render_model with an unsupported layout, mis-named "
-             "render_model file, deck_plan-declared render_model "
-             "missing on disk, orphan render_model not declared by "
-             "deck_plan, deck_plan planned_slide_count disagrees with "
-             "len(slides)). Exits non-zero if any positive or "
-             "negative is not handled as expected.",
+             "editable cells; PNG manifest entry exports as embedded "
+             "<p:pic> + ppt/media/image1.png; JPG manifest entry "
+             "exports as embedded <p:pic> + ppt/media/image1.jpg with "
+             "<Default Extension=\"jpg\" ContentType=\"image/jpeg\"/>; "
+             "JPEG manifest entry exports as embedded <p:pic> + "
+             "ppt/media/image1.jpeg with <Default Extension=\"jpeg\" "
+             "ContentType=\"image/jpeg\"/>; SVG manifest entry still "
+             "falls back to the placeholder shape) and negatives "
+             "(wrong output extension, unsupported `chart_placeholder` "
+             "primitive, render_model missing a required field, "
+             "image_slot image_ref not in manifest, manifest local_path "
+             "with a URI scheme, manifest entry whose .png file is "
+             "missing on disk, manifest entry whose declared extension "
+             "does not match the on-disk magic bytes, manifest entry "
+             "whose local_path is a symlink, render_model with an "
+             "unsupported layout, mis-named render_model file, "
+             "deck_plan-declared render_model missing on disk, orphan "
+             "render_model not declared by deck_plan, deck_plan "
+             "planned_slide_count disagrees with len(slides)). Exits "
+             "non-zero if any positive or negative is not handled as "
+             "expected.",
     )
     args = parser.parse_args(argv)
 

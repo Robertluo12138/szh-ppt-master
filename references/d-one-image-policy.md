@@ -4,10 +4,13 @@
 
 Stage 6 today is covered only by the narrow contract helper `scripts/init_image_manifest.py`, which validates a caller-supplied `--spec` JSON against `schemas/image_manifest.schema.json`, cross-checks every `slide_plan.image_refs[*]` against `images[].id`, and requires every `images[].local_path` to resolve inside the workspace to a regular non-symlink file. The helper does **not** generate any image asset, does **not** call D-One, and does **not** call any public network — assets must already exist locally inside the workspace before the helper runs.
 
+The PPTX exporter (`scripts/export_pptx.py`) embeds **local PNG / JPG / JPEG** manifest entries into `ppt/media/imageN.<ext>` as native `<p:pic>` shapes; SVG / GIF / WebP / any other extension still falls back to the placeholder rectangle (alt-text only) and is never embedded today. The embed slice does NOT generate any new asset — it only consumes assets the caller / a future local generator already wrote into the workspace.
+
 ## Allowed use
 
-- D-One (or any image generator) produces **local image assets only**: spot illustrations, icons, decorative artwork, small textures.
-- Generated images are referenced by `image_manifest.json` and embedded inside the final PPTX.
+- D-One (or any future image generator) produces **local image assets only**: spot illustrations, icons, decorative artwork, small textures.
+- Generated images are referenced by `image_manifest.json` and embedded inside the final PPTX (PNG / JPG / JPEG only today; SVG embedding remains TODO and falls back to the placeholder shape).
+- A future D-One integration that emits SVG must either also emit a PNG fallback (PowerPoint requires both for SVG embedding) or accept the placeholder-shape fallback.
 
 ## Forbidden use
 
@@ -40,4 +43,5 @@ Stage 6 today is covered only by the narrow contract helper `scripts/init_image_
 
 - Define the descriptor vocabulary for image prompts.
 - Decide whether generated assets are cached across runs.
-- Decide image format defaults (PNG vs SVG vs WebP) and size limits.
+- PNG and JPG/JPEG embedding is implemented today; default size limits are enforced via the 10 MiB embed cap in `scripts/export_pptx.py`. SVG / GIF / WebP embedding remain TODO — SVG specifically requires a PNG fallback alongside the SVG blip plus an SVGBlip extension before it can land safely.
+- Decide whether D-One output is allowed to overwrite a pre-existing manifest entry's `local_path`, or whether every generation produces a new sidecar file.

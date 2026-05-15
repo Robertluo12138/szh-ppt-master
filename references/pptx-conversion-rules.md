@@ -1,6 +1,6 @@
 # PPTX Conversion Rules
 
-The terminal output of the pipeline is an **editable** PPTX. An **expanded native editable subset** is now implemented by `scripts/export_pptx.py`; full PPT generation (every layout, every primitive, embedded media, theme palette mapping, determinism inventory) remains TODO. This file is the contract the exporter satisfies for that subset and the surface the contract validator (`scripts/validate_pptx_contract.py`) checks against today.
+The terminal output of the pipeline is an **editable** PPTX. An **expanded native editable subset** is now implemented by `scripts/export_pptx.py`, including a narrow PNG / JPG / JPEG embed slice for `image_slot` primitives; full PPT generation (every layout, every primitive, SVG / GIF / WebP embedded media, theme palette mapping, determinism inventory) remains TODO. This file is the contract the exporter satisfies for that subset and the surface the contract validator (`scripts/validate_pptx_contract.py`) checks against today.
 
 ## Implementation status
 
@@ -9,11 +9,13 @@ The terminal output of the pipeline is an **editable** PPTX. An **expanded nativ
   - layouts: `cover`, `kpi_dashboard`, `agenda`, `section_divider`, `executive_summary`, `key_message`, `two_column`, `timeline`, `conclusion`, `comparison_table`. The slide-body emitter is layout-agnostic — it iterates the render_model's `primitives` list and emits one native PPTX object per primitive — so adding a layout to this allow-list does not change how any single shape is rendered;
   - primitive kinds: `text`, `line`, `shape`, `image_slot`, `kpi`, `table` (the `table` primitive emits a native `<p:graphicFrame>` wrapping `<a:tbl>` with one `<a:gridCol>` per column, a bold header row, and an editable `<a:txBody>` per `<a:tc>` cell);
   - the exporter consumes `render_model.json` directly — it does **not** parse `svg_previews/*.svg`, does **not** screenshot a slide, and does **not** rasterize a whole slide into a single picture;
-  - the package contains only stdlib-written XML parts (`[Content_Types].xml`, `_rels/.rels`, `ppt/presentation.xml`, `ppt/_rels/presentation.xml.rels`, one `ppt/slides/slide{N}.xml` + `_rels/` per exported slide, `ppt/slideLayouts/slideLayout1.xml` + `_rels/`, `ppt/slideMasters/slideMaster1.xml` + `_rels/`, and `ppt/theme/theme1.xml`); there are no embedded media parts, no remote relationships, no macros, no OLE, and no ActiveX parts.
+  - the package contains stdlib-written XML parts (`[Content_Types].xml`, `_rels/.rels`, `ppt/presentation.xml`, `ppt/_rels/presentation.xml.rels`, one `ppt/slides/slide{N}.xml` + `_rels/` per exported slide, `ppt/slideLayouts/slideLayout1.xml` + `_rels/`, `ppt/slideMasters/slideMaster1.xml` + `_rels/`, and `ppt/theme/theme1.xml`) plus zero or more embedded PNG / JPG / JPEG media parts under `ppt/media/imageN.<ext>` (one per unique embedded image_id; the bytes are written verbatim with the same fixed ZIP timestamp so the package stays byte-stable). There are no remote relationships, no macros, no OLE, and no ActiveX parts; embedded media is restricted to the PNG / JPG / JPEG slice described below.
 - The slice intentionally fails closed on everything outside that surface:
   - `chart_placeholder` primitive — fail-closed (no native chart-frame emission yet);
   - layouts outside the allow-list above — per-slide fail-closed with a `[FAIL]` line; the whole run aborts and no `.pptx` is written. Every layout declared by the business_review template skeleton is currently in scope; new layouts must add a paired generator branch before they may appear here. The exporter contract is intentionally all-or-nothing: it refuses to drop coverage for slides whose layout is not yet implemented.
-- Media embedding is **not** implemented. `image_slot` primitives are exported as **native placeholder rectangle shapes** carrying the `image_manifest` alt_text (or the image_ref id when no alt_text is declared). PNG / JPG / SVG bytes are NOT copied into `ppt/media/`. The exporter still validates the `image_ref` against `image_manifest` and re-runs `local_path_is_safe` on the resolved path, so an unsafe / missing reference fails closed at preflight.
+- A **narrow PNG / JPG / JPEG embed slice** is now implemented. An `image_slot` primitive whose `image_manifest` entry resolves to a local PNG / JPG / JPEG file is exported as a native `<p:pic>` (with `<p:blipFill>` and `<a:blip r:embed="rIdN"/>`); the bytes are copied verbatim into `ppt/media/imageN.<ext>` (deterministic, manifest-declared order — `image1.<ext>`, `image2.<ext>`, ...), the matching `<Default Extension="png" ContentType="image/png"/>` (or `image/jpeg`) is added to `[Content_Types].xml`, and a per-slide `image` relationship lands in `ppt/slides/_rels/slideN.xml.rels` with an internal Target like `../media/image1.png` (no `TargetMode="External"`, no `file://`, no URI scheme). Two `image_slot` primitives referencing the same `image_id` share a single relationship.
+- All other manifest extensions (SVG, GIF, WebP, ...) still fall back to the **native placeholder rectangle shape** carrying the `image_manifest` alt_text (or the image_ref id when no alt_text is declared); SVG / GIF / WebP embedding remains TODO.
+- The PNG / JPG / JPEG embed gate is fail-closed: a manifest entry whose path-safety fails, whose resolved path escapes the workspace, whose asset is a symlink (broken or resolvable), whose asset is missing or not a regular file, whose size exceeds the 10 MiB embed cap, or whose magic bytes do not match the declared extension all abort the run before any `.pptx` is written. Manifest entries with a non-PNG/JPG extension are intentionally NOT errors — they demote to the placeholder shape.
 
 ## Editability requirements
 
@@ -25,7 +27,8 @@ The terminal output of the pipeline is an **editable** PPTX. An **expanded nativ
 
 ## Relationship safety
 
-- Allowed relationship types are an explicit allow-list, validated by `relationships.allow_list`: `officeDocument`, `slide`, `slideMaster`, `slideLayout`, `theme` (the canonical `http://schemas.openxmlformats.org/officeDocument/2006/relationships/...` URLs). Anything outside this set fails the security scan. The allow-list widens with the exporter — e.g. media embedding will add the `image` URL.
+- Allowed relationship types are an explicit allow-list, validated by `relationships.allow_list`: `officeDocument`, `slide`, `slideMaster`, `slideLayout`, `theme`, `image` (the canonical `http://schemas.openxmlformats.org/officeDocument/2006/relationships/...` URLs). Anything outside this set fails the security scan.
+- The `image` URL is reserved for per-slide PNG / JPG / JPEG media relationships emitted by the embed slice. Every such relationship carries an internal Target under `../media/imageN.<ext>` and never sets `TargetMode="External"`. The `media.targets_internal` gate enforces this.
 - No OLE objects, ActiveX controls, embedded macros, or external/remote media.
 - All media must be embedded; no remote URLs in `<a:blip r:link="…"/>` style references.
 
@@ -61,7 +64,9 @@ Minimal-evidence gates (grew alongside the exporter):
 - `slide_count.expected` — caller-driven. When the CLI is invoked with `--expected-slide-count N` alongside `--pptx`, the slide-part count must equal `N`, otherwise the run fails closed. This is the validator-side complement to the exporter's `deck_plan` / `render_models` 1:1 coverage gate — it catches a deck the exporter silently truncated;
 - `relationships.no_external` — no `Relationship` element has `TargetMode="External"`, and no `Target` value matches the `^[A-Za-z][A-Za-z0-9+.-]*:` URI-scheme prefix;
 - `relationships.no_file_uri` — no `Relationship` `Target` starts with `file://` (subset of the above, surfaced separately so a regression is unmistakable);
-- `relationships.allow_list` — every `Relationship` `Type` URL is in `{officeDocument, slide, slideMaster, slideLayout, theme}` (canonical OOXML URLs). An unexpected internal Type (hyperlink, comments, image, chart, embedding, ...) trips the gate even when the Target is local and lacks a URI scheme;
+- `relationships.allow_list` — every `Relationship` `Type` URL is in `{officeDocument, slide, slideMaster, slideLayout, theme, image}` (canonical OOXML URLs). An unexpected internal Type (hyperlink, comments, chart, embedding, ...) trips the gate even when the Target is local and lacks a URI scheme;
+- `media.targets_internal` — every `image`-typed `Relationship` `Target` is an internal package path (no URI scheme, no `file://`, no `TargetMode="External"`). Subset of `relationships.no_external` + `.no_file_uri`, surfaced separately so a media-only regression is unmistakable;
+- `media.inventory` — every `image`-typed `Relationship` `Target` resolves to an actual `ppt/media/<name>` part inside the ZIP (no dangling refs); every `ppt/media/` part is referenced by at least one `image` relationship (no orphan media); each part's extension is in `{png, jpg, jpeg}` and matches a `<Default Extension="..." ContentType="..."/>` entry whose ContentType is one of `{image/png, image/jpeg}`;
 - `package.no_macros` — no `ppt/vbaProject.bin` part, no `vbaProject` content-type override;
 - `package.no_ole` — no part under `ppt/embeddings/`, no `oleObject` content-type override;
 - `package.no_activex` — no part under `ppt/activeX/`, no `activeX` content-type override;
@@ -76,22 +81,21 @@ The following checks remain explicitly TODO and are surfaced in every run:
 
 - `editability.full_inventory` — every text frame on every slide is a real text frame (full inventory, not just one slide);
 - `no_image_only_slides.full_inventory` — every slide is positively confirmed to contain editable shapes (the `every_slide_has_native_shape` + `not_all_image_slide` + `no_blank_slide` triple is **minimal evidence** for this; a full per-shape inventory still needs per-shape introspection);
-- `media.embedded_only` — every media item is embedded inside the package (the closest gates today are `relationships.no_external` and `relationships.allow_list`);
-- `media.inventory` — every media item exists inside the package; no dangling refs;
+- `media.embedded_only` — the deeper guarantee that no slide carries a remote `<a:blip r:link="…"/>` reference (the closest gates today are `relationships.no_external` + `relationships.allow_list` + `media.targets_internal`);
 - `theme.palette_mapping` — `design_system` palette resolves to the matching PPTX theme slots;
-- `determinism` — stable IDs, relationship order, and media filenames across runs (the exporter uses a fixed ZIP timestamp and deterministic ids today; the validator does not yet read these back out);
+- `determinism` — stable IDs, relationship order, and media filenames across runs (the exporter uses a fixed ZIP timestamp and deterministic ids + `imageN.<ext>` media filenames today; the validator does not yet read these back out);
 - `layouts.scope` / `primitives.scope` — the exporter enforces layout / primitive scope at write time; the validator does not yet read the layout slot or primitive mapping back out of the produced PPTX.
 
-A passing run of this validator therefore proves the container shape, the absence of macro / OLE / ActiveX parts and external / `file://` relationships, the relationship `Type` allow-list, and minimal evidence of editable native content on every slide. It does NOT prove the deeper TODO surface above.
+A passing run of this validator therefore proves the container shape, the absence of macro / OLE / ActiveX parts and external / `file://` relationships, the relationship `Type` allow-list (including the `image` URL), the embedded-media inventory + targets-internal gates over `ppt/media/` parts, and minimal evidence of editable native content on every slide. It does NOT prove the deeper TODO surface above.
 
 ## Inspection
 
-- A conversion report should list every media item, every relationship type, and confirm that every text run is editable. (TODO — depends on the full-inventory editability checks above.)
+- The `media.inventory` gate iterates every embedded media item under `ppt/media/`, every `image`-typed relationship, and the matching `[Content_Types].xml` Defaults internally to gate them, but the validator's PASS output is only a single `[PASS] media.inventory: <pptx>` line — a failing run lists the offending parts in its detail field. A standalone conversion report that ENUMERATES every media item, every relationship type, and confirms every text run is editable is still TODO; it depends on the full-inventory editability checks above and on a separate report writer that the validator does not have today.
 
 ## TODOs
 
 - Define palette → theme slot mapping.
-- Cover the remaining `render_model` primitive → native PPTX object mapping: `chart_placeholder` → blank chart frame. Today the exporter maps `text` → text frame, `shape` → native PPTX shape, `line` → native line / connector, `image_slot` → placeholder rectangle (alt_text only, no embedded media), `kpi` → composite text frame with stacked paragraphs, `table` → native `<p:graphicFrame>` / `<a:tbl>` with editable cells; `chart_placeholder` fails closed.
-- Implement native-object / full-inventory editability / media / determinism / layouts.scope / primitives.scope checks inside `scripts/validate_pptx_contract.py`. Today these are explicitly TODO. (`relationships.allow_list` is now implemented.)
+- Cover the remaining `render_model` primitive → native PPTX object mapping: `chart_placeholder` → blank chart frame. Today the exporter maps `text` → text frame, `shape` → native PPTX shape, `line` → native line / connector, `image_slot` → native `<p:pic>` (PNG / JPG / JPEG manifest entries) OR placeholder rectangle (everything else), `kpi` → composite text frame with stacked paragraphs, `table` → native `<p:graphicFrame>` / `<a:tbl>` with editable cells; `chart_placeholder` fails closed.
+- Implement native-object / full-inventory editability / determinism / layouts.scope / primitives.scope checks inside `scripts/validate_pptx_contract.py`. Today these are explicitly TODO. (`relationships.allow_list`, `media.targets_internal`, and `media.inventory` are now implemented.)
 - Decide whether speaker notes round-trip.
-- Decide whether and how to embed PNG / JPG / SVG media into `ppt/media/` (PowerPoint requires a PNG fallback for SVG, plus a media relationship per slide picture). When this lands, widen `_ALLOWED_RELATIONSHIP_TYPES` to include the `image` URL.
+- SVG embedding remains TODO. PowerPoint requires a PNG fallback alongside any SVG `<svg+xml>` blip + an SVGBlip extension; pulling that in safely (without expanding the SVG sanitizer surface) is a separate slice. Today SVG manifest entries fall back to the placeholder rectangle.

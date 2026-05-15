@@ -11,10 +11,15 @@ now produces an expanded native editable subset — the `cover`,
 `<p:graphicFrame>` wrapping `<a:tbl>` with editable `<a:tc>` cells) —
 and this validator gates that output with both the original container
 checks and a set of MINIMAL-EVIDENCE checks (see below), including a
-relationship `Type` allow-list. The `chart_placeholder` primitive,
-media embedding, full editability inventory, theme palette mapping,
-determinism, and layout/primitive-scope inspection of the produced
-PPTX all remain TODO and are explicitly named that way in every run.
+relationship `Type` allow-list and the embedded-media gates
+`media.targets_internal` + `media.inventory` (which inventory every
+`ppt/media/` part against the `image`-typed relationships and the
+`{png, jpg, jpeg}` embed allow-list registered by the exporter). The
+`chart_placeholder` primitive, full editability inventory, theme
+palette mapping, determinism, layout/primitive-scope inspection of
+the produced PPTX, and the deeper per-`<a:blip r:link>` "no remote
+link" check (`media.embedded_only`) all remain TODO and are
+explicitly named that way in every run.
 
 USAGE
     # Skeleton mode (no .pptx supplied). Reports the contract /
@@ -61,15 +66,32 @@ CHECKS TODAY (all fail-closed; exit 1 on any failure)
                             called out separately so a file:// regression
                             is unmistakable in the report.)
     relationships.allow_list
-                          — every Relationship Type is one of the
-                            five URLs the minimal exporter is allowed
-                            to emit today: officeDocument, slide,
-                            slideMaster, slideLayout, theme. An
+                          — every Relationship Type is one of the six
+                            URLs the minimal exporter is allowed to
+                            emit today: officeDocument, slide,
+                            slideMaster, slideLayout, theme, image
+                            (the `image` URL covers per-slide
+                            embedded-media relationships). An
                             unexpected Type (hyperlink, comments,
-                            image, chart, embedding, ...) fails the
-                            gate. Maintenance note: the allow-list
-                            widens with the exporter — e.g. media
-                            embedding will add the `image` URL.
+                            chart, embedding, ...) fails the gate.
+    media.targets_internal
+                          — every `image`-typed Relationship Target is
+                            an internal package path under
+                            `ppt/media/`, not an external URL or
+                            `file://` reference. (Subset of
+                            relationships.no_external + .no_file_uri,
+                            but called out separately so a media-only
+                            regression is unmistakable in the report.)
+    media.inventory       — every `image`-typed Relationship Target
+                            resolves to an actual `ppt/media/<name>`
+                            part inside the ZIP, no dangling refs;
+                            every `ppt/media/` part is referenced by
+                            at least one `image` relationship (no
+                            orphan media files); each part's extension
+                            is in the {png, jpg, jpeg} embed allow-list
+                            and matches a `<Default Extension="..."/>`
+                            entry whose ContentType is one of
+                            {image/png, image/jpeg}.
     package.no_macros     — no vbaProject.bin part; no
                             'vbaProject' content type override.
     package.no_ole        — no part under ppt/embeddings/ and no
@@ -127,12 +149,11 @@ TODO (explicitly NOT implemented; reported as TODO every run)
         minimal_evidence.every_slide_has_native_shape pair rules out
         the obvious failure modes; a full per-shape inventory still
         needs per-shape introspection.
-    media.embedded_only — every media item is embedded inside the
-        package (no remote refs, no absolute paths). Today the
-        relationships.no_external + relationships.allow_list pair is
-        the closest gate; a media inventory is still TODO.
-    media.inventory — every media item exists inside the package and
-        no slide carries a dangling reference.
+    media.embedded_only — the deeper guarantee that no slide carries
+        a remote `<a:blip r:link="…"/>` reference. Today the closest
+        gates are relationships.no_external + relationships.allow_list
+        + media.targets_internal; the per-`<a:blip>` inspection
+        remains TODO.
     theme.palette_mapping — design_system palette resolves to the
         matching PPTX theme slots.
     determinism — stable IDs, relationship order, and media filenames
@@ -148,11 +169,14 @@ TODO (explicitly NOT implemented; reported as TODO every run)
 
 OUT OF SCOPE FOR THIS SCRIPT
     Generating PPTX (that is `scripts/export_pptx.py`). Full
-    editability inventory, media inventory, theme palette mapping,
-    determinism inventory, and layout/primitive-scope inspection of
-    the produced PPTX. Any network behavior. (The relationship `Type`
-    allow-list is now in scope as relationships.allow_list — see the
-    CHECKS TODAY block above.)
+    editability inventory, theme palette mapping, determinism
+    inventory, layout/primitive-scope inspection of the produced
+    PPTX, and the per-`<a:blip>` "no remote link" check tracked as
+    media.embedded_only. Any network behavior. (The relationship
+    `Type` allow-list is now in scope as relationships.allow_list,
+    and embedded-media inventory + targets-internal gates are
+    implemented as media.inventory and media.targets_internal — see
+    the CHECKS TODAY block above.)
 
 EXIT
     0  every executed check passed and all skeleton/TODO entries were
@@ -213,15 +237,27 @@ _FORBIDDEN_PARTS: tuple[tuple[str, str, str], ...] = (
 # scripts/export_pptx.py emits (officeDocument under the root, slide /
 # slideMaster / theme under presentation, slideLayout / theme under
 # slideMaster, slideMaster under slideLayout, slideLayout under each
-# slide). Widening the exporter — e.g. adding media embedding — must
-# also widen this set (e.g. add the `image` URL).
+# slide, and `image` per slide for every embedded PNG / JPG / JPEG
+# asset). Widening the exporter beyond these must also widen this set.
 _ALLOWED_RELATIONSHIP_TYPES: frozenset[str] = frozenset({
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide",
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster",
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout",
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
 })
+
+# Embedded-media relationship type URL — separately bound for the
+# media.* gates below.
+_REL_TYPE_IMAGE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+)
+
+# Allowed embedded-media file extensions (lower-cased, no leading dot).
+# A media relationship pointing at an extension outside this set fails
+# the media inventory gate. Today the exporter only embeds these.
+_ALLOWED_MEDIA_EXTENSIONS: frozenset[str] = frozenset({"png", "jpg", "jpeg"})
 
 # Pretty-printed TODO surface. Reported every run so callers cannot
 # mistake a passing container check for a passing export contract.
@@ -240,10 +276,10 @@ TODO_CHECKS: tuple[tuple[str, str], ...] = (
      "all-image and blank-slide failure modes only"),
     ("media.embedded_only",
      "every media item is embedded inside the package "
-     "(relationships.no_external + relationships.allow_list are the "
-     "closest gates today)"),
-    ("media.inventory",
-     "every media item exists inside the package; no dangling refs"),
+     "(relationships.no_external + relationships.allow_list + "
+     "media.targets_internal are the closest gates today; this TODO "
+     "tracks the deeper guarantee that no slide carries a remote "
+     "<a:blip r:link='...'/> reference)"),
     ("theme.palette_mapping",
      "design_system palette resolves to the matching PPTX theme slots"),
     ("determinism",
@@ -371,6 +407,83 @@ def _content_type_overrides(names: set[str], zf: zipfile.ZipFile) -> list[str]:
         if isinstance(ct, str):
             cts.append(ct)
     return cts
+
+
+def _content_type_defaults(
+    names: set[str], zf: zipfile.ZipFile,
+) -> dict[str, str]:
+    """Read [Content_Types].xml and return {extension_lower: ContentType}
+    for every `<Default>` entry. Used by the media.inventory gate to
+    confirm each shipped extension is registered with the expected
+    ContentType. Empty dict if the file is missing or unparseable."""
+    if "[Content_Types].xml" not in names:
+        return {}
+    try:
+        text = zf.read("[Content_Types].xml")
+        root = ET.fromstring(text)
+    except (ET.ParseError, KeyError, OSError):
+        return {}
+    out: dict[str, str] = {}
+    default_tag = f"{{{_NS_CT}}}Default"
+    for el in root:
+        if el.tag != default_tag:
+            continue
+        ext = el.attrib.get("Extension")
+        ct = el.attrib.get("ContentType")
+        if isinstance(ext, str) and isinstance(ct, str):
+            out[ext.lower()] = ct
+    return out
+
+
+def _posix_resolve(base_dir: str, relative: str) -> str | None:
+    """Resolve a POSIX `relative` reference against `base_dir`.
+
+    `base_dir` is a forward-slash path (e.g. `ppt/slides`); a
+    `relative` like `../media/image1.png` resolves to
+    `ppt/media/image1.png`. Returns None if the resolution would
+    escape the package root (a leading `/` or too many `..`).
+
+    Used by the media.inventory gate to confirm an `image`-typed
+    relationship Target lands at an on-disk part of the package."""
+    if relative.startswith("/"):
+        return None
+    parts: list[str] = []
+    if base_dir:
+        parts.extend(p for p in base_dir.split("/") if p)
+    for seg in relative.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if not parts:
+                return None
+            parts.pop()
+            continue
+        parts.append(seg)
+    return "/".join(parts)
+
+
+def _rels_part_owner_dir(rels_part: str) -> str:
+    """Return the directory of the OOXML part that the `.rels` file
+    describes. OOXML relationship Targets are resolved against the
+    PART, not against the `.rels` file itself.
+
+    Conventions:
+      - `_rels/.rels`                              -> package root, ""
+      - `ppt/_rels/presentation.xml.rels`          -> `ppt`
+      - `ppt/slides/_rels/slide1.xml.rels`         -> `ppt/slides`
+
+    The general rule: drop the trailing `_rels/<name>.rels` segments
+    and return the parent directory of the owning part."""
+    segs = rels_part.split("/")
+    if "_rels" not in segs:
+        # Defensive: not actually a rels file — treat its directory as
+        # the owner so the caller still gets a sensible path.
+        return rels_part.rsplit("/", 1)[0] if "/" in rels_part else ""
+    rels_index = segs.index("_rels")
+    # The owner part lives in segs[:rels_index] + the trailing
+    # `<name>.rels` becomes `<name>` (e.g. `slide1.xml`); the owner
+    # directory is the parent of that part.
+    return "/".join(segs[:rels_index])
 
 
 def _all_relationships(names: list[str], zf: zipfile.ZipFile) -> list[tuple[str, dict]]:
@@ -520,6 +633,141 @@ def check_generated_pptx(
             f"relationships.allow_list: {pptx_path.name}",
             not allow_list_offenders,
             ("; ".join(allow_list_offenders) if allow_list_offenders else ""),
+        ))
+
+        # 4b. media.targets_internal + media.inventory.
+        # Both gates iterate the `image`-typed relationships. The
+        # `targets_internal` gate is a media-only restatement of
+        # `relationships.no_external` + `relationships.no_file_uri` so
+        # a media regression is unmistakable in the report (an image
+        # rel pointing at https://attacker/x.png trips both
+        # `no_external` AND `media.targets_internal`). The
+        # `inventory` gate goes further: it confirms every image
+        # rel's Target resolves to an actual `ppt/media/...` ZIP
+        # entry, every `ppt/media/<name>` part is referenced by at
+        # least one image rel (no orphan media bytes), each part's
+        # extension is in the embed allow-list, and there is a
+        # matching `<Default Extension="..."/>` for each extension we
+        # ship.
+        image_rels: list[tuple[str, str]] = []  # (rels_part, target)
+        media_target_offenders: list[str] = []
+        for part, attrs in rels:
+            rtype = attrs.get("Type", "")
+            target = attrs.get("Target", "")
+            if rtype != _REL_TYPE_IMAGE:
+                continue
+            if not isinstance(target, str) or not target:
+                media_target_offenders.append(
+                    f"{part}: image rel missing Target"
+                )
+                continue
+            target_mode = attrs.get("TargetMode", "")
+            if target_mode and target_mode.lower() == "external":
+                media_target_offenders.append(
+                    f"{part}: image rel has TargetMode={target_mode!r}"
+                )
+                continue
+            if _URI_SCHEME_PREFIX.match(target):
+                media_target_offenders.append(
+                    f"{part}: image rel Target={target!r} carries a URI scheme"
+                )
+                continue
+            if target.lower().startswith("file://"):
+                media_target_offenders.append(
+                    f"{part}: image rel Target={target!r} is a file:// reference"
+                )
+                continue
+            image_rels.append((part, target))
+        out.append(CheckResult(
+            f"media.targets_internal: {pptx_path.name}",
+            not media_target_offenders,
+            ("; ".join(media_target_offenders)
+             if media_target_offenders else ""),
+        ))
+
+        # Resolve each image rel Target against the OWNER PART's
+        # directory (NOT the .rels file's directory). The OOXML
+        # convention is that a relationship Target is relative to the
+        # part it relates: a slide rels file at
+        # `ppt/slides/_rels/slide1.xml.rels` describes `ppt/slides/slide1.xml`,
+        # so a Target like `../media/image1.png` resolves to
+        # `ppt/media/image1.png` (one `..` out of `ppt/slides/` lands in
+        # `ppt/`, then `media/image1.png`).
+        media_inventory_offenders: list[str] = []
+        referenced_media_parts: set[str] = set()
+        for part, target in image_rels:
+            owner_dir = _rels_part_owner_dir(part)
+            resolved = _posix_resolve(owner_dir, target)
+            if resolved is None:
+                media_inventory_offenders.append(
+                    f"{part}: image rel Target={target!r} escapes the package"
+                )
+                continue
+            if not resolved.startswith("ppt/media/"):
+                media_inventory_offenders.append(
+                    f"{part}: image rel Target={target!r} resolves to "
+                    f"{resolved!r} (must live under ppt/media/)"
+                )
+                continue
+            if resolved not in names_set:
+                media_inventory_offenders.append(
+                    f"{part}: image rel Target={target!r} resolves to "
+                    f"{resolved!r} which is missing from the package"
+                )
+                continue
+            ext = resolved.rsplit(".", 1)[-1].lower() if "." in resolved else ""
+            if ext not in _ALLOWED_MEDIA_EXTENSIONS:
+                media_inventory_offenders.append(
+                    f"{part}: image rel Target={target!r} resolves to "
+                    f"{resolved!r} whose extension {ext!r} is not in the "
+                    f"embed allow-list {sorted(_ALLOWED_MEDIA_EXTENSIONS)}"
+                )
+                continue
+            referenced_media_parts.add(resolved)
+
+        # Every ppt/media/* part must be referenced by an image rel
+        # (no orphan media files). Mirrors the deck_plan/render_models
+        # 1:1 coverage gate the exporter applies.
+        on_disk_media = {
+            n for n in names_set
+            if n.startswith("ppt/media/") and not n.endswith("/")
+        }
+        orphan_media = sorted(on_disk_media - referenced_media_parts)
+        if orphan_media:
+            media_inventory_offenders.append(
+                f"orphan media parts not referenced by any image rel: "
+                f"{orphan_media}"
+            )
+
+        # Every shipped media extension must have a matching
+        # `<Default Extension="..."/>` declared in [Content_Types].xml.
+        # Without it, PowerPoint cannot dispatch the part type at open.
+        ct_defaults = _content_type_defaults(names_set, zf)
+        shipped_extensions = sorted({
+            n.rsplit(".", 1)[-1].lower()
+            for n in on_disk_media
+            if "." in n
+        })
+        for ext in shipped_extensions:
+            if ext not in _ALLOWED_MEDIA_EXTENSIONS:
+                # Already reported by the per-rel gate above.
+                continue
+            expected_ct = (
+                "image/png" if ext == "png" else "image/jpeg"
+            )
+            declared_ct = ct_defaults.get(ext)
+            if declared_ct != expected_ct:
+                media_inventory_offenders.append(
+                    f"[Content_Types].xml: extension {ext!r} not "
+                    f"registered with ContentType={expected_ct!r} "
+                    f"(found {declared_ct!r})"
+                )
+
+        out.append(CheckResult(
+            f"media.inventory: {pptx_path.name}",
+            not media_inventory_offenders,
+            ("; ".join(media_inventory_offenders)
+             if media_inventory_offenders else ""),
         ))
 
         # 4 + 5 + 6. package.no_macros, package.no_ole, package.no_activex
@@ -728,11 +976,12 @@ def run(
         print(
             "OK (container + minimal-evidence): basic OOXML container "
             "checks passed AND minimal-evidence safety / editability "
-            "gates passed (including relationships.allow_list and "
+            "gates passed (including relationships.allow_list, "
+            "media.targets_internal, media.inventory, and "
             "minimal_evidence.every_slide_has_native_shape). Deeper "
-            "full-inventory editability, media inventory, theme palette "
-            "mapping, determinism, layout-scope, and primitive-scope "
-            "checks remain TODO."
+            "full-inventory editability, theme palette mapping, "
+            "determinism, layout-scope, and primitive-scope checks "
+            "remain TODO."
         )
     return 0
 
@@ -859,13 +1108,24 @@ def _run_tempfixture_negatives() -> list[CheckResult]:
       - relationship with an unexpected Type URL (comments) — fails
         relationships.allow_list even though Target is local;
       - 2-slide PPTX with expected_slide_count=3 — fails
-        slide_count.expected.
+        slide_count.expected;
+      - `image`-typed rel pointing at https://attacker/x.png — fails
+        media.targets_internal (and relationships.no_external);
+      - `image`-typed rel pointing at ../media/missing.png with no
+        on-disk media part behind it — fails media.inventory;
+      - orphan ppt/media/<name> part not referenced by any image
+        rel — fails media.inventory;
+      - ppt/media/image1.gif (extension outside the embed allow-list)
+        with a matching image rel — fails media.inventory.
 
     Generated-pptx positives:
       - minimal editable PPTX (one <p:sp> with a non-empty <a:t>) —
         passes every container + generated-pptx gate;
       - 2-slide editable PPTX with expected_slide_count=2 — passes
-        slide_count.expected."""
+        slide_count.expected;
+      - minimal PNG-embed PPTX (one slide + one image rel +
+        ppt/media/image1.png + matching `<Default Extension="png"/>`)
+        — passes media.targets_internal + media.inventory."""
     import tempfile
 
     out: list[CheckResult] = []
@@ -1164,6 +1424,207 @@ def _run_tempfixture_negatives() -> list[CheckResult]:
             "; ".join(r.detail for r in g_res if not r.ok),
         ))
 
+        # 18. media.targets_internal — an `image` rel pointing at an
+        # external https:// URL fails BOTH `relationships.no_external`
+        # (URI-scheme prefix) and the new media-only restatement
+        # `media.targets_internal`. The double-fail is intentional so a
+        # caller can see at a glance which contract dimension fired.
+        external_image_rel = td / "external_image_rel.pptx"
+        _write_minimal_editable_pptx(
+            external_image_rel, slides=[_EDITABLE_SP_XML],
+        )
+        with zipfile.ZipFile(external_image_rel, "a") as zf:
+            zf.writestr(
+                "ppt/slides/_rels/slide1.xml.rels",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rIdImg" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                'Target="https://attacker.invalid/x.png"/>'
+                '</Relationships>'
+            )
+        g_res = check_generated_pptx(external_image_rel)
+        out.append(CheckResult(
+            "tempfixture: external https:// image rel fails "
+            "media.targets_internal",
+            any(
+                r.name.startswith("media.targets_internal")
+                and not r.ok
+                for r in g_res
+            ),
+            "; ".join(r.detail for r in g_res if not r.ok),
+        ))
+
+        # 19. media.inventory — image rel that points at a missing
+        # ppt/media/<name> part fails the inventory gate. The container
+        # has the rel but no actual media file behind it.
+        dangling_media_rel = td / "dangling_media_rel.pptx"
+        _write_minimal_editable_pptx(
+            dangling_media_rel, slides=[_EDITABLE_SP_XML],
+        )
+        with zipfile.ZipFile(dangling_media_rel, "a") as zf:
+            zf.writestr(
+                "ppt/slides/_rels/slide1.xml.rels",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rIdImg" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                'Target="../media/missing.png"/>'
+                '</Relationships>'
+            )
+        g_res = check_generated_pptx(dangling_media_rel)
+        out.append(CheckResult(
+            "tempfixture: image rel pointing at missing "
+            "ppt/media/<name> part fails media.inventory",
+            any(
+                r.name.startswith("media.inventory")
+                and not r.ok
+                for r in g_res
+            ),
+            "; ".join(r.detail for r in g_res if not r.ok),
+        ))
+
+        # 20. media.inventory — an orphan ppt/media/<name> part with
+        # no image rel referencing it also fails the inventory gate.
+        # This catches the "embedded bytes nobody can render" failure
+        # mode where the exporter copied a file into the package but
+        # never wired up the relationship.
+        orphan_media_pptx = td / "orphan_media.pptx"
+        _write_minimal_editable_pptx(
+            orphan_media_pptx, slides=[_EDITABLE_SP_XML],
+        )
+        with zipfile.ZipFile(orphan_media_pptx, "a") as zf:
+            zf.writestr("ppt/media/orphan.png", b"\x89PNG\r\n\x1a\n")
+        g_res = check_generated_pptx(orphan_media_pptx)
+        out.append(CheckResult(
+            "tempfixture: orphan ppt/media/<name> part fails "
+            "media.inventory",
+            any(
+                r.name.startswith("media.inventory")
+                and not r.ok
+                for r in g_res
+            ),
+            "; ".join(r.detail for r in g_res if not r.ok),
+        ))
+
+        # 21. media.inventory — a ppt/media/<name>.gif part (extension
+        # outside the embed allow-list) fails closed even when an
+        # image rel references it correctly. The exporter only embeds
+        # PNG / JPG / JPEG today; widening that surface must widen the
+        # validator at the same time.
+        bad_ext_pptx = td / "bad_media_ext.pptx"
+        _write_minimal_editable_pptx(
+            bad_ext_pptx, slides=[_EDITABLE_SP_XML],
+        )
+        with zipfile.ZipFile(bad_ext_pptx, "a") as zf:
+            zf.writestr("ppt/media/image1.gif", b"GIF89a;")
+            zf.writestr(
+                "ppt/slides/_rels/slide1.xml.rels",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rIdImg" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                'Target="../media/image1.gif"/>'
+                '</Relationships>'
+            )
+        g_res = check_generated_pptx(bad_ext_pptx)
+        out.append(CheckResult(
+            "tempfixture: ppt/media/image1.gif (extension outside the "
+            "embed allow-list) fails media.inventory",
+            any(
+                r.name.startswith("media.inventory")
+                and not r.ok
+                for r in g_res
+            ),
+            "; ".join(r.detail for r in g_res if not r.ok),
+        ))
+
+        # 22. POSITIVE: a minimal-editable PPTX with one PNG embed +
+        # matching `<Default Extension="png" ContentType="image/png"/>`
+        # + slide rel + on-disk part passes media.inventory and
+        # media.targets_internal cleanly. This is the validator-side
+        # complement to the exporter's PNG-embed self-test.
+        good_media_pptx = td / "good_media.pptx"
+        # Hand-roll the package directly — we want this fixture to
+        # cover the validator independent of the exporter's
+        # correctness, so we bypass `_write_minimal_editable_pptx`'s
+        # fixed [Content_Types].xml shape and emit a custom one here.
+        with zipfile.ZipFile(good_media_pptx, "w") as zf:
+            zf.writestr(
+                "[Content_Types].xml",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                '<Default Extension="xml" ContentType="application/xml"/>'
+                '<Default Extension="png" ContentType="image/png"/>'
+                '<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>'
+                '<Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>'
+                '</Types>'
+            )
+            zf.writestr(
+                "_rels/.rels",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+                'Target="ppt/presentation.xml"/>'
+                '</Relationships>'
+            )
+            zf.writestr(
+                "ppt/presentation.xml",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                '<p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>'
+                '</p:presentation>'
+            )
+            zf.writestr(
+                "ppt/slides/slide1.xml",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+                'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                '<p:cSld><p:spTree>'
+                '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+                '<p:grpSpPr/>'
+                + _EDITABLE_SP_XML +
+                '</p:spTree></p:cSld>'
+                '</p:sld>'
+            )
+            zf.writestr(
+                "ppt/slides/_rels/slide1.xml.rels",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                'Target="../media/image1.png"/>'
+                '</Relationships>'
+            )
+            zf.writestr(
+                "ppt/media/image1.png",
+                bytes([
+                    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+                ]),
+            )
+        g_res = check_generated_pptx(good_media_pptx)
+        # The minimal fixture intentionally skips the slideMaster /
+        # slideLayout / theme parts; the only gates we care about
+        # here are media.targets_internal + media.inventory passing,
+        # not every container check. We assert specifically that
+        # neither media gate failed.
+        media_failures = [
+            r for r in g_res
+            if r.name.startswith("media.") and not r.ok
+        ]
+        out.append(CheckResult(
+            "tempfixture: minimal PNG-embed PPTX passes "
+            "media.targets_internal + media.inventory",
+            not media_failures,
+            "; ".join(
+                f"{r.name}: {r.detail}" for r in media_failures
+            ),
+        ))
+
     return out
 
 
@@ -1194,14 +1655,17 @@ def main(argv: list[str]) -> int:
             "section_divider / executive_summary / key_message / "
             "two_column / timeline / conclusion / comparison_table "
             "layouts; text / line / shape / image_slot / kpi / table "
-            "primitives — and this validator gates that output. With "
+            "primitives; embedded PNG / JPG / JPEG media for "
+            "image_slot — and this validator gates that output. With "
             "--pptx, runs the basic OOXML container checks AND the "
             "minimal-evidence safety/editability checks (slide count, "
             "no external rels, no file:// rels, relationship Type "
-            "allow-list, no macros / OLE / ActiveX parts, at least one "
-            "editable text run, no all-image slide, no blank slide, "
-            "every slide carries at least one <p:sp> or <p:cxnSp>). "
-            "Add --expected-slide-count N to also fail closed if the "
+            "allow-list including the `image` URL, media.targets_internal "
+            "+ media.inventory for embedded PNG / JPG / JPEG assets, "
+            "no macros / OLE / ActiveX parts, at least one editable "
+            "text run, no all-image slide, no blank slide, every "
+            "slide carries at least one <p:sp> or <p:cxnSp>). Add "
+            "--expected-slide-count N to also fail closed if the "
             "number of ppt/slides/slide{N}.xml parts != N. "
             "Without --pptx, runs in skeleton mode and only reports "
             "the contract / TODO surface. --self-test runs the "
@@ -1246,10 +1710,14 @@ def main(argv: list[str]) -> int:
             "all-image slide [fails both not_all_image_slide and "
             "every_slide_has_native_shape], no editable text, blank "
             "slide alongside an editable one, slide_count.expected "
-            "mismatch) plus a minimal-valid-container positive, a "
-            "minimal-editable PPTX positive, and a 2-slide PPTX "
-            "passing slide_count.expected=2. Exits non-zero if any "
-            "negative is not caught or any positive is not accepted."
+            "mismatch, external image rel, dangling image-rel Target, "
+            "orphan ppt/media part, ppt/media/<name>.gif outside the "
+            "embed allow-list) plus positives (minimal valid "
+            "container, minimal editable PPTX, 2-slide PPTX passing "
+            "slide_count.expected=2, minimal PNG-embed PPTX passing "
+            "media.targets_internal + media.inventory). Exits non-zero "
+            "if any negative is not caught or any positive is not "
+            "accepted."
         ),
     )
     args = parser.parse_args(argv)
