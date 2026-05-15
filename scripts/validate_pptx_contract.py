@@ -12,14 +12,13 @@ now produces an expanded native editable subset — the `cover`,
 and this validator gates that output with both the original container
 checks and a set of MINIMAL-EVIDENCE checks (see below), including a
 relationship `Type` allow-list and the embedded-media gates
-`media.targets_internal` + `media.inventory` (which inventory every
-`ppt/media/` part against the `image`-typed relationships and the
-`{png, jpg, jpeg}` embed allow-list registered by the exporter). The
-`chart_placeholder` primitive, full editability inventory, theme
-palette mapping, determinism, layout/primitive-scope inspection of
-the produced PPTX, and the deeper per-`<a:blip r:link>` "no remote
-link" check (`media.embedded_only`) all remain TODO and are
-explicitly named that way in every run.
+`media.targets_internal`, `media.inventory`, and `media.embedded_only`
+(the per-`<a:blip>` "no remote link" check that walks every content
+XML part under `ppt/` and refuses any `<a:blip r:link="…"/>` element).
+The `chart_placeholder` primitive, full editability inventory, theme
+palette mapping, determinism, and layout/primitive-scope inspection
+of the produced PPTX all remain TODO and are explicitly named that
+way in every run.
 
 USAGE
     # Skeleton mode (no .pptx supplied). Reports the contract /
@@ -92,6 +91,30 @@ CHECKS TODAY (all fail-closed; exit 1 on any failure)
                             and matches a `<Default Extension="..."/>`
                             entry whose ContentType is one of
                             {image/png, image/jpeg}.
+    media.embedded_only   — no `<a:blip>` element anywhere in the
+                            package's content XML carries an
+                            `r:link="..."` attribute. Scope is every
+                            `*.xml` part under `ppt/` that is not a
+                            `_rels/` file (slides, slideMasters,
+                            slideLayouts, theme, presentation). The
+                            `r:link` form is OOXML's external-linked
+                            image reference; the exporter only emits
+                            `r:embed`. This is the deeper guarantee
+                            that complements relationships.no_external
+                            + relationships.allow_list +
+                            media.targets_internal on the rels side.
+                            Read + parse handling is fail-closed:
+                            ANY exception during `ZipFile.read()` or
+                            `ET.fromstring()` against an in-scope
+                            part is itself reported as an offender —
+                            including `zipfile.BadZipFile` (CRC
+                            mismatch; base is `Exception`, NOT
+                            `OSError`) and `RuntimeError` (archive-
+                            internal failures) — so a corrupted or
+                            malformed XML part cannot silently bypass
+                            the gate. The exception type name is
+                            included in the offender string for
+                            debuggability.
     package.no_macros     — no vbaProject.bin part; no
                             'vbaProject' content type override.
     package.no_ole        — no part under ppt/embeddings/ and no
@@ -149,11 +172,6 @@ TODO (explicitly NOT implemented; reported as TODO every run)
         minimal_evidence.every_slide_has_native_shape pair rules out
         the obvious failure modes; a full per-shape inventory still
         needs per-shape introspection.
-    media.embedded_only — the deeper guarantee that no slide carries
-        a remote `<a:blip r:link="…"/>` reference. Today the closest
-        gates are relationships.no_external + relationships.allow_list
-        + media.targets_internal; the per-`<a:blip>` inspection
-        remains TODO.
     theme.palette_mapping — design_system palette resolves to the
         matching PPTX theme slots.
     determinism — stable IDs, relationship order, and media filenames
@@ -170,13 +188,13 @@ TODO (explicitly NOT implemented; reported as TODO every run)
 OUT OF SCOPE FOR THIS SCRIPT
     Generating PPTX (that is `scripts/export_pptx.py`). Full
     editability inventory, theme palette mapping, determinism
-    inventory, layout/primitive-scope inspection of the produced
-    PPTX, and the per-`<a:blip>` "no remote link" check tracked as
-    media.embedded_only. Any network behavior. (The relationship
-    `Type` allow-list is now in scope as relationships.allow_list,
-    and embedded-media inventory + targets-internal gates are
-    implemented as media.inventory and media.targets_internal — see
-    the CHECKS TODAY block above.)
+    inventory, and layout/primitive-scope inspection of the produced
+    PPTX. Any network behavior. (The relationship `Type` allow-list
+    is now in scope as relationships.allow_list, and embedded-media
+    inventory, targets-internal, and the per-`<a:blip>` "no remote
+    link" gates are implemented as media.inventory,
+    media.targets_internal, and media.embedded_only — see the CHECKS
+    TODAY block above.)
 
 EXIT
     0  every executed check passed and all skeleton/TODO entries were
@@ -220,6 +238,12 @@ _NS_RELS = "http://schemas.openxmlformats.org/package/2006/relationships"
 _NS_CT = "http://schemas.openxmlformats.org/package/2006/content-types"
 _NS_DRAWING = "http://schemas.openxmlformats.org/drawingml/2006/main"
 _NS_PRES = "http://schemas.openxmlformats.org/presentationml/2006/main"
+# DrawingML `r:` prefix — used by `<a:blip r:embed="..."/>` (embedded,
+# allowed) and `<a:blip r:link="..."/>` (external linked image, BANNED).
+# Different from `_NS_RELS` (which is the package-level rels namespace).
+_NS_OFFICE_RELS = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+)
 
 # Forbidden / risky package shapes, as a tuple of
 # (label, prefix_path, content_type_substring). A part whose name
@@ -274,12 +298,6 @@ TODO_CHECKS: tuple[tuple[str, str], ...] = (
      "minimal_evidence.not_all_image_slide + minimal_evidence.no_blank_slide "
      "+ minimal_evidence.every_slide_has_native_shape rule out the "
      "all-image and blank-slide failure modes only"),
-    ("media.embedded_only",
-     "every media item is embedded inside the package "
-     "(relationships.no_external + relationships.allow_list + "
-     "media.targets_internal are the closest gates today; this TODO "
-     "tracks the deeper guarantee that no slide carries a remote "
-     "<a:blip r:link='...'/> reference)"),
     ("theme.palette_mapping",
      "design_system palette resolves to the matching PPTX theme slots"),
     ("determinism",
@@ -503,6 +521,101 @@ def _all_relationships(names: list[str], zf: zipfile.ZipFile) -> list[tuple[str,
             if child.tag != f"{{{_NS_RELS}}}Relationship":
                 continue
             out.append((part, dict(child.attrib)))
+    return out
+
+
+def _iter_ppt_xml_parts(names: set[str]) -> list[str]:
+    """Return every `*.xml` part under `ppt/` that is NOT a relationships
+    file. Used by the media.embedded_only gate to scan every part that
+    could legitimately carry an `<a:blip>` element (slides, slide
+    masters, slide layouts, theme, presentation). The `_rels/` files
+    are intentionally skipped — they hold `<Relationship>` elements,
+    not DrawingML, and the relationships.* gates already inspect
+    them."""
+    out: list[str] = []
+    for n in names:
+        if not n.startswith("ppt/"):
+            continue
+        if not n.endswith(".xml"):
+            continue
+        if "_rels/" in n:
+            continue
+        out.append(n)
+    out.sort()
+    return out
+
+
+def _blip_link_offenders(
+    zf: zipfile.ZipFile, parts: list[str],
+) -> list[str]:
+    """Return one offender string per `<a:blip>` element whose `r:link`
+    attribute is set, across the supplied list of XML parts.
+
+    The OOXML DrawingML `<a:blip>` element carries either `r:embed`
+    (the rId of an EMBEDDED media part — the only form the exporter
+    emits today) or `r:link` (the rId of a LINKED relationship — the
+    form whose Target can legally be a remote URL, `file://` path, or
+    any other reference outside the package). A blip MAY carry both;
+    the presence of `r:link` is what makes the slide a remote-image
+    consumer at open time, regardless of whether `r:embed` is also
+    present.
+
+    The `relationships.no_external` + `relationships.no_file_uri` +
+    `relationships.allow_list` + `media.targets_internal` gates already
+    catch most of the "external media" failure surface from the rels
+    side; this helper closes the deeper guarantee from the BLIP side:
+    even if the rels file were tampered with to point an `image` rel
+    at an internal Target, a slide that USES that rel through
+    `r:link` is asking PowerPoint to treat the part as a linked image
+    instead of an embedded one. The contract is no `r:link` anywhere
+    in the package's content XML.
+
+    Fail-closed read + parse handling: an XML part that the caller
+    listed in `parts` but that cannot be READ or PARSED is recorded
+    as its own offender — the gate cannot rule out a buried
+    `<a:blip r:link/>` in malformed XML or in a corrupted ZIP entry
+    and must not silently pass. Both except clauses are deliberately
+    broad (`except Exception`) so the security-relevant set is
+    closed: `zipfile.BadZipFile` is raised on CRC mismatch and is
+    NOT an `OSError` subclass in Python 3, `RuntimeError` is raised
+    by `ZipFile.read()` on certain archive-internal failures, and
+    `zlib.error` may surface from deflate decoding — none of which
+    are caught by a narrow `(KeyError, OSError)` tuple. The other
+    minimal-evidence gates already react to malformed slide XML (a
+    slide whose XML fails to parse counts as zero shapes for the
+    every_slide_has_native_shape / editable_text gates), but they do
+    not run against slideMasters / slideLayouts / theme / presentation,
+    so a fail-open `continue` here would have hidden a linked blip in
+    those parts entirely. The exception TYPE NAME is included in the
+    offender string so a malformed-package regression is debuggable
+    from the validator output alone."""
+    out: list[str] = []
+    blip_tag = f"{{{_NS_DRAWING}}}blip"
+    link_attr = f"{{{_NS_OFFICE_RELS}}}link"
+    for part in parts:
+        try:
+            text = zf.read(part)
+        except Exception as exc:
+            out.append(
+                f"{part}: unreadable XML part — cannot rule out "
+                f"<a:blip r:link/> "
+                f"({type(exc).__name__}: {exc})"
+            )
+            continue
+        try:
+            root = ET.fromstring(text)
+        except Exception as exc:
+            out.append(
+                f"{part}: unparseable XML — cannot rule out "
+                f"<a:blip r:link/> "
+                f"({type(exc).__name__}: {exc})"
+            )
+            continue
+        for blip in root.iter(blip_tag):
+            link_val = blip.attrib.get(link_attr)
+            if link_val is None:
+                continue
+            out.append(f"{part}: <a:blip r:link={link_val!r}/>")
     return out
 
 
@@ -770,6 +883,24 @@ def check_generated_pptx(
              if media_inventory_offenders else ""),
         ))
 
+        # 4c. media.embedded_only — every `<a:blip>` in the package's
+        # content XML carries `r:embed` (or no rId at all, for an
+        # empty placeholder), never `r:link`. This is the deeper
+        # guarantee that no slide / master / layout / theme part is
+        # asking PowerPoint to fetch a linked image. Scope is every
+        # `*.xml` part under `ppt/` that is not a `_rels/` file —
+        # i.e. slides, slideMasters, slideLayouts, theme,
+        # presentation; the `_rels/` parts are inspected separately
+        # by the relationships.* gates above.
+        ppt_xml_parts = _iter_ppt_xml_parts(names_set)
+        blip_link_offenders = _blip_link_offenders(zf, ppt_xml_parts)
+        out.append(CheckResult(
+            f"media.embedded_only: {pptx_path.name}",
+            not blip_link_offenders,
+            ("; ".join(blip_link_offenders)
+             if blip_link_offenders else ""),
+        ))
+
         # 4 + 5 + 6. package.no_macros, package.no_ole, package.no_activex
         content_types = _content_type_overrides(names_set, zf)
         for label, prefix, ct_substr in _FORBIDDEN_PARTS:
@@ -977,7 +1108,8 @@ def run(
             "OK (container + minimal-evidence): basic OOXML container "
             "checks passed AND minimal-evidence safety / editability "
             "gates passed (including relationships.allow_list, "
-            "media.targets_internal, media.inventory, and "
+            "media.targets_internal, media.inventory, "
+            "media.embedded_only, and "
             "minimal_evidence.every_slide_has_native_shape). Deeper "
             "full-inventory editability, theme palette mapping, "
             "determinism, layout-scope, and primitive-scope checks "
@@ -1073,6 +1205,44 @@ _PIC_ONLY_XML = (
 )
 
 
+# <p:pic> whose <a:blip> carries an `r:link` attribute — the OOXML
+# external-linked-image reference form. media.embedded_only must fail
+# closed on any slide carrying this shape, regardless of whether the
+# rels file backs the rId with an internal Target. The fixture
+# intentionally omits an `r:embed` attribute so the offender is
+# unambiguously the linked form.
+_PIC_LINK_XML = (
+    '<p:pic>'
+    '<p:nvPicPr>'
+    '<p:cNvPr id="3" name="linked"/>'
+    '<p:cNvPicPr/>'
+    '<p:nvPr/>'
+    '</p:nvPicPr>'
+    '<p:blipFill><a:blip r:link="rIdL"/></p:blipFill>'
+    '<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></a:xfrm>'
+    '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
+    '</p:pic>'
+)
+
+
+# <p:pic> whose <a:blip> uses `r:embed` only — the allowed embedded
+# form. media.embedded_only must accept this even when paired with an
+# editable text shape, so the positive PNG-embed fixture below uses
+# this shape to actually exercise the gate's accept path.
+_PIC_EMBED_XML = (
+    '<p:pic>'
+    '<p:nvPicPr>'
+    '<p:cNvPr id="3" name="embed"/>'
+    '<p:cNvPicPr/>'
+    '<p:nvPr/>'
+    '</p:nvPicPr>'
+    '<p:blipFill><a:blip r:embed="rId1"/></p:blipFill>'
+    '<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></a:xfrm>'
+    '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
+    '</p:pic>'
+)
+
+
 def _run_tempfixture_negatives() -> list[CheckResult]:
     """Build a handful of bad fixtures under a temporary directory and
     confirm the container + generated-pptx checks reject each one. These
@@ -1116,16 +1286,36 @@ def _run_tempfixture_negatives() -> list[CheckResult]:
       - orphan ppt/media/<name> part not referenced by any image
         rel — fails media.inventory;
       - ppt/media/image1.gif (extension outside the embed allow-list)
-        with a matching image rel — fails media.inventory.
+        with a matching image rel — fails media.inventory;
+      - slide carrying <a:blip r:link="rIdL"/> alongside an editable
+        text shape — fails media.embedded_only (and only that gate;
+        the rels file is left untouched so every other media.* /
+        relationships.* gate stays green, which is the point — the
+        per-<a:blip> inspection is the only gate that catches the
+        linked-image form);
+      - unparseable XML at ppt/theme/theme1.xml — fails closed on
+        media.embedded_only (the gate cannot rule out a buried
+        <a:blip r:link/> in malformed XML, so a fail-open `continue`
+        would have hidden the offender);
+      - direct unit-test on _blip_link_offenders: a stub ZipFile
+        whose read() raises zipfile.BadZipFile (CRC mismatch — base
+        is Exception, NOT OSError) and RuntimeError (archive-
+        internal failure) — both MUST be recorded as offenders,
+        otherwise a corrupted .pptx entry could silently bypass the
+        gate. The offender string must also include the exception
+        type name so a regression in the report is visible.
 
     Generated-pptx positives:
       - minimal editable PPTX (one <p:sp> with a non-empty <a:t>) —
         passes every container + generated-pptx gate;
       - 2-slide editable PPTX with expected_slide_count=2 — passes
         slide_count.expected;
-      - minimal PNG-embed PPTX (one slide + one image rel +
-        ppt/media/image1.png + matching `<Default Extension="png"/>`)
-        — passes media.targets_internal + media.inventory."""
+      - minimal PNG-embed PPTX (one slide carrying both an editable
+        text shape AND a <p:pic> with <a:blip r:embed="rId1"/>, plus
+        one image rel + ppt/media/image1.png + matching
+        `<Default Extension="png"/>`) — passes
+        media.targets_internal + media.inventory +
+        media.embedded_only."""
     import tempfile
 
     out: list[CheckResult] = []
@@ -1587,7 +1777,12 @@ def _run_tempfixture_negatives() -> list[CheckResult]:
                 '<p:cSld><p:spTree>'
                 '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
                 '<p:grpSpPr/>'
-                + _EDITABLE_SP_XML +
+                + _EDITABLE_SP_XML
+                # Adding the r:embed picture next to the editable shape
+                # so the positive actually exercises
+                # media.embedded_only's accept path; without it the
+                # gate would pass trivially (zero blips in the slide).
+                + _PIC_EMBED_XML +
                 '</p:spTree></p:cSld>'
                 '</p:sld>'
             )
@@ -1609,20 +1804,132 @@ def _run_tempfixture_negatives() -> list[CheckResult]:
         g_res = check_generated_pptx(good_media_pptx)
         # The minimal fixture intentionally skips the slideMaster /
         # slideLayout / theme parts; the only gates we care about
-        # here are media.targets_internal + media.inventory passing,
-        # not every container check. We assert specifically that
-        # neither media gate failed.
+        # here are media.targets_internal + media.inventory +
+        # media.embedded_only passing, not every container check. We
+        # assert specifically that no `media.*` gate failed. Because
+        # the slide body now carries _PIC_EMBED_XML alongside the
+        # editable text shape, media.embedded_only is actually
+        # exercised (not just vacuously passed on a zero-blip slide).
         media_failures = [
             r for r in g_res
             if r.name.startswith("media.") and not r.ok
         ]
         out.append(CheckResult(
             "tempfixture: minimal PNG-embed PPTX passes "
-            "media.targets_internal + media.inventory",
+            "media.targets_internal + media.inventory + "
+            "media.embedded_only",
             not media_failures,
             "; ".join(
                 f"{r.name}: {r.detail}" for r in media_failures
             ),
+        ))
+
+        # 23. media.embedded_only — a slide that carries
+        # <a:blip r:link="rIdL"/> fails closed even though the slide
+        # ALSO carries an editable text shape (so editable_text /
+        # not_all_image_slide / no_blank_slide /
+        # every_slide_has_native_shape all PASS — the only gate that
+        # fires is media.embedded_only itself). This is what
+        # distinguishes media.embedded_only from the rels-side
+        # gates: the rels file is left untouched, so
+        # relationships.no_external / relationships.no_file_uri /
+        # relationships.allow_list / media.targets_internal /
+        # media.inventory do NOT trip — only the per-<a:blip>
+        # inspection catches the linked-image form.
+        linked_blip_pptx = td / "linked_blip.pptx"
+        _write_minimal_editable_pptx(
+            linked_blip_pptx,
+            slides=[_EDITABLE_SP_XML + _PIC_LINK_XML],
+        )
+        g_res = check_generated_pptx(linked_blip_pptx)
+        out.append(CheckResult(
+            "tempfixture: <a:blip r:link='...'/> fails "
+            "media.embedded_only",
+            any(
+                r.name.startswith("media.embedded_only")
+                and not r.ok
+                for r in g_res
+            ),
+            "; ".join(r.detail for r in g_res if not r.ok),
+        ))
+
+        # 24. media.embedded_only — an unparseable XML part anywhere
+        # under ppt/ (here a malformed ppt/theme/theme1.xml) fails
+        # closed on media.embedded_only. The gate cannot rule out a
+        # buried <a:blip r:link/> in malformed XML, so a fail-open
+        # `continue` would have hidden the offender. The fixture puts
+        # the malformed XML in a part the slide-level gates don't
+        # scan (theme1.xml is not a slide), so this specifically
+        # exercises media.embedded_only's parse path — the other
+        # minimal-evidence gates stay green.
+        unparseable_xml_pptx = td / "unparseable_xml.pptx"
+        _write_minimal_editable_pptx(
+            unparseable_xml_pptx, slides=[_EDITABLE_SP_XML],
+        )
+        with zipfile.ZipFile(unparseable_xml_pptx, "a") as zf:
+            zf.writestr("ppt/theme/theme1.xml", "<not-xml")
+        g_res = check_generated_pptx(unparseable_xml_pptx)
+        out.append(CheckResult(
+            "tempfixture: unparseable XML part under ppt/ fails "
+            "closed on media.embedded_only (no fail-open parse path)",
+            any(
+                r.name.startswith("media.embedded_only")
+                and not r.ok
+                for r in g_res
+            ),
+            "; ".join(r.detail for r in g_res if not r.ok),
+        ))
+
+        # 25. Direct unit-test on _blip_link_offenders' READ-side
+        # exception handling. zipfile.ZipFile.read() can raise
+        # exceptions outside the (KeyError, OSError) tuple:
+        # zipfile.BadZipFile on CRC mismatch (its base is Exception,
+        # NOT OSError), and RuntimeError on certain archive-internal
+        # failures. Both must land in the offender list — otherwise
+        # a corrupted .pptx entry would silently bypass the gate.
+        # The stub raises the exception in place of a real ZipFile
+        # so the test does not depend on Python's zipfile internals
+        # producing the right error for a hand-corrupted archive
+        # (which is brittle across CPython versions). The same stub
+        # also covers the parse-side broadening, since a Unicode
+        # decode failure surfaces as a non-ParseError exception in
+        # some XML parsers.
+        class _ReadRaisesZipFile:
+            def __init__(self, exc: Exception) -> None:
+                self._exc = exc
+
+            def read(self, _part: str) -> bytes:
+                raise self._exc
+
+        read_side_failures: list[str] = []
+        for exc in (
+            zipfile.BadZipFile("simulated CRC failure on read"),
+            RuntimeError("simulated read on closed archive"),
+        ):
+            fake_zf = _ReadRaisesZipFile(exc)
+            offenders = _blip_link_offenders(
+                fake_zf,  # type: ignore[arg-type]
+                ["ppt/theme/theme1.xml"],
+            )
+            if not offenders:
+                read_side_failures.append(
+                    f"{type(exc).__name__} did not produce an offender"
+                )
+                continue
+            # The offender string MUST name the exception type so a
+            # regression in the message format is visible too.
+            joined = "; ".join(offenders)
+            if type(exc).__name__ not in joined:
+                read_side_failures.append(
+                    f"{type(exc).__name__} offender did not include "
+                    f"the exception type name: {joined!r}"
+                )
+        out.append(CheckResult(
+            "tempfixture: read-side zipfile.BadZipFile + RuntimeError "
+            "are reported as media.embedded_only offenders "
+            "(fail-closed read path)",
+            not read_side_failures,
+            "; ".join(read_side_failures),
         ))
 
     return out
@@ -1661,8 +1968,11 @@ def main(argv: list[str]) -> int:
             "minimal-evidence safety/editability checks (slide count, "
             "no external rels, no file:// rels, relationship Type "
             "allow-list including the `image` URL, media.targets_internal "
-            "+ media.inventory for embedded PNG / JPG / JPEG assets, "
-            "no macros / OLE / ActiveX parts, at least one editable "
+            "+ media.inventory + media.embedded_only for embedded "
+            "PNG / JPG / JPEG assets (the last refuses any "
+            "<a:blip r:link='...'/> linked-image reference anywhere in "
+            "the package's content XML), no macros / OLE / ActiveX "
+            "parts, at least one editable "
             "text run, no all-image slide, no blank slide, every "
             "slide carries at least one <p:sp> or <p:cxnSp>). Add "
             "--expected-slide-count N to also fail closed if the "
@@ -1712,12 +2022,18 @@ def main(argv: list[str]) -> int:
             "slide alongside an editable one, slide_count.expected "
             "mismatch, external image rel, dangling image-rel Target, "
             "orphan ppt/media part, ppt/media/<name>.gif outside the "
-            "embed allow-list) plus positives (minimal valid "
-            "container, minimal editable PPTX, 2-slide PPTX passing "
+            "embed allow-list, slide carrying <a:blip r:link='...'/>, "
+            "unparseable XML at ppt/theme/theme1.xml [fails closed on "
+            "media.embedded_only — no fail-open parse path], direct "
+            "unit-test that stub-injected zipfile.BadZipFile + "
+            "RuntimeError on read are recorded as media.embedded_only "
+            "offenders [no fail-open read path]) "
+            "plus positives (minimal valid container, minimal "
+            "editable PPTX, 2-slide PPTX passing "
             "slide_count.expected=2, minimal PNG-embed PPTX passing "
-            "media.targets_internal + media.inventory). Exits non-zero "
-            "if any negative is not caught or any positive is not "
-            "accepted."
+            "media.targets_internal + media.inventory + "
+            "media.embedded_only). Exits non-zero if any negative is "
+            "not caught or any positive is not accepted."
         ),
     )
     args = parser.parse_args(argv)
