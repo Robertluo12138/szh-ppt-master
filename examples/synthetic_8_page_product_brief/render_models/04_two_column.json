@@ -55,7 +55,7 @@
         "x": 96,
         "y": 320,
         "w": 832,
-        "h": 340
+        "h": 96
       },
       "style": {
         "color_token": "palette.text",
@@ -72,9 +72,9 @@
       "kind": "text",
       "bounds": {
         "x": 96,
-        "y": 660,
+        "y": 416,
         "w": 832,
-        "h": 340
+        "h": 96
       },
       "style": {
         "color_token": "palette.text",
@@ -112,7 +112,7 @@
         "x": 992,
         "y": 320,
         "w": 832,
-        "h": 340
+        "h": 96
       },
       "style": {
         "color_token": "palette.text",
@@ -129,9 +129,9 @@
       "kind": "text",
       "bounds": {
         "x": 992,
-        "y": 660,
+        "y": 416,
         "w": 832,
-        "h": 340
+        "h": 96
       },
       "style": {
         "color_token": "palette.text",

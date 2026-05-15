@@ -15,8 +15,8 @@
       "type": "kpi",
       "required": true,
       "primitive_kind": "kpi",
-      "bounds": { "x": 64, "y": 280, "w": 1792, "h": 600 }
+      "bounds": { "x": 64, "y": 280, "w": 1792, "h": 200 }
     }
   ],
-  "todo": "Define KPI tile count (e.g. 3 / 4 / 6) and delta formatting rules."
+  "todo": "Slot sized to wrap the label + value (+ optional delta) lines; the generator paints a rounded-rect card per tile."
 }

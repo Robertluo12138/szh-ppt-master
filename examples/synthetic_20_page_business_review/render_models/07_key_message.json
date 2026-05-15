@@ -35,7 +35,7 @@
         "x": 160,
         "y": 260,
         "w": 1600,
-        "h": 360
+        "h": 140
       },
       "style": {
         "fill_token": "palette.background",
@@ -54,7 +54,7 @@
         "x": 160,
         "y": 260,
         "w": 1600,
-        "h": 360
+        "h": 140
       },
       "style": {
         "color_token": "palette.text",
@@ -71,9 +71,9 @@
       "kind": "text",
       "bounds": {
         "x": 160,
-        "y": 700,
+        "y": 440,
         "w": 1600,
-        "h": 280
+        "h": 180
       },
       "style": {
         "color_token": "palette.text",

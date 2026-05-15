@@ -1737,8 +1737,11 @@ def _write_synthetic_workspace(ws: Path) -> None:
         "grid": {"width_px": 1920, "height_px": 1080, "margin_px": 64},
     }, indent=2))
     (ws / "image_manifest.json").write_text(json.dumps({"images": []}))
-    # Cover slide: line + text. No image_slot so the empty manifest is
-    # legitimate.
+    # Cover slide: structural title divider + title text. Geometry
+    # mirrors what scripts/generate_render_models.py emits today
+    # against the business_review cover layout (title bound h=100;
+    # subtitle / presenter / date / accent slots are optional and
+    # omitted by this minimal fixture).
     (ws / "render_models" / "01_cover.json").write_text(json.dumps({
         "index": 1,
         "layout": "cover",
@@ -1759,7 +1762,7 @@ def _write_synthetic_workspace(ws: Path) -> None:
                 "id": "title",
                 "slot_id": "title",
                 "kind": "text",
-                "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200},
+                "bounds": {"x": 160, "y": 320, "w": 1280, "h": 100},
                 "style": {
                     "color_token": "palette.text",
                     "typography_token": "typography.heading",
@@ -1768,7 +1771,10 @@ def _write_synthetic_workspace(ws: Path) -> None:
             },
         ],
     }, indent=2))
-    # kpi_dashboard slide: title + shape + two kpi tiles.
+    # kpi_dashboard slide: title + one rounded-rectangle "card" shape
+    # per KPI tile + one `kpi` primitive layered on top of each card.
+    # The fixture mirrors the new generator output: there is NO
+    # single outer band shape; every tile carries its own card.
     (ws / "render_models" / "02_kpi_dashboard.json").write_text(json.dumps({
         "index": 2,
         "layout": "kpi_dashboard",
@@ -1787,9 +1793,9 @@ def _write_synthetic_workspace(ws: Path) -> None:
                 "text": {"content": "Synthetic Metrics", "role": "heading"},
             },
             {
-                "id": "kpi_band_bg",
+                "id": "kpi_card_01",
                 "kind": "shape",
-                "bounds": {"x": 64, "y": 280, "w": 1792, "h": 600},
+                "bounds": {"x": 96, "y": 300, "w": 858, "h": 160},
                 "style": {
                     "fill_token": "palette.background",
                     "stroke_token": "palette.primary",
@@ -1801,15 +1807,26 @@ def _write_synthetic_workspace(ws: Path) -> None:
                 "id": "kpi_01",
                 "slot_id": "kpis",
                 "kind": "kpi",
-                "bounds": {"x": 96, "y": 310, "w": 864, "h": 540},
+                "bounds": {"x": 96, "y": 300, "w": 858, "h": 160},
                 "style": {"color_token": "palette.text"},
                 "kpi": {"label": "alpha", "value": "<value>", "delta": "<delta>"},
+            },
+            {
+                "id": "kpi_card_02",
+                "kind": "shape",
+                "bounds": {"x": 966, "y": 300, "w": 858, "h": 160},
+                "style": {
+                    "fill_token": "palette.background",
+                    "stroke_token": "palette.primary",
+                    "stroke_width_px": 2,
+                },
+                "shape": {"shape_kind": "rounded_rectangle", "corner_radius_px": 12},
             },
             {
                 "id": "kpi_02",
                 "slot_id": "kpis",
                 "kind": "kpi",
-                "bounds": {"x": 972, "y": 310, "w": 864, "h": 540},
+                "bounds": {"x": 966, "y": 300, "w": 858, "h": 160},
                 "style": {"color_token": "palette.text"},
                 "kpi": {"label": "beta", "value": "<value>"},
             },

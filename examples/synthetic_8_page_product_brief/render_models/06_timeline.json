@@ -29,58 +29,129 @@
       "slot_id": "title"
     },
     {
+      "id": "timeline_axis",
+      "kind": "line",
+      "bounds": {
+        "x": 88,
+        "y": 260,
+        "w": 1,
+        "h": 288
+      },
+      "style": {
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 2
+      },
+      "line": {
+        "stroke_style": "solid"
+      }
+    },
+    {
+      "id": "timeline_marker_01",
+      "kind": "shape",
+      "bounds": {
+        "x": 80,
+        "y": 300,
+        "w": 16,
+        "h": 16
+      },
+      "style": {
+        "fill_token": "palette.primary",
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 2
+      },
+      "shape": {
+        "shape_kind": "ellipse"
+      }
+    },
+    {
       "id": "timeline_item_01",
       "kind": "text",
       "bounds": {
-        "x": 64,
+        "x": 112,
         "y": 260,
-        "w": 1792,
-        "h": 233
+        "w": 1744,
+        "h": 96
       },
       "style": {
         "color_token": "palette.text",
         "typography_token": "typography.body"
       },
       "text": {
-        "content": "\u2022 Milestone A \u2014 placeholder",
+        "content": "Milestone A \u2014 placeholder",
         "role": "body"
       },
       "slot_id": "timeline_items"
+    },
+    {
+      "id": "timeline_marker_02",
+      "kind": "shape",
+      "bounds": {
+        "x": 80,
+        "y": 396,
+        "w": 16,
+        "h": 16
+      },
+      "style": {
+        "fill_token": "palette.primary",
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 2
+      },
+      "shape": {
+        "shape_kind": "ellipse"
+      }
     },
     {
       "id": "timeline_item_02",
       "kind": "text",
       "bounds": {
-        "x": 64,
-        "y": 493,
-        "w": 1792,
-        "h": 233
+        "x": 112,
+        "y": 356,
+        "w": 1744,
+        "h": 96
       },
       "style": {
         "color_token": "palette.text",
         "typography_token": "typography.body"
       },
       "text": {
-        "content": "\u2022 Milestone B \u2014 placeholder",
+        "content": "Milestone B \u2014 placeholder",
         "role": "body"
       },
       "slot_id": "timeline_items"
     },
     {
+      "id": "timeline_marker_03",
+      "kind": "shape",
+      "bounds": {
+        "x": 80,
+        "y": 492,
+        "w": 16,
+        "h": 16
+      },
+      "style": {
+        "fill_token": "palette.primary",
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 2
+      },
+      "shape": {
+        "shape_kind": "ellipse"
+      }
+    },
+    {
       "id": "timeline_item_03",
       "kind": "text",
       "bounds": {
-        "x": 64,
-        "y": 726,
-        "w": 1792,
-        "h": 233
+        "x": 112,
+        "y": 452,
+        "w": 1744,
+        "h": 96
       },
       "style": {
         "color_token": "palette.text",
         "typography_token": "typography.body"
       },
       "text": {
-        "content": "\u2022 Milestone C \u2014 placeholder",
+        "content": "Milestone C \u2014 placeholder",
         "role": "body"
       },
       "slot_id": "timeline_items"

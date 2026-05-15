@@ -29,13 +29,13 @@
       }
     },
     {
-      "id": "kpi_band_bg",
+      "id": "kpi_card_01",
       "kind": "shape",
       "bounds": {
-        "x": 64,
-        "y": 280,
-        "w": 1792,
-        "h": 600
+        "x": 96,
+        "y": 300,
+        "w": 423,
+        "h": 160
       },
       "style": {
         "fill_token": "palette.background",
@@ -53,9 +53,9 @@
       "kind": "kpi",
       "bounds": {
         "x": 96,
-        "y": 310,
+        "y": 300,
         "w": 423,
-        "h": 540
+        "h": 160
       },
       "style": {
         "color_token": "palette.text"
@@ -67,14 +67,33 @@
       }
     },
     {
+      "id": "kpi_card_02",
+      "kind": "shape",
+      "bounds": {
+        "x": 531,
+        "y": 300,
+        "w": 423,
+        "h": 160
+      },
+      "style": {
+        "fill_token": "palette.background",
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 2
+      },
+      "shape": {
+        "shape_kind": "rounded_rectangle",
+        "corner_radius_px": 12
+      }
+    },
+    {
       "id": "kpi_02",
       "slot_id": "kpis",
       "kind": "kpi",
       "bounds": {
         "x": 531,
-        "y": 310,
+        "y": 300,
         "w": 423,
-        "h": 540
+        "h": 160
       },
       "style": {
         "color_token": "palette.text"
@@ -86,14 +105,33 @@
       }
     },
     {
+      "id": "kpi_card_03",
+      "kind": "shape",
+      "bounds": {
+        "x": 966,
+        "y": 300,
+        "w": 423,
+        "h": 160
+      },
+      "style": {
+        "fill_token": "palette.background",
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 2
+      },
+      "shape": {
+        "shape_kind": "rounded_rectangle",
+        "corner_radius_px": 12
+      }
+    },
+    {
       "id": "kpi_03",
       "slot_id": "kpis",
       "kind": "kpi",
       "bounds": {
         "x": 966,
-        "y": 310,
+        "y": 300,
         "w": 423,
-        "h": 540
+        "h": 160
       },
       "style": {
         "color_token": "palette.text"
@@ -105,14 +143,33 @@
       }
     },
     {
+      "id": "kpi_card_04",
+      "kind": "shape",
+      "bounds": {
+        "x": 1401,
+        "y": 300,
+        "w": 423,
+        "h": 160
+      },
+      "style": {
+        "fill_token": "palette.background",
+        "stroke_token": "palette.primary",
+        "stroke_width_px": 2
+      },
+      "shape": {
+        "shape_kind": "rounded_rectangle",
+        "corner_radius_px": 12
+      }
+    },
+    {
       "id": "kpi_04",
       "slot_id": "kpis",
       "kind": "kpi",
       "bounds": {
         "x": 1401,
-        "y": 310,
+        "y": 300,
         "w": 423,
-        "h": 540
+        "h": 160
       },
       "style": {
         "color_token": "palette.text"

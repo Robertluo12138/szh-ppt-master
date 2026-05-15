@@ -3,9 +3,9 @@
   <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>
   <text x="72" y="117.333" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="37.333px" fill="#1A1A1A" font-weight="700">Agenda</text>
   <text x="72" y="278.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">• Market Context</text>
-  <text x="72" y="394.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">• Performance</text>
-  <text x="72" y="510.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">• Operations</text>
-  <text x="72" y="626.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">• Risks</text>
-  <text x="72" y="742.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">• Outlook</text>
-  <text x="72" y="858.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">• Asks</text>
+  <text x="72" y="374.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">• Performance</text>
+  <text x="72" y="470.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">• Operations</text>
+  <text x="72" y="566.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">• Risks</text>
+  <text x="72" y="662.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">• Outlook</text>
+  <text x="72" y="758.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">• Asks</text>
 </svg>

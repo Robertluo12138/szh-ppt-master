@@ -2,7 +2,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080">
   <rect x="0" y="0" width="1920" height="1080" fill="#FFFFFF"/>
   <text x="72" y="117.333" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="37.333px" fill="#1A1A1A" font-weight="700">Top Result</text>
-  <rect x="160" y="260" width="1600" height="360" rx="16" ry="16" fill="#FFFFFF" stroke="#1F3A5F" stroke-width="2"/>
+  <rect x="160" y="260" width="1600" height="140" rx="16" ry="16" fill="#FFFFFF" stroke="#1F3A5F" stroke-width="2"/>
   <text x="168" y="297.333" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="37.333px" fill="#1A1A1A">Synthetic Team met its qualitative goals for the quarter.</text>
-  <text x="168" y="718.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">Detail is intentionally qualitative; no financial figures.</text>
+  <text x="168" y="458.667" font-family="Calibri, Helvetica Neue, Arial, sans-serif" font-size="18.667px" fill="#1A1A1A">Detail is intentionally qualitative; no financial figures.</text>
 </svg>

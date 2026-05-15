@@ -3341,11 +3341,12 @@ def _build_coverage_template(template_root: Path) -> None:
     """Build a self-contained template that declares one generator-
     supported layout (`cover`) and one unsupported one (`org_chart`).
     The cover layout's `title` slot mirrors the real business_review
-    cover slot so the test render_model can target it. The `org_chart`
-    layout is a synthetic placeholder for a layout the generator does
-    not implement (its `chart` slot maps to the still-unsupported
-    chart_placeholder primitive_kind), so the coverage check can prove
-    unsupported layouts are NOT flagged."""
+    cover slot (h=100 — the tightened title bound) so the test
+    render_model can target it. The `org_chart` layout is a synthetic
+    placeholder for a layout the generator does not implement (its
+    `chart` slot maps to the still-unsupported chart_placeholder
+    primitive_kind), so the coverage check can prove unsupported
+    layouts are NOT flagged."""
     _make_template_dir(
         template_root,
         "coverage_tmpl",
@@ -3356,7 +3357,7 @@ def _build_coverage_template(template_root: Path) -> None:
                     {
                         "id": "title", "type": "text", "required": True,
                         "primitive_kind": "text",
-                        "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200},
+                        "bounds": {"x": 160, "y": 320, "w": 1280, "h": 100},
                     },
                 ],
             },
@@ -3455,7 +3456,7 @@ def _build_coverage_workspace(
                     "id": "title",
                     "slot_id": "title",
                     "kind": "text",
-                    "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200},
+                    "bounds": {"x": 160, "y": 320, "w": 1280, "h": 100},
                     "style": {
                         "color_token": "palette.text",
                         "typography_token": "typography.heading",
@@ -5609,9 +5610,16 @@ def _build_generator_template(template_root: Path) -> None:
         "cover": {
             "name": "cover",
             "slots": [
+                # Title bounds mirror the real business_review/cover.json
+                # geometry (h=100). The optional subtitle / presenter /
+                # date / accent slots are intentionally left without
+                # bounds here so the generator's fallback-table path
+                # stays exercised even though the committed real
+                # business_review cover layout declares bounds on every
+                # slot.
                 {"id": "title", "type": "text", "required": True,
                  "primitive_kind": "text",
-                 "bounds": {"x": 160, "y": 320, "w": 1280, "h": 200}},
+                 "bounds": {"x": 160, "y": 320, "w": 1280, "h": 100}},
                 {"id": "subtitle", "type": "text", "required": False,
                  "primitive_kind": "text"},
                 {"id": "presenter", "type": "text", "required": False,
@@ -5625,12 +5633,19 @@ def _build_generator_template(template_root: Path) -> None:
         "kpi_dashboard": {
             "name": "kpi_dashboard",
             "slots": [
+                # `kpis.h=200` matches the real business_review/
+                # kpi_dashboard.json geometry — the slot is sized to
+                # wrap the actual KPI tile content rather than reserving
+                # a 600px-tall empty band. The render_model generator
+                # emits per-tile cards inside this slot; the per-tile
+                # card layout is exercised end-to-end by the exporter
+                # self-test fixture in scripts/export_pptx.py.
                 {"id": "title", "type": "text", "required": True,
                  "primitive_kind": "text",
                  "bounds": {"x": 64, "y": 80, "w": 1792, "h": 120}},
                 {"id": "kpis", "type": "kpi", "required": True,
                  "primitive_kind": "kpi",
-                 "bounds": {"x": 64, "y": 280, "w": 1792, "h": 600}},
+                 "bounds": {"x": 64, "y": 280, "w": 1792, "h": 200}},
             ],
         },
         "org_chart": {

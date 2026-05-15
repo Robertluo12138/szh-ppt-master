@@ -104,107 +104,101 @@ concrete visual gaps that are not flagged by any automated check today:
    placeholder; the date string can be a synthetic-but-specific value
    without changing the trial's "no real data" guarantee.
 
-## Why most refinements are deferred
+## Refinements applied
 
-Gaps #1 – #4 all sit downstream of either the render-model generator
-(`scripts/generate_render_models.py`) or the layout slot bounds in
-`templates/layouts/business_review/layouts/*.json`. The committed example
-workspaces `examples/synthetic_20_page_business_review` and
-`examples/synthetic_8_page_product_brief` already ship `render_models/`
-and `svg_previews/` that were generated against the current generator
-and current layouts. Any change to the generator's geometry — including
-the obvious "cap each list item at ~96px so a 2-bullet column doesn't
-sprawl 340px wide" fix — produces render_models that differ from those
-committed snapshots, and `validate_workspace` enforces
-`primitive.bounds ⊆ slot.bounds` against the layout slots, so shrinking
-a slot's bounds without regenerating the committed render_models also
-fails. Refreshing those committed `render_models/` and `svg_previews/`
-artifacts in the same change would mean committing generated pipeline
-outputs, which this trial's scope rules explicitly forbid (`Do not
-commit generated PPTX, HTML, JSON reports, render_models, svg_previews,
-or pipeline outputs.`).
-
-Gaps #1 – #4 are therefore deferred to a follow-up change that picks
-between two paths: (a) accept a coordinated fixture refresh of the
-committed `render_models/` and `svg_previews/`, or (b) leave the
-shipped examples on the legacy layout while introducing the refined
-layout under a new template family. Neither path is "minimal" for this
-trial.
-
-## Refinement applied
-
-That leaves one minimal refinement that improves the deck without
-touching the generator's geometry or the committed example fixtures:
+The scoped follow-up pass took the coordinated-fixture-refresh path:
+the generator + layout JSONs change in lock-step with a regeneration
+of the committed `examples/synthetic_*/render_models/*.json` and
+`svg_previews/*.svg` so `validate_workspace` continues to enforce
+`primitive.bounds ⊆ slot.bounds` against the new geometry. The trial
+deck length stays at 7 slides; no new layouts, primitives, schemas,
+or templates were introduced.
 
 | # | File | Change |
 |---|---|---|
-| 5 | `examples/synthetic_authoring_trial/slide_specs/01_cover.json` | Replace `"<placeholder-date>"` with `"Season 24 review window"` — still a synthetic placeholder per the bundle README, but reads as deliberate. |
+| 1 | `scripts/generate_render_models.py` — `_list_item_bounds` + new `LIST_ITEM_MAX_H = 96` | Clamp every list item to 96px so a small N (2–3 bullets) packs at the top of the slot instead of sprawling. Trailing whitespace below is intentional. |
+| 2 | `scripts/generate_render_models.py` — `_generate_timeline` + new `TIMELINE_*` constants | Emit a structural vertical axis line + one filled-ellipse marker per step, then render each step's text to the right of the marker (no bullet prefix; the marker replaces it). Axis + markers are structural shapes / lines (no `slot_id`); only the per-step text remains slot-bound to `timeline_items`, so `slot.primitive_kind=text` still binds the right primitives. |
+| 3 | `scripts/generate_render_models.py` — `_generate_kpi_dashboard` (+ `KPI_TILE_CORNER_RADIUS`, tightened `KPI_INSET_Y`) and `templates/layouts/business_review/layouts/kpi_dashboard.json` | Shrink the `kpis` slot from `h=600` to `h=200` so the slot wraps the actual KPI tile content (label + value + optional delta) instead of reserving a 600px-tall empty band. Replace the single outer decorative band with one rounded-rect card per tile (structural shape painted at each KPI tile's bounds) so the dashboard reads as a grid of cards. |
+| 4 | `scripts/generate_render_models.py` — `LAYOUT_FALLBACK_BOUNDS["key_message"]` and `templates/layouts/business_review/layouts/key_message.json` | Shrink `message` bounds from `h=360` to `h=140` and pull `supporting_text` up from `y=700, h=280` to `y=440, h=180`. The callout no longer renders as a single-line statement floating at the top of a 360px-tall empty rectangle. |
+| 5 | `scripts/generate_render_models.py` — `COVER_FALLBACK_BOUNDS` and `templates/layouts/business_review/layouts/cover.json` | Tighten the cover title/subtitle lockup: shrink `title.h` from 200 to 100, declare `subtitle`/`presenter`/`date`/`accent` bounds directly in the layout (the generator no longer relies on its forward-compat fallback for cover slots), and pull `subtitle` up from `y=540` to `y=460`. |
+| 6 | `examples/synthetic_authoring_trial/slide_specs/01_cover.json` | (Carried from the prior pass.) Replace `"<placeholder-date>"` with `"Season 24 review window"` — still a synthetic placeholder per the bundle README, but reads as deliberate. |
+
+## Fixture refresh
+
+The geometry changes invalidated the committed example fixtures, so
+they were regenerated in-place against the new generator + layouts:
+
+- `examples/synthetic_20_page_business_review/render_models/*.json` (20 files)
+- `examples/synthetic_20_page_business_review/svg_previews/*.svg`     (20 files)
+- `examples/synthetic_8_page_product_brief/render_models/*.json`      (8 files)
+- `examples/synthetic_8_page_product_brief/svg_previews/*.svg`        (8 files)
+
+These are NOT trial outputs; they ship with the repo so
+`validate_workspace` can prove generator/template alignment against
+real worked examples. Both workspaces still validate clean against
+`scripts/validate_workspace.py`, and `scripts/validate_scaffold.py`
+continues to pass. The trial's own workspace, PPTX, JSON report, and
+contact sheet remain OUTSIDE the repo (every trial run writes them to
+`/tmp/sat_*`).
 
 ## After-refinement findings
 
-After the refinement above, the pipeline still runs green —
+After the refinements above, the pipeline still runs green —
 `validate_authoring_bundle`, every stage of `run_explicit_pipeline`,
 `validate_visual_quality`, and the container + minimal-evidence PPTX
 gates all pass. The single `text_density_low` warning on slide 5
 remains (the validator measures `text` primitives only; the KPI tiles
 are `kpi` primitives, so the metric does not change with this work).
 
-Concrete before / after on the gaps above:
+Concrete before / after on the gaps above (all measurements via the
+JSON visual-quality report and per-slide render_model inspection):
 
 | Gap | Before | After |
 |---|---|---|
-| 1. List items stretched | bullets 175 – 340px apart on slides 2/4/6/7 | unchanged — deferred (would require regenerating committed example render_models, which the scope forbids) |
-| 2. KPI band mostly empty | 600px decorative band, ~80px content | unchanged — deferred (same reason) |
-| 3. Cover title/subtitle gap | ~180px empty band between baselines | unchanged — deferred (same reason) |
-| 4. Key-message callout empty | 360px box, single-line text hugging top | unchanged — deferred (same reason) |
-| 5. Placeholder-looking date | literal `<placeholder-date>` | synthetic-but-specific `Season 24 review window` |
+| 1. List items stretched | slide 2: 3 bullets ~193px apart in a 580px slot; slide 4: 2 bullets ~340px apart in a 680px column; slide 6: 4 steps ~175px apart in a 700px slot; slide 7: 2 CTAs ~300px apart in a 600px slot | every list item is exactly 96px tall and packs at the top of the slot (slide 2 stack 288px tall in a 580px slot; slide 4 columns 192px tall in 680px; slide 7 stack 192px tall in 600px). Trailing whitespace below is intentional. |
+| 2. KPI band mostly empty | `kpis` slot `h=600`, ~80px of content at the top, ~520px of empty band below | `kpis` slot `h=200`; per-tile rounded-rect card (one per KPI) wraps each tile. No outer band. Slide 5 primitive count: 5 → 7. |
+| 3. Cover title/subtitle gap | title bound `h=200`, subtitle fallback `y=540` → ~202px between text baselines | title bound `h=100`, subtitle declared at `y=460` → ~122px between baselines. Slide 1 primitive count unchanged at 5; geometry only. |
+| 4. Key-message callout empty | message bound `h=360`, single-line text hugging the top | message bound `h=140` (callout wraps its line); `supporting_text` pulled up to `y=440, h=180`. Slide 3 primitive count unchanged at 4. |
+| 5. Timeline reads as plain bullet list | only the slide title distinguishes it from `agenda`; per-step bullets aligned to a list slot | structural vertical axis line + filled ellipse marker per step + step text to the right of the marker. Slide 6 primitive count: 5 → 10. |
+| 6. Placeholder-looking date | (already addressed in prior pass) | (unchanged) — `Season 24 review window`. |
+
+The after-change visual-quality report (`/tmp/sat_visual.json`)
+records: `0 errors, 1 warning` (the same informational `text_density_low`
+on the KPI dashboard, unchanged from the baseline — discussed below).
 
 ## Remaining visual gaps (not fixed by this pass)
 
-These remain visible in the contact sheet but are out of scope for a
-minimal style pass; they require either a coordinated fixture refresh,
-a new template family, or new primitives. Recording them so the next
-pass can pick them up:
+These remain visible in the contact sheet but are out of scope for the
+current narrow geometry pass; they would require a new primitive, a
+new template family, a different design-system default, or a
+validator surface change. Recording them so the next pass can pick
+them up:
 
-- **Geometry fixes for gaps #1 – #4.** Each is a one- or two-line edit
-  in the relevant generator helper / layout JSON. They are deferred as
-  one bundle until a follow-up change that also refreshes the committed
-  `examples/synthetic_*/render_models/*.json` and the matching
-  `svg_previews/*.svg` files in the same commit (so `validate_workspace`
-  continues to pass and the shipped examples stop being stale relative
-  to the generator). The minimal-but-self-coherent shape of that
-  follow-up is: (a) add `LIST_ITEM_MAX_H ≈ 96` and clamp in
-  `_list_item_bounds`, (b) shrink `key_message.message` bounds to
-  ~h=140 and pull `supporting_text` up to ~y=440, h=180, (c) shrink
-  `kpi_dashboard.kpis` to ~h=320 and lower its top, (d) declare bounds
-  on `cover.subtitle`/`presenter`/`date` so the renderer stops relying
-  on the generator's forward-compat fallback table.
-- **Timeline reads as a plain bullet list.** The `timeline` layout has
-  no axis primitive, no step badges, no dates — the only visual
-  difference from a plain `agenda` slide is the slide title. Adding a
-  structural axis line and step markers would be a generator change
-  with its own contract (primitives, schema implications); deferred.
 - **Cover has no visible structural rule under the title.** The
-  decorative kicker bar above the title is the cover's only structural
-  flourish; the title/subtitle/presenter/date stack reads as a single
-  body block. Adding a thin rule under the title (mirroring the
-  `section_divider` rule) would tighten the lockup; deferred — it
-  would add a structural primitive and a fallback constant pair.
-- **KPI tiles still lack per-tile cards.** Even after the band shrinks,
-  the three tiles would still share one outer rectangle. Per-tile
-  rounded-rect backgrounds would make the dashboard read as a grid;
-  deferred — it would add one shape primitive per tile in
-  `_generate_kpi_dashboard`.
-- **`text_density_low` on the KPI dashboard.** The visual-quality gate
-  measures `text` primitives only and does not count `kpi` content.
-  Either the metric or the gate's WARN threshold should treat `kpi`
-  primitives as text-bearing; deferred — it is a validator surface,
-  not a deck surface.
+  decorative kicker bar above the title is still the cover's only
+  structural flourish. Adding a thin rule under the title (mirroring
+  the `section_divider` rule) would tighten the lockup; deferred —
+  it would add a structural primitive and another fallback constant
+  pair.
+- **`text_density_low` on the KPI dashboard.** The visual-quality
+  gate measures `text` primitives only and does not count `kpi`
+  content. Either the metric or the gate's WARN threshold should
+  treat `kpi` primitives as text-bearing; deferred — it is a
+  validator surface, not a deck surface.
 - **Body type weight.** Body runs at 14pt is on the small side for a
   1920×1080 canvas. Raising it to 16 – 18pt would improve the
   legibility of every bulleted slide; deferred — it would change the
-  default design system and touch every committed example workspace's
-  visual baseline.
+  default design system and touch every committed example
+  workspace's visual baseline.
+- **Timeline marker style.** Markers are simple filled ellipses with
+  no per-step badge or date. Adding numeric step badges or a
+  date-strip alongside the marker would be a generator change with
+  its own contract; deferred.
+- **KPI tile dividers within a card.** Each card carries the label,
+  value, and (optional) delta stacked as plain text; no rule between
+  label and value, no delta-direction styling (green/red, up/down).
+  Adding any of those would extend the controlled primitive set;
+  deferred.
 
 ## What this review does NOT do
 

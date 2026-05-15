@@ -6,13 +6,22 @@ Reads a workspace's existing pipeline outputs and emits
 `<workspace>/render_models/<idx>_<layout>.json` for the supported layouts.
 
 SUPPORTED LAYOUTS
-    cover              text + line + (optional) image_slot
-    section_divider    text + line (structural divider rule)
+    cover              text + structural line (title divider)
+                       + (optional) image_slot
+    section_divider    text + structural line (rule under the title)
     executive_summary  text + bulleted text list (key_points)
-    key_message        text + decorative rounded shape + callout text
+    key_message        text + decorative rounded shape (callout
+                       background, sized to message slot bounds)
+                       + callout text on top
     two_column         text + paired bulleted text lists per column
-    kpi_dashboard      text + shape (decorative band) + kpi tiles
-    timeline           text + bulleted text list (timeline_items)
+    kpi_dashboard      text + one rounded-rectangle "card" shape
+                       per KPI tile + one kpi primitive layered on
+                       top of each card (no outer decorative band)
+    timeline           text + structural vertical line (axis)
+                       + one filled-ellipse marker per step
+                       + one text primitive per step offset to the
+                       right of the marker (no bullet prefix; the
+                       marker replaces it)
     agenda             text + bulleted text list (agenda_items)
     conclusion         text + bulleted text list (call_to_action)
     comparison_table   text + native table primitive (columns + rows)
@@ -39,15 +48,25 @@ imported from validate_workspace.
 DETERMINISM
     The generator never invents source content. Text and callout
     strings come from `slide_plan.blocks[].content`. List entries
-    (key_points, left_content, right_content, call_to_action,
-    timeline_items, agenda_items) are read from the matching
-    slide_plan list block's content array and each entry becomes
-    its own bulleted text primitive distributed inside the slot's
-    bounds. KPI rows come from `slide_plan.blocks[id="kpis"].content`.
-    Image refs come from `slide_plan.blocks[id="accent"].content`
-    and must be declared in `image_manifest`. Bounds use the layout
-    slot's `bounds` when set, otherwise the deterministic fallback
-    table at the top of this file (LAYOUT_FALLBACK_BOUNDS).
+    (key_points, left_content, right_content, agenda_items,
+    call_to_action) are read from the matching slide_plan list
+    block's content array; each entry becomes its own bulleted text
+    primitive whose height is `min(slot.h // count, LIST_ITEM_MAX_H)`
+    so a short list packs tight at the top of the slot rather than
+    sprawling across the full slot height. timeline_items uses the
+    same per-item-height helper but its visual shape is different:
+    each entry becomes a non-bulleted text primitive offset to the
+    right of a structural axis line plus one filled-ellipse marker
+    centered on the axis at the item's vertical midline. KPI rows
+    come from `slide_plan.blocks[id="kpis"].content`; each entry
+    becomes one rounded-rectangle "card" shape (structural, no slot)
+    plus one `kpi` primitive layered on top at the same bounds —
+    there is no single outer band shape. Image refs come from
+    `slide_plan.blocks[id="accent"].content` and must be declared
+    in `image_manifest`. Bounds use the layout slot's `bounds` when
+    set, otherwise the deterministic fallback table at the top of
+    this file (LAYOUT_FALLBACK_BOUNDS / COVER_FALLBACK_BOUNDS /
+    KPI_FALLBACK_BOUNDS).
 
 PREFLIGHT GATES (run BEFORE render_models/ cleanup)
     Cleanup deletes every *.json under render_models/, so any check that
@@ -159,30 +178,37 @@ SUPPORTED_LAYOUTS = (
 )
 
 # Deterministic fallback bounds for cover slots that don't carry their own
-# bounds. Used only when the layout slot omits `bounds`. The cover layout in
-# templates/layouts/business_review/layouts/cover.json sets bounds on
-# `title` only today; the others fall back here.
+# bounds. The cover layout now declares bounds for every text slot (title,
+# subtitle, presenter, date) and the optional image slot (accent); these
+# fallbacks remain as a forward-compat safety net so the generator still
+# produces a deterministic render_model if any of those bounds are ever
+# removed from the layout.
 COVER_FALLBACK_BOUNDS = {
-    "title":     (160, 320, 1280, 180),
-    "subtitle":  (160, 540, 1280, 80),
-    "presenter": (160, 860, 600, 60),
-    "date":      (1160, 860, 600, 60),
+    "title":     (160, 320, 1280, 100),
+    "subtitle":  (160, 460, 1280, 80),
+    "presenter": (160, 880, 600, 60),
+    "date":      (1160, 880, 600, 60),
     "accent":    (1480, 200, 320, 320),
 }
 # Structural primitive: a divider line above the title. No slot id — the
 # line is purely decorative and not driven by slide_plan content.
 COVER_TITLE_DIVIDER_BOUNDS = (160, 290, 1280, 4)
 
-# Deterministic fallback bounds for the kpi_dashboard slots (the layout sets
-# bounds on both required slots today; these fallbacks exist for forward
-# compatibility if the bounds are ever removed from the layout).
+# Deterministic fallback bounds for the kpi_dashboard slots. The kpis slot
+# is sized to wrap the actual KPI tile content (label + value + optional
+# delta) rather than reserving an oversized empty band; matches the
+# bounds declared by templates/layouts/business_review/layouts/kpi_dashboard.json.
 KPI_FALLBACK_BOUNDS = {
     "title": (64, 80, 1792, 120),
-    "kpis":  (64, 280, 1792, 600),
+    "kpis":  (64, 280, 1792, 200),
 }
 KPI_TILE_GAP = 12
 KPI_INSET_X = 32  # horizontal padding inside the kpis slot
-KPI_INSET_Y = 30  # vertical padding inside the kpis slot
+KPI_INSET_Y = 20  # vertical padding inside the kpis slot
+# Corner radius used for the per-tile card backgrounds. Structural shapes
+# painted behind every KPI tile so the dashboard reads as a grid of cards
+# instead of a single wide band with empty space below the text.
+KPI_TILE_CORNER_RADIUS = 12
 
 # Deterministic fallback bounds for the non-cover / non-kpi_dashboard layouts.
 # Used only when the layout slot omits `bounds`. The owned business_review
@@ -199,8 +225,8 @@ LAYOUT_FALLBACK_BOUNDS = {
     },
     "key_message": {
         "title":           (64, 80, 1792, 100),
-        "message":         (160, 260, 1600, 360),
-        "supporting_text": (160, 700, 1600, 280),
+        "message":         (160, 260, 1600, 140),
+        "supporting_text": (160, 440, 1600, 180),
     },
     "two_column": {
         "title":         (64, 80, 1792, 100),
@@ -237,9 +263,26 @@ LAYOUT_FALLBACK_BOUNDS = {
 # section_divider layout. Structural: no slot binding.
 SECTION_DIVIDER_RULE_BOUNDS = (64, 700, 1792, 4)
 
+# Timeline visual-affordance constants. The timeline layout otherwise
+# renders as a plain bulleted list — visually indistinguishable from an
+# agenda. A structural axis line + a filled circle marker per step give
+# it a recognisable timeline silhouette using only the controlled
+# primitive set (line, shape, text).
+TIMELINE_AXIS_OFFSET_PX = 24   # x-inset of the axis inside the slot
+TIMELINE_AXIS_STROKE_PX = 2    # axis stroke width
+TIMELINE_MARKER_RADIUS_PX = 8  # half-side of the marker bounding box
+TIMELINE_TEXT_OFFSET_PX = 48   # x-inset of step text inside the slot
+
 # Minimum vertical pixels per list item before the generator refuses to
 # distribute. Body text is ~19px tall at 14pt; 28px gives modest leading.
 LIST_ITEM_MIN_H = 28
+# Maximum vertical pixels per list item before items pack at the top of
+# the slot with trailing whitespace below. Without this clamp, two
+# bullets in a 680px slot each become 340px tall and read as a sparse
+# pair of headlines rather than a list. 96px fits the 14pt body line
+# (~19px) with generous breathing room while keeping a 7- or 8-item
+# list visually contained.
+LIST_ITEM_MAX_H = 96
 # Bullet prefix prepended to each list item's text content. Renderers
 # treat text.content as a literal display string; the prefix gives the
 # preview a recognisable bullet without requiring rich-text support.
@@ -367,10 +410,15 @@ def _callout_block_content(blocks_by_id: dict, slot_id: str) -> str:
 def _list_item_bounds(slot_bounds: dict, count: int, index: int) -> dict:
     """Distribute `count` list items vertically inside slot_bounds and
     return the bounds for the item at `index`. Integer-only arithmetic
-    so output is byte-stable. The trailing remainder (slot.h % count)
-    is left as whitespace at the bottom of the slot rather than
-    silently extending the last item — keeping every item the same
-    height makes the preview legible at any count."""
+    so output is byte-stable.
+
+    Each item gets ``min(slot.h // count, LIST_ITEM_MAX_H)`` pixels of
+    vertical space. The clamp keeps a short list packed at the top of
+    the slot rather than letting two bullets sprawl across a 680px
+    column slot (which read visually as a sparse pair of headlines,
+    not as a list). Trailing whitespace below the last item is
+    intentional; keeping every item the same height keeps the preview
+    legible at any count."""
     if count <= 0 or index < 0 or index >= count:
         raise GenerationError(
             f"invalid list item request: count={count}, index={index}"
@@ -385,6 +433,8 @@ def _list_item_bounds(slot_bounds: dict, count: int, index: int) -> dict:
             f"list slot too short for {count} items "
             f"(item_h={item_h} < {LIST_ITEM_MIN_H})"
         )
+    if item_h > LIST_ITEM_MAX_H:
+        item_h = LIST_ITEM_MAX_H
     return {"x": sx, "y": sy + index * item_h, "w": sw, "h": item_h}
 
 
@@ -586,6 +636,16 @@ def _generate_kpi_dashboard(
     manifest_ids: set[str],
     manifest_alt_by_id: dict,
 ) -> dict:
+    """kpi_dashboard: required title text + required kpi list. For each
+    entry in `slide_plan.blocks[id="kpis"].content` the generator emits
+    one structural rounded-rectangle "card" shape (no slot_id, sized to
+    the tile's bounds — the visible card border) and one `kpi`
+    primitive layered on top at the same bounds (slot_bound to the
+    `kpis` slot — the editable label / value / optional delta).
+    There is no single outer band shape: the kpis slot is sized to
+    wrap the actual tile content, and each tile carries its own
+    border, so the dashboard reads as a grid of cards rather than a
+    band with text floating at the top."""
     grid = design_system["grid"]
     canvas = {"width_px": grid["width_px"], "height_px": grid["height_px"]}
     slots_by_id = {
@@ -634,24 +694,13 @@ def _generate_kpi_dashboard(
 
     kpis_bounds = _bounds_or_fallback(kpis_slot, KPI_FALLBACK_BOUNDS["kpis"])
 
-    # Decorative band background. No slot_id — the shape is structural and
-    # is intentionally not bound to the 'kpis' slot (whose primitive_kind is
-    # 'kpi'); binding it would trigger a slot.primitive_kind mismatch.
-    primitives.append({
-        "id": "kpi_band_bg",
-        "kind": "shape",
-        "bounds": dict(kpis_bounds),
-        "style": {
-            "fill_token": "palette.background",
-            "stroke_token": "palette.primary",
-            "stroke_width_px": 2,
-        },
-        "shape": {
-            "shape_kind": "rounded_rectangle",
-            "corner_radius_px": 12,
-        },
-    })
-
+    # Per-tile card backgrounds. Each card is a structural rounded
+    # rectangle (no slot_id) painted at the same bounds as its KPI
+    # tile, then the tile primitive is layered on top. The dashboard
+    # reads as a grid of cards rather than a single wide band with
+    # empty space below the value line. Structural-only — the kpis
+    # slot's primitive_kind=kpi gate fires only on slot-bound
+    # primitives, so card shapes do not trip the mismatch check.
     for i, entry in enumerate(kpis_content):
         if not isinstance(entry, dict):
             raise GenerationError(
@@ -679,11 +728,26 @@ def _generate_kpi_dashboard(
                 f"slot 'kpis' content[{i}].delta must be a non-empty "
                 f"string when set; got {type(delta).__name__}"
             )
+        tile_bounds = _kpi_tile_bounds(kpis_bounds, len(kpis_content), i)
+        primitives.append({
+            "id": f"kpi_card_{i + 1:02d}",
+            "kind": "shape",
+            "bounds": dict(tile_bounds),
+            "style": {
+                "fill_token": "palette.background",
+                "stroke_token": "palette.primary",
+                "stroke_width_px": 2,
+            },
+            "shape": {
+                "shape_kind": "rounded_rectangle",
+                "corner_radius_px": KPI_TILE_CORNER_RADIUS,
+            },
+        })
         primitives.append({
             "id": f"kpi_{i + 1:02d}",
             "slot_id": "kpis",
             "kind": "kpi",
-            "bounds": _kpi_tile_bounds(kpis_bounds, len(kpis_content), i),
+            "bounds": tile_bounds,
             "style": {"color_token": "palette.text"},
             "kpi": kpi_payload,
         })
@@ -1059,11 +1123,16 @@ def _generate_timeline(
     manifest_ids: set[str],
     manifest_alt_by_id: dict,
 ) -> dict:
-    """timeline: required title + required timeline_items list. Items are
-    rendered as a vertically stacked bulleted list inside the
-    timeline_items slot. The timeline.json layout (outside this script's
-    ownership) does not declare bounds today; both slots fall back to the
-    table in LAYOUT_FALLBACK_BOUNDS."""
+    """timeline: required title + required timeline_items list. The
+    timeline_items list is rendered as a structural vertical axis line
+    plus one filled ellipse marker per step plus one text primitive per
+    step (no bullet prefix — the marker replaces the bullet). The axis
+    and markers are structural primitives (no slot_id), so the
+    slot.primitive_kind=text gate on `timeline_items` binds only the
+    text primitives; the structural shapes are checked against the
+    canvas only. The timeline.json layout (outside this script's
+    ownership) does not declare bounds today; both slots fall back to
+    the table in LAYOUT_FALLBACK_BOUNDS."""
     grid = design_system["grid"]
     canvas = {"width_px": grid["width_px"], "height_px": grid["height_px"]}
     slots_by_id = {
@@ -1087,11 +1156,63 @@ def _generate_timeline(
 
     items_bounds = _bounds_for(slots_by_id, "timeline", "timeline_items")
     items = _list_block_content(blocks_by_id, "timeline_items")
+    count = len(items)
+    sx = items_bounds["x"]
+    sy = items_bounds["y"]
+    sw = items_bounds["w"]
+    # _list_item_bounds applies LIST_ITEM_MIN_H / LIST_ITEM_MAX_H. Use it
+    # to compute the per-item slice height once so the axis length
+    # matches the actual item stack rather than the full slot height.
+    first_item = _list_item_bounds(items_bounds, count, 0)
+    item_h = first_item["h"]
+    axis_height = count * item_h
+    axis_x = sx + TIMELINE_AXIS_OFFSET_PX
+
+    # Structural vertical axis. Bounds.w must be > 0 per the schema;
+    # the SVG renderer draws the line from (x, y) to (x+w, y+h), so
+    # w=1 with the stroke width supplied by style gives a clean axis.
+    primitives.append({
+        "id": "timeline_axis",
+        "kind": "line",
+        "bounds": {
+            "x": axis_x, "y": sy,
+            "w": 1, "h": axis_height,
+        },
+        "style": {
+            "stroke_token": "palette.primary",
+            "stroke_width_px": TIMELINE_AXIS_STROKE_PX,
+        },
+        "line": {"stroke_style": "solid"},
+    })
+
     for i, item in enumerate(items):
+        item_bounds = _list_item_bounds(items_bounds, count, i)
+        marker_cy = item_bounds["y"] + item_h // 2
+        primitives.append({
+            "id": f"timeline_marker_{i + 1:02d}",
+            "kind": "shape",
+            "bounds": {
+                "x": axis_x - TIMELINE_MARKER_RADIUS_PX,
+                "y": marker_cy - TIMELINE_MARKER_RADIUS_PX,
+                "w": TIMELINE_MARKER_RADIUS_PX * 2,
+                "h": TIMELINE_MARKER_RADIUS_PX * 2,
+            },
+            "style": {
+                "fill_token": "palette.primary",
+                "stroke_token": "palette.primary",
+                "stroke_width_px": 2,
+            },
+            "shape": {"shape_kind": "ellipse"},
+        })
+        text_bounds = {
+            "x": sx + TIMELINE_TEXT_OFFSET_PX,
+            "y": item_bounds["y"],
+            "w": sw - TIMELINE_TEXT_OFFSET_PX,
+            "h": item_h,
+        }
         primitives.append(_make_text_primitive(
             f"timeline_item_{i + 1:02d}", "timeline_items",
-            _list_item_bounds(items_bounds, len(items), i),
-            LIST_ITEM_BULLET_PREFIX + item,
+            text_bounds, item,
             role="body",
             typography_token="typography.body",
         ))

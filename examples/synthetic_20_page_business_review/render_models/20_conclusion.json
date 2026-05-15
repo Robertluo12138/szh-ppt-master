@@ -55,7 +55,7 @@
         "x": 64,
         "y": 400,
         "w": 1792,
-        "h": 300
+        "h": 96
       },
       "style": {
         "color_token": "palette.text",
@@ -72,9 +72,9 @@
       "kind": "text",
       "bounds": {
         "x": 64,
-        "y": 700,
+        "y": 496,
         "w": 1792,
-        "h": 300
+        "h": 96
       },
       "style": {
         "color_token": "palette.text",
