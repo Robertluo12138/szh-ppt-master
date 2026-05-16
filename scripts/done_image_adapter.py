@@ -152,6 +152,7 @@ IMAGE_MANIFEST_FILENAME = "image_manifest.json"
 IMAGE_MANIFEST_SCHEMA = SCHEMAS_DIR / "image_manifest.schema.json"
 SOURCE_INPUT_RELPATH = "input/source.md"
 DEFAULT_PLAN_FILENAME = "d_one_adapter_plan.json"
+PLAN_SCHEMA = SCHEMAS_DIR / "d_one_adapter_plan.schema.json"
 
 # Only manifest entries whose source == "d_one_local" are eligible for
 # D-One generation. local_asset / synthetic entries belong to a
@@ -625,6 +626,120 @@ def _build_plan(validated_requests: list[dict]) -> dict:
     }
 
 
+def _load_workspace_manifest_and_source(
+    workspace: Path,
+) -> tuple[
+    dict[str, dict] | None,
+    bytes | None,
+    str | None,
+    int,
+    str,
+]:
+    """Load + validate ``<workspace>/image_manifest.json`` and (optionally)
+    read ``<workspace>/input/source.md``. Shared by the write path
+    (``done_image_adapter``) and the validate path (``validate_plan_file``)
+    so the two cannot drift on what counts as a valid workspace.
+
+    Returns ``(manifest_by_id, manifest_bytes, source_text, rc, msg)``.
+    On success ``rc == 0`` and the first three values are populated; on
+    failure ``rc != 0`` and ``msg`` is non-empty. The caller is expected
+    to have already passed ``--workspace`` through the URI-shape gate and
+    the workspace symlink / existence / is_dir gates."""
+    manifest_path = workspace / IMAGE_MANIFEST_FILENAME
+    is_symlink, msg = _refuse_symlink(manifest_path, IMAGE_MANIFEST_FILENAME)
+    if is_symlink:
+        return None, None, None, 2, msg
+    if not manifest_path.is_file():
+        return None, None, None, 2, (
+            f"FAIL: --workspace {workspace} is missing "
+            f"{IMAGE_MANIFEST_FILENAME}; run "
+            f"scripts/init_image_manifest.py first to seed Stage-6 "
+            f"(this adapter does not write the manifest, it reads it)."
+        )
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, None, None, 2, f"FAIL: cannot read {manifest_path}: {exc}"
+    if not isinstance(manifest, dict):
+        return None, None, None, 2, (
+            f"FAIL: {manifest_path} did not decode to an object "
+            f"(got {type(manifest).__name__})"
+        )
+    manifest_errors = _schema_validate(manifest, IMAGE_MANIFEST_SCHEMA)
+    if manifest_errors:
+        return None, None, None, 1, (
+            f"FAIL: {manifest_path} does not validate against "
+            f"image_manifest.schema.json: " + "; ".join(manifest_errors)
+        )
+
+    images = manifest.get("images") or []
+    manifest_by_id: dict[str, dict] = {}
+    for i, img in enumerate(images):
+        if not isinstance(img, dict):
+            return None, None, None, 1, (
+                f"FAIL: images[{i}] is not an object "
+                f"(got {type(img).__name__})"
+            )
+        img_id = img.get("id")
+        if not isinstance(img_id, str) or not img_id:
+            return None, None, None, 1, (
+                f"FAIL: images[{i}].id must be a non-empty string "
+                f"(got {img_id!r})"
+            )
+        if img_id in manifest_by_id:
+            return None, None, None, 1, (
+                f"FAIL: {manifest_path} declares duplicate "
+                f"images[].id {img_id!r}"
+            )
+        # Defense in depth: local_path safety (matches the gate
+        # init_image_manifest / materialize_image_assets apply).
+        local_path = img.get("local_path")
+        if not isinstance(local_path, str) or not local_path:
+            return None, None, None, 1, (
+                f"FAIL: images[{i}] (id {img_id!r}): local_path must "
+                f"be a non-empty string (got {local_path!r})"
+            )
+        if not local_path_is_safe(local_path):
+            return None, None, None, 1, (
+                f"FAIL: images[{i}] (id {img_id!r}): local_path "
+                f"{local_path!r} is not a safe workspace-relative path"
+            )
+        if not _resolves_within(workspace, local_path):
+            return None, None, None, 1, (
+                f"FAIL: images[{i}] (id {img_id!r}): local_path "
+                f"{local_path!r} escapes --workspace after resolution"
+            )
+        manifest_by_id[img_id] = img
+
+    # Read input/source.md if present, ONLY for the shingle check.
+    # A missing source body is acceptable (skips the shingle check);
+    # a symlinked source body aborts the run.
+    source_path = workspace / SOURCE_INPUT_RELPATH
+    source_text: str | None = None
+    if source_path.is_symlink():
+        try:
+            link_target = str(source_path.readlink())
+        except OSError:
+            link_target = "<unreadable>"
+        return None, None, None, 1, (
+            f"FAIL: {source_path} is a symlink (-> {link_target}); "
+            f"done_image_adapter refuses to follow it. Replace it "
+            f"with a regular file or remove it (the shingle check is "
+            f"skipped when the source body is absent)."
+        )
+    if source_path.is_file():
+        try:
+            source_text = source_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return None, None, None, 1, (
+                f"FAIL: cannot read {source_path} as UTF-8 for the "
+                f"shingle check: {exc}"
+            )
+
+    return manifest_by_id, manifest_bytes, source_text, 0, ""
+
+
 def done_image_adapter(
     *,
     workspace: Path,
@@ -673,98 +788,15 @@ def done_image_adapter(
     if not spec.is_file():
         return 2, f"FAIL: --spec {spec} is not a regular file"
 
-    # image_manifest.json must be present + schema-valid.
+    # image_manifest.json + input/source.md preflight (shared helper).
     manifest_path = workspace / IMAGE_MANIFEST_FILENAME
-    is_symlink, msg = _refuse_symlink(manifest_path, IMAGE_MANIFEST_FILENAME)
-    if is_symlink:
-        return 2, msg
-    if not manifest_path.is_file():
-        return 2, (
-            f"FAIL: --workspace {workspace} is missing "
-            f"{IMAGE_MANIFEST_FILENAME}; run "
-            f"scripts/init_image_manifest.py first to seed Stage-6 "
-            f"(this adapter does not write the manifest, it reads it)."
-        )
-    try:
-        manifest_bytes_before = manifest_path.read_bytes()
-        manifest = json.loads(manifest_bytes_before.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return 2, f"FAIL: cannot read {manifest_path}: {exc}"
-    if not isinstance(manifest, dict):
-        return 2, (
-            f"FAIL: {manifest_path} did not decode to an object "
-            f"(got {type(manifest).__name__})"
-        )
-    manifest_errors = _schema_validate(manifest, IMAGE_MANIFEST_SCHEMA)
-    if manifest_errors:
-        return 1, (
-            f"FAIL: {manifest_path} does not validate against "
-            f"image_manifest.schema.json: " + "; ".join(manifest_errors)
-        )
-
-    images = manifest.get("images") or []
-    manifest_by_id: dict[str, dict] = {}
-    for i, img in enumerate(images):
-        if not isinstance(img, dict):
-            return 1, (
-                f"FAIL: images[{i}] is not an object "
-                f"(got {type(img).__name__})"
-            )
-        img_id = img.get("id")
-        if not isinstance(img_id, str) or not img_id:
-            return 1, (
-                f"FAIL: images[{i}].id must be a non-empty string "
-                f"(got {img_id!r})"
-            )
-        if img_id in manifest_by_id:
-            return 1, (
-                f"FAIL: {manifest_path} declares duplicate "
-                f"images[].id {img_id!r}"
-            )
-        # Defense in depth: local_path safety (matches the gate
-        # init_image_manifest / materialize_image_assets apply).
-        local_path = img.get("local_path")
-        if not isinstance(local_path, str) or not local_path:
-            return 1, (
-                f"FAIL: images[{i}] (id {img_id!r}): local_path must "
-                f"be a non-empty string (got {local_path!r})"
-            )
-        if not local_path_is_safe(local_path):
-            return 1, (
-                f"FAIL: images[{i}] (id {img_id!r}): local_path "
-                f"{local_path!r} is not a safe workspace-relative path"
-            )
-        if not _resolves_within(workspace, local_path):
-            return 1, (
-                f"FAIL: images[{i}] (id {img_id!r}): local_path "
-                f"{local_path!r} escapes --workspace after resolution"
-            )
-        manifest_by_id[img_id] = img
-
-    # Read input/source.md if present, ONLY for the shingle check.
-    # A missing source body is acceptable (skips the shingle check);
-    # a symlinked source body aborts the run.
-    source_path = workspace / SOURCE_INPUT_RELPATH
-    source_text: str | None = None
-    if source_path.is_symlink():
-        try:
-            link_target = str(source_path.readlink())
-        except OSError:
-            link_target = "<unreadable>"
-        return 1, (
-            f"FAIL: {source_path} is a symlink (-> {link_target}); "
-            f"done_image_adapter refuses to follow it. Replace it "
-            f"with a regular file or remove it (the shingle check is "
-            f"skipped when the source body is absent)."
-        )
-    if source_path.is_file():
-        try:
-            source_text = source_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            return 1, (
-                f"FAIL: cannot read {source_path} as UTF-8 for the "
-                f"shingle check: {exc}"
-            )
+    manifest_by_id, manifest_bytes_before, source_text, rc, msg = (
+        _load_workspace_manifest_and_source(workspace)
+    )
+    if rc != 0:
+        return rc, msg
+    assert manifest_by_id is not None
+    assert manifest_bytes_before is not None
 
     # Parse --spec.
     try:
@@ -882,6 +914,24 @@ def done_image_adapter(
             f"FAIL: re-parsed {plan_out} does not match the in-memory "
             f"plan; rolled back."
         )
+    # Defense-in-depth: validate the just-written plan against
+    # d_one_adapter_plan.schema.json. The in-memory shape is produced
+    # by _build_plan which is the only writer today, but a future
+    # generator (or a refactor) that constructs the plan differently
+    # would still have to satisfy the schema. Roll back on failure so
+    # an unrecognized shape never lands on disk.
+    plan_schema_errors = _schema_validate(reparsed, PLAN_SCHEMA)
+    if plan_schema_errors:
+        try:
+            plan_out.unlink()
+        except OSError:
+            pass
+        return 1, (
+            f"FAIL: {plan_out} does not validate against "
+            f"d_one_adapter_plan.schema.json: "
+            + "; ".join(plan_schema_errors)
+            + "; rolled back."
+        )
     try:
         manifest_bytes_after = manifest_path.read_bytes()
     except OSError as exc:
@@ -909,6 +959,233 @@ def done_image_adapter(
         f"  spec: {spec}\n"
         f"  plan: {plan_out}\n"
         f"  mode: dry_run (no D-One call; no image bytes generated)"
+    )
+
+
+def validate_plan_file(
+    *,
+    workspace: Path,
+    plan: Path,
+) -> tuple[int, str]:
+    """Validate an existing ``d_one_adapter_plan.json``. Returns
+    ``(exit_code, message)``.
+
+    The validator is **non-mutating** — it never writes the plan, the
+    manifest, or any other workspace file. It applies four layers of
+    gates against the candidate plan:
+
+      1. String- and filesystem-layer gates on ``--workspace`` /
+         ``--plan`` (URI shape refused, symlink refused, exists,
+         regular file / directory).
+      2. The same ``image_manifest.json`` + ``input/source.md``
+         preflight the write path applies, via
+         ``_load_workspace_manifest_and_source`` — so a workspace
+         without a schema-valid manifest is refused before the plan
+         is even parsed.
+      3. ``schemas/d_one_adapter_plan.schema.json`` against the plan
+         JSON — catches malformed plans, list-rooted plans, unknown
+         top-level / per-request fields, missing required fields,
+         ``mode != "dry_run"``, ``schema_version != 1``, ``note``
+         missing the dry-run sentinel, ``manifest_source !=
+         "d_one_local"``, non-positive ``width_px`` / ``height_px``,
+         non-integer ``request_count``, etc.
+      4. Cross-checks the schema cannot express: ``request_count ==
+         len(requests)``; no duplicate request ``id`` across the
+         array; every ``id`` resolves to an ``images[].id`` in the
+         manifest whose ``source == "d_one_local"``; ``manifest_source``
+         and ``manifest_local_path`` recorded on each request agree
+         with the matching manifest entry's current values
+         byte-for-byte; ``manifest_local_path`` passes
+         ``local_path_is_safe`` AND ``_resolves_within`` against the
+         workspace (defense-in-depth, in case the manifest changed
+         after the plan was written); every ``prompt`` passes the
+         full ``_scan_prompt_safety`` deny list (URIs, file paths,
+         raw-source markers, 40-char ``input/source.md`` shingles,
+         credential / PII shapes, full-slide / page / screenshot
+         wording); every ``intended_use`` (when present) passes the
+         full-slide-wording subset.
+
+    Post-condition: the manifest bytes and the plan bytes are
+    byte-identical pre/post the call. A successful run returns
+    ``(0, "OK: ...")``; a validation failure returns ``(1, "FAIL:
+    ...")``; an invocation / file error returns ``(2, "FAIL: ...")``.
+    """
+    if _has_uri_scheme(str(workspace)):
+        return 2, (
+            f"FAIL: --workspace {workspace} looks like a URI; "
+            f"done_image_adapter only accepts local directory paths"
+        )
+    if _has_uri_scheme(str(plan)):
+        return 2, (
+            f"FAIL: --plan {plan} looks like a URI; "
+            f"done_image_adapter only accepts local file paths"
+        )
+
+    if workspace.is_symlink():
+        return 2, (
+            f"FAIL: --workspace {workspace} is a symlink; refusing to "
+            f"follow it. Pass a regular directory path."
+        )
+    if not workspace.exists():
+        return 2, f"FAIL: --workspace {workspace} does not exist"
+    if not workspace.is_dir():
+        return 2, f"FAIL: --workspace {workspace} is not a directory"
+
+    is_symlink, msg = _refuse_symlink(plan, "--plan")
+    if is_symlink:
+        return 2, msg
+    if not plan.exists():
+        return 2, f"FAIL: --plan {plan} does not exist"
+    if not plan.is_file():
+        return 2, f"FAIL: --plan {plan} is not a regular file"
+
+    manifest_path = workspace / IMAGE_MANIFEST_FILENAME
+    manifest_by_id, manifest_bytes_before, source_text, rc, msg = (
+        _load_workspace_manifest_and_source(workspace)
+    )
+    if rc != 0:
+        return rc, msg
+    assert manifest_by_id is not None
+    assert manifest_bytes_before is not None
+
+    try:
+        plan_bytes_before = plan.read_bytes()
+        plan_doc = json.loads(plan_bytes_before.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return 1, f"FAIL: cannot read --plan {plan}: {exc}"
+
+    schema_errors = _schema_validate(plan_doc, PLAN_SCHEMA)
+    if schema_errors:
+        return 1, (
+            f"FAIL: {plan} does not validate against "
+            f"d_one_adapter_plan.schema.json: "
+            + "; ".join(schema_errors)
+        )
+
+    # By this point the schema guarantees plan_doc is a dict with
+    # all required top-level fields and that plan_doc["requests"] is
+    # a non-empty list of objects each carrying id / prompt /
+    # manifest_local_path / manifest_source. The cross-checks below
+    # cover what the schema alone cannot express.
+    requests = plan_doc["requests"]
+    if plan_doc["request_count"] != len(requests):
+        return 1, (
+            f"FAIL: {plan} request_count={plan_doc['request_count']} "
+            f"disagrees with len(requests)={len(requests)}"
+        )
+
+    seen_ids: dict[str, int] = {}
+    for i, req in enumerate(requests):
+        req_id = req["id"]
+        if req_id in seen_ids:
+            return 1, (
+                f"FAIL: {plan} requests[{i}].id {req_id!r} duplicates "
+                f"requests[{seen_ids[req_id]}].id (each manifest id "
+                f"may appear at most once per plan)"
+            )
+        seen_ids[req_id] = i
+
+        if req_id not in manifest_by_id:
+            return 1, (
+                f"FAIL: {plan} requests[{i}].id {req_id!r} does not "
+                f"match any image_manifest.images[].id "
+                f"(known ids: {sorted(manifest_by_id.keys()) or '<none>'})"
+            )
+        manifest_entry = manifest_by_id[req_id]
+
+        manifest_source = manifest_entry.get("source")
+        if manifest_source != ELIGIBLE_MANIFEST_SOURCE:
+            return 1, (
+                f"FAIL: {plan} requests[{i}].id {req_id!r}: "
+                f"image_manifest entry has source={manifest_source!r}, "
+                f"but plan entries are only valid against source="
+                f"{ELIGIBLE_MANIFEST_SOURCE!r}"
+            )
+        if req["manifest_source"] != manifest_source:
+            return 1, (
+                f"FAIL: {plan} requests[{i}].manifest_source="
+                f"{req['manifest_source']!r} disagrees with the "
+                f"image_manifest entry's current source="
+                f"{manifest_source!r} (the manifest changed after the "
+                f"plan was written, or the plan was authored against "
+                f"a different manifest)"
+            )
+
+        manifest_local_path = manifest_entry.get("local_path")
+        if req["manifest_local_path"] != manifest_local_path:
+            return 1, (
+                f"FAIL: {plan} requests[{i}].manifest_local_path="
+                f"{req['manifest_local_path']!r} disagrees with the "
+                f"image_manifest entry's local_path="
+                f"{manifest_local_path!r}"
+            )
+        # _load_workspace_manifest_and_source already ran the same
+        # checks against the manifest's local_path; re-running them
+        # against the plan's recorded copy catches a plan whose
+        # value drifted (or whose value was authored by hand and never
+        # passed through the write path).
+        if not local_path_is_safe(req["manifest_local_path"]):
+            return 1, (
+                f"FAIL: {plan} requests[{i}].manifest_local_path="
+                f"{req['manifest_local_path']!r} is not a safe "
+                f"workspace-relative path"
+            )
+        if not _resolves_within(workspace, req["manifest_local_path"]):
+            return 1, (
+                f"FAIL: {plan} requests[{i}].manifest_local_path="
+                f"{req['manifest_local_path']!r} escapes --workspace "
+                f"after resolution"
+            )
+
+        prompt_violations = _scan_prompt_safety(
+            req["prompt"], source_text=source_text,
+        )
+        if prompt_violations:
+            return 1, (
+                f"FAIL: {plan} requests[{i}].prompt (id {req_id!r}) "
+                f"failed safety scan: " + "; ".join(prompt_violations)
+            )
+
+        intended_use = req.get("intended_use")
+        if intended_use is not None:
+            iu_violations = _scan_intended_use(intended_use)
+            if iu_violations:
+                return 1, (
+                    f"FAIL: {plan} requests[{i}].intended_use "
+                    f"(id {req_id!r}) failed safety scan: "
+                    + "; ".join(iu_violations)
+                )
+
+    # Post-condition: nothing was written. A mismatch here would mean
+    # another process is touching either file while we validated,
+    # which is a stronger signal than the validator itself producing
+    # a bad outcome.
+    try:
+        manifest_bytes_after = manifest_path.read_bytes()
+        plan_bytes_after = plan.read_bytes()
+    except OSError as exc:
+        return 1, (
+            f"FAIL: cannot re-read workspace state after validate: {exc}"
+        )
+    if manifest_bytes_after != manifest_bytes_before:
+        return 1, (
+            f"FAIL: {manifest_path} bytes changed during --validate-plan "
+            f"(expected byte-identical)"
+        )
+    if plan_bytes_after != plan_bytes_before:
+        return 1, (
+            f"FAIL: {plan} bytes changed during --validate-plan "
+            f"(expected byte-identical)"
+        )
+
+    return 0, (
+        f"OK: {plan} validates against "
+        f"d_one_adapter_plan.schema.json AND the workspace's "
+        f"image_manifest.json AND the full prompt safety scan.\n"
+        f"  workspace: {workspace}\n"
+        f"  requests:  {len(requests)}\n"
+        f"  mode:      {plan_doc['mode']} "
+        f"(NON-MUTATING — no file was written)"
     )
 
 
@@ -1880,6 +2157,516 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
             ok, f"rc={rc}, ordered_ids={ordered_ids}",
         ))
 
+    # =========================================================================
+    # validate_plan_file scenarios.
+    # =========================================================================
+
+    def _seed_validate_workspace(td: Path) -> tuple[Path, Path]:
+        """Seed a workspace + write a fresh plan via the writing path.
+        Returns (workspace, plan_path). Used as the happy-path fixture
+        for the validate-plan scenarios."""
+        ws = td / "ws"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "media/a.png", "source": "d_one_local"},
+            {"id": "b", "local_path": "media/b.png", "source": "d_one_local"},
+        ])
+        spec_path = td / "spec.json"
+        _write_spec(spec_path, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract geometric pattern, no text",
+                    "intended_use": "spot illustration",
+                    "width_px": 800,
+                    "height_px": 600,
+                },
+                {
+                    "id": "b",
+                    "prompt": "soft gradient texture, no text",
+                },
+            ],
+        })
+        rc, msg = done_image_adapter(workspace=ws, spec=spec_path)
+        assert rc == 0, f"happy-path writer failed: rc={rc} msg={msg!r}"
+        return ws, ws / DEFAULT_PLAN_FILENAME
+
+    def _overwrite_plan(plan_path: Path, body: object) -> None:
+        plan_path.write_text(
+            json.dumps(body, indent=2, sort_keys=True) + "\n"
+        )
+
+    # ---- 30. validate-plan happy path: a plan freshly written by the
+    # writing path validates clean. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = rc == 0 and "validates against" in msg
+        results.append(_expect(
+            "validate-plan: a plan freshly written by done_image_adapter "
+            "round-trips through --validate-plan with rc=0",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 31. validate-plan is non-mutating: manifest + plan bytes
+    # byte-identical pre/post a successful validate. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        manifest_path = ws / IMAGE_MANIFEST_FILENAME
+        before_manifest = manifest_path.read_bytes()
+        before_plan = plan_path.read_bytes()
+        before_files = _list_workspace(ws)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        after_manifest = manifest_path.read_bytes()
+        after_plan = plan_path.read_bytes()
+        after_files = _list_workspace(ws)
+        ok = (
+            rc == 0
+            and after_manifest == before_manifest
+            and after_plan == before_plan
+            and after_files == before_files
+        )
+        results.append(_expect(
+            "validate-plan: NON-MUTATING — manifest bytes, plan bytes, "
+            "and workspace file set all byte-identical pre/post",
+            ok, f"rc={rc}",
+        ))
+
+    # ---- 32. schema gate: list-rooted plan refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        _overwrite_plan(plan_path, [])
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = rc == 1 and "d_one_adapter_plan.schema.json" in msg
+        results.append(_expect(
+            "validate-plan: list-rooted plan refused by schema "
+            "(type: object)",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 33. schema gate: unknown top-level field refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["unexpected_key"] = "anything"
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and "additional property 'unexpected_key' not allowed" in msg
+        )
+        results.append(_expect(
+            "validate-plan: unknown top-level field refused by schema "
+            "(additionalProperties: false)",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 34. schema gate: missing required top-level field refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        del plan_body["mode"]
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = rc == 1 and "missing required property 'mode'" in msg
+        results.append(_expect(
+            "validate-plan: missing required top-level field 'mode' "
+            "refused by schema",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 35. schema gate: mode != 'dry_run' refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["mode"] = "live"
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = rc == 1 and "not in enum" in msg
+        results.append(_expect(
+            "validate-plan: mode != 'dry_run' refused by schema enum "
+            "(evidence of dry-run is mandatory)",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 36. schema gate: wrong schema_version refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["schema_version"] = 2
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = rc == 1 and "schema_version" in msg and "not in enum" in msg
+        results.append(_expect(
+            "validate-plan: schema_version != 1 refused by schema enum "
+            "(version drift must be a paired script change)",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 37. schema gate: note missing the dry-run sentinel refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["note"] = "An unsigned note."
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and "does not match pattern" in msg
+            and "D-One adapter contract stub" in msg
+        )
+        results.append(_expect(
+            "validate-plan: note missing the 'D-One adapter contract "
+            "stub' sentinel refused by schema pattern",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 38. schema gate: manifest_source != 'd_one_local' on a
+    # request refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["manifest_source"] = "local_asset"
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and "manifest_source" in msg
+            and "not in enum" in msg
+        )
+        results.append(_expect(
+            "validate-plan: request.manifest_source != 'd_one_local' "
+            "refused by schema enum",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 39. schema gate: unknown per-request field refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["extra_field"] = "x"
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and "additional property 'extra_field' not allowed" in msg
+        )
+        results.append(_expect(
+            "validate-plan: unknown per-request field refused by schema "
+            "(per-item additionalProperties: false)",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 40. schema gate: missing required per-request field refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        del plan_body["requests"][0]["prompt"]
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = rc == 1 and "missing required property 'prompt'" in msg
+        results.append(_expect(
+            "validate-plan: missing required per-request field 'prompt' "
+            "refused by schema",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 41. cross-check: duplicate request id refused (the schema
+    # cannot express this; the validator's seen_ids check catches it). ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        # Re-use the first request's body under id 'a' twice.
+        first = dict(plan_body["requests"][0])
+        plan_body["requests"] = [first, dict(first)]
+        plan_body["request_count"] = 2
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = rc == 1 and "duplicates" in msg
+        results.append(_expect(
+            "validate-plan: duplicate request id refused by cross-check",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 42. cross-check: request_count != len(requests) refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["request_count"] = 999
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and "request_count=999" in msg
+            and "len(requests)=2" in msg
+        )
+        results.append(_expect(
+            "validate-plan: request_count != len(requests) refused by "
+            "cross-check",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 43. cross-check: request id not present in manifest refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["id"] = "ghost"
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = rc == 1 and "does not match any image_manifest" in msg
+        results.append(_expect(
+            "validate-plan: request id not present in image_manifest "
+            "refused by cross-check",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 44. cross-check: manifest_local_path disagrees with the
+    # manifest entry refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["manifest_local_path"] = "media/elsewhere.png"
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and "manifest_local_path" in msg
+            and "disagrees" in msg
+        )
+        results.append(_expect(
+            "validate-plan: manifest_local_path disagreement with the "
+            "manifest entry refused by cross-check",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 45. cross-check: prompt containing URL refused (re-runs the
+    # full _scan_prompt_safety deny list against each prompt). ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["prompt"] = (
+            "abstract pattern, see https://attacker.example/x"
+        )
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and "URI scheme" in msg
+            and "safety scan" in msg
+        )
+        results.append(_expect(
+            "validate-plan: URL in a plan prompt refused by cross-check "
+            "safety scan",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 46. cross-check: prompt containing a 40-char input/source.md
+    # shingle refused (raw-source paste suspected). ----
+    distinctive = "Q9_validate_plan_distinctive_marker_QQQQQ"
+    assert len(distinctive) >= _SOURCE_SHINGLE_WINDOW
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws"
+        _seed_workspace(
+            ws,
+            images=[
+                {"id": "a", "local_path": "media/a.png", "source": "d_one_local"},
+            ],
+            source_body=f"# Heading\n\n{distinctive}\n",
+        )
+        spec_path = td / "spec.json"
+        _write_spec(spec_path, {
+            "requests": [
+                {"id": "a", "prompt": "abstract pattern, no text"},
+            ],
+        })
+        rc, _ = done_image_adapter(workspace=ws, spec=spec_path)
+        assert rc == 0
+        plan_path = ws / DEFAULT_PLAN_FILENAME
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["prompt"] = (
+            "abstract pattern, context: " + distinctive
+        )
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and "substring of input/source.md" in msg
+            and "safety scan" in msg
+        )
+        results.append(_expect(
+            "validate-plan: 40-char shingle of input/source.md inside a "
+            "plan prompt refused by cross-check safety scan",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 47. cross-check: prompt containing credential refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["prompt"] = (
+            "abstract pattern, key AKIA1234567890ABCDEF more text"
+        )
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = rc == 1 and "safety scan" in msg
+        results.append(_expect(
+            "validate-plan: credential-shaped substring in prompt "
+            "refused by cross-check safety scan",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 48. cross-check: prompt containing full-slide wording
+    # refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["prompt"] = (
+            "abstract pattern, render the slide as background"
+        )
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and "safety scan" in msg
+            and "full-slide" in msg
+        )
+        results.append(_expect(
+            "validate-plan: full-slide wording in prompt refused by "
+            "cross-check safety scan",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 49. cross-check: intended_use containing forbidden wording
+    # refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["intended_use"] = "full-slide background"
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = rc == 1 and "intended_use" in msg and "safety scan" in msg
+        results.append(_expect(
+            "validate-plan: intended_use containing full-slide wording "
+            "refused by cross-check safety scan",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 50. malformed plan JSON refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_path.write_text("{not json")
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = rc == 1 and "cannot read --plan" in msg
+        results.append(_expect(
+            "validate-plan: malformed plan JSON refused",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 51. missing plan file refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_missing_plan"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        missing_plan = ws / "does_not_exist.json"
+        rc, msg = validate_plan_file(workspace=ws, plan=missing_plan)
+        ok = rc == 2 and "does not exist" in msg
+        results.append(_expect(
+            "validate-plan: missing --plan refused",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 52. symlink at --plan refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, real_plan = _seed_validate_workspace(td)
+        link_plan = ws / "linked_plan.json"
+        link_plan.symlink_to(real_plan)
+        rc, msg = validate_plan_file(workspace=ws, plan=link_plan)
+        ok = (
+            rc == 2
+            and "symlink" in msg
+            and real_plan.read_bytes() == real_plan.read_bytes()  # tautology guard
+        )
+        results.append(_expect(
+            "validate-plan: symlink at --plan refused",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- 53. URI-shaped --plan refused at the string layer. ----
+    rc, msg = validate_plan_file(
+        workspace=Path("/tmp/ws"),
+        plan=Path("https://attacker.example/plan.json"),
+    )
+    ok = rc == 2 and "URI" in msg
+    results.append(_expect(
+        "validate-plan: URI-shaped --plan refused at the string layer",
+        ok, f"rc={rc}, msg={msg!r}",
+    ))
+
+    # ---- 54. write-path post-write schema validation rolls back when
+    # the in-memory plan does not satisfy the schema (regression for the
+    # post-write _schema_validate step). Monkey-patches _build_plan to
+    # drop a required field, then verifies the plan file is not left
+    # on disk. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_writepath_schema"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "media/a.png", "source": "d_one_local"},
+        ])
+        spec_path = td / "spec.json"
+        _write_spec(spec_path, {
+            "requests": [{"id": "a", "prompt": "abstract pattern, no text"}],
+        })
+        import sys as _sys
+        _module = _sys.modules[__name__]
+        original_build = _module._build_plan
+
+        def fake_build_plan(validated_requests: list[dict]) -> dict:
+            plan = original_build(validated_requests)
+            del plan["mode"]  # schema requires it; should trigger rollback
+            return plan
+
+        _module._build_plan = fake_build_plan  # type: ignore[attr-defined]
+        try:
+            rc, msg = done_image_adapter(workspace=ws, spec=spec_path)
+        finally:
+            _module._build_plan = original_build  # type: ignore[attr-defined]
+        ok = (
+            rc == 1
+            and "d_one_adapter_plan.schema.json" in msg
+            and "rolled back" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "write path: post-write schema-validation failure rolls back "
+            "the plan file (regression for the new _schema_validate "
+            "post-condition step)",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
     return results
 
 
@@ -1921,6 +2708,34 @@ def main(argv: list[str]) -> int:
              "inside --workspace and must not pre-exist.",
     )
     parser.add_argument(
+        "--validate-plan", action="store_true",
+        help="Validate an EXISTING d_one_adapter_plan.json instead of "
+             "writing a new one. Requires --workspace and --plan. The "
+             "validator is NON-MUTATING: it applies the schema "
+             "(d_one_adapter_plan.schema.json — covers list-rooted, "
+             "unknown fields, missing required fields, mode != "
+             "'dry_run', schema_version drift, manifest_source != "
+             "'d_one_local', non-positive dimensions), the workspace + "
+             "image_manifest preflight (manifest schema-valid; no "
+             "duplicate ids; every local_path safe), and the full set "
+             "of cross-checks the schema cannot express (request_count "
+             "== len(requests); no duplicate request ids; every id "
+             "resolves in the manifest with source='d_one_local'; "
+             "manifest_local_path / manifest_source agree with the "
+             "manifest entry byte-for-byte; every prompt re-passes the "
+             "full URL / file-path / raw-source marker / 40-char source "
+             "shingle / credential / PII / full-slide wording deny list, "
+             "and every intended_use re-passes the full-slide wording "
+             "subset of that list — the same scope the write path "
+             "applies).",
+    )
+    parser.add_argument(
+        "--plan", type=Path, default=None,
+        help="Path to the existing plan file to validate. Required "
+             "with --validate-plan. Refused if it is a symlink, missing, "
+             "not a regular file, or URI-shaped.",
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help="Run in-script tempfixture scenarios covering the happy "
              "path, determinism, unknown id, wrong manifest source, "
@@ -1930,15 +2745,21 @@ def main(argv: list[str]) -> int:
              "workspace/spec/plan/source, pre-existing plan, malformed "
              "/schema-invalid manifest, malformed spec, duplicate "
              "request ids, empty prompts, no-image-bytes guarantee, "
-             "mid-write rollback, no-source-leak, and plan determinism. "
-             "Exits non-zero if any scenario does not behave as "
-             "expected. Mutually exclusive with --workspace / --spec / "
-             "--plan-out.",
+             "mid-write rollback, no-source-leak, plan determinism, "
+             "plus the standalone --validate-plan path covering "
+             "schema gates, cross-checks, and the non-mutating "
+             "post-condition. Exits non-zero if any scenario does not "
+             "behave as expected. Mutually exclusive with --workspace "
+             "/ --spec / --plan-out / --plan / --validate-plan.",
     )
     args = parser.parse_args(argv)
 
     if args.self_test:
-        if any(v is not None for v in (args.workspace, args.spec, args.plan_out)):
+        if any(
+            v is not None for v in (
+                args.workspace, args.spec, args.plan_out, args.plan,
+            )
+        ) or args.validate_plan:
             print(
                 "FAIL: --self-test does not take any other argument",
                 file=sys.stderr,
@@ -1965,6 +2786,51 @@ def main(argv: list[str]) -> int:
             "paths."
         )
         return 0
+
+    if args.validate_plan:
+        rejected = [
+            name for name, value in (
+                ("--spec", args.spec),
+                ("--plan-out", args.plan_out),
+            )
+            if value is not None
+        ]
+        if rejected:
+            print(
+                f"FAIL: --validate-plan does not accept "
+                f"{', '.join(rejected)}; use --workspace and --plan only",
+                file=sys.stderr,
+            )
+            return 2
+        missing = [
+            name for name, value in (
+                ("--workspace", args.workspace),
+                ("--plan", args.plan),
+            )
+            if value is None
+        ]
+        if missing:
+            print(
+                f"FAIL: --validate-plan requires {', '.join(missing)}",
+                file=sys.stderr,
+            )
+            return 2
+        rc, msg = validate_plan_file(
+            workspace=args.workspace,
+            plan=args.plan,
+        )
+        if rc == 0:
+            print(msg)
+        else:
+            print(msg, file=sys.stderr)
+        return rc
+
+    if args.plan is not None:
+        print(
+            "FAIL: --plan is only valid with --validate-plan",
+            file=sys.stderr,
+        )
+        return 2
 
     missing = [
         name for name, value in (
