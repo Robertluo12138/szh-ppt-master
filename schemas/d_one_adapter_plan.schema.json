@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "d_one_adapter_plan.schema.json",
+  "title": "D-One Adapter Dry-Run Plan",
+  "description": "Deterministic dry-run plan written by scripts/done_image_adapter.py. The plan records the validated D-One generation requests for a future generator to consume. The plan is NOT D-One integration — no D-One call is made and no image bytes are produced. The schema is strict on shape and on the dry-run sentinel fields (mode, note, manifest_source); deeper safety gates (no URLs / credentials / source-text leakage / full-slide wording in prompts; ids resolve in image_manifest.json; manifest_source matches manifest entry) are enforced by scripts/done_image_adapter.py at write time and re-runnable via `done_image_adapter.py --validate-plan`.",
+  "type": "object",
+  "required": ["schema_version", "mode", "note", "request_count", "requests"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [1],
+      "description": "Plan-file schema version. Locked to integer 1 today. Bumped only with a paired script change so a future real-D-One generator can refuse a plan shape it does not recognize."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["dry_run"],
+      "description": "Evidence the plan was produced by the adapter stub — no D-One call was made and no image bytes were generated. The enum lock is the dry-run gate: a 'type: string' alone would silently accept 'live' / 'production' / arbitrary strings; a future real-D-One mode must bump schema_version and extend this enum (a paired change)."
+    },
+    "note": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "D-One adapter contract stub",
+      "description": "Self-describing audit note. Must contain the literal 'D-One adapter contract stub' so the file is identifiable as stub output even when read out of context."
+    },
+    "request_count": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Equal to len(requests). Redundant with the array length but kept so a glance at the file shows the count without parsing the array. The adapter cross-checks the equality before writing."
+    },
+    "requests": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "prompt", "manifest_local_path", "manifest_source"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Asset id. Must match an images[].id in the workspace's image_manifest.json whose source == 'd_one_local'. The cross-check (done_image_adapter --validate-plan / write-time validate) refuses unknown ids and duplicates."
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Safety-scrubbed prompt. The adapter has already run the defense-in-depth deny list (URIs / file paths / raw-source markers / 40-char source shingles / credential and PII shapes / full-slide-page-screenshot wording) against this string before the plan was written; --validate-plan re-runs the same scan."
+          },
+          "manifest_local_path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Workspace-relative local_path copied verbatim from the matching images[].local_path. The schema enforces non-empty string; the cross-check enforces local_path_is_safe (no URI / no leading '/' / no '..' segment) and _resolves_within against the workspace, and that the value equals the manifest entry's local_path byte-for-byte."
+          },
+          "manifest_source": {
+            "type": "string",
+            "enum": ["d_one_local"],
+            "description": "Always 'd_one_local'. local_asset / synthetic manifest entries are not eligible for D-One generation and the adapter refuses to issue requests against them; the enum lock is the schema-level reflection of that rule."
+          },
+          "intended_use": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Optional. Short caller-supplied descriptor (e.g. 'spot illustration'). Must not contain full-slide / page / screenshot wording — the adapter and --validate-plan both re-scan this field."
+          },
+          "width_px": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "description": "Optional. Target asset width in pixels. Positive integer."
+          },
+          "height_px": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "description": "Optional. Target asset height in pixels. Positive integer."
+          }
+        }
+      }
+    }
+  }
+}
