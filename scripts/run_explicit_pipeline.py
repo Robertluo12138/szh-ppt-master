@@ -26,7 +26,14 @@ source / spec files:
 **This is explicit-input end-to-end orchestration only — it is NOT a
 full prompt/report/Markdown-to-PPTX automation.** Every Stage-1-to-6
 artifact's content comes from the caller via flags or JSON spec files;
-Stage 7-10 consumes only what Stage 1-6 wrote. The orchestrator NEVER:
+Stage 7-10 consumes only what Stage 1-6 wrote. Asset bytes (optional,
+``--assets-dir <dir>``) are caller-staged: the orchestrator delegates
+to ``prepare_workspace.py``'s materialize_image_assets step, which
+copies ``<assets-dir>/<local_path>`` bytes into
+``<workspace>/<local_path>`` between Stage 5 and Stage 6 so
+``init_image_manifest``'s ``local_path``-existence gate has the bytes
+to look at. Asset bytes are never generated, fetched, or otherwise
+invented. The orchestrator NEVER:
 
   - parses ``input/source.md`` for business content (the prepare_workspace
     helpers each delegate to the Stage-1/Stage-2 bridge, which reads the
@@ -166,6 +173,7 @@ def run_explicit_pipeline(
     tone: str | None = None,
     language: str | None = None,
     approximate_slide_count: int | None = None,
+    assets_dir: Path | None = None,
 ) -> ExplicitPipelineResult:
     """Run Stage 1-6 (in-process) then Stage 7-10 (subprocess).
 
@@ -191,6 +199,7 @@ def run_explicit_pipeline(
         tone=tone,
         language=language,
         approximate_slide_count=approximate_slide_count,
+        assets_dir=assets_dir,
     )
     if not prep.overall_ok:
         failed = prep.first_failure.name if prep.first_failure else "unknown"
@@ -336,6 +345,19 @@ def main(argv: list[str]) -> int:
              "init_image_manifest).",
     )
     parser.add_argument(
+        "--assets-dir", type=Path, default=None,
+        help="Optional directory of caller-staged image asset bytes "
+             "keyed by the relative paths declared in "
+             "--image-manifest-spec's images[].local_path. When passed, "
+             "prepare_workspace inserts a materialize_image_assets step "
+             "between init_slide_plans (Stage 5) and init_image_manifest "
+             "(Stage 6) that copies <assets-dir>/<local_path> bytes into "
+             "<workspace>/<local_path> before init_image_manifest's "
+             "local_path-existence gate runs. Refuses symlinks at "
+             "source, refuses to overwrite at destination, generates "
+             "nothing.",
+    )
+    parser.add_argument(
         "--output", type=Path, default=None,
         help="Path to write the .pptx output. Extension must be .pptx. "
              "MUST live outside --workspace. Symlinks and directories "
@@ -363,8 +385,22 @@ def main(argv: list[str]) -> int:
              "happy-path --report-dir produces "
              "<report-dir>/inventory.json with ok=true and the "
              "evidence_basis line and the marker phrase is NOT "
-             "embedded in the inventory). Mutually exclusive with "
-             "the orchestration flags.",
+             "embedded in the inventory, --assets-dir happy path: "
+             "caller-staged asset bytes are copied between Stage 5 and "
+             "Stage 6 so one invocation produces a validated PPTX, "
+             "--assets-dir within-stage rollback: a missing source for "
+             "image 2 of 2 unwinds the image-1 copy + parent dir so "
+             "the workspace is byte-identical to its pre-call state, "
+             "--assets-dir cross-stage rollback: a downstream "
+             "init_image_manifest failure unwinds materialize's "
+             "writes so the workspace retains no orphaned asset bytes "
+             "from the failed prep run, and --assets-dir "
+             "symlinked-parent containment: a parent component inside "
+             "--assets-dir that is a symlink pointing outside the "
+             "assets directory is refused before any bytes are read, "
+             "so an outside payload at the resolved target never "
+             "lands in the workspace and no PPTX is produced). "
+             "Mutually exclusive with the orchestration flags.",
     )
     args = parser.parse_args(argv)
 
@@ -376,6 +412,7 @@ def main(argv: list[str]) -> int:
             args.plan_spec, args.design_system_spec,
             args.template_root, args.slide_specs_dir,
             args.image_manifest_spec, args.output, args.report_dir,
+            args.assets_dir,
         )
         if any(v is not None for v in orchestration_args) or args.theme_from_template:
             print(
@@ -469,6 +506,7 @@ def main(argv: list[str]) -> int:
         tone=args.tone,
         language=args.language,
         approximate_slide_count=args.approximate_slide_count,
+        assets_dir=args.assets_dir,
     )
 
     print(_format_prep(result.prep))
@@ -1036,6 +1074,566 @@ def _scenario_inventory_written_with_report_dir(td: Path) -> ScenarioResult:
     )
 
 
+_MINIMAL_PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n"
+    b"\x00\x00\x00\rIHDR"
+    b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+    b"\x1f\x15\xc4\x89"
+    b"\x00\x00\x00\rIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01"
+    b"\r\n-\xb4"
+    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+def _build_fixture_with_image(td: Path) -> dict:
+    """Variant of ``_build_fixture`` whose first slide carries one
+    ``image_ref`` declared in image_manifest_spec. Used by the
+    ``--assets-dir`` happy-path scenario: prove that one
+    ``run_explicit_pipeline.py`` invocation, with caller-staged asset
+    bytes under ``--assets-dir``, completes the cascade including
+    materialize_image_assets and init_image_manifest in a single shot."""
+    td.mkdir(parents=True, exist_ok=True)
+    source = td / "fixture_source.md"
+    source.write_text(_FIXTURE_SOURCE)
+    source_id = "fixture_source"
+
+    plan_spec = td / "plan_spec.json"
+    _write_json(plan_spec, {
+        "template": "business_review",
+        "planning": {
+            "planned_slide_count": 2,
+            "rationale": (
+                "Two-slide fixture exercising --assets-dir wiring; no "
+                "business content."
+            ),
+        },
+        "sections": [
+            {
+                "id": "intro",
+                "title": "Intro",
+                "summary": "Cover plus one body slide.",
+                "slide_indices": [1, 2],
+            },
+        ],
+        "slides": [
+            {
+                "index": 1,
+                "layout": "cover",
+                "title": "Fixture Cover Title",
+                "section_id": "intro",
+                "summary": "Cover slide.",
+                "density": "low",
+                "source_refs": [source_id],
+            },
+            {
+                "index": 2,
+                "layout": "key_message",
+                "title": "Fixture Message",
+                "section_id": "intro",
+                "summary": "Single key-message slide.",
+                "density": "low",
+                "source_refs": [source_id],
+            },
+        ],
+    })
+
+    specs_dir = td / "specs"
+    specs_dir.mkdir()
+    _write_json(specs_dir / "01_cover.json", {
+        "index": 1,
+        "layout": "cover",
+        "title": "Fixture Cover Title",
+        "blocks": [
+            {"id": "title", "kind": "text", "content": "Fixture Cover Title"},
+            {"id": "accent", "kind": "image_ref", "content": "cover_accent"},
+        ],
+        "image_refs": ["cover_accent"],
+    })
+    _write_json(specs_dir / "02_key_message.json", {
+        "index": 2,
+        "layout": "key_message",
+        "title": "Fixture Message",
+        "blocks": [
+            {
+                "id": "message",
+                "kind": "callout",
+                "content": "Fixture key-message body.",
+            },
+        ],
+    })
+
+    image_manifest_spec = td / "image_manifest_spec.json"
+    _write_json(image_manifest_spec, {
+        "images": [
+            {
+                "id": "cover_accent",
+                "local_path": "media/cover_accent.png",
+                "source": "d_one_local",
+                "alt_text": "Synthetic test pattern.",
+                "intended_use": "spot illustration",
+            },
+        ],
+    })
+
+    return {
+        "source": source,
+        "title": "Fixture Title",
+        "audience": "Internal fixture audience",
+        "objective": (
+            "Exercise --assets-dir end-to-end."
+        ),
+        "plan_spec": plan_spec,
+        "slide_specs_dir": specs_dir,
+        "image_manifest_spec": image_manifest_spec,
+        "template_root": REPO_ROOT / "templates" / "layouts",
+        "theme_from_template": True,
+        "source_id": source_id,
+    }
+
+
+def _build_fixture_two_images(td: Path) -> dict:
+    """Variant of ``_build_fixture_with_image`` whose first slide
+    references TWO images. Used by the within-stage rollback scenario:
+    when caller-staged bytes exist for image 1 but NOT for image 2,
+    the materialize step must roll back the image-1 copy before
+    returning non-zero."""
+    td.mkdir(parents=True, exist_ok=True)
+    source = td / "fixture_source.md"
+    source.write_text(_FIXTURE_SOURCE)
+    source_id = "fixture_source"
+
+    plan_spec = td / "plan_spec.json"
+    _write_json(plan_spec, {
+        "template": "business_review",
+        "planning": {
+            "planned_slide_count": 2,
+            "rationale": (
+                "Two-slide fixture exercising rollback when one of two "
+                "image assets is missing from --assets-dir; no business "
+                "content."
+            ),
+        },
+        "sections": [
+            {
+                "id": "intro",
+                "title": "Intro",
+                "summary": "Cover plus one body slide.",
+                "slide_indices": [1, 2],
+            },
+        ],
+        "slides": [
+            {
+                "index": 1,
+                "layout": "cover",
+                "title": "Fixture Cover Title",
+                "section_id": "intro",
+                "summary": "Cover slide.",
+                "density": "low",
+                "source_refs": [source_id],
+            },
+            {
+                "index": 2,
+                "layout": "key_message",
+                "title": "Fixture Message",
+                "section_id": "intro",
+                "summary": "Single key-message slide.",
+                "density": "low",
+                "source_refs": [source_id],
+            },
+        ],
+    })
+
+    specs_dir = td / "specs"
+    specs_dir.mkdir()
+    _write_json(specs_dir / "01_cover.json", {
+        "index": 1,
+        "layout": "cover",
+        "title": "Fixture Cover Title",
+        "blocks": [
+            {"id": "title", "kind": "text", "content": "Fixture Cover Title"},
+            {"id": "accent", "kind": "image_ref", "content": "img_one"},
+        ],
+        "image_refs": ["img_one", "img_two"],
+    })
+    _write_json(specs_dir / "02_key_message.json", {
+        "index": 2,
+        "layout": "key_message",
+        "title": "Fixture Message",
+        "blocks": [
+            {
+                "id": "message",
+                "kind": "callout",
+                "content": "Fixture key-message body.",
+            },
+        ],
+    })
+
+    image_manifest_spec = td / "image_manifest_spec.json"
+    _write_json(image_manifest_spec, {
+        "images": [
+            {
+                "id": "img_one",
+                "local_path": "media/img_one.png",
+                "source": "d_one_local",
+                "alt_text": "Synthetic one.",
+                "intended_use": "spot illustration",
+            },
+            {
+                "id": "img_two",
+                "local_path": "media/img_two.png",
+                "source": "d_one_local",
+                "alt_text": "Synthetic two.",
+                "intended_use": "spot illustration",
+            },
+        ],
+    })
+
+    return {
+        "source": source,
+        "title": "Fixture Title",
+        "audience": "Internal fixture audience",
+        "objective": "Exercise --assets-dir rollback.",
+        "plan_spec": plan_spec,
+        "slide_specs_dir": specs_dir,
+        "image_manifest_spec": image_manifest_spec,
+        "template_root": REPO_ROOT / "templates" / "layouts",
+        "theme_from_template": True,
+        "source_id": source_id,
+    }
+
+
+def _build_fixture_undeclared_image_ref(td: Path) -> dict:
+    """Variant of ``_build_fixture_with_image`` whose cover slide
+    references an image id NOT declared in the image_manifest_spec.
+    Used by the cross-stage rollback scenario: materialize succeeds on
+    the one declared image, then init_image_manifest fails on the
+    undeclared id cross-check. The orchestrator must unwind
+    materialize's copy so the failed prep run leaves no orphaned bytes
+    in the workspace."""
+    td.mkdir(parents=True, exist_ok=True)
+    source = td / "fixture_source.md"
+    source.write_text(_FIXTURE_SOURCE)
+    source_id = "fixture_source"
+
+    plan_spec = td / "plan_spec.json"
+    _write_json(plan_spec, {
+        "template": "business_review",
+        "planning": {
+            "planned_slide_count": 2,
+            "rationale": (
+                "Two-slide fixture; cover references an undeclared "
+                "image id so init_image_manifest fails after the "
+                "materialize step copies the one declared image."
+            ),
+        },
+        "sections": [
+            {
+                "id": "intro",
+                "title": "Intro",
+                "summary": "Cover plus one body slide.",
+                "slide_indices": [1, 2],
+            },
+        ],
+        "slides": [
+            {
+                "index": 1,
+                "layout": "cover",
+                "title": "Fixture Cover Title",
+                "section_id": "intro",
+                "summary": "Cover slide.",
+                "density": "low",
+                "source_refs": [source_id],
+            },
+            {
+                "index": 2,
+                "layout": "key_message",
+                "title": "Fixture Message",
+                "section_id": "intro",
+                "summary": "Single key-message slide.",
+                "density": "low",
+                "source_refs": [source_id],
+            },
+        ],
+    })
+
+    specs_dir = td / "specs"
+    specs_dir.mkdir()
+    _write_json(specs_dir / "01_cover.json", {
+        "index": 1,
+        "layout": "cover",
+        "title": "Fixture Cover Title",
+        "blocks": [
+            {"id": "title", "kind": "text", "content": "Fixture Cover Title"},
+            {"id": "accent", "kind": "image_ref",
+             "content": "cover_accent"},
+        ],
+        # The slide_plan references two ids; only "cover_accent" is
+        # declared in image_manifest_spec.images below — the orphan
+        # "missing_id" triggers init_image_manifest's undeclared-ref
+        # cross-check after the materialize step has already copied
+        # cover_accent's bytes.
+        "image_refs": ["cover_accent", "missing_id"],
+    })
+    _write_json(specs_dir / "02_key_message.json", {
+        "index": 2,
+        "layout": "key_message",
+        "title": "Fixture Message",
+        "blocks": [
+            {
+                "id": "message",
+                "kind": "callout",
+                "content": "Fixture key-message body.",
+            },
+        ],
+    })
+
+    image_manifest_spec = td / "image_manifest_spec.json"
+    _write_json(image_manifest_spec, {
+        "images": [
+            {
+                "id": "cover_accent",
+                "local_path": "media/cover_accent.png",
+                "source": "d_one_local",
+                "alt_text": "Synthetic accent.",
+                "intended_use": "spot illustration",
+            },
+        ],
+    })
+
+    return {
+        "source": source,
+        "title": "Fixture Title",
+        "audience": "Internal fixture audience",
+        "objective": "Exercise cross-stage rollback.",
+        "plan_spec": plan_spec,
+        "slide_specs_dir": specs_dir,
+        "image_manifest_spec": image_manifest_spec,
+        "template_root": REPO_ROOT / "templates" / "layouts",
+        "theme_from_template": True,
+        "source_id": source_id,
+    }
+
+
+def _scenario_assets_dir_within_stage_rollback(td: Path) -> ScenarioResult:
+    """The materialize_image_assets step rolls back any incremental
+    writes when a later image in the same call fails its preflight.
+    Setup: two images declared in --image-manifest-spec; image 1 has
+    caller-staged bytes under --assets-dir; image 2 does NOT. After
+    materialize fails, neither image's local_path may exist in the
+    workspace, and the parent directory the step created (`media/`)
+    must also be gone — the workspace should be byte-identical to its
+    pre-materialize state."""
+    fx = _build_fixture_two_images(td / "fx_within_stage")
+    ws = td / "ws_within_stage"
+    out = td / "within_stage.pptx"
+    assets_dir = td / "within_stage_assets"
+    assets_dir.mkdir()
+    # Stage bytes ONLY for image 1; image 2's source is intentionally
+    # absent so materialize fails after copying image 1.
+    asset_target = assets_dir / "media" / "img_one.png"
+    asset_target.parent.mkdir(parents=True, exist_ok=True)
+    asset_target.write_bytes(_MINIMAL_PNG_BYTES)
+
+    rc, sout, _serr = _invoke_runner(
+        _args_from_fixture(fx, workspace=ws, output=out)
+        + ["--assets-dir", str(assets_dir)]
+    )
+    img_one_dst = ws / "media" / "img_one.png"
+    img_two_dst = ws / "media" / "img_two.png"
+    media_dir = ws / "media"
+    ok = (
+        rc != 0
+        and not out.exists()
+        and "[FAIL] materialize_image_assets" in sout
+        and "[SKIP] init_image_manifest" in sout
+        and not img_one_dst.exists()
+        and not img_two_dst.exists()
+        and not media_dir.exists()
+    )
+    return ScenarioResult(
+        "within-stage rollback: materialize_image_assets fails when "
+        "image 2 of 2 is missing from --assets-dir AFTER image 1 was "
+        "already copied; the helper unwinds image 1's bytes AND the "
+        "parent directory it created so the workspace returns to its "
+        "pre-call state and init_image_manifest is SKIPPED",
+        ok,
+        (f"rc={rc}, "
+         f"materialize_fail={'[FAIL] materialize_image_assets' in sout}, "
+         f"init_im_skip={'[SKIP] init_image_manifest' in sout}, "
+         f"img_one_left={img_one_dst.exists()}, "
+         f"img_two_left={img_two_dst.exists()}, "
+         f"media_dir_left={media_dir.exists()}"
+         if not ok else ""),
+    )
+
+
+def _scenario_assets_dir_cross_stage_rollback(td: Path) -> ScenarioResult:
+    """When materialize_image_assets succeeds but a later stage fails,
+    the orchestrator must unwind the materialize step's writes so the
+    failed prep run leaves no orphaned asset bytes in the workspace.
+    Setup: one image declared in image_manifest_spec; bytes staged in
+    --assets-dir; the cover slide_plan references an extra,
+    undeclared image id so init_image_manifest fails on its undeclared-
+    ref cross-check after materialize succeeds. The workspace must not
+    contain the copied bytes after the run."""
+    fx = _build_fixture_undeclared_image_ref(td / "fx_cross_stage")
+    ws = td / "ws_cross_stage"
+    out = td / "cross_stage.pptx"
+    assets_dir = td / "cross_stage_assets"
+    assets_dir.mkdir()
+    asset_target = assets_dir / "media" / "cover_accent.png"
+    asset_target.parent.mkdir(parents=True, exist_ok=True)
+    asset_target.write_bytes(_MINIMAL_PNG_BYTES)
+
+    rc, sout, _serr = _invoke_runner(
+        _args_from_fixture(fx, workspace=ws, output=out)
+        + ["--assets-dir", str(assets_dir)]
+    )
+    dst = ws / "media" / "cover_accent.png"
+    media_dir = ws / "media"
+    ok = (
+        rc != 0
+        and not out.exists()
+        and "[PASS] materialize_image_assets" in sout
+        and "[FAIL] init_image_manifest" in sout
+        and not dst.exists()
+        and not media_dir.exists()
+    )
+    return ScenarioResult(
+        "cross-stage rollback: materialize_image_assets succeeds, "
+        "init_image_manifest fails on an undeclared image_ref, and "
+        "the orchestrator unwinds materialize's writes so the workspace "
+        "does not retain orphaned asset bytes from the failed prep run",
+        ok,
+        (f"rc={rc}, "
+         f"materialize_pass={'[PASS] materialize_image_assets' in sout}, "
+         f"init_im_fail={'[FAIL] init_image_manifest' in sout}, "
+         f"asset_left={dst.exists()}, "
+         f"media_dir_left={media_dir.exists()}"
+         if not ok else ""),
+    )
+
+
+def _scenario_assets_dir_symlinked_parent_refused(td: Path) -> ScenarioResult:
+    """When a PARENT component inside ``--assets-dir`` is a symlink
+    pointing outside the assets directory (e.g.
+    ``<assets-dir>/media -> /tmp/outside``), the materialize step
+    must refuse before reading bytes. We stage a real PNG payload at
+    the resolved symlink target so the leaf would otherwise be
+    readable — only the per-component symlink walk gates the run.
+    The outside payload must never land in the workspace, no PPTX
+    must be produced, and init_image_manifest must be SKIPPED.
+
+    This is the regression gate for the symlinked-parent containment
+    issue: a leaf-only ``src.is_symlink()`` check (the pre-fix
+    behavior) misses parent-component symlinks because src itself is
+    not a symlink — only its ancestor is."""
+    fx = _build_fixture_with_image(td / "fx_symlinked_parent")
+    ws = td / "ws_symlinked_parent"
+    out = td / "symlinked_parent.pptx"
+    assets_dir = td / "symlinked_parent_assets"
+    assets_dir.mkdir()
+    outside = td / "symlinked_parent_outside"
+    outside.mkdir()
+    outside_payload = _MINIMAL_PNG_BYTES
+    (outside / "cover_accent.png").write_bytes(outside_payload)
+    # <assets-dir>/media -> outside. The leaf
+    # <assets-dir>/media/cover_accent.png is a regular file (via the
+    # symlink), but its PARENT component is a symlink — the
+    # per-component walk must refuse it before any bytes are copied.
+    (assets_dir / "media").symlink_to(outside)
+
+    rc, sout, _serr = _invoke_runner(
+        _args_from_fixture(fx, workspace=ws, output=out)
+        + ["--assets-dir", str(assets_dir)]
+    )
+    dst = ws / "media" / "cover_accent.png"
+    media_dir = ws / "media"
+    outside_payload_in_ws = False
+    if ws.exists():
+        for p in ws.rglob("*"):
+            if p.is_file() and not p.is_symlink():
+                try:
+                    if outside_payload in p.read_bytes():
+                        outside_payload_in_ws = True
+                        break
+                except OSError:
+                    pass
+    ok = (
+        rc != 0
+        and not out.exists()
+        and "[FAIL] materialize_image_assets" in sout
+        and "[SKIP] init_image_manifest" in sout
+        and not dst.exists()
+        and not media_dir.exists()
+        and not outside_payload_in_ws
+    )
+    return ScenarioResult(
+        "--assets-dir symlinked-parent containment: when "
+        "<assets-dir>/<parent> is a symlink pointing outside the "
+        "assets directory, materialize_image_assets refuses before "
+        "reading bytes; no outside payload lands in the workspace; "
+        "no PPTX is produced; init_image_manifest is SKIPPED",
+        ok,
+        (f"rc={rc}, "
+         f"materialize_fail={'[FAIL] materialize_image_assets' in sout}, "
+         f"init_im_skip={'[SKIP] init_image_manifest' in sout}, "
+         f"dst_exists={dst.exists()}, "
+         f"media_dir_exists={media_dir.exists()}, "
+         f"outside_payload_in_ws={outside_payload_in_ws}"
+         if not ok else ""),
+    )
+
+
+def _scenario_assets_dir_happy_path(td: Path) -> ScenarioResult:
+    """One ``run_explicit_pipeline.py`` invocation with ``--assets-dir``
+    completes the cascade end-to-end when caller-staged asset bytes are
+    placed at ``<assets-dir>/<local_path>`` for every entry declared in
+    ``--image-manifest-spec``. Stage-1-to-6 includes a new
+    materialize_image_assets step between init_slide_plans and
+    init_image_manifest; Stage-7-to-10 then produces the PPTX as usual."""
+    fx = _build_fixture_with_image(td / "fx_assets_dir")
+    ws = td / "ws_assets_dir"
+    out = td / "assets_dir.pptx"
+    assets_dir = td / "assets_dir"
+    assets_dir.mkdir()
+    # Pre-stage one PNG byte payload at the manifest-declared local_path.
+    asset_target = assets_dir / "media" / "cover_accent.png"
+    asset_target.parent.mkdir(parents=True, exist_ok=True)
+    asset_target.write_bytes(_MINIMAL_PNG_BYTES)
+    rc, sout, _serr = _invoke_runner(
+        _args_from_fixture(fx, workspace=ws, output=out)
+        + ["--assets-dir", str(assets_dir)]
+    )
+    workspace_asset = ws / "media" / "cover_accent.png"
+    ok = (
+        rc == 0
+        and out.is_file()
+        and out.stat().st_size > 0
+        and "OK: explicit-input end-to-end run succeeded" in sout
+        and "[PASS] materialize_image_assets" in sout
+        and "[PASS] init_image_manifest" in sout
+        and workspace_asset.is_file()
+        and workspace_asset.read_bytes() == _MINIMAL_PNG_BYTES
+    )
+    return ScenarioResult(
+        "--assets-dir happy path: caller-staged asset bytes are copied "
+        "from <assets-dir>/<local_path> into <workspace>/<local_path> "
+        "between init_slide_plans (Stage 5) and init_image_manifest "
+        "(Stage 6); one run_explicit_pipeline invocation produces a "
+        "validated PPTX with no failure / recovery dance",
+        ok,
+        (f"rc={rc}, "
+         f"out_size={out.stat().st_size if out.is_file() else 0}, "
+         f"materialize_marker={'[PASS] materialize_image_assets' in sout}, "
+         f"init_im_marker={'[PASS] init_image_manifest' in sout}, "
+         f"asset_exists={workspace_asset.is_file()}, "
+         f"asset_bytes_match="
+         f"{workspace_asset.is_file() and workspace_asset.read_bytes() == _MINIMAL_PNG_BYTES}"
+         if not ok else ""),
+    )
+
+
 def _run_self_tests() -> list[ScenarioResult]:
     results: list[ScenarioResult] = []
     template_root = REPO_ROOT / "templates" / "layouts"
@@ -1056,6 +1654,10 @@ def _run_self_tests() -> list[ScenarioResult]:
         results.append(_scenario_marker_phrase_isolation(td))
         results.append(_scenario_determinism(td))
         results.append(_scenario_inventory_written_with_report_dir(td))
+        results.append(_scenario_assets_dir_happy_path(td))
+        results.append(_scenario_assets_dir_within_stage_rollback(td))
+        results.append(_scenario_assets_dir_cross_stage_rollback(td))
+        results.append(_scenario_assets_dir_symlinked_parent_refused(td))
     return results
 
 

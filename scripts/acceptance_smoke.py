@@ -42,12 +42,25 @@ Post-conditions (asserted only after every stage above has passed):
 
 **This is MVP acceptance smoke only — NOT full prompt/report/Markdown-to-
 PPTX automation.** Every Stage-1-to-6 artifact's content still comes
-from the bundle's already-authored JSON spec files; the smoke script
-never extracts business content from ``input/source.md``, never
-generates any image / spec / slide body, never calls any public network
-/ telemetry / external service / model API, and never modifies files
-inside the repo (every output lands under ``--output-root`` or an
-auto-created temporary directory).
+from the bundle's already-authored JSON spec files; in live mode
+(``run_smoke`` against ``--bundle``) the smoke script never extracts
+business content from ``input/source.md``, never generates any image /
+spec / slide body, never calls D-One / Qoder / any public network /
+image generation / telemetry / external service / model API, and never
+modifies files inside the repo (every output lands under
+``--output-root`` or an auto-created temporary directory). The
+``--self-test`` image-asset chain scenario (described below) delegates
+to ``scripts/image_asset_acceptance_smoke.py --self-test`` which DOES
+emit a single fixed magic-byte synthetic PNG payload (the delegated
+smoke's synthetic bundle declares exactly one ``cover_accent`` image
+at ``media/cover_accent.png``; ``run_d_one_generation`` in
+``--allow-synthetic-bytes`` mode supports both PNG and JPEG, but this
+smoke only exercises PNG today) under its own
+``tempfile.TemporaryDirectory()`` — strictly local: no real D-One
+call, no MCP, no public network, no model API, no image search, no
+Qoder, no external service. The parent self-test never mutates files
+under ``REPO_ROOT/examples/`` (final snapshot-diff scenario asserts
+this).
 
 Fail-closed: any stage exiting non-zero, or any post-condition failing,
 aborts the smoke immediately and the script exits non-zero with a clear
@@ -64,11 +77,58 @@ invalid bundle directory (missing required file); preflight failure
 ``<output_root>/workspace/``); PPTX-contract failure (injected stage 3
 exit-1); inventory-post-condition failure (manufactured bad
 inventory.json: ok=false / findings non-empty / wrong basis / wrong
-slide_count); visual-quality failure (injected stage 4 exit-1);
-inventory determinism (re-running ``inspect_pptx_inventory.py`` on the
-happy-path PPTX produces byte-identical inventory bytes); and a
-snapshot-diff that proves no file under ``REPO_ROOT/examples/`` was
-mutated by any scenario.
+slide_count); visual-quality failure (injected stage 4 exit-1); the
+image-asset chain smoke (delegates to
+``scripts/image_asset_acceptance_smoke.py --self-test``, which exercises
+the explicit-input acceptance path with a synthetic two-slide bundle:
+the d_one chain runs against a *staging* workspace
+(``init_workspace`` + hand-written ``image_manifest.json`` per the
+*direct-author workflow* at ``scripts/materialize_image_assets.py:14-47``)
+through ``done_image_adapter`` -> ``run_d_one_generation`` (mock
+``--allow-synthetic-bytes`` provider, fixed magic-byte-valid PNG
+payload for the single ``cover_accent`` image declared in the
+synthetic bundle; the runner also supports JPEG but this smoke does
+not exercise it) -> ``materialize_image_assets`` (copy branch); then
+``scripts/run_explicit_pipeline.py --assets-dir <staging>`` is
+invoked once against a fresh *production* workspace + the same
+d_one_local bundle and is expected to return rc=0. The staging
+workspace already carries the materialized PNG bytes at
+``<staging>/<local_path>``, so the orchestrator's
+materialize_image_assets step (inserted between Stage 5 and Stage 6
+when ``--assets-dir`` is passed) copies the bytes into the production
+workspace before ``init_image_manifest`` (Stage 6) runs; the cascade
+then completes Stages 1-10 in a single shot — no expected failure,
+no manual recovery, no fallback to the Stage-7-to-10 prepared-
+workspace runner. The delegated smoke adds
+``scripts/validate_pptx_contract.py --expected-slide-count N`` +
+``scripts/validate_visual_quality.py --workspace ... --output
+<report-dir>/visual_quality.json`` as belt-and-braces validators and
+asserts a SEPARATE post-condition contract on the produced artifacts:
+the final ``.pptx`` exists as a non-empty regular non-symlink file,
+embeds at least one ``ppt/media/<file>`` part whose extension is
+``.png`` / ``.jpg`` / ``.jpeg``, carries no ``.rels`` Target with a
+URI scheme prefix and no ``TargetMode='External'`` relationship; the
+``<report-dir>/inventory.json`` parses with ``ok == True`` /
+``findings == []`` / ``slide_count == len(deck_plan.slides)`` /
+``len(media_parts) > 0`` / ``evidence_basis`` exactly equal to
+``"OOXML structure only; not proof of full PowerPoint editability"``;
+and ``<report-dir>/visual_quality.json`` exists as a regular
+non-symlink file under the temp report directory and parses as JSON.
+The delegated smoke also asserts the explicit-pipeline output
+contains every documented success marker (``OK: explicit-input
+end-to-end run succeeded``, ``[PASS] materialize_image_assets``,
+``[PASS] init_image_manifest``) and NO expected-failure / recovery
+wording, statically refuses any reference to the Stage-7-to-10
+prepared-workspace runner in its own source body, and re-snapshots
+``REPO_ROOT/examples/`` to refuse any byte-level change. **MOCK /
+stub acceptance only — NOT real D-One integration; no public
+network, no MCP, no model API, no image search, no Qoder.** This
+scenario passes/fails the parent self-test on the delegated smoke's
+exit code and a substring check on its stdout banner; the parent
+does NOT re-verify the delegated post-conditions); inventory determinism (re-running
+``inspect_pptx_inventory.py`` on the happy-path PPTX produces
+byte-identical inventory bytes); and a snapshot-diff that proves no
+file under ``REPO_ROOT/examples/`` was mutated by any scenario.
 
 Stdlib-only.
 """
@@ -792,8 +852,11 @@ def main(argv: list[str]) -> int:
             "Run the in-script tempfixture scenarios (happy path; "
             "missing / invalid bundle; preflight / pipeline / "
             "pptx-contract / inventory-post-condition / visual-quality "
-            "failures; inventory determinism; no-mutation snapshot of "
-            "examples/). Mutually exclusive with the orchestration "
+            "failures; image-asset D-One-stub chain smoke "
+            "(scripts/image_asset_acceptance_smoke.py --self-test; "
+            "MOCK / stub acceptance only — NOT real D-One "
+            "integration); inventory determinism; no-mutation snapshot "
+            "of examples/). Mutually exclusive with the orchestration "
             "flags so a caller cannot accidentally run the live smoke "
             "and the self-test at the same time."
         ),
@@ -1204,6 +1267,95 @@ def _scenario_inventory_post_condition_failure(td: Path) -> ScenarioResult:
     )
 
 
+def _scenario_image_asset_chain(td: Path) -> ScenarioResult:
+    """Invoke ``scripts/image_asset_acceptance_smoke.py --self-test`` as
+    a subprocess so the existing-input authoring-trial smoke and the
+    D-One-stub chain smoke share one verification entry point.
+
+    The invoked script runs entirely under its own
+    ``tempfile.TemporaryDirectory()``. The chain it exercises:
+
+      1. d_one chain in a *staging* workspace (init_workspace +
+         hand-written ``image_manifest.json`` with ``d_one_local``
+         entries — the direct-author workflow at
+         scripts/materialize_image_assets.py:14–47) ->
+         ``done_image_adapter`` -> ``run_d_one_generation``
+         (``--allow-synthetic-bytes``) -> ``materialize_image_assets``;
+      2. ``scripts/run_explicit_pipeline.py --assets-dir <staging>``
+         against a fresh *production* workspace + the same
+         ``d_one_local`` bundle: the orchestrator's
+         materialize_image_assets step (Stage 5.5, only present when
+         ``--assets-dir`` is passed) copies the staged bytes from
+         ``<staging>/<local_path>`` into
+         ``<workspace>/<local_path>`` so init_image_manifest (Stage 6)
+         finds them, and the cascade then completes Stages 1-10 in one
+         invocation with rc=0 — no expected failure, no manual
+         recovery;
+      3. belt-and-braces ``scripts/validate_pptx_contract.py
+         --expected-slide-count N`` + ``scripts/validate_visual_quality.py
+         --output <report-dir>/visual_quality.json``;
+      4. post-conditions: PPTX embeds at least one
+         ppt/media/<file>.{png|jpg|jpeg}, no external / file:// /
+         data: relationships, inventory.json ok=true / findings=[] /
+         slide_count == len(deck_plan.slides) / media_parts non-empty
+         / exact evidence_basis line; visual_quality.json exists as
+         a regular non-symlink file and parses as JSON; the
+         explicit-pipeline output carries every success marker and NO
+         expected-failure / recovery wording.
+
+    **Mock / stub acceptance only — NOT real D-One integration.** The
+    invoked script's own examples/-snapshot gate proves no generated
+    artifact lands in any committed example directory; we don't
+    double-check it here. ``td`` is unused (the invoked script owns
+    its own tempdir) — kept in the signature so this scenario matches
+    the other ``td``-receiving scenarios in the suite."""
+    del td  # invoked script owns its own tempdir
+    rc, captured = _invoke_image_asset_smoke()
+    ok = (
+        rc == 0
+        and "image-asset acceptance smoke passed" in captured
+        and "MOCK D-One chain only" in captured
+        and "Traceback (most recent call last)" not in captured
+    )
+    return ScenarioResult(
+        "image-asset chain: d_one_local image_manifest entries -> "
+        "done_image_adapter -> run_d_one_generation (mock --allow-"
+        "synthetic-bytes) -> materialize_image_assets -> "
+        "run_explicit_pipeline.py --assets-dir <staging> (one shot, "
+        "rc=0; materialize_image_assets step + init_image_manifest "
+        "both PASS) -> validate_pptx_contract -> "
+        "validate_visual_quality -> inventory passes end-to-end; "
+        "PPTX embeds ppt/media PNG; no external / file:// / data: "
+        "rels; inventory ok=true / findings=[] / slide_count matches "
+        "deck_plan / media_parts non-empty / exact evidence_basis "
+        "line; visual_quality.json exists and parses. MOCK / stub "
+        "acceptance only — NOT real D-One integration",
+        ok,
+        (f"rc={rc}, "
+         f"captured_tail={captured.splitlines()[-5:]!r}"
+         if not ok else ""),
+    )
+
+
+def _invoke_image_asset_smoke() -> tuple[int, str]:
+    """Spawn scripts/image_asset_acceptance_smoke.py --self-test as a
+    subprocess. Returns ``(returncode, combined_stdout_stderr)``."""
+    cmd = [
+        sys.executable,
+        str(SCRIPTS_DIR / "image_asset_acceptance_smoke.py"),
+        "--self-test",
+    ]
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    proc = subprocess.run(
+        cmd,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
 def _scenario_visual_quality_failure(td: Path) -> ScenarioResult:
     """Inject a stage-4 (validate_visual_quality) failure. Stages 1-3
     are also overridden to pass instantly so the test does not run the
@@ -1512,6 +1664,7 @@ def _run_self_tests() -> int:
         results.append(_scenario_pptx_contract_failure(td))
         results.append(_scenario_inventory_post_condition_failure(td))
         results.append(_scenario_visual_quality_failure(td))
+        results.append(_scenario_image_asset_chain(td))
         # Direct-call probes of _validate_output_root's
         # refused-top-level-directory branch. These exercise the
         # diagnostic without invoking the real pipeline so they are

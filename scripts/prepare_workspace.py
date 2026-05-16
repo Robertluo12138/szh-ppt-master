@@ -34,7 +34,26 @@ comes from the caller via flags or JSON spec files:
   - the slide bodies come from ``--slide-specs-dir`` (a directory of
     ``slide_plan`` JSON candidates);
   - the image manifest comes from ``--image-manifest-spec`` (an
-    ``image_manifest`` JSON candidate).
+    ``image_manifest`` JSON candidate);
+  - asset bytes (optional) come from ``--assets-dir <dir>``. When
+    supplied, the orchestrator inserts a deterministic copy step
+    between Stage 5 (``init_slide_plans``) and Stage 6
+    (``init_image_manifest``) that copies
+    ``<assets-dir>/<local_path>`` bytes into
+    ``<workspace>/<local_path>`` for every ``images[].local_path``
+    declared in ``--image-manifest-spec``. Asset bytes are caller-
+    supplied; the orchestrator does NOT generate, fetch, or otherwise
+    invent them. Refuses symlinks at source and refuses to overwrite
+    any pre-existing file at destination. The materialize step is the
+    one stage whose writes the orchestrator unwinds on a downstream
+    failure (defense in depth above each helper's per-stage rollback):
+    if it succeeded but a later stage failed, every file + directory
+    it created is removed so the workspace does not retain orphaned
+    asset bytes from a failed prep run. A within-stage failure
+    (missing source for image N, symlink at destination, copy error,
+    ...) is rolled back by the materialize helper itself before it
+    returns. Without ``--assets-dir`` the cascade runs the original
+    six stages unchanged.
 
 The orchestrator NEVER:
 
@@ -52,11 +71,16 @@ The orchestrator NEVER:
 
 Fail-closed semantics: the first stage that returns a non-zero exit
 code halts the orchestration; every downstream stage is marked SKIPPED
-and is NOT run. Each stage helper owns its own rollback contract — the
-orchestrator does not roll back earlier-stage artifacts when a later
-stage fails (the same as running the helpers manually one at a time).
-A caller who needs a clean retry should delete the workspace directory
-(or fix the failing input and rerun from the failing stage manually).
+and is NOT run. Each Stage-1-through-6 init_* helper owns its own
+rollback contract — the orchestrator does not roll back earlier-stage
+artifacts when a later stage fails (the same as running the helpers
+manually one at a time). The one exception is the optional
+materialize_image_assets step (only present when ``--assets-dir`` is
+supplied): it is an orchestration intermediate rather than a public
+CLI helper, so the orchestrator additionally unwinds its writes when
+ANY later stage fails — see the asset-bytes bullet above. A caller
+who needs a clean retry should delete the workspace directory (or
+fix the failing input and rerun from the failing stage manually).
 
 Stdlib-only. Deterministic — every stage helper is deterministic, so
 two runs from byte-identical inputs into two different empty
@@ -66,6 +90,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -83,6 +109,294 @@ from init_deck_plan import init_deck_plan  # noqa: E402
 from init_design_system import init_design_system  # noqa: E402
 from init_slide_plans import init_slide_plans  # noqa: E402
 from init_image_manifest import init_image_manifest  # noqa: E402
+from validate_scaffold import local_path_is_safe, _resolves_within  # noqa: E402
+
+_URI_SCHEME_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
+
+
+def _new_dirs_to_create(workspace: Path, dst: Path) -> list[Path]:
+    """Return parents of ``dst`` inside ``workspace`` that do not yet
+    exist on disk, top-down (closest-to-workspace first). Caller
+    ``mkdir``s each entry in order; rollback removes them in reverse so
+    children are unwound before parents.
+
+    Stops at ``workspace`` so the workspace itself is never returned
+    (workspace must already exist — ``init_workspace`` created it) and
+    so a rollback cannot ``rmdir`` it."""
+    to_create: list[Path] = []
+    cur = dst.parent
+    while cur != workspace and not cur.exists():
+        to_create.insert(0, cur)
+        next_parent = cur.parent
+        if next_parent == cur:
+            # Defensive: we've hit the filesystem root without finding
+            # the workspace. Stop walking — this scenario should never
+            # arise because dst is inside workspace by construction.
+            break
+        cur = next_parent
+    return to_create
+
+
+def _walk_for_symlinks(base: Path, rel_parts: tuple[str, ...]) -> Path | None:
+    """Walk each component from ``base`` (exclusive) down through
+    ``rel_parts`` (inclusive). Return the first symlink encountered,
+    or ``None`` if no component on the path is a symlink. The caller
+    must have already gated ``base`` itself with ``is_symlink``.
+
+    Uses ``Path.is_symlink()`` per component without resolving — so a
+    symlink at depth N is caught DIRECTLY rather than only indirectly
+    via the resolved final-path containment check. This catches the
+    case where ``<assets-dir>/<parent>`` is a symlink (e.g.
+    ``<assets-dir>/media -> /tmp/outside``): the leaf
+    ``<assets-dir>/media/<id>.png`` is not itself a symlink, so a
+    leaf-only ``is_symlink()`` check would miss it. A non-existent
+    component reports ``is_symlink()`` as False, so the walk
+    tolerates missing leaves — the downstream ``is_file()`` check
+    handles those."""
+    cur = base
+    for part in rel_parts:
+        cur = cur / part
+        if cur.is_symlink():
+            return cur
+    return None
+
+
+def _undo_materialize_writes(
+    paths: list[tuple[str, Path]],
+) -> None:
+    """Best-effort rollback of paths the materialize_image_assets step
+    created (in reverse order so children are removed before parents).
+    Files are ``unlink``-ed; directories are ``rmdir``-ed (succeeds only
+    if empty, which is the invariant — we only ever ``mkdir`` dirs that
+    did not exist before this run). Symlinks at either kind are skipped
+    so a malicious mid-run swap cannot trick rollback into following
+    them. ``OSError`` during rollback is swallowed so it cannot mask
+    the original failure diagnostic."""
+    for kind, p in reversed(paths):
+        try:
+            if kind == "file":
+                if p.is_file() and not p.is_symlink():
+                    p.unlink()
+            elif kind == "dir":
+                if p.is_dir() and not p.is_symlink():
+                    p.rmdir()
+        except OSError:
+            pass
+
+
+def _stage_image_assets(
+    *,
+    workspace: Path,
+    image_manifest_spec: Path,
+    assets_dir: Path,
+    created_paths_out: list[tuple[str, Path]] | None = None,
+) -> tuple[int, str]:
+    """Copy caller-staged asset bytes from ``<assets_dir>/<local_path>``
+    into ``<workspace>/<local_path>`` for every ``images[].local_path``
+    declared in ``--image-manifest-spec``.
+
+    Inserted between Stage 5 (``init_slide_plans``) and Stage 6
+    (``init_image_manifest``) when ``--assets-dir`` is supplied: Stage 1
+    (``init_workspace``) refuses a non-empty workspace, so asset bytes
+    cannot be pre-positioned before Stage 1 fires; this prep step is the
+    deterministic place where caller-supplied bytes are dropped into the
+    workspace before ``init_image_manifest``'s ``local_path``-existence
+    gate runs.
+
+    Refuses symlinks at source, refuses to overwrite a pre-existing file
+    at destination, applies ``local_path_is_safe`` + ``_resolves_within``
+    to every declared ``local_path`` (defense in depth — the same gate
+    ``init_image_manifest`` re-applies to the manifest it actually
+    writes), creates any parent directories the destination needs.
+
+    Rollback contract:
+
+      - **Within-stage**: a mid-iteration failure (missing source for
+        image N, symlink at destination, copy ``OSError``, ...) rolls
+        back every file the helper has copied AND every parent
+        directory it created so far in this call. On a non-zero return
+        the workspace is byte-identical to its pre-call state.
+      - **Cross-stage**: when the helper succeeds it appends every
+        ``(kind, path)`` it created to ``created_paths_out`` (when
+        supplied). The caller (``prepare_workspace``) walks that list
+        in reverse and unwinds it if any later stage fails, so a
+        failed prep run never leaves orphaned asset bytes in the
+        workspace.
+
+    Does NOT generate image bytes, call any network, invoke D-One /
+    Qoder, or modify files outside ``--workspace``."""
+    if _URI_SCHEME_PREFIX.match(str(assets_dir)):
+        return 2, (
+            f"FAIL: --assets-dir {assets_dir} looks like a URI; "
+            f"prepare_workspace only accepts local directory paths"
+        )
+    if assets_dir.is_symlink():
+        return 2, (
+            f"FAIL: --assets-dir {assets_dir} is a symlink; refusing to "
+            f"follow it. Pass a regular directory path."
+        )
+    if not assets_dir.is_dir():
+        return 2, (
+            f"FAIL: --assets-dir {assets_dir} is not a directory"
+        )
+
+    if image_manifest_spec.is_symlink():
+        return 2, (
+            f"FAIL: --image-manifest-spec {image_manifest_spec} is a "
+            f"symlink; refusing to follow it."
+        )
+    if not image_manifest_spec.is_file():
+        return 2, (
+            f"FAIL: --image-manifest-spec {image_manifest_spec} is not "
+            f"a regular file"
+        )
+    try:
+        spec = json.loads(image_manifest_spec.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return 2, (
+            f"FAIL: --image-manifest-spec {image_manifest_spec} did not "
+            f"parse as JSON: {exc}"
+        )
+    if not isinstance(spec, dict):
+        return 2, (
+            f"FAIL: --image-manifest-spec {image_manifest_spec} did not "
+            f"decode to an object (got {type(spec).__name__})"
+        )
+    images = spec.get("images") or []
+    if not isinstance(images, list):
+        return 2, (
+            f"FAIL: --image-manifest-spec.images must be a list "
+            f"(got {type(images).__name__})"
+        )
+
+    # Track every file + directory this call creates. On any failure
+    # path below, we roll back this list in reverse before returning
+    # rc != 0 so the workspace is byte-identical to its pre-call state.
+    # On success, the caller (prepare_workspace) gets this list via
+    # ``created_paths_out`` so it can unwind us if a later stage fails.
+    local_created: list[tuple[str, Path]] = []
+
+    for i, img in enumerate(images):
+        if not isinstance(img, dict):
+            _undo_materialize_writes(local_created)
+            return 1, (
+                f"FAIL: --image-manifest-spec.images[{i}] is not an "
+                f"object (got {type(img).__name__})"
+            )
+        local_path = img.get("local_path")
+        img_id = img.get("id")
+        if not isinstance(local_path, str) or not local_path:
+            _undo_materialize_writes(local_created)
+            return 1, (
+                f"FAIL: --image-manifest-spec.images[{i}] (id "
+                f"{img_id!r}): local_path must be a non-empty string "
+                f"(got {type(local_path).__name__})"
+            )
+        if not local_path_is_safe(local_path):
+            _undo_materialize_writes(local_created)
+            return 1, (
+                f"FAIL: --image-manifest-spec.images[{i}] (id "
+                f"{img_id!r}): local_path {local_path!r} is not a safe "
+                f"workspace-relative path"
+            )
+        if not _resolves_within(workspace, local_path):
+            _undo_materialize_writes(local_created)
+            return 1, (
+                f"FAIL: --image-manifest-spec.images[{i}] (id "
+                f"{img_id!r}): local_path {local_path!r} escapes "
+                f"--workspace after resolution"
+            )
+        src = assets_dir / local_path
+        # Per-component symlink walk from assets_dir (already gated
+        # above) down through every part of local_path INCLUDING the
+        # leaf. A leaf-only ``src.is_symlink()`` check would miss the
+        # case where a PARENT component inside assets_dir is a symlink
+        # pointing outside (e.g. ``<assets-dir>/media -> /tmp/outside``)
+        # — the leaf is not a symlink, only its parent is — so the
+        # bytes copied would not actually live under --assets-dir.
+        # Refuse any symlink at any depth.
+        offender = _walk_for_symlinks(assets_dir, Path(local_path).parts)
+        if offender is not None:
+            try:
+                target = str(offender.readlink())
+            except OSError:
+                target = "<unreadable>"
+            _undo_materialize_writes(local_created)
+            return 2, (
+                f"FAIL: source asset path component {offender} is a "
+                f"symlink (-> {target}); refusing to follow it"
+            )
+        # Belt-and-braces resolution check: after the per-component
+        # walk passes, ``src.resolve()`` must still land under
+        # ``assets_dir.resolve()``. Catches odd path shapes that
+        # escape after ``Path.resolve()`` even when no component
+        # looked like a symlink during the walk above.
+        if not _resolves_within(assets_dir, local_path):
+            _undo_materialize_writes(local_created)
+            return 2, (
+                f"FAIL: source asset {src} escapes --assets-dir "
+                f"({assets_dir}) after resolution"
+            )
+        if not src.is_file():
+            _undo_materialize_writes(local_created)
+            return 2, (
+                f"FAIL: source asset {src} for image id {img_id!r} is "
+                f"missing or not a regular file"
+            )
+        dst = workspace / local_path
+        if dst.is_symlink():
+            _undo_materialize_writes(local_created)
+            return 2, (
+                f"FAIL: destination {dst} is a symlink; refusing to "
+                f"follow it"
+            )
+        if dst.exists():
+            _undo_materialize_writes(local_created)
+            return 2, (
+                f"FAIL: destination {dst} already exists; refusing to "
+                f"overwrite"
+            )
+        # Materialize parent dirs THIS call creates so they can be
+        # rolled back. Pre-existing dirs are untouched.
+        new_dirs = _new_dirs_to_create(workspace, dst)
+        try:
+            for new_dir in new_dirs:
+                new_dir.mkdir()
+                local_created.append(("dir", new_dir))
+        except OSError as exc:
+            _undo_materialize_writes(local_created)
+            return 2, (
+                f"FAIL: creating parent directory for {dst} raised "
+                f"{type(exc).__name__}: {exc}"
+            )
+        # Track the destination BEFORE attempting the copy so a copy
+        # that raises mid-stream — after shutil.copy2 has already
+        # opened dst for writing and possibly streamed bytes into it —
+        # is still cleaned up. _undo_materialize_writes guards on
+        # is_file() + not is_symlink(), so when copy2 raises before
+        # creating dst (e.g. EACCES on open) the unlink is a no-op.
+        local_created.append(("file", dst))
+        try:
+            shutil.copy2(src, dst)
+        except OSError as exc:
+            _undo_materialize_writes(local_created)
+            return 2, (
+                f"FAIL: copying {src} -> {dst} raised "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    # Expose the created paths so the caller can unwind us on a later
+    # stage failure (cross-stage rollback). On rc != 0 above we returned
+    # before reaching here, so this only fires on full success.
+    if created_paths_out is not None:
+        created_paths_out.extend(local_created)
+
+    copied_files = [p for kind, p in local_created if kind == "file"]
+    return 0, (
+        f"OK: staged {len(copied_files)} image asset(s) into "
+        f"{workspace}: "
+        f"{[p.relative_to(workspace).as_posix() for p in copied_files]}"
+    )
 
 
 # Artifacts the orchestrator promises a successful run leaves behind.
@@ -153,6 +467,7 @@ def prepare_workspace(
     tone: str | None = None,
     language: str | None = None,
     approximate_slide_count: int | None = None,
+    assets_dir: Path | None = None,
 ) -> PrepareResult:
     """Run stages 1-6 in order, halting on the first non-zero exit code.
 
@@ -226,14 +541,44 @@ def prepare_workspace(
                 specs_dir=slide_specs_dir,
             ),
         ),
-        (
-            "init_image_manifest",
-            lambda: init_image_manifest(
-                workspace=workspace,
-                spec=image_manifest_spec,
-            ),
-        ),
     ]
+
+    # Optional asset-staging step: only present in the cascade when the
+    # caller supplied --assets-dir. Sits between Stage 5 (init_slide_plans)
+    # and Stage 6 (init_image_manifest) because init_workspace must have
+    # already created the workspace tree, and init_image_manifest's
+    # local_path-existence gate must run AFTER the bytes are on disk.
+    #
+    # ``materialize_paths`` collects every file + directory the helper
+    # creates on a successful run, so we can unwind those writes if a
+    # later stage (init_image_manifest) fails. Each init_* helper already
+    # owns its own rollback contract, but the materialize step's outputs
+    # are orchestration intermediates (no separate CLI helper writes
+    # them) — leaving them on disk after a failed prep run would orphan
+    # asset bytes the caller never asked to keep. The within-stage
+    # rollback inside ``_stage_image_assets`` handles a failure inside
+    # the materialize step itself; this list-based rollback handles a
+    # failure in a later stage AFTER materialize succeeded.
+    materialize_paths: list[tuple[str, Path]] = []
+
+    if assets_dir is not None:
+        stage_fns.append((
+            "materialize_image_assets",
+            lambda: _stage_image_assets(
+                workspace=workspace,
+                image_manifest_spec=image_manifest_spec,
+                assets_dir=assets_dir,
+                created_paths_out=materialize_paths,
+            ),
+        ))
+
+    stage_fns.append((
+        "init_image_manifest",
+        lambda: init_image_manifest(
+            workspace=workspace,
+            spec=image_manifest_spec,
+        ),
+    ))
 
     failed_at: str | None = None
     for name, fn in stage_fns:
@@ -254,6 +599,17 @@ def prepare_workspace(
         ))
         if rc != 0:
             failed_at = name
+
+    # Cross-stage rollback for the materialize_image_assets step. If
+    # materialize succeeded but a later stage failed, unwind the asset
+    # bytes the helper wrote so the workspace does not retain orphaned
+    # files from a failed prep run. When materialize itself fails it
+    # already rolled back its own writes (within-stage), so
+    # ``materialize_paths`` is empty in that case and this block is a
+    # no-op. When the whole cascade succeeds we also skip the unwind so
+    # the caller actually receives the materialized bytes.
+    if failed_at is not None and materialize_paths:
+        _undo_materialize_writes(materialize_paths)
 
     return result
 
@@ -713,6 +1069,165 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:
                 f"rc={proc.returncode}, stderr_tail={proc.stderr.strip().splitlines()[-3:] if proc.stderr.strip() else []}",
             ))
 
+    # 8. Copy-failure rollback. shutil.copy2 may have opened dst for
+    # writing and streamed bytes into it before raising. The materialize
+    # step's local_created list adds dst BEFORE the copy attempt so the
+    # rollback removes any partial file. Monkey-patch shutil.copy2 to
+    # simulate a mid-stream failure (write partial bytes, then raise)
+    # and verify the partial file does NOT survive the rollback.
+    original_copy2 = shutil.copy2
+
+    def _broken_copy2(src, dst, *args, **kwargs):
+        Path(dst).write_bytes(b"PARTIAL_FROM_FAILED_COPY")
+        raise OSError(28, "simulated mid-stream copy failure")
+
+    shutil.copy2 = _broken_copy2  # type: ignore[assignment]
+    try:
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            fixture = _build_fixture(td / "fx_partial_copy")
+            # Add one image to the manifest spec so materialize has
+            # work to do. (Slide plans don't reference it; that's
+            # allowed by init_image_manifest — declared images may go
+            # un-referenced.)
+            _write_json(fixture["image_manifest_spec"], {
+                "images": [
+                    {
+                        "id": "partial_test_img",
+                        "local_path": "media/partial_test_img.png",
+                        "source": "d_one_local",
+                        "alt_text": "Synthetic test image.",
+                        "intended_use": "spot illustration",
+                    },
+                ],
+            })
+            # Stage a source for the (patched, broken) copy to read.
+            assets_dir = td / "partial_assets"
+            (assets_dir / "media").mkdir(parents=True)
+            (assets_dir / "media" / "partial_test_img.png").write_bytes(
+                b"PNG_SOURCE_BYTES"
+            )
+            ws = td / "ws_partial"
+            result = prepare_workspace(
+                workspace=ws,
+                assets_dir=assets_dir,
+                **fixture,
+            )
+            partial_dst = ws / "media" / "partial_test_img.png"
+            media_dir = ws / "media"
+            materialize_outcome = next(
+                (s for s in result.stages
+                 if s.name == "materialize_image_assets"),
+                None,
+            )
+            ok = (
+                materialize_outcome is not None
+                and not materialize_outcome.ok
+                and "simulated mid-stream" in materialize_outcome.message
+                and not partial_dst.exists()
+                and not media_dir.exists()
+                and result.first_failure is not None
+                and result.first_failure.name == "materialize_image_assets"
+            )
+            results.append(_expect(
+                "copy-failure rollback: shutil.copy2 raising after "
+                "partially writing dst triggers rollback of the partial "
+                "file AND the parent dir the materialize step created; "
+                "no orphaned bytes remain in the workspace",
+                ok,
+                (f"materialize_msg={materialize_outcome.message if materialize_outcome else None}, "
+                 f"partial_dst_left={partial_dst.exists()}, "
+                 f"media_dir_left={media_dir.exists()}, "
+                 f"first_failure={result.first_failure.name if result.first_failure else None}"
+                 if not ok else ""),
+            ))
+    finally:
+        shutil.copy2 = original_copy2  # type: ignore[assignment]
+
+    # 9. Symlinked-parent containment. When a PARENT component inside
+    # --assets-dir is a symlink pointing OUTSIDE the assets directory
+    # (e.g. <assets-dir>/media -> /tmp/outside), the materialize step
+    # must refuse before reading any bytes. We stage a regular file at
+    # the symlink target so the leaf would otherwise be readable —
+    # only the per-component symlink walk gates the run. The outside
+    # payload must never land in the workspace.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        fixture = _build_fixture(td / "fx_symlinked_parent")
+        _write_json(fixture["image_manifest_spec"], {
+            "images": [
+                {
+                    "id": "symlinked_parent_img",
+                    "local_path": "media/symlinked_parent_img.png",
+                    "source": "d_one_local",
+                    "alt_text": "Synthetic test image.",
+                    "intended_use": "spot illustration",
+                },
+            ],
+        })
+        outside = td / "outside_target"
+        outside.mkdir()
+        outside_payload = b"OUTSIDE_PAYLOAD_MUST_NOT_BE_COPIED"
+        (outside / "symlinked_parent_img.png").write_bytes(outside_payload)
+        assets_dir = td / "assets_with_symlinked_parent"
+        assets_dir.mkdir()
+        # <assets-dir>/media -> /tmp/.../outside_target. The leaf
+        # <assets-dir>/media/symlinked_parent_img.png is NOT itself a
+        # symlink — only its parent "media" is. A leaf-only
+        # is_symlink() check would miss this case; the per-component
+        # walk must catch it.
+        (assets_dir / "media").symlink_to(outside)
+        ws = td / "ws_symlinked_parent"
+        result = prepare_workspace(
+            workspace=ws,
+            assets_dir=assets_dir,
+            **fixture,
+        )
+        materialize_outcome = next(
+            (s for s in result.stages
+             if s.name == "materialize_image_assets"),
+            None,
+        )
+        dst = ws / "media" / "symlinked_parent_img.png"
+        media_dir = ws / "media"
+        # After the refusal, no bytes from the outside payload may
+        # appear anywhere in the workspace, and the workspace's
+        # media/ directory must not exist (the materialize step is
+        # the only thing that could have created it).
+        outside_payload_in_ws = False
+        if ws.exists():
+            for p in ws.rglob("*"):
+                if p.is_file() and not p.is_symlink():
+                    try:
+                        if outside_payload in p.read_bytes():
+                            outside_payload_in_ws = True
+                            break
+                    except OSError:
+                        pass
+        ok = (
+            materialize_outcome is not None
+            and not materialize_outcome.ok
+            and "symlink" in materialize_outcome.message.lower()
+            and not dst.exists()
+            and not media_dir.exists()
+            and not outside_payload_in_ws
+            and result.first_failure is not None
+            and result.first_failure.name == "materialize_image_assets"
+        )
+        results.append(_expect(
+            "symlinked-parent containment: <assets-dir>/media -> "
+            "/tmp/outside is refused before any bytes are read; the "
+            "outside payload never lands in the workspace; "
+            "init_image_manifest is SKIPPED",
+            ok,
+            (f"materialize_msg={materialize_outcome.message if materialize_outcome else None}, "
+             f"dst_exists={dst.exists()}, "
+             f"media_dir_exists={media_dir.exists()}, "
+             f"outside_payload_in_ws={outside_payload_in_ws}, "
+             f"first_failure={result.first_failure.name if result.first_failure else None}"
+             if not ok else ""),
+        ))
+
     return results
 
 
@@ -811,6 +1326,18 @@ def main(argv: list[str]) -> int:
              "init_image_manifest.",
     )
     parser.add_argument(
+        "--assets-dir", type=Path, default=None,
+        help="Optional directory of caller-staged image asset bytes "
+             "keyed by the relative paths declared in "
+             "--image-manifest-spec's images[].local_path. When passed, "
+             "the orchestrator inserts a materialize_image_assets step "
+             "between init_slide_plans (Stage 5) and init_image_manifest "
+             "(Stage 6) that copies <assets-dir>/<local_path> bytes into "
+             "<workspace>/<local_path> before init_image_manifest's "
+             "local_path-existence gate runs. Refuses symlinks at source, "
+             "refuses to overwrite at destination, generates nothing.",
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help="Run in-script tempfixture scenarios (happy path through "
              "Stage 6, per-stage failure short-circuits downstream "
@@ -818,7 +1345,14 @@ def main(argv: list[str]) -> int:
              "non-empty workspace refused, source-body marker phrase "
              "never copied beyond input/source.md, deterministic repeat "
              "runs produce byte-identical artifacts, prepared workspace "
-             "passes validate_workspace.py). Exits non-zero if any "
+             "passes validate_workspace.py, copy-failure rollback: "
+             "shutil.copy2 raising after partially writing dst removes "
+             "the partial file + parent dir so no orphaned bytes "
+             "remain, and symlinked-parent containment: a parent "
+             "component inside --assets-dir that is a symlink pointing "
+             "outside the assets directory is refused before any bytes "
+             "are read, so an outside payload at the resolved target "
+             "never lands in the workspace). Exits non-zero if any "
              "scenario does not behave as expected. Mutually exclusive "
              "with the orchestration flags.",
     )
@@ -831,7 +1365,7 @@ def main(argv: list[str]) -> int:
             args.tone, args.language, args.approximate_slide_count,
             args.plan_spec, args.design_system_spec,
             args.template_root, args.slide_specs_dir,
-            args.image_manifest_spec,
+            args.image_manifest_spec, args.assets_dir,
         )
         if any(v is not None for v in orchestration_args) or args.theme_from_template:
             print(
@@ -915,6 +1449,7 @@ def main(argv: list[str]) -> int:
         tone=args.tone,
         language=args.language,
         approximate_slide_count=args.approximate_slide_count,
+        assets_dir=args.assets_dir,
     )
 
     text = _format_result(result)
