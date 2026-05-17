@@ -585,6 +585,88 @@ python3 scripts/validate_visual_quality.py --self-test
 python3 scripts/verify_skill_package.py
 
 python3 scripts/verify_skill_package.py --self-test
+
+# Deterministic internal skill-package builder. Emits exactly one .zip
+# of the allow-listed package surface under dist/ (or --output PATH)
+# after scripts/verify_skill_package.py gates pass, then re-inspects
+# the produced archive against the same forbidden-member, doc-
+# reference, and allow-list gates. Shipped surface is an EXPLICIT
+# allow-list intersected with git ls-files (tracked only). Root files
+# allowed: SKILL.md / README.md / SECURITY.md. Root dirs allowed:
+# references / schemas / scripts / templates / examples. Everything
+# else — VCS/control metadata (.gitignore, .gitattributes,
+# .gitmodules, any future .git* control file), local-development
+# docs whose audience is in-repo AI agents (CLAUDE.md / AGENTS.md),
+# editor / OS junk — is excluded even when git ls-files reports it.
+# Untracked-not-ignored files are NOT shipped either, because they
+# would not survive a clean checkout / git archive. Archive is
+# deterministic: members in sorted POSIX order; per-member
+# date_time pinned to (1980, 1, 1, 0, 0, 0); per-member
+# create_system pinned to 3 (UNIX); per-member external_attr pinned
+# to 0o100644 << 16 (regular file, rw-r--r--); ZIP_DEFLATED at
+# compresslevel 6; no extra fields, no comments. Three post-write
+# gates: archive_no_forbidden re-runs G1 on the archive member name
+# list; archive_doc_references_present requires every
+# scripts/<name>.py and schemas/<name>.schema.json referenced by any
+# shipped doc (SKILL.md / README.md / CLAUDE.md / AGENTS.md /
+# references/*.md) to also be a member of the archive; and
+# archive_members_allow_listed requires every member's top-level
+# path component to be in the explicit package allow-list — defense
+# in depth against a future writer drift that would otherwise ship
+# .gitignore / CLAUDE.md / any other non-allow-listed file.
+# Writes to <output>.partial first and renames on success; any
+# pre-flight or post-write gate failure removes the partial / final
+# archive. Stale-archive hygiene: the output-path cleanup runs
+# BEFORE pre-flight, so a prior successful build's zip does NOT
+# survive a later failing pre-flight attempt at the same --output —
+# the on-disk state always reflects the latest build outcome.
+# Symlink at the output path itself is refused outright by the same
+# up-front cleanup. Parent-symlink policy is split by mode: for a
+# user-supplied --output a symlink at the parent directory is
+# INTENTIONALLY NOT refused (macOS /tmp is a symlink to /private/tmp
+# and refusing parent symlinks would make TMPDIR=/tmp unusable), but
+# in default-path mode (no --output) any symlinked path component
+# STRICTLY UNDER <root> on the way to the output's parent (e.g. a
+# symlinked <root>/dist/) IS refused outright — that path is not
+# canonical filesystem geometry; it can only have been planted by
+# the user or an attacker, and silently following it would let the
+# cleanup unlink + overwrite a file the symlink resolves to before
+# the build had even started. Does NOT call D-One / MCP / Qoder /
+# any public network / telemetry / model API / image search /
+# external service; does NOT change PPTX export behavior. Live
+# Qoder runtime import / runtime packaging remain UNVERIFIED here
+# (and TODO across the wider repo) — the produced zip is a static
+# archive whose loadability inside a Qoder runtime is not proven by
+# this builder. --self-test exercises 16 tempfixture scenarios;
+# outputs land in a sibling tempdir so the verifier never sees the
+# freshly-written zip; the baseline scenario tracks .gitignore /
+# CLAUDE.md / AGENTS.md and asserts those names are tracked but NOT
+# in the archive while every allow-listed root file IS; four direct
+# A3 negatives pin the .gitignore / .git* family / CLAUDE.md+
+# AGENTS.md / unknown-root-dir exclusions on the member level; a
+# select_package_members unit test exercises the filter directly;
+# one scenario pins the stale-archive-hygiene fix; one scenario
+# exercises main() end-to-end with a symlink at --output to pin the
+# fix for a CLI-path bypass where Path.resolve() in _resolve_output
+# had silently followed the symlink to its target before
+# _prepare_output_path saw it (Path.absolute() is used instead,
+# which does NOT follow symlinks); and one scenario exercises
+# main() end-to-end with NO --output and a symlink planted at
+# <root>/dist/ pointing at a sibling decoy directory — the cleanup
+# refuses the symlinked parent component BEFORE any unlink, the
+# decoy file at the symlink target is preserved byte-identical, and
+# the symlinked parent dir itself is left in place untouched. A
+# final scenario pins the write_deterministic_zip atomicity contract:
+# calling it directly with one regular source file followed by a
+# symlinked source file raises SystemExit on the per-source-file
+# symlink check, and the leftover <output>.partial — which would
+# otherwise survive on disk because tmp_path.replace(out_path) never
+# runs after a mid-write failure — is unlinked defensively before
+# the exception propagates (symlink-safe, best-effort cleanup) so
+# the caller is never left with a stale half-written archive.
+python3 scripts/package_skill.py
+
+python3 scripts/package_skill.py --self-test
 ```
 
 All commands exit non-zero if any check disagrees, including built-in negative cases (e.g. unsafe `http://` / `s3://` / `data:` paths must be rejected, dropping a required layout slot must be detected, an orphan slide_plan must be detected, a render_model that uses an unsupported `kind` must be rejected, the generator must fail closed on an unknown `image_ref`, an SVG preview missing for a render_model or carrying a `<foreignObject>` / unsafe `href` / `<text>` anchor outside the canvas must fail, an `.pptx` carrying an external relationship / `file://` Target / unexpected relationship `Type` / vbaProject / OLE / ActiveX part / all-image slide / no editable text / blank slide / external image rel / dangling image-rel Target / orphan `ppt/media/` part / `ppt/media/` part with an extension outside the embed allow-list / `<a:blip r:link="..."/>` linked-image reference anywhere in the package's content XML must be rejected). SVG-preview generation and validation are implemented for the supported primitive subset (`text`, `line`, `shape`, `image_slot`, `kpi`, `table`) and only run against render_models the generator produces today (the 10 supported layouts above); slides whose layout maps to the `chart_placeholder` primitive kind have no render_model and no SVG preview yet. The PPTX exporter covers the same 10 layouts and emits native editable shapes (text frames, connectors, preset shapes, `<a:tbl>` graphic frames); `image_slot` is rendered as a native `<p:pic>` for PNG / JPG / JPEG manifest entries (bytes copied into `ppt/media/imageN.<ext>` with a per-slide `image` relationship) and as a native placeholder rectangle with alt_text for every other extension (SVG / GIF / WebP embedding remains TODO). `validate_pptx_contract.py --pptx` reports a passing run as `OK (container + minimal-evidence)` and explicitly names the full-inventory editability, theme palette mapping, determinism, layout-scope, and primitive-scope checks that remain TODO; the `media.targets_internal`, `media.inventory`, and `media.embedded_only` gates are implemented and run on every `--pptx` invocation today. SVG repair, full PPTX coverage (`chart_placeholder`, SVG / GIF / WebP media embedding, full editability inventory), security scan, visual regression, and SVG / render-model coverage for the `chart_placeholder`-mapped layouts and primitive kind remain TODO until their scripts exist.
