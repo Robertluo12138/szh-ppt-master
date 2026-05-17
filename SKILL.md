@@ -540,6 +540,51 @@ python3 scripts/validate_visual_quality.py \
   --output /tmp/szh-ppt-master-smoke/8_page_visual_quality.html
 
 python3 scripts/validate_visual_quality.py --self-test
+
+# Packaging readiness check — verify-only, no zip emission today.
+# Runs five static fail-closed gates over the package surface
+# (git ls-files + git ls-files --others --exclude-standard, rooted
+# at --root or this repo): no generated artifacts (__pycache__,
+# *.pptx, pipeline_report.{json,txt}, inventory.json,
+# visual_quality.json, *.log/*.tmp, *.pem/*.key, .env / .env.*,
+# .DS_Store, dist/ / build/ / out/ / output/ / previews/ /
+# renders/ / exports/ / projects/ / .git/ / .claude/ anywhere in
+# the path); every scripts/*.py and schemas/*.schema.json
+# referenced by SKILL.md / README.md / CLAUDE.md / AGENTS.md /
+# references/*.md must (a) exist as a regular file on disk AND
+# (b) be tracked or staged for tracking (present in
+# git ls-files) — a docs-referenced file that exists only as
+# untracked-or-gitignored survives the surface enumerator's
+# untracked-not-ignored bucket but drops out of a clean
+# git archive / fresh checkout, so the gate fails closed with
+# an explicit "not tracked or staged for tracking" diagnostic;
+# no credential shape
+# (AKIA-key / PEM / JWT / Bearer-long / inline secret literal) in
+# any runtime DATA file (schemas/ / templates/ / examples/) —
+# scripts/*.py exempted because they ship adversarial deny-list
+# fixtures; no external URL (https?:// / s3:// / ftp:// / file://
+# / data:<lower>) in any runtime DATA file except the well-known
+# allow-list (JSON-Schema draft-07 $schema URL, W3C SVG / xlink
+# namespace URIs in examples/**/*.svg). The JSON-aware doc-key
+# skip (strings under description / title / $comment / default /
+# examples are documentation, not runtime references) is
+# RESTRICTED to schemas/*.json — templates/ and examples/ legit-
+# imately use those same key names as REAL content fields
+# (deck_brief.title, deck_plan.sections[].title,
+# template.description), so applying the skip there would let an
+# attacker hide a URL in a content field. Non-schema runtime
+# data files are text-scanned end-to-end. Does NOT call D-One /
+# MCP / Qoder / any public network / telemetry / model API /
+# image search / external service; does NOT change PPTX export
+# behavior; does NOT emit a zip. Live Qoder runtime import /
+# runtime packaging remain UNVERIFIED here (and TODO across the
+# wider repo).
+# --self-test exercises 40 tempfixture scenarios; each fixture is
+# its own ephemeral git repo so the tracked-or-staged check has a
+# real git ls-files to consult.
+python3 scripts/verify_skill_package.py
+
+python3 scripts/verify_skill_package.py --self-test
 ```
 
 All commands exit non-zero if any check disagrees, including built-in negative cases (e.g. unsafe `http://` / `s3://` / `data:` paths must be rejected, dropping a required layout slot must be detected, an orphan slide_plan must be detected, a render_model that uses an unsupported `kind` must be rejected, the generator must fail closed on an unknown `image_ref`, an SVG preview missing for a render_model or carrying a `<foreignObject>` / unsafe `href` / `<text>` anchor outside the canvas must fail, an `.pptx` carrying an external relationship / `file://` Target / unexpected relationship `Type` / vbaProject / OLE / ActiveX part / all-image slide / no editable text / blank slide / external image rel / dangling image-rel Target / orphan `ppt/media/` part / `ppt/media/` part with an extension outside the embed allow-list / `<a:blip r:link="..."/>` linked-image reference anywhere in the package's content XML must be rejected). SVG-preview generation and validation are implemented for the supported primitive subset (`text`, `line`, `shape`, `image_slot`, `kpi`, `table`) and only run against render_models the generator produces today (the 10 supported layouts above); slides whose layout maps to the `chart_placeholder` primitive kind have no render_model and no SVG preview yet. The PPTX exporter covers the same 10 layouts and emits native editable shapes (text frames, connectors, preset shapes, `<a:tbl>` graphic frames); `image_slot` is rendered as a native `<p:pic>` for PNG / JPG / JPEG manifest entries (bytes copied into `ppt/media/imageN.<ext>` with a per-slide `image` relationship) and as a native placeholder rectangle with alt_text for every other extension (SVG / GIF / WebP embedding remains TODO). `validate_pptx_contract.py --pptx` reports a passing run as `OK (container + minimal-evidence)` and explicitly names the full-inventory editability, theme palette mapping, determinism, layout-scope, and primitive-scope checks that remain TODO; the `media.targets_internal`, `media.inventory`, and `media.embedded_only` gates are implemented and run on every `--pptx` invocation today. SVG repair, full PPTX coverage (`chart_placeholder`, SVG / GIF / WebP media embedding, full editability inventory), security scan, visual regression, and SVG / render-model coverage for the `chart_placeholder`-mapped layouts and primitive kind remain TODO until their scripts exist.
