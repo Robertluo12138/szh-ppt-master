@@ -1123,10 +1123,11 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
         rec["approvals"]["per_image_review_refs"] = [
             {"id": "x_dummy", "decision": "pass"},
         ]
-        # But that orphan trips A16 — easier: drop reviews to satisfy A16
-        # the schema requires minItems: 1, so we keep an orphan and
-        # accept that A16 will fire. Instead test: rejected row missing
-        # rejection_reason still fires A12.
+        # But that orphan trips A16. The schema's minItems on
+        # per_image_review_refs is 0, so an empty array would also
+        # satisfy the schema; we keep an orphan here so the assertion
+        # focuses on A12: rejected row missing rejection_reason still
+        # fires A12 even when A16 also fires.
         rec["approvals"]["per_image_review_refs"] = [
             {"id": "cover_accent", "decision": "pass"},
         ]
@@ -1171,13 +1172,14 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
         for k in ("output_magic_label", "output_sha256",
                   "materialized_sha256"):
             req.pop(k, None)
-        # Drop reviews of the now-failed request: schema requires
-        # minItems:1, so reuse the id but mark decision=fail with
-        # cleanup_ref. But the row outcome != 'ok' so A16 sees
-        # ok_ids=empty AND review_ids={cover_accent} -> orphan. To keep
-        # the test minimal we accept that and expect BOTH gate_fired
-        # and the orphan-review errors; the test asserts the gate_fired
-        # one is present.
+        # Keep a review for the now-failed request: the schema's
+        # minItems on per_image_review_refs is 0, so an empty array
+        # would satisfy the schema; we reuse the id to leave A16
+        # firing alongside the target gate. The row outcome != 'ok'
+        # so A16 sees ok_ids=empty AND review_ids={cover_accent} ->
+        # orphan. To keep the test minimal we accept that and expect
+        # BOTH gate_fired and the orphan-review errors; the test
+        # asserts the gate_fired one is present.
         rec["approvals"]["per_image_review_refs"] = [
             {"id": "cover_accent", "decision": "pass"},
         ]
