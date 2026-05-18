@@ -283,7 +283,7 @@
         },
         "per_image_review_refs": {
           "type": "array",
-          "minItems": 1,
+          "minItems": 0,
           "items": {
             "type": "object",
             "required": ["id", "decision"],
@@ -310,7 +310,7 @@
               }
             }
           },
-          "description": "One row per image that reached outcome == 'ok'. M5 requires every such image to be reviewed; a missing row is itself a F17 condition."
+          "description": "One row per image that reached outcome == 'ok'. M5 requires every such image to be reviewed; a missing row is itself a F17 condition. For fully-failed runs where no request reached outcome == 'ok' (e.g. F1 allow-list miss before any live call; F4 vocabulary miss; F6 transport error on every request), this array MUST be empty per A16's set-equality (both sides empty). Earlier versions of this schema enforced minItems: 1 here, which was inconsistent with A16 for fully-failed runs (the schema forced at least one row but A16 required zero); minItems is now 0, so strict A16 is satisfiable in every case."
         },
         "cleanup_ref": {
           "type": "string",

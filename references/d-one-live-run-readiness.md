@@ -240,7 +240,17 @@ does not flip the §1 status from UNVERIFIED to VERIFIED.
 - **A16 — Per-image-review coverage.** The set of
   `approvals.per_image_review_refs[*].id` values MUST exactly equal
   the set of `requests[*].id` values whose `outcome == "ok"` —
-  no missing review row, no orphan review row.
+  no missing review row, no orphan review row, no duplicate review
+  row. For fully-failed runs where no request reached
+  `outcome == "ok"` (e.g. F1 allow-list miss before any live call;
+  F4 vocabulary miss; F6 transport error on every request), both
+  sides of the equality are empty and the record MUST carry
+  `approvals.per_image_review_refs: []`. The schema's `minItems` on
+  that array is `0` for exactly this case (an earlier draft of the
+  schema had `minItems: 1`, which made A16 unsatisfiable for
+  fully-failed runs — the schema forced at least one row but A16
+  required zero; the schema was relaxed in a paired change so
+  strict A16 is now satisfiable in every case).
 - **A17 — Materialized hash matches output hash.** For every request
   where both `output_sha256` and `materialized_sha256` are present,
   they MUST be byte-identical. A mismatch is itself a F12 / F13
