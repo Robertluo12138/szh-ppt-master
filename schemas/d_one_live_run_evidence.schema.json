@@ -1,0 +1,326 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "d_one_live_run_evidence.schema.json",
+  "title": "D-One Live-Run Evidence Record",
+  "description": "Contract sketch for a future audit record produced by a real-D-One run. NOT wired into runtime today: no script in this repo reads or writes a record in this shape, scripts/run_d_one_generation.py has no --audit-out flag, and there has never been a live run. The schema ships only so references/d-one-live-run-readiness.md can point at concrete field names; flipping the readiness checklist's status from UNVERIFIED to VERIFIED requires the wiring TODOs in references/d-one-live-integration-design.md (§13) to be resolved under separate explicit user requests. Strict on shape: additionalProperties: false at every level; mode locked to 'live' so a dry-run plan is never accidentally read as an audit record; note pattern carries a self-describing sentinel; bytes are recorded as sha256 + length only (no raw prompt text, no raw output bytes, no customer identifiers, no credentials, no absolute paths, no URLs).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "mode",
+    "note",
+    "runner_version",
+    "endpoint_label",
+    "disable_switch_state",
+    "operator_label",
+    "clock_label",
+    "plan_sha256",
+    "plan_request_count",
+    "assets_dir_label",
+    "run_outcome",
+    "requests",
+    "approvals"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [1],
+      "description": "Record-file schema version. Locked to integer 1 today. Bumped only with a paired wiring change so a future audit-record validator can refuse a shape it does not recognize."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["live"],
+      "description": "Evidence the record was produced by a live-D-One run. The enum lock distinguishes the record from the dry-run plan in schemas/d_one_adapter_plan.schema.json whose mode is 'dry_run'. A future mock-shaped record (if one is ever introduced) must bump schema_version and extend this enum (a paired change)."
+    },
+    "note": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9 .,;!?()\\-]*D-One live-run evidence record[A-Za-z0-9 .,;!?()\\-]*$",
+      "description": "Self-describing audit note. Must contain the literal 'D-One live-run evidence record' so the file is identifiable as an audit record even when read out of context. The surrounding text (if any) is locked to a tight whitelist — ASCII letters, digits, spaces, and basic sentence punctuation only. This refuses URI schemes (no ':'), paths (no '/' or '\\\\'), file-scheme references, query strings, and other URL/path shapes at the schema layer, so a tampered record cannot smuggle 'D-One live-run evidence record http://attacker.example' past the sentinel check."
+    },
+    "runner_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+      "description": "Opaque version string for the runner that produced this record (e.g. a short git sha or release tag). Free-form but bounded; the pattern lock refuses URL/path/special shapes at the schema layer (no '/', no '\\\\', no ':', no '?', no '#') so a tampered record cannot smuggle a URL or absolute path through this field."
+    },
+    "endpoint_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]*$",
+      "description": "Opaque identifier for the approved live endpoint this run called. MUST match an entry in the live-D-One endpoint allow-list (R2 in references/d-one-live-run-readiness.md). NEVER a URL or network destination — the mapping from label to destination lives in the allow-list file and nowhere else (R5)."
+    },
+    "disable_switch_state": {
+      "type": "string",
+      "enum": ["off"],
+      "description": "The global disable-switch state at run time. Locked to 'off' because a live run can only execute when the switch is off (per references/d-one-live-integration-design.md §9.6). A record claiming 'on' would itself be evidence of a contract violation; the enum lock refuses that shape outright."
+    },
+    "operator_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]*$",
+      "description": "Opaque identifier for the operator who flipped the disable switch off for this run (M4). Never a real name, email, or other PII shape — that mapping lives in the per-operator allow-list outside this record."
+    },
+    "clock_label": {
+      "type": "string",
+      "minLength": 19,
+      "maxLength": 35,
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+\\-][0-9]{2}:[0-9]{2})?$",
+      "description": "The single caller-supplied non-deterministic field per A9 in references/d-one-live-run-readiness.md. Locked to an ISO-8601 timestamp shape (YYYY-MM-DDTHH:MM:SS, optional fractional seconds, optional Z or +/-HH:MM offset) — the structural pattern refuses every URI-scheme bypass at the schema layer (e.g. 'http:something' or 'data:Hello' cannot pass because the year position requires exactly 4 digits and the rest of the slots are also fixed). Everything else in the record MUST be deterministic given byte-identical inputs and live outcomes so a re-run can be diffed against the original."
+    },
+    "plan_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex sha256 of the input d_one_adapter_plan.json bytes (A3). Defense in depth: a reviewer can re-run scripts/done_image_adapter.py --validate-plan against the same plan and confirm the live provider consumed exactly what the adapter approved."
+    },
+    "plan_request_count": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Equal to len(requests) AND equal to the request_count recorded in the input plan. Redundant with the array length but kept so a glance at the record shows the count without parsing the array."
+    },
+    "assets_dir_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9_./\\-]*$",
+      "description": "Opaque workspace-relative label for the --assets-dir this run wrote to. NOT an absolute path, NOT a URI, NOT a file-scheme reference. The pattern lock refuses a leading '/' or '\\\\', refuses any URI scheme (no ':'), and refuses every '..' substring via the leading negative lookahead — so a workspace-escape shape like 'a/../b' or 'foo..' is refused at the schema layer (the runner still runs local_path_is_safe + _resolves_within for the on-disk path-safety gate)."
+    },
+    "run_outcome": {
+      "type": "string",
+      "enum": ["ok", "rejected", "error", "rolled_back"],
+      "description": "Overall run outcome. 'ok': every request succeeded and every image passed per-image manual review (M5). 'rejected': the runner refused a precondition (allow-list miss, plan invalid, vocabulary miss, re-scan miss). 'error': the live call or a downstream gate raised. 'rolled_back': a per-image review FAIL (F14) or a mid-run failure rolled the assets-dir back to its pre-call state. A run with outcome != 'ok' is FAIL per E7."
+    },
+    "gate_fired": {
+      "type": "string",
+      "enum": [
+        "F1_allow_list_miss",
+        "F2_disable_switch_on",
+        "F3_plan_invalid",
+        "F4_vocabulary_miss",
+        "F5_rescan_miss",
+        "F6_transport_error",
+        "F7_extension_miss",
+        "F8_magic_byte_miss",
+        "F9_embed_cap_miss",
+        "F10_overwrite_attempt",
+        "F11_audit_overwrite_attempt",
+        "F12_symlink_anywhere",
+        "F13_write_outside_assets_dir",
+        "F14_per_image_review_fail",
+        "F15_schema_invalid_audit_record",
+        "F16_determinism_miss",
+        "F17_approval_missing"
+      ],
+      "description": "Optional. Present only when run_outcome != 'ok'. Closed enum drawn from F1-F17 in references/d-one-live-run-readiness.md §7 so a reviewer can grep across audit records for a single failure mode. Free-form 'why' detail (if any) lives in gate_detail."
+    },
+    "gate_detail": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9 \\n\\t.,;!?()\\[\\]{}'\"_=\\-]+$",
+      "description": "Optional. Short, bounded free-form annotation accompanying gate_fired. The pattern lock is a positive whitelist: ASCII letters, digits, whitespace, and common sentence punctuation only. This refuses every URI-scheme/URL/path shape at the schema layer (no ':' so no scheme prefix like 'http:' or 'data:' or 'javascript:'; no '/' so no path or '://' authority; no '\\\\' so no Windows path; no '@' so no email; no '#'/'&'/'%' so no fragment/query/percent-encoding; no '<'/'>' so no XML/HTML; no '+'/'*'/'$'/'~' so no shell/glob/regex shape). Diagnostics that would naturally use ':' should use ';' or '-' instead (e.g. 'allow-list miss; endpoint not found'). Credential and PII shapes (JWT, AWS key, email, SSN, UUID) can still bypass a character-class whitelist; A11 in references/d-one-live-run-readiness.md §5.1 requires a separate runtime scan for those shapes. The runtime gate is the producer's responsibility; this schema only bounds the length and the character set."
+    },
+    "evidence_notes": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[A-Za-z0-9 \\n\\t.,;!?()\\[\\]{}'\"_=\\-]+$",
+      "description": "Optional. Short, bounded free-form annotation for E10 in references/d-one-live-run-readiness.md — if the checklist, design, or policy files changed across the run, name the change, the reviewer, and the date here. Same positive-whitelist pattern as gate_detail (refuses URI schemes via no-':' lock, refuses URLs / paths / file-scheme shapes at the schema layer; credential and PII shapes still need the §5.1 runtime scan)."
+    },
+    "requests": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "prompt_sha256",
+          "manifest_local_path",
+          "manifest_source",
+          "outcome",
+          "elapsed_ms",
+          "output_length_bytes"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]*$",
+            "description": "Asset id. MUST match an images[].id in the workspace's image_manifest.json whose source == 'd_one_local' AND match the same id on the corresponding request in the input plan (A4). The pattern lock refuses path-shaped ids (no '/', no '\\\\') and URI-scheme-shaped ids (no ':') at the schema layer — closes the regression where an id like 'a/b' would create a subdirectory under --assets-dir and break the materialize handoff. The cross-check against the actual manifest is the producer's responsibility."
+          },
+          "prompt_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex sha256 of the prompt bytes the live provider sent (A4). The record carries the hash only — never the raw prompt text — so a leaked record cannot reveal the prompt body."
+          },
+          "intended_use_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Optional. Lowercase hex sha256 of the intended_use bytes. Present iff the corresponding plan request carries intended_use."
+          },
+          "width_px": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "description": "Optional. Declared target width in pixels, copied verbatim from the input plan request."
+          },
+          "height_px": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "description": "Optional. Declared target height in pixels, copied verbatim from the input plan request."
+          },
+          "manifest_local_path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9_./\\-]*$",
+            "description": "Workspace-relative local_path copied verbatim from the matching images[].local_path. The pattern lock refuses a leading '/' or '\\\\' (no absolute path), every URI scheme (no ':'), and every '..' substring via the leading negative lookahead (no traversal) — so a workspace-escape shape like '../etc/passwd' or 'file:absolute' cannot pass the schema. The runtime gate still runs local_path_is_safe + _resolves_within against the actual workspace."
+          },
+          "manifest_source": {
+            "type": "string",
+            "enum": ["d_one_local"],
+            "description": "Always 'd_one_local'. local_asset / synthetic manifest entries are not eligible for D-One generation; the enum lock is the schema-level reflection of that rule."
+          },
+          "outcome": {
+            "type": "string",
+            "enum": ["ok", "rejected", "error"],
+            "description": "Per-request outcome (A5). 'ok': bytes were produced and passed the live magic-byte / embed-cap gates. 'rejected': the live provider or the runner refused this request (vocabulary miss, re-scan miss, extension miss). 'error': the live call or a downstream gate raised."
+          },
+          "rejection_reason": {
+            "type": "string",
+            "enum": [
+              "vocabulary_miss",
+              "rescan_miss",
+              "extension_miss",
+              "magic_byte_miss",
+              "embed_cap_miss",
+              "transport_error",
+              "per_image_review_fail",
+              "other"
+            ],
+            "description": "Optional. Present only when outcome != 'ok'. Closed enum so a reviewer can aggregate rejections across runs."
+          },
+          "endpoint_label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]*$",
+            "description": "Optional. Per-request opaque endpoint identifier when a run multiplexes across more than one approved endpoint (rare); MUST itself be on the live-D-One endpoint allow-list (R1, R2). Defaults to the top-level endpoint_label."
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Wall-clock elapsed time for this request in milliseconds. Recorded for cost/latency review; not used for any safety decision."
+          },
+          "output_length_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10485760,
+            "description": "Byte length of the live provider's output blob. The schema enforces the 10 MiB embed cap (10485760 bytes) scripts/export_pptx.py enforces today; a tighter per-endpoint cap from R2 is layered by the runtime gate. Zero is only valid when outcome != 'ok' (the runtime cross-check at A12 in references/d-one-live-run-readiness.md §5.1 enforces that — the schema cannot express the conditional in this validator's draft-07 subset)."
+          },
+          "output_magic_label": {
+            "type": "string",
+            "enum": ["png", "jpg", "jpeg"],
+            "description": "Optional. Magic-byte signature label for the produced blob. Present iff outcome == 'ok'. The runtime gate (F8) checks the actual first bytes against the declared extension (PNG: 89 50 4E 47 0D 0A 1A 0A; JPEG: FF D8 FF); the schema records the human-readable label."
+          },
+          "output_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Optional. Lowercase hex sha256 of the live provider's output blob. Present iff outcome == 'ok'."
+          },
+          "materialized_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Optional. Lowercase hex sha256 of the bytes that scripts/materialize_image_assets.py later copied into <workspace>/<manifest_local_path> (A6). Present iff outcome == 'ok' AND materialize has been run. MUST equal output_sha256 — a mismatch means a tampered or corrupted handoff and is itself a F12 / F13 condition for the materialize run."
+          }
+        }
+      },
+      "description": "One row per plan request, in the same order as the input plan's requests array (which is itself sorted by id by scripts/done_image_adapter.py). Order is part of the determinism contract (A9)."
+    },
+    "approvals": {
+      "type": "object",
+      "required": [
+        "endpoint_approval_ref",
+        "vocabulary_approval_ref",
+        "deck_approval_ref",
+        "operator_ref",
+        "per_image_review_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "endpoint_approval_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+          "description": "Opaque reference to the recorded endpoint approval (M1). The pattern lock refuses URL/path/special shapes at the schema layer (no '/', no '\\\\', no ':', no '@', no '#') so a tampered ref cannot smuggle a URL or absolute path through this field."
+        },
+        "vocabulary_approval_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+          "description": "Opaque reference to the recorded vocabulary approval (M2). Same pattern lock as endpoint_approval_ref."
+        },
+        "deck_approval_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+          "description": "Opaque reference to the per-deck approval (M3). Same pattern lock as endpoint_approval_ref."
+        },
+        "operator_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+          "description": "Opaque reference to the operator who flipped the disable switch off for this run (M4). Same pattern lock as endpoint_approval_ref."
+        },
+        "per_image_review_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "decision"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]*$",
+                "description": "Asset id this review row covers. MUST match exactly one requests[].id whose outcome == 'ok'. Same pattern lock as the per-request id (no '/', no ':')."
+              },
+              "decision": {
+                "type": "string",
+                "enum": ["pass", "fail"],
+                "description": "M5 outcome for this image. A single 'fail' forces the §7 rollback path for the whole run (F14)."
+              },
+              "review_ref": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+                "description": "Optional. Opaque reference to the recorded per-image review (e.g. a reviewer note id). Same pattern lock as endpoint_approval_ref."
+              }
+            }
+          },
+          "description": "One row per image that reached outcome == 'ok'. M5 requires every such image to be reviewed; a missing row is itself a F17 condition."
+        },
+        "cleanup_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+          "description": "Optional. Opaque reference to the recorded cleanup decision (M6). Present iff any per_image_review_refs.decision == 'fail' (the runtime cross-check at A14 in references/d-one-live-run-readiness.md §5.1 enforces that conditional — the schema cannot express it in this validator's draft-07 subset). Same pattern lock as endpoint_approval_ref."
+        }
+      },
+      "description": "Manual approval block. Every reference is opaque (no URL, no PII); the actual approval records live outside this file."
+    }
+  }
+}
