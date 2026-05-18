@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "mode": "preflight",
+  "note": "Synthetic placeholder D-One live-run preflight record. Replace all placeholder values before any PASS claim.",
+  "endpoint_label": "template_sandbox_endpoint",
+  "disable_switch_state": "off",
+  "operator_label": "template_operator",
+  "allow_list_path_label": "config/d_one_endpoint_allowlist.json",
+  "vocabulary_path_label": "config/d_one_descriptor_vocabulary.json",
+  "workspace_label": "workspace",
+  "assets_dir_label": "assets",
+  "audit_out_path_label": "audit/preflight_run.audit.json",
+  "approvals": {
+    "endpoint_approval_ref": "template_endpoint_appr_ref",
+    "vocabulary_approval_ref": "template_vocab_appr_ref",
+    "deck_approval_ref": "template_deck_appr_ref",
+    "operator_ref": "template_operator_ref"
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "d_one_descriptor_vocabulary.schema.json",
+  "title": "D-One Descriptor Vocabulary",
+  "description": "Contract sketch for the V1/V2 approved descriptor vocabulary named in references/d-one-live-run-readiness.md and references/d-one-live-prerequisites.md. NOT wired into runtime today: no script reads this file at prompt-assembly time, no prompt assembler exists, and there has never been a real D-One call. The schema ships only so references/d-one-live-prerequisites.md can point at concrete field names. V3 closed-enumeration: a runtime prompt assembler, when one is written, MUST refuse any descriptor not present in this file; the live runner MUST re-check this at its own boundary (defense in depth). V2 abstract-only: every entry is one of four kinds — a design-system color token referenced by name, a geometric noun, a mood adjective, or a composition adjective. Proper nouns, product names, customer names, quoted source text, source-derived sentences, dates, and numbers pulled from the source body are forbidden; the schema enforces lowercase-identifier shape via a positive-whitelist 'pattern' lock on every descriptor value (refusing uppercase letters, whitespace, URI schemes, paths, emails, and fragment / query / percent-encoded shapes) AND a negative-lookahead deny clause that refuses forbidden-token shapes at the schema layer — bounded tokens 'public', 'upload', 'raw', 'customer', 'confidential', 'screenshot', 'credential', 'password', 'secret' (matched as standalone identifier tokens with start-of-string / end-of-string / an identifier-boundary char '.' / '_' / '-' on each side, so legitimate words like 'drawing' that merely contain 'raw' mid-word still pass, AND so hyphen-separator forms like 'public-upload' / 'raw-source' / 'customer-acme' / 'confidential-report' and dotted forms like 'public.upload' fail too) and the compound phrases 'full slide', 'image search', 'web generation', 'page generation', 'slide generation' — each compound matched across ZERO OR MORE identifier-boundary chars so the underscore form ('full_slide'), the hyphen form ('full-slide'), the dotted form ('full.slide'), the concatenated form ('fullslide'), AND every separator-stacked obfuscation (multi-char runs like 'full__slide' / 'full--slide' / 'full..slide' / 'full___slide' / 'full----slide', and mixed-separator runs like 'full_-slide' / 'full.-slide' / 'full_.slide') all fail. The deny is a fail-closed schema-layer precaution; the V4 post-assembly re-scan (the adapter's full deny list re-running on every assembled prompt before the plan is written) remains the adapter runtime's responsibility and is still TODO.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "note",
+    "kind_enum",
+    "descriptors"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [1],
+      "description": "File-shape schema version. Locked to integer 1 today; bumped only with a paired schema/validator change so a future consumer can refuse a shape it does not recognize."
+    },
+    "note": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9 .,;!?()\\-]*D-One descriptor vocabulary[A-Za-z0-9 .,;!?()\\-]*$",
+      "description": "Self-describing sentinel. MUST contain the literal 'D-One descriptor vocabulary' verbatim so the file is identifiable even when read out of context. Surrounding text is locked to ASCII letters, digits, spaces, and basic sentence punctuation only — refuses URI schemes (no ':'), paths (no '/' or '\\\\'), emails (no '@'), and fragment / query / percent-encoded shapes (no '#' / '?' / '%')."
+    },
+    "kind_enum": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "string",
+        "enum": [
+          "color_token",
+          "geometric_noun",
+          "mood_adjective",
+          "composition_adjective"
+        ]
+      },
+      "description": "The closed set of descriptor kinds (V2). The array is fixed-length so a tampered file cannot silently widen the vocabulary surface. The runtime gate, when it exists, will cross-check every descriptors[*].kind against this list AND against the same hard-coded enum (defense in depth)."
+    },
+    "descriptors": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "value"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "color_token",
+              "geometric_noun",
+              "mood_adjective",
+              "composition_adjective"
+            ],
+            "description": "One of the four V2 kinds: 'color_token' (design-system palette token referenced by name, never a hex literal pulled from a customer palette), 'geometric_noun' (e.g. circle, wedge, isometric stack), 'mood_adjective' (e.g. calm, energetic, minimal), 'composition_adjective' (e.g. centered, off-axis, balanced)."
+          },
+          "value": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Lowercase identifier-shaped descriptor with a forbidden-token deny clause. The positive whitelist refuses uppercase letters (so proper nouns cannot pass), whitespace (so multi-word phrases cannot pass), URI schemes (no ':'), paths (no '/' or '\\\\'), emails (no '@'), fragment / query / percent-encoded shapes (no '#' / '?' / '%'), and the leading character must be a lowercase letter so '.internal' / '-flag' / '0num' cannot pass. The leading negative lookaheads additionally refuse forbidden-token shapes: bounded tokens 'public', 'upload', 'raw', 'customer', 'confidential', 'screenshot', 'credential', 'password', 'secret' (each matched only when surrounded by start-of-string / end-of-string / an identifier-boundary char '.' / '_' / '-', so 'drawing' and 'palette.background' still pass while 'raw_source', 'raw-source', 'customer_acme', 'customer-acme', 'confidential_report', 'confidential-report', 'public_upload', 'public-upload' all fail), and the compound phrases 'full slide', 'image search', 'web generation', 'page generation', 'slide generation' (each matched across ZERO OR MORE identifier-boundary chars so the underscore form 'full_slide', the hyphen form 'full-slide', the dotted form 'full.slide', the concatenated form 'fullslide', AND every separator-stacked obfuscation — multi-char runs like 'full__slide' / 'full--slide' / 'full..slide' / 'full___slide' / 'full----slide', mixed-separator runs like 'full_-slide' / 'full.-slide' / 'full_.slide', and the same families for the other four compounds — all fail; same for the other four). For 'color_token' entries, the runtime vocabulary validator (when written) MUST cross-check that the value resolves to a 'palette.<name>' token in design_system.json; the schema records the lowercase-identifier shape constraint AND the schema-layer deny against the listed forbidden tokens — the V4 post-assembly adapter re-scan (full deny list against the assembled prompt) remains the runtime's responsibility and is still TODO."
+          },
+          "approved_in_review_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+            "description": "Optional. Opaque reference to the recorded V1 vocabulary approval review under which this descriptor was added. NEVER a real reviewer name, NEVER an email, NEVER any PII shape: the pattern lock refuses '/', '\\\\', ':', '@', '#'."
+          }
+        }
+      },
+      "description": "Approved descriptor list. V3 closed-enumeration: an empty array is equivalent to 'no prompt is assemblable' and is the resting state today. V5 paired-change rule: adding, removing, or modifying a descriptor requires a paired update to this file and to the runtime validator (or, if no validator yet exists, the corresponding TODO in references/d-one-live-integration-design.md §13 is still open and the live path stays unwired). V4 post-assembly re-scan: any prompt assembled from these descriptors MUST re-pass the full adapter deny list (URI schemes, file paths, raw-source markers, 40-char source shingles, credential / PII shapes, full-slide / page-generation / screenshot wording) AFTER assembly, BEFORE the plan is written; that gate is the adapter's runtime responsibility, not this schema's."
+    }
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "note": "Synthetic placeholder D-One descriptor vocabulary. Abstract V2-compliant descriptors only. Replace under a separate review.",
+  "kind_enum": [
+    "color_token",
+    "geometric_noun",
+    "mood_adjective",
+    "composition_adjective"
+  ],
+  "descriptors": [
+    {
+      "kind": "color_token",
+      "value": "palette.accent"
+    },
+    {
+      "kind": "color_token",
+      "value": "palette.background"
+    },
+    {
+      "kind": "geometric_noun",
+      "value": "circle"
+    },
+    {
+      "kind": "geometric_noun",
+      "value": "wedge"
+    },
+    {
+      "kind": "geometric_noun",
+      "value": "isometric_stack"
+    },
+    {
+      "kind": "mood_adjective",
+      "value": "calm"
+    },
+    {
+      "kind": "mood_adjective",
+      "value": "minimal"
+    },
+    {
+      "kind": "composition_adjective",
+      "value": "centered"
+    },
+    {
+      "kind": "composition_adjective",
+      "value": "off_axis"
+    }
+  ]
+}

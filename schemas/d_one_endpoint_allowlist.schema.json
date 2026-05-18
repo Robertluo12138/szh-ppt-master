@@ -1,0 +1,116 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "d_one_endpoint_allowlist.schema.json",
+  "title": "D-One Endpoint Allow-List",
+  "description": "Contract sketch for the R1/R2 maintained endpoint allow-list named in references/d-one-live-run-readiness.md and references/d-one-live-prerequisites.md. NOT wired into runtime today: no real endpoint is named anywhere in this repo, no script reads this file at call time, scripts/run_d_one_generation.py has no --live-mode or --audit-out flag, and there has never been a real D-One call. The schema ships only so references/d-one-live-prerequisites.md can point at concrete field names. R3 default-deny is the resting state: a file with an empty 'entries' array is equivalent to 'every endpoint denied' and the runner MUST refuse any endpoint not on this list at its own boundary. R5 no-URL-leaves-the-list is enforced at the schema layer by positive-whitelist 'pattern' locks on every string field — no URI scheme can pass (no ':'), no path can pass (no '/' or '\\\\'), no email can pass (no '@'), no fragment / query / percent-encoded shape can pass (no '#' / '?' / '%'), and the leading character is restricted to alphanumerics so internal-hostname shapes like '.internal' or '//host' cannot pass either.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "note",
+    "default_policy",
+    "entries"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [1],
+      "description": "File-shape schema version. Locked to integer 1 today; bumped only with a paired schema/validator change so a future consumer can refuse a shape it does not recognize."
+    },
+    "note": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9 .,;!?()\\-]*D-One endpoint allow-list[A-Za-z0-9 .,;!?()\\-]*$",
+      "description": "Self-describing sentinel. MUST contain the literal 'D-One endpoint allow-list' verbatim so the file is identifiable as an allow-list even when read out of context. Surrounding text is locked to a positive whitelist: ASCII letters, digits, spaces, and basic sentence punctuation only — no ':' so no scheme prefix, no '/' so no path or '://' authority, no '\\\\' so no Windows path, no '@' so no email, no '<' or '>' so no XML/HTML, no '#' / '?' / '%' so no fragment / query / percent-encoded shape."
+    },
+    "default_policy": {
+      "type": "string",
+      "enum": ["deny"],
+      "description": "R3 default-deny lock. The schema refuses any other resting policy. The runner MUST refuse any endpoint not on this allow-list at its own boundary; an empty 'entries' array is equivalent to 'every endpoint denied'. A future variant policy (e.g. an 'observation-only' mode) would require a paired schema bump and a corresponding TODO in references/d-one-live-integration-design.md §13."
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "endpoint_label",
+          "destination_label",
+          "approval_reviewer_ref",
+          "approval_date",
+          "security_review_ref",
+          "scope"
+        ],
+        "properties": {
+          "endpoint_label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z][A-Za-z0-9_\\-]*$",
+            "description": "Opaque identifier for the approved endpoint. This is the label that appears verbatim in the audit record's endpoint_label field (R2, R5) and is the ONLY identifier ever written to a record. NEVER a URL or network destination: the pattern lock refuses '/', '\\\\', ':', '@', '#', '?', '%' (so URI schemes, paths, emails, fragment / query / percent-encoded shapes cannot pass), refuses '.' (so dotted-hostname shapes like 'host.internal' and dotted IPv4 shapes like '10.0.0.1' cannot pass), and the leading character must be a letter (so leading-digit shapes like '10' / '127' cannot pass either). MUST be unique across the entries list; the runtime gate enforces uniqueness."
+          },
+          "destination_label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z][A-Za-z0-9_\\-]*$",
+            "description": "Opaque label naming the network destination this endpoint resolves to. NEVER a literal URL, NEVER a scheme://host, NEVER an internal hostname (e.g. an '.internal' / '.corp' / '.local' / '.lan' / '.intranet' TLD), NEVER a private IPv4 (10/8, 127/8, 192.168/16, 172.16/12), NEVER any other network shape: the pattern lock refuses '/', '\\\\', ':', '@', '#', '?', '%' (so URI schemes / paths / emails / fragment shapes cannot pass), refuses '.' entirely (so dotted-hostname shapes like 'host.internal' / 'api.example.com' AND dotted IPv4 shapes like '10.0.0.1' / '192.168.1.1' / '127.0.0.1' / '172.16.0.1' cannot pass), and the leading character must be a letter (so leading-digit shapes like '10' / '127' / '172' / '192' cannot pass either). The real mapping from this label to a destination lives outside this repo on the operator's machine; nothing in the repo (including this file when populated) ever names a real destination."
+          },
+          "approval_reviewer_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+            "description": "Opaque reference to the approving reviewer's recorded sign-off (R2). NEVER a real name, NEVER an email, NEVER any PII shape: the pattern lock refuses '/', '\\\\', ':', '@', '#'. The real mapping from ref to reviewer identity lives in the operator's per-reviewer record store."
+          },
+          "approval_date": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:Z|[+\\-][0-9]{2}:[0-9]{2})$",
+            "description": "Approval date as an ISO-8601 timestamp with mandatory timezone (Z or signed HH:MM offset). The fixed-position digit pattern refuses every URI scheme at the schema layer (the year position must be exactly 4 digits, the month/day/time positions are also fixed, so 'http:something' or 'data:Hello' cannot pass)."
+          },
+          "security_review_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+            "description": "Opaque reference to the recorded security-review sign-off for this endpoint (R2). Same pattern lock as approval_reviewer_ref."
+          },
+          "scope": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "environment",
+              "request_types",
+              "byte_cap_max_bytes"
+            ],
+            "properties": {
+              "environment": {
+                "type": "string",
+                "enum": ["sandbox", "production"],
+                "description": "R4: 'sandbox' or 'production'. A 'production' entry is only PASS-eligible after at least one 'sandbox' PASS audit record on the same endpoint shape; that ordering is a runtime cross-check, not expressible at the schema layer in the in-repo draft-07 subset."
+              },
+              "request_types": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "enum": ["image_generation"]
+                },
+                "description": "Closed set of request types this endpoint is approved for. Only 'image_generation' is defined today (D-One generates supporting illustration assets). Any future request type — e.g. a chart rendering API — requires a paired schema bump and a corresponding entry in references/d-one-live-integration-design.md §13. Full-slide / page-generation / screenshot request types are FORBIDDEN by references/d-one-image-policy.md and MUST NOT be added here. The runtime gate enforces request-type uniqueness; the in-repo JSON-Schema subset does not implement 'uniqueItems' so the schema records only the membership constraint."
+              },
+              "byte_cap_max_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10485760,
+                "description": "Per-endpoint byte cap. MUST be less than or equal to the global 10 MiB cap (10485760 bytes) scripts/export_pptx.py enforces today; the schema enforces the ceiling. A tighter per-endpoint cap is allowed (any positive integer below the ceiling); the runtime cap is min(this value, 10485760)."
+              }
+            }
+          }
+        }
+      },
+      "description": "Approved endpoint list. R3 default-deny: an empty list is equivalent to 'every endpoint denied' and is the resting state today. R1 requires the runner to refuse any endpoint not on this list at its own boundary. R6 forbids the runner from making any network call outside this list (no telemetry, no analytics, no public scraping, no public image search, no model-API call beyond an approved endpoint, no third-party SDK callback, no CDN fetch). The list-shape contract is intentionally narrow: future caching, retry, or multi-endpoint multiplexing behavior is out of scope and would need its own schema bump."
+    }
+  }
+}

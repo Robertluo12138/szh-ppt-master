@@ -1,0 +1,143 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "d_one_preflight_audit.schema.json",
+  "title": "D-One Live-Run Preflight Record",
+  "description": "Contract sketch for the local-only preflight record an operator would author BEFORE a future real-D-One run. NOT wired into runtime today: scripts/run_d_one_generation.py has no --live-mode or --audit-out flag, no script reads a record in this shape, and there has never been a real D-One call. The schema ships only so references/d-one-live-prerequisites.md can point at concrete field names. Purpose: capture the R1 / V1 / M1-M6 preconditions and the audit-out path placement BEFORE the run, so a future runner has one schema-validated input to gate against the §3 pre-trial checklist in references/d-one-live-trial-packet.md. The preflight record is the upstream sibling of the existing schemas/d_one_live_run_evidence.schema.json (which captures the POST-call audit record); the live run consumes a preflight, makes one approved call per request, and produces an evidence record. Strict on shape: additionalProperties: false at every level; mode locked to 'preflight' so a preflight is never accidentally read as an evidence record; path-label fields use positive-whitelist 'pattern' locks identical to those on d_one_live_run_evidence's assets_dir_label / manifest_local_path — refusing URI schemes (no ':'), absolute paths (no leading '/' or '\\\\'), '..' traversal segments, and the empty string; the same patterns refuse whitespace so multi-word raw prompt text or pasted raw source text cannot pass either. The schema layer does NOT by itself refuse every credential or PII shape: opaque alphanumeric runs (e.g. an AWS access-key-shaped substring) and digit/hyphen runs (e.g. an SSN- or phone-shaped substring) can survive the positive-whitelist path-label / opaque-ref patterns. NO validator scans THIS preflight record for those residual shapes today — the live-mode flag and the audit-record runtime hook that would refuse them at runtime are still TODO (see references/d-one-live-integration-design.md §13), and scripts/validate_d_one_live_run_evidence.py's G11 free-form scan applies ONLY to the separate POST-call evidence record (schemas/d_one_live_run_evidence.schema.json), not to this preflight. Schema PASS here is therefore necessary, not sufficient; the residual credential / PII gap on this preflight is the operator's manual responsibility until the runtime hook is wired. Stdlib scripts/validate_artifacts.py only implements the JSON-Schema subset listed at its top (no '$ref', no 'uniqueItems', no 'format', no logical combinators) — uniqueness, runtime cross-checks, and free-form deny scans are not enforced at this layer.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "mode",
+    "note",
+    "endpoint_label",
+    "disable_switch_state",
+    "operator_label",
+    "allow_list_path_label",
+    "vocabulary_path_label",
+    "workspace_label",
+    "assets_dir_label",
+    "audit_out_path_label",
+    "approvals"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [1],
+      "description": "Record-file schema version. Locked to integer 1 today; bumped only with a paired schema/validator change."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["preflight"],
+      "description": "Evidence the record is the pre-call preflight artifact, not the post-call audit record. The enum lock distinguishes this file from d_one_live_run_evidence.json (whose mode is 'live') and from the dry-run plan in d_one_adapter_plan.json (whose mode is 'dry_run')."
+    },
+    "note": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9 .,;!?()\\-]*D-One live-run preflight record[A-Za-z0-9 .,;!?()\\-]*$",
+      "description": "Self-describing sentinel. MUST contain the literal 'D-One live-run preflight record' so the file is identifiable even when read out of context. Surrounding text whitelist refuses URI schemes (no ':'), paths (no '/' or '\\\\'), emails (no '@'), and fragment / query / percent-encoded shapes (no '#' / '?' / '%')."
+    },
+    "endpoint_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z][A-Za-z0-9_\\-]*$",
+      "description": "Opaque identifier for the endpoint this run will call. MUST appear in the endpoint allow-list file referenced by allow_list_path_label (R1) and follow the same shape constraints as that file's endpoint_label. NEVER a URL or network destination: the pattern lock refuses '/', '\\\\', ':', '@', '#', '?', '%' (so URI schemes / paths / emails / fragment shapes cannot pass), refuses '.' (so dotted-hostname shapes like 'host.internal' and dotted IPv4 shapes like '10.0.0.1' cannot pass), and the leading character must be a letter (so leading-digit shapes cannot pass either)."
+    },
+    "disable_switch_state": {
+      "type": "string",
+      "enum": ["off"],
+      "description": "M4 disable-switch state. Locked to 'off' — a preflight that records 'on' would itself be evidence of a contract violation (a run cannot proceed with the switch on). The runtime gate refuses the run if the actual switch state at call time differs from this declared state."
+    },
+    "operator_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]*$",
+      "description": "Opaque identifier for the operator who will flip the disable switch off for this run (M4). Never a real name, never an email, never any PII shape."
+    },
+    "allow_list_path_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative label for the endpoint allow-list file (R1) the runner will read. MUST be path-safe: no absolute path (no leading '/' or '\\\\'), no URI scheme (no ':'), no '..' traversal (the leading negative lookahead refuses every '..' substring). The runtime gate additionally runs local_path_is_safe + _resolves_within against the workspace before opening the file."
+    },
+    "vocabulary_path_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative label for the descriptor vocabulary file (V1) the runner will read. Same path-safety pattern lock as allow_list_path_label."
+    },
+    "workspace_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9_./\\-]*$",
+      "description": "Opaque workspace-relative label naming the workspace this run targets. NOT an absolute path; same path-safety pattern lock as allow_list_path_label."
+    },
+    "assets_dir_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative label for the --assets-dir this run will write image bytes to. The future runner's image-byte writes are confined to this directory; the runtime gate refuses any write outside it (F13). Same path-safety pattern lock as allow_list_path_label."
+    },
+    "audit_out_path_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative label for the --audit-out evidence record path the runner will write at run completion. F11 requires the actual file path to be symlink-refused, parent-symlink-refused, pass local_path_is_safe, and MUST NOT pre-exist (no overwrite); the schema enforces the workspace-relative path shape, the runtime gate enforces the rest. The audit-out is the single artifact that survives the §7 rollback (per references/d-one-live-integration-design.md §7); it lives OUTSIDE --assets-dir."
+    },
+    "approvals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint_approval_ref",
+        "vocabulary_approval_ref",
+        "deck_approval_ref",
+        "operator_ref"
+      ],
+      "properties": {
+        "endpoint_approval_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+          "description": "Opaque reference to the M1 endpoint approval recorded BEFORE this preflight was authored. NEVER a real name, never an email, never any PII shape: the pattern lock refuses '/', '\\\\', ':', '@', '#'. MUST match the allow-list entry's approval_reviewer_ref AND security_review_ref (cross-check is the runtime gate's responsibility)."
+        },
+        "vocabulary_approval_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+          "description": "Opaque reference to the M2 vocabulary approval. Same pattern lock as endpoint_approval_ref."
+        },
+        "deck_approval_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+          "description": "Opaque reference to the per-deck approval (M3). A standing 'this team may use D-One' approval is NOT sufficient — each deck is its own decision; the ref names the specific deck-level approval record."
+        },
+        "operator_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+          "description": "Opaque reference to the operator who flipped the disable switch off for this run (M4). Same pattern lock as endpoint_approval_ref."
+        },
+        "cleanup_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+          "description": "Optional. Opaque reference to the M6 cleanup approval an operator will invoke if any per-image review (M5) fails. Per-image M5 reviews themselves are recorded in the POST-call evidence record (schemas/d_one_live_run_evidence.schema.json approvals.per_image_review_refs); the preflight names only the cleanup channel that would be used if a rollback fires."
+        }
+      },
+      "description": "Manual approval block. Mirrors d_one_live_run_evidence.schema.json's approvals shape for the four pre-call refs (M1, M2, M3, M4); M5 per-image refs are written into the POST-call evidence record only, and M6 cleanup_ref is optional here (it becomes required in the evidence record when an M5 review fails). Every reference is opaque (no URL, no PII); the actual approval records live outside this file."
+    }
+  }
+}

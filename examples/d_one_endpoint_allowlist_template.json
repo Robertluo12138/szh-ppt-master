@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "note": "Synthetic placeholder for the D-One endpoint allow-list. Empty entries demonstrate R3 default-deny resting state. Replace placeholder content with real approved entries only under a separate explicit user request and a paired security review.",
+  "default_policy": "deny",
+  "entries": []
+}
