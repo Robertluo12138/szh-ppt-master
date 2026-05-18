@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "mode": "live",
+  "note": "Synthetic template for a D-One live-run evidence record. Replace all placeholder values before any PASS claim.",
+  "runner_version": "v0.0.0-template",
+  "endpoint_label": "template_sandbox_endpoint",
+  "disable_switch_state": "off",
+  "operator_label": "template_operator",
+  "clock_label": "2026-01-01T00:00:00Z",
+  "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "plan_request_count": 1,
+  "assets_dir_label": "template_assets",
+  "run_outcome": "ok",
+  "requests": [
+    {
+      "id": "template_image_id",
+      "prompt_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "manifest_local_path": "media/template_image.png",
+      "manifest_source": "d_one_local",
+      "outcome": "ok",
+      "elapsed_ms": 0,
+      "output_length_bytes": 1,
+      "output_magic_label": "png",
+      "output_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "materialized_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  ],
+  "approvals": {
+    "endpoint_approval_ref": "template_endpoint_appr_ref",
+    "vocabulary_approval_ref": "template_vocab_appr_ref",
+    "deck_approval_ref": "template_deck_appr_ref",
+    "operator_ref": "template_operator_ref",
+    "per_image_review_refs": [
+      {
+        "id": "template_image_id",
+        "decision": "pass"
+      }
+    ]
+  }
+}
