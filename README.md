@@ -377,7 +377,7 @@ Fail-closed gates (every gate aborts the run and rolls back any target this run 
 python3 scripts/materialize_image_assets.py --self-test
 ```
 
-When real D-One integration ships, it will plug in upstream of this gate: D-One produces local PNG / JPG / JPEG bytes under a controlled local directory, the agent places them under `--assets-dir`, and `materialize_image_assets.py` then enforces every safety rule above before any byte lands in the workspace. See `references/d-one-image-policy.md` for the policy that any such integration must satisfy before it ships.
+When real D-One integration ships, it will plug in upstream of this gate: D-One produces local PNG / JPG / JPEG bytes under a controlled local directory, the agent places them under `--assets-dir`, and `materialize_image_assets.py` then enforces every safety rule above before any byte lands in the workspace. See `references/d-one-image-policy.md` for the policy that any such integration must satisfy before it ships, and `references/d-one-live-integration-design.md` for the narrow design (allowed / forbidden inputs, prompt redaction, output rules, fail-closed conditions, audit evidence, manual approval boundaries) the future real-D-One wiring must follow — mock / local path is verified today; real D-One is not.
 
 ### Stage-1-to-6 local orchestration helper
 
