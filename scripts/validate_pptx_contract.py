@@ -1932,6 +1932,46 @@ def _run_tempfixture_negatives() -> list[CheckResult]:
             "; ".join(read_side_failures),
         ))
 
+        # 26. media.targets_internal — an `image`-typed rel
+        # placed at the PACKAGE-level rels file
+        # (`ppt/_rels/presentation.xml.rels`) pointing at an
+        # external https:// URL must fail closed on both
+        # `relationships.no_external` and `media.targets_internal`.
+        # Existing scenario #18 exercises the same gate at slide
+        # rels level; this scenario proves the rels walker covers
+        # every rels part in the package (defense in depth for
+        # the embedded-only contract). The fixture also sets
+        # TargetMode="External" so the no_external gate fires on
+        # the TargetMode dimension AND on the URI-scheme prefix.
+        pkg_external_image_rel = td / "pkg_external_image_rel.pptx"
+        _write_minimal_editable_pptx(
+            pkg_external_image_rel, slides=[_EDITABLE_SP_XML],
+        )
+        with zipfile.ZipFile(pkg_external_image_rel, "a") as zf:
+            zf.writestr(
+                "ppt/_rels/presentation.xml.rels",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rIdExtImg" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                'Target="https://attacker.invalid/leaked.png" '
+                'TargetMode="External"/>'
+                '</Relationships>'
+            )
+        g_res = check_generated_pptx(pkg_external_image_rel)
+        out.append(CheckResult(
+            "tempfixture: external image rel at the package-level "
+            "rels (ppt/_rels/presentation.xml.rels) fails closed on "
+            "media.targets_internal (rels walker covers every rels "
+            "part, not just slide rels)",
+            any(
+                r.name.startswith("media.targets_internal")
+                and not r.ok
+                for r in g_res
+            ),
+            "; ".join(r.detail for r in g_res if not r.ok),
+        ))
+
     return out
 
 
@@ -2027,7 +2067,10 @@ def main(argv: list[str]) -> int:
             "media.embedded_only — no fail-open parse path], direct "
             "unit-test that stub-injected zipfile.BadZipFile + "
             "RuntimeError on read are recorded as media.embedded_only "
-            "offenders [no fail-open read path]) "
+            "offenders [no fail-open read path], external image rel "
+            "at package-level rels [ppt/_rels/presentation.xml.rels] "
+            "fails closed on media.targets_internal — rels walker "
+            "covers every rels part, not just slide rels) "
             "plus positives (minimal valid container, minimal "
             "editable PPTX, 2-slide PPTX passing "
             "slide_count.expected=2, minimal PNG-embed PPTX passing "

@@ -33,7 +33,7 @@ USAGE
     # itself only refuses an existing symlink at --out.
     python3 scripts/inspect_pptx_inventory.py --pptx deck.pptx --out report.json
 
-    # Self-test: 16 temp-fixture scenarios — happy path, deterministic
+    # Self-test: 17 temp-fixture scenarios — happy path, deterministic
     # repeated inventory, image-only slide failure, missing media,
     # image rel with NO Target attribute (without the explicit check
     # the rel would fall off every downstream media gate — the
@@ -42,7 +42,11 @@ USAGE
     # path-traversal rel, bad XML at a slide part, unsupported media
     # extension, linked-blip `<a:blip r:link/>` in slide content,
     # unparseable XML in a non-slide ppt/ part (no fail-open
-    # continue), unreadable ZIP, and nonexistent file.
+    # continue), unreadable ZIP, nonexistent file, and an external
+    # image rel placed at the PACKAGE-level rels file
+    # (`ppt/_rels/presentation.xml.rels`) — defense in depth proving
+    # the rels walker iterates every `*.rels` member, not only
+    # slide-level rels.
     python3 scripts/inspect_pptx_inventory.py --self-test
 
 FAIL-CLOSED SURFACE (each emits a finding with severity="error";
@@ -938,7 +942,7 @@ def _run_self_test() -> int:
     """Build temp-fixture .pptx packages and confirm build_inventory
     produces the expected findings / counts.
 
-    Coverage (16 scenarios, in execution order):
+    Coverage (17 scenarios, in execution order):
       1. happy path (one PNG, one editable slide; ok=True).
       2. deterministic repeated inventory (two runs yield byte-identical
          JSON for the same input).
@@ -978,6 +982,13 @@ def _run_self_test() -> int:
      16. nonexistent file (`--pptx` path that does not exist) fails
          closed on `package.unreadable_zip` (the build_inventory entry
          emits the synthetic finding when `Path.is_file()` is False).
+     17. external image rel placed at the PACKAGE-level rels file
+         (`ppt/_rels/presentation.xml.rels`) surfaces a
+         `relationships.external` finding pinned to that part —
+         defense in depth for the embedded-only contract, proving
+         the walker iterates every `*.rels` member in the package
+         (not only slide-level rels). Mirrors the analogous
+         validate_pptx_contract scenario.
 
     Each scenario asserts an expected finding code is present OR (for
     the happy path / determinism case) that no findings exist.
@@ -1383,6 +1394,52 @@ def _run_self_test() -> int:
                 f"nonexistent file: codes={codes}, ok={inv['ok']}"
             )
 
+        # ---- external image rel at package-level rels ----
+        # An `image`-typed rel placed at the PACKAGE-level rels
+        # file (`ppt/_rels/presentation.xml.rels`) with
+        # TargetMode="External" and an https:// Target must
+        # surface a `relationships.external` finding. Scenario 7
+        # exercises the same gate at slide rels level; this
+        # scenario proves the walker iterates every `*.rels`
+        # member in the package — defense in depth for the
+        # embedded-only contract, mirroring the analogous
+        # validate_pptx_contract scenario.
+        pkg_external = td / "pkg_external_image_rel.pptx"
+        _write_minimal_pptx_with_slides(
+            pkg_external,
+            slide_bodies=[_EDITABLE_BODY],
+            extra_entries={
+                "ppt/_rels/presentation.xml.rels": (
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<Relationships xmlns='
+                    '"http://schemas.openxmlformats.org/package/2006/relationships">'
+                    '<Relationship Id="rIdExtImg" '
+                    'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+                    'relationships/image" '
+                    'Target="https://attacker.invalid/leaked.png" '
+                    'TargetMode="External"/>'
+                    '</Relationships>'
+                ),
+            },
+        )
+        inv = build_inventory(pkg_external)
+        offender_parts = [
+            f.get("part") for f in inv["findings"]
+            if f.get("code") == "relationships.external"
+        ]
+        scn_ok = (
+            "ppt/_rels/presentation.xml.rels" in offender_parts
+            and inv["ok"] is False
+        )
+        scenarios.append((
+            "external image rel at package-level rels", scn_ok,
+        ))
+        if not scn_ok:
+            failures.append(
+                f"package-level external rel: "
+                f"offender_parts={offender_parts}, ok={inv['ok']}"
+            )
+
     print("self-test scenarios:")
     for name, ok in scenarios:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
@@ -1631,7 +1688,7 @@ def main(argv: list[str]) -> int:
         "--self-test",
         action="store_true",
         help=(
-            "Run the in-script tempfixture scenarios (16 today): "
+            "Run the in-script tempfixture scenarios (17 today): "
             "happy path, deterministic repeated inventory, image-only "
             "slide failure, missing media (image rel resolves to a "
             "part not on disk), image rel with NO Target attribute "
@@ -1650,7 +1707,11 @@ def main(argv: list[str]) -> int:
             "surfaced via the linked-blip walker as "
             "package.unreadable_xml (no fail-open continue — a buried "
             "r:link in malformed XML would otherwise be invisible), "
-            "unreadable ZIP, and nonexistent file."
+            "unreadable ZIP, nonexistent file, and an external image "
+            "rel placed at the PACKAGE-level rels file "
+            "(`ppt/_rels/presentation.xml.rels`) — defense in depth "
+            "proving the walker iterates every `*.rels` member, not "
+            "only slide-level rels."
         ),
     )
     args = parser.parse_args(argv)

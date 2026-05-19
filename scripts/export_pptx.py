@@ -3610,6 +3610,282 @@ def _run_self_tests() -> list[CheckResult]:
              ) else ""),
         ))
 
+        # 22. NEGATIVE: a primitive carrying a forbidden
+        # `rotation` key fails closed at schema validation. The
+        # render_model contract is intentionally bounds-only —
+        # primitives have {id, slot_id, kind, bounds, style, ...
+        # kind-payload} under `additionalProperties: false`, so
+        # group-rotation / pivot fields are NOT representable.
+        # Clean-room cross-check: if the schema ever drifts to
+        # accept rotation-style keys, this probe fires before a
+        # bounds-vs-pivot double-application can manifest in an
+        # exported deck.
+        rotated_ws = td / "forbidden_rotation"
+        _write_synthetic_workspace(rotated_ws)
+        rotated_path = rotated_ws / "render_models" / "01_cover.json"
+        rotated_obj = json.loads(rotated_path.read_text())
+        rotated_obj["primitives"][1]["rotation"] = 45
+        rotated_path.write_text(json.dumps(rotated_obj, indent=2))
+        rotated_out = td / "rotated.pptx"
+        rc, _stdout, stderr = _run_capture(rotated_ws, rotated_out)
+        msg = stderr + _stdout
+        results.append(CheckResult(
+            "selftest: primitive with forbidden `rotation` key "
+            "fails closed at schema (group rotation/pivot is not "
+            "representable in the current render model)",
+            (
+                rc != 0
+                and "rotation" in msg
+                and "schema" in msg.lower()
+                and not rotated_out.exists()
+            ),
+            (f"rc={rc}, missing 'rotation'/'schema' in messages, "
+             f"output_exists={rotated_out.exists()}; {stderr.strip()}"
+             if rc == 0
+                or "rotation" not in msg
+                or "schema" not in msg.lower()
+                or rotated_out.exists() else ""),
+        ))
+
+        # 23. NEGATIVE: an image_slot carrying a forbidden
+        # `transform` key fails closed at schema validation.
+        # image_slot's properties are `image_ref` + `alt_text`
+        # under `additionalProperties: false`, so no transform /
+        # matrix / crop / clip_path key can sneak through. This
+        # is the contract-layer guarantee that the bounds-to-EMU
+        # map (`_bounds_to_xfrm`) is the ONLY spatial transform
+        # applied to an image — there is no upstream `transform`
+        # field for a downstream stage to double-apply.
+        bad_xform_ws = td / "forbidden_image_transform"
+        _write_synthetic_workspace(bad_xform_ws)
+        (bad_xform_ws / "assets").mkdir(exist_ok=True)
+        (bad_xform_ws / "assets" / "tiny.png").write_bytes(_TINY_PNG_BYTES)
+        (bad_xform_ws / "image_manifest.json").write_text(json.dumps({
+            "images": [
+                {
+                    "id": "tiny",
+                    "local_path": "assets/tiny.png",
+                    "source": "synthetic",
+                    "alt_text": "Tiny synthetic PNG fixture.",
+                    "intended_use": "icon",
+                    "width_px": 1,
+                    "height_px": 1,
+                },
+            ],
+        }, indent=2))
+        (bad_xform_ws / "render_models" / "01_cover.json").write_text(json.dumps({
+            "index": 1,
+            "layout": "cover",
+            "canvas": {"width_px": 1920, "height_px": 1080},
+            "source_refs": ["synthetic_src"],
+            "primitives": [
+                {
+                    "id": "title",
+                    "slot_id": "title",
+                    "kind": "text",
+                    "bounds": {"x": 160, "y": 320, "w": 1280, "h": 100},
+                    "style": {
+                        "color_token": "palette.text",
+                        "typography_token": "typography.heading",
+                    },
+                    "text": {"content": "transformed", "role": "heading"},
+                },
+                {
+                    "id": "ill_image",
+                    "kind": "image_slot",
+                    "bounds": {"x": 100, "y": 600, "w": 200, "h": 200},
+                    "image_slot": {
+                        "image_ref": "tiny",
+                        "alt_text": "doubled",
+                        "transform": "rotate(45)",
+                    },
+                },
+            ],
+        }))
+        bad_xform_out = td / "bad_xform.pptx"
+        rc, _stdout, stderr = _run_capture(bad_xform_ws, bad_xform_out)
+        msg = stderr + _stdout
+        results.append(CheckResult(
+            "selftest: image_slot with forbidden `transform` key "
+            "fails closed at schema (image transform is not "
+            "representable, so cannot be double-applied)",
+            (
+                rc != 0
+                and "transform" in msg
+                and "schema" in msg.lower()
+                and not bad_xform_out.exists()
+            ),
+            (f"rc={rc}, missing 'transform'/'schema' in messages, "
+             f"output_exists={bad_xform_out.exists()}; {stderr.strip()}"
+             if rc == 0
+                or "transform" not in msg
+                or "schema" not in msg.lower()
+                or bad_xform_out.exists() else ""),
+        ))
+
+        # 24. POSITIVE: a full-bleed image_slot (bounds == canvas
+        # dimensions) exports with a single <p:pic> whose
+        # <a:off>/<a:ext> map 1:1 from the canvas px to EMU and
+        # carries no <a:srcRect> (no clip artifact). This is the
+        # runtime-layer cross-check on the "no-op rectangular
+        # clip / fit" surface: the only spatial transform on the
+        # picture is the bounds-to-EMU multiplication, so a
+        # regression that double-multiplies (or invents a clip
+        # rect on a full-bleed slot) would be caught by the
+        # exact-EMU + srcRect-absent assertions below.
+        full_bleed_ws = td / "full_bleed_image"
+        _write_synthetic_workspace(full_bleed_ws)
+        (full_bleed_ws / "assets").mkdir(exist_ok=True)
+        (full_bleed_ws / "assets" / "tiny.png").write_bytes(_TINY_PNG_BYTES)
+        (full_bleed_ws / "image_manifest.json").write_text(json.dumps({
+            "images": [
+                {
+                    "id": "tiny",
+                    "local_path": "assets/tiny.png",
+                    "source": "synthetic",
+                    "alt_text": "Tiny synthetic PNG fixture.",
+                    "intended_use": "icon",
+                    "width_px": 1,
+                    "height_px": 1,
+                },
+            ],
+        }, indent=2))
+        (full_bleed_ws / "render_models" / "01_cover.json").write_text(json.dumps({
+            "index": 1,
+            "layout": "cover",
+            "canvas": {"width_px": 1920, "height_px": 1080},
+            "source_refs": ["synthetic_src"],
+            "primitives": [
+                {
+                    "id": "title",
+                    "slot_id": "title",
+                    "kind": "text",
+                    "bounds": {"x": 160, "y": 320, "w": 1280, "h": 100},
+                    "style": {
+                        "color_token": "palette.text",
+                        "typography_token": "typography.heading",
+                    },
+                    "text": {"content": "Full Bleed", "role": "heading"},
+                },
+                {
+                    "id": "tiny_full",
+                    "kind": "image_slot",
+                    "bounds": {"x": 0, "y": 0, "w": 1920, "h": 1080},
+                    "image_slot": {"image_ref": "tiny",
+                                   "alt_text": "full-bleed PNG"},
+                },
+            ],
+        }))
+        full_bleed_out = td / "full_bleed.pptx"
+        rc, _stdout, stderr = _run_capture(full_bleed_ws, full_bleed_out)
+        single_pic = False
+        emu_off_ok = False
+        emu_ext_ok = False
+        no_src_rect = False
+        if rc == 0 and full_bleed_out.is_file():
+            with _zipfile.ZipFile(full_bleed_out) as _zf:
+                slide_xml = _zf.read("ppt/slides/slide1.xml").decode("utf-8")
+            single_pic = slide_xml.count("<p:pic>") == 1
+            pic_start = slide_xml.find("<p:pic>")
+            pic_end = slide_xml.find("</p:pic>", pic_start)
+            pic_block = (
+                slide_xml[pic_start: pic_end + len("</p:pic>")]
+                if pic_start >= 0 and pic_end >= 0 else ""
+            )
+            # 1920 px * 9525 EMU/px = 18288000; 1080 * 9525 = 10287000.
+            emu_off_ok = '<a:off x="0" y="0"/>' in pic_block
+            emu_ext_ok = (
+                '<a:ext cx="18288000" cy="10287000"/>' in pic_block
+            )
+            no_src_rect = "<a:srcRect" not in pic_block
+        results.append(CheckResult(
+            "selftest: full-bleed image_slot (bounds == canvas) "
+            "exports as a single <p:pic> with 1:1 px->EMU "
+            "<a:off>/<a:ext> and no <a:srcRect> clip artifact "
+            "(no-op fit does not break or double-transform)",
+            (
+                rc == 0
+                and single_pic
+                and emu_off_ok
+                and emu_ext_ok
+                and no_src_rect
+            ),
+            (f"rc={rc}, single_pic={single_pic}, "
+             f"emu_off_ok={emu_off_ok}, emu_ext_ok={emu_ext_ok}, "
+             f"no_src_rect={no_src_rect}; {stderr.strip()}"
+             if not (
+                rc == 0
+                and single_pic
+                and emu_off_ok
+                and emu_ext_ok
+                and no_src_rect
+             ) else ""),
+        ))
+
+        # 25. POSITIVE: a successful export writes only the
+        # named .pptx into the output directory — no
+        # `.tmp` / `.partial` / `.cache` / `~` sibling files and
+        # no media-fallback cache subdirectory survive. The
+        # exporter goes straight from `zipfile.ZipFile(output,
+        # "w")` to a complete archive, so this probe is a
+        # regression gate against any future atomic-write swap
+        # or SVG/PNG fallback cache that would leak intermediate
+        # bytes next to the deck after a clean run. The fixture
+        # uses its own isolated subdirectory under `td` so the
+        # other scenarios' workspaces / `.pptx` outputs don't
+        # appear as siblings.
+        no_leftover_dir = td / "no_leftover_root"
+        no_leftover_dir.mkdir()
+        no_leftover_ws = no_leftover_dir / "ws"
+        _write_synthetic_workspace(no_leftover_ws)
+        no_leftover_out = no_leftover_dir / "deck.pptx"
+        rc, _stdout, stderr = _run_capture(no_leftover_ws, no_leftover_out)
+        sibling_names = sorted(p.name for p in no_leftover_dir.iterdir())
+        only_expected_siblings = sibling_names == ["deck.pptx", "ws"]
+        # Walk the workspace for any post-export stray cache or
+        # temp files: png / svg / jpg / jpeg / tmp / partial /
+        # cache that we did not author. Authored entries are the
+        # JSON artifacts under render_models/ and the four
+        # stage artifacts at the workspace root. Anything else
+        # is a leftover.
+        workspace_extras: list[str] = []
+        if no_leftover_ws.is_dir():
+            for p in no_leftover_ws.rglob("*"):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(no_leftover_ws).as_posix()
+                if rel in {
+                    "design_system.json",
+                    "deck_plan.json",
+                    "image_manifest.json",
+                }:
+                    continue
+                if rel.startswith("render_models/") and rel.endswith(".json"):
+                    continue
+                workspace_extras.append(rel)
+        workspace_clean = not workspace_extras
+        results.append(CheckResult(
+            "selftest: successful export writes no temp / partial "
+            "/ cache siblings next to the output and leaves no "
+            "media-fallback artifacts in the workspace (clean "
+            "media-leftover surface)",
+            (
+                rc == 0
+                and no_leftover_out.is_file()
+                and only_expected_siblings
+                and workspace_clean
+            ),
+            (f"rc={rc}, output_exists={no_leftover_out.is_file()}, "
+             f"sibling_names={sibling_names}, "
+             f"workspace_extras={workspace_extras}; {stderr.strip()}"
+             if not (
+                rc == 0
+                and no_leftover_out.is_file()
+                and only_expected_siblings
+                and workspace_clean
+             ) else ""),
+        ))
+
     return results
 
 
@@ -3686,7 +3962,11 @@ def main(argv: list[str]) -> int:
              "JPEG manifest entry exports as embedded <p:pic> + "
              "ppt/media/image1.jpeg with <Default Extension=\"jpeg\" "
              "ContentType=\"image/jpeg\"/>; SVG manifest entry still "
-             "falls back to the placeholder shape) and negatives "
+             "falls back to the placeholder shape; full-bleed "
+             "image_slot bounds==canvas maps 1:1 px->EMU with no "
+             "<a:srcRect> clip artifact; successful export writes no "
+             "temp / partial / cache siblings or workspace fallback "
+             "leftovers) and negatives "
              "(wrong output extension, unsupported `chart_placeholder` "
              "primitive, render_model missing a required field, "
              "image_slot image_ref not in manifest, manifest local_path "
@@ -3697,7 +3977,10 @@ def main(argv: list[str]) -> int:
              "unsupported layout, mis-named render_model file, "
              "deck_plan-declared render_model missing on disk, orphan "
              "render_model not declared by deck_plan, deck_plan "
-             "planned_slide_count disagrees with len(slides)). Exits "
+             "planned_slide_count disagrees with len(slides), primitive "
+             "carrying a forbidden `rotation` key fails closed at "
+             "schema, image_slot carrying a forbidden `transform` key "
+             "fails closed at schema). Exits "
              "non-zero if any positive or negative is not handled as "
              "expected.",
     )

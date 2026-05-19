@@ -611,7 +611,7 @@ python3 scripts/inspect_pptx_inventory.py --pptx \
 python3 scripts/inspect_pptx_inventory.py --pptx deck.pptx \
   --out /tmp/inventory.json
 
-# Self-test — 16 tempfixture scenarios: happy path, deterministic
+# Self-test — 17 tempfixture scenarios: happy path, deterministic
 # repeated inventory, image-only slide failure, missing media,
 # image rel with NO Target attribute (without this explicit check
 # the rel would fall off every downstream media gate — the path-
@@ -621,7 +621,11 @@ python3 scripts/inspect_pptx_inventory.py --pptx deck.pptx \
 # linked-blip `<a:blip r:link/>` in slide content (the same
 # surface validate_pptx_contract.py's media.embedded_only gate
 # refuses), unparseable XML in a non-slide ppt/ part (no
-# fail-open continue), unreadable ZIP, and nonexistent file.
+# fail-open continue), unreadable ZIP, nonexistent file, and an
+# external image rel placed at the PACKAGE-level rels file
+# (`ppt/_rels/presentation.xml.rels`) — defense in depth proving
+# the rels walker iterates every `*.rels` member in the package,
+# not only slide-level rels.
 python3 scripts/inspect_pptx_inventory.py --self-test
 ```
 
