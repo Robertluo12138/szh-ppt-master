@@ -243,10 +243,11 @@ records only the lowercase-identifier shape, the runtime validator
   documented forbidden value (`public_upload`, `raw_source`,
   `full_slide`, `image_search`, `web_generation`, `customer_acme`,
   `confidential_report`, `https://example.com`,
-  `file:///etc/passwd`, and a free-form raw-source sentence) is
-  refused at the schema layer when injected into the descriptor
-  value slot, any `allowed_values` slot, and any
-  `synthetic_requests` slot; T5 confirms a shape-valid but
+  `file:///etc/passwd`, a public asset URL shape
+  `https://cdn.public.example.com/asset.png`, and a free-form
+  raw-source sentence) is refused at the schema layer when
+  injected into the descriptor value slot, any `allowed_values`
+  slot, and any `synthetic_requests` slot; T5 confirms a shape-valid but
   out-of-taxonomy value (`drawing`) is refused by the per-
   dimension `enum`; T6 confirms the optional `modifier` field can
   be omitted; T7 confirms a tampered `allowed_values` length is

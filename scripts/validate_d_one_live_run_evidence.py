@@ -2257,6 +2257,7 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
         "confidential_report",
         "https://example.com",
         "file:///etc/passwd",
+        "https://cdn.public.example.com/asset.png",
         "Acme reported revenue of $4.2M in Q3",
     )
 
