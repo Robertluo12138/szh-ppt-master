@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """Pre-pipeline authoring quality gate for explicit-input spec bundles.
 
+**This is a narrow bridge contract, NOT a full prompt/report/Markdown-to-PPTX
+automation.** It validates an authoring bundle the caller has already
+written (brief metadata + ``--plan-spec`` deck_plan + design_system input
++ ``--slide-specs-dir`` slide_plans + ``--image-manifest-spec`` image_manifest)
+against the structural rules every Stage-2-through-6 ``init_*.py`` helper
+would re-apply at runtime. The bundle's content comes from the caller; the
+gate never invents brief fields, deck_plan slides, design tokens, slide
+bodies, or image manifest entries from raw source text. The bridge it
+provides is *authoring-time → Stage-1 workspace*: confirm the bundle is
+structurally consistent so a six-stage prep run is not wasted.
+
 Takes the same explicit caller-supplied inputs ``scripts/run_explicit_pipeline.py``
 accepts (``--source`` plus ``--title`` / ``--audience`` / ``--objective``
 plus ``--plan-spec`` plus ``--design-system-spec`` OR ``--theme-from-template``
@@ -18,7 +29,15 @@ This is **a validation gate, not generation**. The script NEVER:
     for byte-level integrity (UTF-8 decode + non-empty) AND for a narrow
     "raw-source-leakage into image_manifest prompt-like fields" scan;
   - calls D-One / Qoder / any public network / image generation / telemetry /
-    external service / model API. The script is stdlib-only and offline.
+    external service / model API. The script is stdlib-only and offline;
+  - implements full prompt/report/Markdown-to-PPTX automation. The bridge
+    contract is intentionally narrow: it cross-checks bundle parts the
+    caller already wrote, including the `source_refs` chain linking
+    slide.source_refs back to the single-element brief.source_refs the
+    Stage-1 ``source_manifest.source.id`` will write. Bundles that
+    overclaim prompt-to-PPTX automation (``ai-generated``, ``model-generated``,
+    ``prompt-to-pptx``, ``automatic prompt-to-`` markers, etc. in any spec
+    field) fail closed alongside the network / model-API token scan below.
 
 Gate behavior
 -------------
@@ -115,6 +134,20 @@ _FORBIDDEN_TOKENS: tuple[tuple[str, str, str], ...] = (
     ("anthropic", "ERROR", "no model-API references allowed in specs"),
     ("api_key",   "ERROR", "no credential-shaped strings allowed in specs"),
     ("telemetry", "ERROR", "no telemetry references allowed in specs"),
+    # Overclaim-of-automation tokens. The repo's bridge contract turns an
+    # explicit authoring bundle into a workspace; it is NOT a prompt/report/
+    # Markdown-to-PPTX automation. Specs that claim AI-generated, model-
+    # generated, or prompt-to-PPTX automation contradict the contract and
+    # fail closed here so the agent fixes the claim before invoking the
+    # runtime pipeline. Substrings are intentionally specific (hyphenated
+    # / phrase-shaped) so they do not collide with the legitimate word
+    # "generate" used in helper / pipeline / stage descriptions.
+    ("ai-generated",        "ERROR", "overclaim: this repo is a bridge contract, not an AI generator"),
+    ("model-generated",     "ERROR", "overclaim: this repo is a bridge contract, not a model-driven generator"),
+    ("prompt-to-pptx",      "ERROR", "overclaim: this repo is a bridge contract, not a prompt-to-PPTX automation"),
+    ("prompt-to-ppt",       "ERROR", "overclaim: this repo is a bridge contract, not a prompt-to-PPT automation"),
+    ("prompt-to-deck",      "ERROR", "overclaim: this repo is a bridge contract, not a prompt-to-deck automation"),
+    ("automatic prompt-to", "ERROR", "overclaim: this repo is a bridge contract, not a prompt-to-* automation"),
 )
 
 # Phrases that indicate a full-slide raster / background-image intent. Only
@@ -1253,15 +1286,16 @@ def _format_report(report: Report) -> str:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Pre-pipeline authoring quality gate. Validates an "
-            "explicit-input spec bundle (the same inputs "
+            "Pre-pipeline authoring quality gate (NARROW BRIDGE "
+            "CONTRACT, not a prompt/report/Markdown-to-PPTX automation). "
+            "Validates an explicit-input spec bundle (the same inputs "
             "scripts/run_explicit_pipeline.py takes) structurally, "
             "WITHOUT creating a workspace or generating any artifact. "
             "Mirrors the structural checks the per-stage init_* helpers "
             "would apply at runtime, plus a small set of authoring "
-            "rules (forbidden network/model/API tokens, full-slide "
-            "raster intent, raw-source leakage into image-manifest "
-            "prompt-like fields)."
+            "rules (forbidden network/model/API tokens, overclaim-of-"
+            "automation tokens, full-slide raster intent, raw-source "
+            "leakage into image-manifest prompt-like fields)."
         ),
     )
     parser.add_argument("--source", type=Path, default=None)
@@ -1285,7 +1319,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--self-test", action="store_true",
         help="Run in-script tempfixture scenarios (happy path + every "
-             "fail-closed gate). Mutually exclusive with the bundle flags.",
+             "fail-closed gate, including the overclaim-of-automation "
+             "scan that protects the bridge-contract framing). Mutually "
+             "exclusive with the bundle flags.",
     )
     args = parser.parse_args(argv)
 
@@ -2241,6 +2277,109 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:
             "fail-closed: slide.index values mix str + int → ERROR (no traceback)",
             ok,
             f"crash={crash}, errors={[f.name for f in report.errors]}",
+        ))
+
+    # 40. Overclaim: ai-generated label in slide_plan notes. The repo's
+    # bridge contract turns an explicit authoring bundle into a workspace
+    # — it does NOT generate content from prompts via AI — so an
+    # ai-generated attribution in any spec field must fail closed.
+    def mut_overclaim_ai_generated(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        spec = json.loads(spec_path.read_text())
+        spec["notes"] = "Body copy was AI-generated from the prompt."
+        _write_json(spec_path, spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report = _run_gate(Path(raw_td), mut_overclaim_ai_generated)
+        ok = (
+            not report.ok
+            and _has_error(report, "ai-generated")
+            and _has_error(report, "overclaim")
+        )
+        results.append(_scenario(
+            "overclaim: slide_plan notes claiming 'AI-generated' content "
+            "flagged (this repo is a bridge contract, not an AI generator)",
+            ok,
+            f"errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # 41. Overclaim: prompt-to-pptx claim in image_manifest alt_text. The
+    # repo is not a prompt/report/Markdown-to-PPTX automation; an alt_text
+    # asserting it is must fail closed.
+    def mut_overclaim_prompt_to_pptx(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "01_cover.json"
+        spec = json.loads(spec_path.read_text())
+        spec["image_refs"] = ["accent"]
+        spec["blocks"].append(
+            {"id": "accent", "kind": "image_ref", "content": "accent"},
+        )
+        _write_json(spec_path, spec)
+        _write_json(bundle["image_manifest_spec"], {
+            "images": [
+                {"id": "accent", "local_path": "assets/a.svg",
+                 "source": "synthetic",
+                 "alt_text": "Produced by the prompt-to-pptx pipeline."},
+            ],
+        })
+    with tempfile.TemporaryDirectory() as raw_td:
+        report = _run_gate(Path(raw_td), mut_overclaim_prompt_to_pptx)
+        ok = (
+            not report.ok
+            and _has_error(report, "prompt-to-pptx")
+            and _has_error(report, "overclaim")
+        )
+        results.append(_scenario(
+            "overclaim: image_manifest alt_text claiming 'prompt-to-pptx' "
+            "automation flagged (this repo is a bridge contract, not a "
+            "prompt-to-PPTX automation)",
+            ok,
+            f"errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # 42. Overclaim: model-generated label in plan_spec rationale. Any
+    # spec field that claims model-driven generation must fail closed.
+    def mut_overclaim_model_generated(td, bundle):
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["planning"]["rationale"] = (
+            "Slide list is model-generated from the source brief."
+        )
+        _write_json(bundle["plan_spec"], plan)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report = _run_gate(Path(raw_td), mut_overclaim_model_generated)
+        ok = (
+            not report.ok
+            and _has_error(report, "model-generated")
+            and _has_error(report, "overclaim")
+        )
+        results.append(_scenario(
+            "overclaim: plan_spec rationale claiming 'model-generated' "
+            "content flagged (this repo is a bridge contract, not a "
+            "model-driven generator)",
+            ok,
+            f"errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # 43. Overclaim: automatic prompt-to-* assertion in slide_plan notes.
+    # The suffix is intentionally NOT one of the specific "prompt-to-<x>"
+    # tokens — those would trip first and the scanner returns on the
+    # first match, so this scenario would otherwise verify the wrong gate.
+    def mut_overclaim_automatic_prompt_to(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        spec = json.loads(spec_path.read_text())
+        spec["notes"] = "Generated via an automatic prompt-to-slides workflow."
+        _write_json(spec_path, spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report = _run_gate(Path(raw_td), mut_overclaim_automatic_prompt_to)
+        ok = (
+            not report.ok
+            and _has_error(report, "automatic prompt-to")
+            and _has_error(report, "overclaim")
+        )
+        results.append(_scenario(
+            "overclaim: slide_plan notes claiming an 'automatic prompt-to-*' "
+            "workflow flagged (this repo is a bridge contract, not a "
+            "prompt-to-* automation)",
+            ok,
+            f"errors={[(f.name, f.detail) for f in report.errors]}",
         ))
 
     return results
