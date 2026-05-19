@@ -2345,7 +2345,13 @@ def _run_self_tests() -> list[CheckResult]:
     that — the exporter must fail closed):
       - wrong --output extension (.zip);
       - render_model containing a `chart_placeholder` primitive
-        (unsupported);
+        (unsupported); every schema-legal chart_kind (bar / column /
+        line / pie) AND the chart_kind-omitted form fail closed
+        identically — a regression that silently lowered any one
+        kind to a <p:pic> fallback would slip past the single-kind
+        probe; the chart_placeholder fail-closed path also does NOT
+        silently rasterize the chart as a full-slide image (no .png
+        / .jpg / .jpeg / .svg residue is left on disk);
       - render_model with a missing required field (no `primitives`);
       - image_slot whose image_ref is not declared in image_manifest;
       - image_manifest local_path with an unsafe URI scheme;
@@ -2562,6 +2568,112 @@ def _run_self_tests() -> list[CheckResult]:
             (f"rc={rc}, missing chart_placeholder in messages, "
              f"output_exists={chart_out.exists()}"
              if rc == 0 or "chart_placeholder" not in msg or chart_out.exists() else ""),
+        ))
+
+        # 4b. Defense-in-depth: every schema-legal chart_kind (bar /
+        # column / line / pie) AND the optional-chart_kind-omitted form
+        # must fail closed. Without this loop a regression that
+        # lowered, say, `pie` to a silent <p:pic> fallback would slip
+        # past scenario 4 (which exercises `bar` only). Each iteration
+        # also confirms no .pptx is written and no `<p:pic>` substitute
+        # ends up on disk under the temp dir, so a chart-shaped
+        # full-slide raster cannot silently take over the slide.
+        for chart_kind in ("bar", "column", "line", "pie", None):
+            label = chart_kind if chart_kind is not None else "(unset)"
+            chart_kind_ws = td / f"with_chart_{label}"
+            _write_synthetic_workspace(chart_kind_ws)
+            placeholder_payload = {"caption": "synthetic"}
+            if chart_kind is not None:
+                placeholder_payload["chart_kind"] = chart_kind
+            (chart_kind_ws / "render_models" / "01_cover.json").write_text(
+                json.dumps({
+                    "index": 1,
+                    "layout": "cover",
+                    "canvas": {"width_px": 1920, "height_px": 1080},
+                    "source_refs": ["synthetic_src"],
+                    "primitives": [
+                        {
+                            "id": "bad_chart",
+                            "kind": "chart_placeholder",
+                            "bounds": {
+                                "x": 100, "y": 100, "w": 800, "h": 400,
+                            },
+                            "chart_placeholder": placeholder_payload,
+                        },
+                    ],
+                })
+            )
+            out_pptx = td / f"chart_{label}.pptx"
+            rc, _stdout, stderr = _run_capture(chart_kind_ws, out_pptx)
+            msg = stderr + _stdout
+            results.append(CheckResult(
+                f"selftest: chart_placeholder chart_kind={label!r} "
+                f"fails closed and writes no .pptx",
+                rc != 0
+                and "chart_placeholder" in msg
+                and not out_pptx.exists(),
+                (f"rc={rc}, msg_has_chart_placeholder="
+                 f"{'chart_placeholder' in msg}, "
+                 f"output_exists={out_pptx.exists()}"
+                 if rc == 0
+                 or "chart_placeholder" not in msg
+                 or out_pptx.exists() else ""),
+            ))
+
+        # 4c. Defense-in-depth: prove the chart_placeholder fail-closed
+        # path does NOT silently rasterize the chart slot as a
+        # full-slide image. We export the same chart_placeholder
+        # render_model as 4 and confirm (i) no .pptx is on disk, (ii)
+        # no media artefact (.png/.jpg/.jpeg/.svg) was written under
+        # the workspace, render_models tree, or output directory. This
+        # is the regression guard for a "lower to <p:pic>" shortcut.
+        raster_ws = td / "with_chart_raster_probe"
+        _write_synthetic_workspace(raster_ws)
+        (raster_ws / "render_models" / "01_cover.json").write_text(
+            json.dumps({
+                "index": 1,
+                "layout": "cover",
+                "canvas": {"width_px": 1920, "height_px": 1080},
+                "source_refs": ["synthetic_src"],
+                "primitives": [
+                    {
+                        "id": "bad_chart",
+                        "kind": "chart_placeholder",
+                        "bounds": {
+                            "x": 100, "y": 100, "w": 800, "h": 400,
+                        },
+                        "chart_placeholder": {
+                            "caption": "raster regression guard",
+                            "chart_kind": "column",
+                        },
+                    },
+                ],
+            })
+        )
+        raster_out = td / "raster_probe.pptx"
+        rc, _stdout, _stderr = _run_capture(raster_ws, raster_out)
+        raster_residue = []
+        # Look anywhere under the temp dir for files the exporter
+        # would only emit on a chart->raster shortcut. The workspace's
+        # own image_manifest is intentionally empty in
+        # _write_synthetic_workspace.
+        for ext in (".png", ".jpg", ".jpeg", ".svg"):
+            raster_residue.extend(str(p) for p in raster_ws.rglob(f"*{ext}"))
+        raster_residue.extend(
+            str(p) for p in raster_out.parent.glob("raster_probe.*")
+        )
+        results.append(CheckResult(
+            "selftest: chart_placeholder fail-closed path does not "
+            "silently emit a rasterized image (no .pptx, no .png / "
+            ".jpg / .jpeg / .svg residue)",
+            rc != 0
+            and not raster_out.exists()
+            and not raster_residue,
+            (f"rc={rc}, output_exists={raster_out.exists()}, "
+             f"residue={raster_residue!r}"
+             if rc == 0
+             or raster_out.exists()
+             or raster_residue else ""),
         ))
 
         # 5. NEGATIVE: render_model missing required field (`primitives`).

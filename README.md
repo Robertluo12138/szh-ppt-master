@@ -611,11 +611,15 @@ python3 scripts/inspect_pptx_inventory.py --pptx \
 python3 scripts/inspect_pptx_inventory.py --pptx deck.pptx \
   --out /tmp/inventory.json
 
-# Self-test — 17 tempfixture scenarios: happy path, deterministic
-# repeated inventory, image-only slide failure, missing media,
-# image rel with NO Target attribute (without this explicit check
-# the rel would fall off every downstream media gate — the path-
-# traversal block guards on target truthiness), orphan media,
+# Self-test — 18 tempfixture scenarios: happy path, deterministic
+# repeated inventory, image-only slide failure, chart-shaped
+# full-slide <p:pic> raster regression guard (the same
+# `slide.image_only` finding fires when the picture is sized to
+# the whole 16:9 canvas — gate is size-blind, so a chart silently
+# lowered to a full-bleed rasterization cannot pass), missing
+# media, image rel with NO Target attribute (without this explicit
+# check the rel would fall off every downstream media gate — the
+# path-traversal block guards on target truthiness), orphan media,
 # external rel, file:// rel, absolute-path rel, path-traversal
 # rel, bad XML at a slide part, unsupported media extension,
 # linked-blip `<a:blip r:link/>` in slide content (the same

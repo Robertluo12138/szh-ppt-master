@@ -33,17 +33,21 @@ USAGE
     # itself only refuses an existing symlink at --out.
     python3 scripts/inspect_pptx_inventory.py --pptx deck.pptx --out report.json
 
-    # Self-test: 17 temp-fixture scenarios — happy path, deterministic
-    # repeated inventory, image-only slide failure, missing media,
-    # image rel with NO Target attribute (without the explicit check
-    # the rel would fall off every downstream media gate — the
-    # path-traversal block guards on `target` truthiness), orphan
-    # media, external rel, file:// rel, absolute-path rel,
-    # path-traversal rel, bad XML at a slide part, unsupported media
-    # extension, linked-blip `<a:blip r:link/>` in slide content,
-    # unparseable XML in a non-slide ppt/ part (no fail-open
-    # continue), unreadable ZIP, nonexistent file, and an external
-    # image rel placed at the PACKAGE-level rels file
+    # Self-test: 18 temp-fixture scenarios — happy path, deterministic
+    # repeated inventory, image-only slide failure, chart-shaped
+    # full-slide <p:pic> raster regression guard (the same
+    # `slide.image_only` finding fires when the picture is sized to
+    # the whole 16:9 canvas — proves the gate is size-blind, so a
+    # chart silently lowered to a full-bleed rasterization cannot
+    # pass), missing media, image rel with NO Target attribute
+    # (without the explicit check the rel would fall off every
+    # downstream media gate — the path-traversal block guards on
+    # `target` truthiness), orphan media, external rel, file:// rel,
+    # absolute-path rel, path-traversal rel, bad XML at a slide part,
+    # unsupported media extension, linked-blip `<a:blip r:link/>` in
+    # slide content, unparseable XML in a non-slide ppt/ part (no
+    # fail-open continue), unreadable ZIP, nonexistent file, and an
+    # external image rel placed at the PACKAGE-level rels file
     # (`ppt/_rels/presentation.xml.rels`) — defense in depth proving
     # the rels walker iterates every `*.rels` member, not only
     # slide-level rels.
@@ -942,47 +946,52 @@ def _run_self_test() -> int:
     """Build temp-fixture .pptx packages and confirm build_inventory
     produces the expected findings / counts.
 
-    Coverage (17 scenarios, in execution order):
+    Coverage (18 scenarios, in execution order):
       1. happy path (one PNG, one editable slide; ok=True).
       2. deterministic repeated inventory (two runs yield byte-identical
          JSON for the same input).
       3. image-only slide fails closed on `slide.image_only`.
-      4. missing media (image rel resolves to a part not on disk)
+      4. chart-shaped full-slide <p:pic> (9144000x6858000 EMU,
+         i.e. the shape a chart silently lowered to a full-bleed
+         rasterization would take) still fails closed on
+         `slide.image_only` — proves the finding is size-blind, so a
+         regression that exempted "large" pics would not slip through.
+      5. missing media (image rel resolves to a part not on disk)
          fails closed on `media.missing`.
-      5. image rel with NO `Target` attribute fails closed on
+      6. image rel with NO `Target` attribute fails closed on
          `media.missing` — the path-traversal block guards on
          `target` truthiness, so without the explicit missing-Target
          check an image rel that declares no Target at all would
          silently pass every downstream media gate.
-      6. orphan media (ppt/media part with no referencing image rel)
+      7. orphan media (ppt/media part with no referencing image rel)
          fails closed on `media.orphan`.
-      7. external relationship (`TargetMode="External"` + URI scheme)
+      8. external relationship (`TargetMode="External"` + URI scheme)
          fails closed on `relationships.external`.
-      8. `file://` relationship fails closed on both
+      9. `file://` relationship fails closed on both
          `relationships.file_uri` AND `relationships.external` (the
          scheme prefix is the external dimension).
-      9. absolute-path relationship (leading `/`) fails closed on
+     10. absolute-path relationship (leading `/`) fails closed on
          `relationships.absolute`.
-     10. path-traversal relationship (`..` segments escape the
+     11. path-traversal relationship (`..` segments escape the
          package root) fails closed on `relationships.path_traversal`.
-     11. bad XML at a slide part fails closed on
+     12. bad XML at a slide part fails closed on
          `package.unreadable_xml`.
-     12. unsupported media extension (`ppt/media/image1.gif`) fails
+     13. unsupported media extension (`ppt/media/image1.gif`) fails
          closed on `media.unsupported_extension`.
-     13. linked-blip `<a:blip r:link="rIdL"/>` in a slide fails closed
+     14. linked-blip `<a:blip r:link="rIdL"/>` in a slide fails closed
          on `media.linked_blip` (closes the same surface
          validate_pptx_contract.py's media.embedded_only gate refuses).
-     14. unparseable XML in a non-slide part under `ppt/` (here
+     15. unparseable XML in a non-slide part under `ppt/` (here
          ppt/theme/theme1.xml) fails closed on `package.unreadable_xml`
          from the linked-blip walker (the walker cannot rule out a
          buried r:link in malformed XML, so a fail-open continue would
          silently bypass the contract).
-     15. unreadable ZIP (non-ZIP bytes at a `.pptx` path) fails closed
+     16. unreadable ZIP (non-ZIP bytes at a `.pptx` path) fails closed
          on `package.unreadable_zip`.
-     16. nonexistent file (`--pptx` path that does not exist) fails
+     17. nonexistent file (`--pptx` path that does not exist) fails
          closed on `package.unreadable_zip` (the build_inventory entry
          emits the synthetic finding when `Path.is_file()` is False).
-     17. external image rel placed at the PACKAGE-level rels file
+     18. external image rel placed at the PACKAGE-level rels file
          (`ppt/_rels/presentation.xml.rels`) surfaces a
          `relationships.external` finding pinned to that part —
          defense in depth for the embedded-only contract, proving
@@ -1068,6 +1077,33 @@ def _run_self_test() -> int:
         if not scn_ok:
             failures.append(
                 f"image-only: codes={codes}, ok={inv['ok']}"
+            )
+
+        # ---- chart-shaped full-slide raster regression guard ----
+        # A slide whose only content is a <p:pic> sized to the full
+        # 16:9 canvas (9144000 x 6858000 EMU) — the shape a chart
+        # silently lowered to a full-bleed rasterization would take —
+        # must still surface `slide.image_only`. Mirrors the analogous
+        # scenario in scripts/validate_pptx_contract.py and proves the
+        # finding is size-blind: a regression that exempted "large"
+        # pics on the grounds that they could be intentional
+        # background imagery would slip past the 100x100 probe above
+        # but trip on this one.
+        chart_raster = td / "chart_raster.pptx"
+        _write_minimal_pptx_with_slides(
+            chart_raster,
+            slide_bodies=[_PIC_FULL_SLIDE_BODY],
+        )
+        inv = build_inventory(chart_raster)
+        codes = [f["code"] for f in inv["findings"]]
+        scn_ok = ("slide.image_only" in codes) and inv["ok"] is False
+        scenarios.append((
+            "chart-shaped full-slide <p:pic> raster regression guard",
+            scn_ok,
+        ))
+        if not scn_ok:
+            failures.append(
+                f"chart raster: codes={codes}, ok={inv['ok']}"
             )
 
         # ---- missing media ----
@@ -1499,6 +1535,29 @@ _PIC_ONLY_BODY = (
 )
 
 
+# Chart-shaped <p:pic>: a single picture sized to ~the full 16:9
+# canvas (9144000 x 6858000 EMU). Used by the chart-raster regression
+# probe so the existing `slide.image_only` finding is proven
+# size-blind: a regression that exempted "large" pics from the
+# image-only check (e.g. allowing a chart silently lowered to a
+# full-bleed rasterization) would slip past the 100x100 body above
+# but trip on this one. Mirrors the analogous scenario in
+# scripts/validate_pptx_contract.py.
+_PIC_FULL_SLIDE_BODY = (
+    '<p:pic>'
+    '<p:nvPicPr>'
+    '<p:cNvPr id="2" name="chart_raster"/>'
+    '<p:cNvPicPr/>'
+    '<p:nvPr/>'
+    '</p:nvPicPr>'
+    '<p:blipFill><a:blip/></p:blipFill>'
+    '<p:spPr><a:xfrm><a:off x="0" y="0"/>'
+    '<a:ext cx="9144000" cy="6858000"/></a:xfrm>'
+    '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
+    '</p:pic>'
+)
+
+
 def _write_minimal_pptx_with_slides(
     path: Path,
     *,
@@ -1688,10 +1747,15 @@ def main(argv: list[str]) -> int:
         "--self-test",
         action="store_true",
         help=(
-            "Run the in-script tempfixture scenarios (17 today): "
+            "Run the in-script tempfixture scenarios (18 today): "
             "happy path, deterministic repeated inventory, image-only "
-            "slide failure, missing media (image rel resolves to a "
-            "part not on disk), image rel with NO Target attribute "
+            "slide failure, chart-shaped full-slide <p:pic> raster "
+            "regression guard (the same `slide.image_only` finding "
+            "fires when the picture is sized to the whole 16:9 canvas "
+            "— gate is size-blind, so a chart silently lowered to a "
+            "full-bleed rasterization cannot pass), missing media "
+            "(image rel resolves to a part not on disk), image rel "
+            "with NO Target attribute "
             "(without the explicit check the rel would fall off every "
             "downstream media gate — the path-traversal block guards "
             "on `target` truthiness, so a missing or empty Target "

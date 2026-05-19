@@ -1205,6 +1205,29 @@ _PIC_ONLY_XML = (
 )
 
 
+# Chart-shaped <p:pic>: a single picture sized to ~the full canvas
+# (9144000 x 6858000 EMU = standard 16:9 deck). Used by the
+# chart-raster regression probe so the existing
+# minimal_evidence.every_slide_has_native_shape +
+# minimal_evidence.not_all_image_slide gates are proven size-blind.
+# A regression that exempted "large" pics from the all-image check —
+# e.g. allowing a full-bleed chart rasterization — would slip past
+# the 100x100 fixture above but trip on this one.
+_PIC_FULL_SLIDE_XML = (
+    '<p:pic>'
+    '<p:nvPicPr>'
+    '<p:cNvPr id="2" name="chart_raster"/>'
+    '<p:cNvPicPr/>'
+    '<p:nvPr/>'
+    '</p:nvPicPr>'
+    '<p:blipFill><a:blip/></p:blipFill>'
+    '<p:spPr><a:xfrm><a:off x="0" y="0"/>'
+    '<a:ext cx="9144000" cy="6858000"/></a:xfrm>'
+    '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
+    '</p:pic>'
+)
+
+
 # <p:pic> whose <a:blip> carries an `r:link` attribute — the OOXML
 # external-linked-image reference form. media.embedded_only must fail
 # closed on any slide carrying this shape, regardless of whether the
@@ -1555,6 +1578,43 @@ def _run_tempfixture_negatives() -> list[CheckResult]:
                 for r in g_res
             ),
             "; ".join(r.detail for r in g_res if not r.ok),
+        ))
+
+        # 16b. Chart-shaped raster regression guard. A slide whose only
+        # content is a `<p:pic>` sized to the full 16:9 canvas
+        # (9144000 x 6858000 EMU) — i.e. a chart silently lowered to a
+        # full-slide rasterization — must trip both
+        # `minimal_evidence.not_all_image_slide` AND
+        # `minimal_evidence.every_slide_has_native_shape`. Proves the
+        # gate is size-blind: a regression that exempted "large" pics
+        # (e.g. on the theory that a full-bleed background image is
+        # fine) would slip past the 100x100 fixture above but fail
+        # here. Belt-and-braces for the chart_placeholder fail-closed
+        # contract in scripts/export_pptx.py.
+        chart_raster_pptx = td / "chart_raster.pptx"
+        _write_minimal_editable_pptx(
+            chart_raster_pptx,
+            slides=[_PIC_FULL_SLIDE_XML],
+        )
+        g_res = check_generated_pptx(chart_raster_pptx)
+        not_all_image_fired = any(
+            r.name.startswith("minimal_evidence.not_all_image_slide")
+            and not r.ok for r in g_res
+        )
+        no_native_fired = any(
+            r.name.startswith(
+                "minimal_evidence.every_slide_has_native_shape"
+            ) and not r.ok for r in g_res
+        )
+        out.append(CheckResult(
+            "tempfixture: chart-shaped full-slide <p:pic> "
+            "(9144000x6858000 EMU) fails both "
+            "minimal_evidence.not_all_image_slide AND "
+            "minimal_evidence.every_slide_has_native_shape (gate is "
+            "size-blind — a full-bleed chart raster cannot pass)",
+            not_all_image_fired and no_native_fired,
+            ("; ".join(r.detail for r in g_res if not r.ok)
+             if not (not_all_image_fired and no_native_fired) else ""),
         ))
 
         # 17a. slide_count.expected — positive: a 2-slide PPTX
