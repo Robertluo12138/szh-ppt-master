@@ -9,7 +9,8 @@
     "schema_version",
     "note",
     "kind_enum",
-    "descriptors"
+    "descriptors",
+    "image_taxonomy"
   ],
   "properties": {
     "schema_version": {
@@ -74,6 +75,250 @@
         }
       },
       "description": "Approved descriptor list. V3 closed-enumeration: an empty array is equivalent to 'no prompt is assemblable' and is the resting state today. V5 paired-change rule: adding, removing, or modifying a descriptor requires a paired update to this file and to the runtime validator (or, if no validator yet exists, the corresponding TODO in references/d-one-live-integration-design.md §13 is still open and the live path stays unwired). V4 post-assembly re-scan: any prompt assembled from these descriptors MUST re-pass the full adapter deny list (URI schemes, file paths, raw-source markers, 40-char source shingles, credential / PII shapes, full-slide / page-generation / screenshot wording) AFTER assembly, BEFORE the plan is written; that gate is the adapter's runtime responsibility, not this schema's."
+    },
+    "image_taxonomy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rendering_style",
+        "palette_family",
+        "image_role",
+        "layout_pattern",
+        "modifier"
+      ],
+      "properties": {
+        "rendering_style": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_values"],
+          "properties": {
+            "allowed_values": {
+              "type": "array",
+              "minItems": 5,
+              "maxItems": 5,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "enum": [
+                  "flat_vector",
+                  "line_diagram",
+                  "isometric_lite",
+                  "low_poly",
+                  "solid_shape"
+                ],
+                "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+              },
+              "description": "Closed enumeration of permitted rendering-style values. Defense in depth: the items[].enum locks the canonical five tokens, and the items[].pattern re-applies the descriptor-layer positive whitelist + forbidden-token deny clause so a future schema-edit that loosened the enum would still trip the pattern on any unsafe token. Length is pinned to exactly 5 so a tampered file cannot widen the surface; adding or removing a value is a paired schema/template/validator change."
+            }
+          },
+          "description": "Dimension 1 — visual rendering treatment requested for a synthetic image. The five values are clean-room engineering tokens, not a quote of any external rendering-style catalog."
+        },
+        "palette_family": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_values"],
+          "properties": {
+            "allowed_values": {
+              "type": "array",
+              "minItems": 5,
+              "maxItems": 5,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "enum": [
+                  "neutral_grey",
+                  "accent_only",
+                  "dual_tone",
+                  "mono_brand",
+                  "palette_default"
+                ],
+                "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+              },
+              "description": "Closed enumeration of permitted palette-family values. Each value names HOW the runtime should pull colors from the design-system palette tokens (which are themselves a separate closed contract in design_system.json) — never a raw hex literal pulled from a customer palette."
+            }
+          },
+          "description": "Dimension 2 — palette mapping strategy. Each value resolves at runtime against design_system.json's palette tokens; the schema only fixes the strategy enumeration."
+        },
+        "image_role": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_values"],
+          "properties": {
+            "allowed_values": {
+              "type": "array",
+              "minItems": 5,
+              "maxItems": 5,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "enum": [
+                  "decorative_accent",
+                  "metaphor_icon",
+                  "divider_motif",
+                  "kpi_emblem",
+                  "cover_motif"
+                ],
+                "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+              },
+              "description": "Closed enumeration of slide-purpose roles a synthetic image is allowed to play. 'full_slide' / 'whole_slide' / 'screenshot' shapes would trip the descriptor deny pattern at the schema layer; only small motif / icon / emblem / divider / cover roles are permitted, matching references/d-one-image-policy.md (the local pipeline never asks D-One for a full slide)."
+            }
+          },
+          "description": "Dimension 3 — slide-purpose role. The role narrows WHAT a synthetic image is for; it never includes any 'full slide' / 'whole page' / 'screenshot' value, which would also be refused by the descriptor pattern itself."
+        },
+        "layout_pattern": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_values"],
+          "properties": {
+            "allowed_values": {
+              "type": "array",
+              "minItems": 5,
+              "maxItems": 5,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "enum": [
+                  "single_center",
+                  "left_anchor",
+                  "right_anchor",
+                  "top_band",
+                  "bottom_band"
+                ],
+                "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+              },
+              "description": "Closed enumeration of spatial composition patterns. Each value names a coarse subject placement on the canvas; finer placement is the slide-plan / render-model layer's responsibility, not this taxonomy's."
+            }
+          },
+          "description": "Dimension 4 — spatial composition pattern. Coarse subject placement only; the slide-plan layout engine still positions the rendered asset on the slide."
+        },
+        "modifier": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_values"],
+          "properties": {
+            "allowed_values": {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "enum": [
+                  "low_contrast",
+                  "soft_edges",
+                  "grid_aligned",
+                  "negative_space"
+                ],
+                "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+              },
+              "description": "Closed enumeration of optional intensity / texture modifiers. Each value softens or constrains the rendered output (lower contrast, softer edges, grid-aligned subject, generous negative space)."
+            }
+          },
+          "description": "Dimension 5 — optional intensity / texture modifier. Applied on top of the four required dimensions; never carries product-specific or customer-specific tokens."
+        }
+      },
+      "description": "Image-request taxonomy. A synthetic image request is composed from five clean-room dimensions: rendering_style, palette_family, image_role, layout_pattern, modifier. Each dimension declares a fixed-length 'allowed_values' array whose entries are simultaneously enum-locked AND pattern-locked at the schema layer — the same positive whitelist + forbidden-token deny clause that descriptors[*].value uses. Canonical-set-membership invariant: every 'allowed_values' array carries minItems == maxItems == N AND uniqueItems == true AND items.enum of length N, where N is the canonical count (5 for rendering_style / palette_family / image_role / layout_pattern, 4 for modifier). With N unique items drawn from an N-element enum, the only valid array is a permutation of the canonical set — a tampered file that ships `[\"flat_vector\"] * 5` would fail uniqueItems, and a file that omits a value would fail minItems; neither false-greens. Defense in depth: the runtime image-request gate (when wired) MUST cross-check every dimension value against the matching 'allowed_values' AND independently re-apply the deny pattern. This taxonomy is intentionally minimal — five dimensions × ≤5 values — and is not a mirror of any external image-style catalog. Adding, removing, or modifying a dimension or value is a paired schema / template / validator-probe change."
+    },
+    "synthetic_requests": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "rendering_style",
+          "palette_family",
+          "image_role",
+          "layout_pattern"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Synthetic request identifier. Same lowercase-identifier positive whitelist + forbidden-token deny clause as descriptors[*].value; never a real customer / product / project name."
+          },
+          "rendering_style": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "enum": [
+              "flat_vector",
+              "line_diagram",
+              "isometric_lite",
+              "low_poly",
+              "solid_shape"
+            ],
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+          },
+          "palette_family": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "enum": [
+              "neutral_grey",
+              "accent_only",
+              "dual_tone",
+              "mono_brand",
+              "palette_default"
+            ],
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+          },
+          "image_role": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "enum": [
+              "decorative_accent",
+              "metaphor_icon",
+              "divider_motif",
+              "kpi_emblem",
+              "cover_motif"
+            ],
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+          },
+          "layout_pattern": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "enum": [
+              "single_center",
+              "left_anchor",
+              "right_anchor",
+              "top_band",
+              "bottom_band"
+            ],
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+          },
+          "modifier": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "enum": [
+              "low_contrast",
+              "soft_edges",
+              "grid_aligned",
+              "negative_space"
+            ],
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Optional. When omitted, the runtime gate (when wired) applies no modifier. When present, MUST be one of the closed enumeration values."
+          }
+        }
+      },
+      "description": "Optional synthetic composed-request list. Each item demonstrates a fully composed image request whose four required dimensions (and optional modifier) all draw from image_taxonomy.<dim>.allowed_values. Length is bounded so a tampered file cannot smuggle a large free-form payload here. The schema's per-dimension enum lock means a tampered request cannot use a value outside the canonical taxonomy. Empty array is acceptable — this list is a documentation aid, not a contract requirement."
     }
   }
 }

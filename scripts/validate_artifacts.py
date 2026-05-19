@@ -14,7 +14,7 @@ draft-07 sufficient to validate the synthetic fixtures shipped with this repo:
   Supported keywords:
     type, required, enum, pattern, minLength, maxLength,
     minimum, maximum, exclusiveMinimum, exclusiveMaximum,
-    minItems, maxItems, properties,
+    minItems, maxItems, uniqueItems, properties,
     additionalProperties (boolean OR object schema),
     items (single subschema only; tuple-form 'items' is surfaced as an error).
 
@@ -51,7 +51,7 @@ SUPPORTED_KEYWORDS = {
     "type", "required", "enum", "pattern",
     "minLength", "maxLength",
     "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
-    "minItems", "maxItems",
+    "minItems", "maxItems", "uniqueItems",
     "properties", "additionalProperties", "items",
     # Documentation-only keywords we silently allow:
     "$schema", "$id", "title", "description", "default", "examples",
@@ -130,6 +130,25 @@ def _validate(value: Any, schema: dict, path: str, errors: list[str]) -> None:
             errors.append(f"{path}: array has {len(value)} items, minItems is {schema['minItems']}")
         if "maxItems" in schema and len(value) > schema["maxItems"]:
             errors.append(f"{path}: array has {len(value)} items, maxItems is {schema['maxItems']}")
+        if schema.get("uniqueItems") is True:
+            seen: dict[str, int] = {}
+            for i, item in enumerate(value):
+                try:
+                    key = json.dumps(item, sort_keys=True)
+                except (TypeError, ValueError):
+                    errors.append(
+                        f"{path}[{i}]: cannot canonicalize element for "
+                        f"uniqueItems check"
+                    )
+                    continue
+                if key in seen:
+                    errors.append(
+                        f"{path}[{i}]: duplicate element refused under "
+                        f"uniqueItems (already at {path}[{seen[key]}]): "
+                        f"{item!r}"
+                    )
+                else:
+                    seen[key] = i
         item_schema = schema.get("items")
         if isinstance(item_schema, dict):
             for i, item in enumerate(value):

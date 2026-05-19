@@ -181,6 +181,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from validate_artifacts import _validate  # noqa: E402
 
 EVIDENCE_SCHEMA = SCHEMAS_DIR / "d_one_live_run_evidence.schema.json"
+DESCRIPTOR_VOCAB_SCHEMA = SCHEMAS_DIR / "d_one_descriptor_vocabulary.schema.json"
 
 # ---------------------------------------------------------------------------
 # Free-form field scan tables (A11 + readiness §6 + privacy rules).
@@ -946,6 +947,93 @@ def _minimal_ok_record() -> dict:
                 {"id": "cover_accent", "decision": "pass"},
             ],
         },
+    }
+
+
+def _canonical_descriptor_vocab() -> dict:
+    """Return a canonical, schema-valid descriptor vocabulary payload that
+    the in-script taxonomy probes can mutate. Mirrors the synthetic
+    template at examples/d_one_descriptor_vocabulary_template.json but is
+    kept in-script so the probes do not depend on on-disk template bytes
+    (a probe that loaded the on-disk template would silently mask a
+    drift between schema and template — the schema/template pair is
+    intentionally re-validated by the
+    `python3 scripts/validate_artifacts.py --schema ... <template>`
+    command separately)."""
+    return {
+        "schema_version": 1,
+        "note": (
+            "Synthetic placeholder D-One descriptor vocabulary for "
+            "in-script taxonomy probes."
+        ),
+        "kind_enum": [
+            "color_token",
+            "geometric_noun",
+            "mood_adjective",
+            "composition_adjective",
+        ],
+        "descriptors": [
+            {"kind": "color_token", "value": "palette.accent"},
+            {"kind": "geometric_noun", "value": "circle"},
+            {"kind": "mood_adjective", "value": "calm"},
+            {"kind": "composition_adjective", "value": "centered"},
+        ],
+        "image_taxonomy": {
+            "rendering_style": {
+                "allowed_values": [
+                    "flat_vector",
+                    "line_diagram",
+                    "isometric_lite",
+                    "low_poly",
+                    "solid_shape",
+                ],
+            },
+            "palette_family": {
+                "allowed_values": [
+                    "neutral_grey",
+                    "accent_only",
+                    "dual_tone",
+                    "mono_brand",
+                    "palette_default",
+                ],
+            },
+            "image_role": {
+                "allowed_values": [
+                    "decorative_accent",
+                    "metaphor_icon",
+                    "divider_motif",
+                    "kpi_emblem",
+                    "cover_motif",
+                ],
+            },
+            "layout_pattern": {
+                "allowed_values": [
+                    "single_center",
+                    "left_anchor",
+                    "right_anchor",
+                    "top_band",
+                    "bottom_band",
+                ],
+            },
+            "modifier": {
+                "allowed_values": [
+                    "low_contrast",
+                    "soft_edges",
+                    "grid_aligned",
+                    "negative_space",
+                ],
+            },
+        },
+        "synthetic_requests": [
+            {
+                "id": "cover_motif_neutral",
+                "rendering_style": "flat_vector",
+                "palette_family": "neutral_grey",
+                "image_role": "cover_motif",
+                "layout_pattern": "single_center",
+                "modifier": "negative_space",
+            },
+        ],
     }
 
 
@@ -2133,6 +2221,293 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
                 f"negation): {note!r}",
                 rc == 0 and not errs,
                 f"rc={rc}, errs={errs!r}",
+            ))
+
+    # ---- Taxonomy probes (image-request taxonomy contract). ----
+    # Defense-in-depth probes for the image_taxonomy + synthetic_requests
+    # extension to schemas/d_one_descriptor_vocabulary.schema.json. The
+    # five dimensions (rendering_style, palette_family, image_role,
+    # layout_pattern, modifier) are closed enumerations. The probes
+    # confirm: (a) the canonical synthetic vocabulary validates clean;
+    # (b) each documented forbidden token shape is refused at the schema
+    # layer when injected into a descriptor value, an allowed_values
+    # slot, or a synthetic_requests slot; (c) a shape-valid but
+    # out-of-taxonomy value is refused by the enum lock; (d) a tampered
+    # allowed_values length is refused by the maxItems lock. The probes
+    # do NOT call D-One / Qoder / any image-generation model / any
+    # network — they only validate in-memory JSON payloads written to a
+    # tempfile against the on-disk schema.
+    vocab_schema = json.loads(
+        DESCRIPTOR_VOCAB_SCHEMA.read_text(encoding="utf-8")
+    )
+    taxonomy_dims = (
+        "rendering_style",
+        "palette_family",
+        "image_role",
+        "layout_pattern",
+        "modifier",
+    )
+    forbidden_descriptor_values = (
+        "public_upload",
+        "raw_source",
+        "full_slide",
+        "image_search",
+        "web_generation",
+        "customer_acme",
+        "confidential_report",
+        "https://example.com",
+        "file:///etc/passwd",
+        "Acme reported revenue of $4.2M in Q3",
+    )
+
+    # T1: canonical descriptor vocabulary (descriptors + image_taxonomy
+    # + synthetic_requests) validates clean.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        p = _write(td, "vocab.json", _canonical_descriptor_vocab())
+        errs: list[str] = []
+        _validate(json.loads(p.read_text()), vocab_schema, "<root>", errs)
+        results.append(_expect(
+            "T1: canonical descriptor vocabulary "
+            "(taxonomy + synthetic_requests) validates clean",
+            errs == [],
+            f"errs={errs!r}",
+        ))
+
+    # T2: each documented forbidden value is refused when injected as a
+    # descriptors[*].value. The descriptor value pattern is the only
+    # gate at that slot (no enum), so a pattern-error confirms the
+    # deny-clause is doing the work.
+    for forbidden in forbidden_descriptor_values:
+        rec = _canonical_descriptor_vocab()
+        rec["descriptors"].append(
+            {"kind": "geometric_noun", "value": forbidden}
+        )
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            p = _write(td, "vocab.json", rec)
+            errs = []
+            _validate(json.loads(p.read_text()), vocab_schema, "<root>", errs)
+            results.append(_expect(
+                f"T2: forbidden descriptor value refused at "
+                f"schema layer: {forbidden!r}",
+                any("does not match pattern" in e for e in errs),
+                f"errs={errs!r}",
+            ))
+
+    # T3: each documented forbidden value is refused when injected into
+    # any image_taxonomy.<dim>.allowed_values slot. At that slot the
+    # closed enum AND the deny pattern both apply; either failure mode
+    # is acceptable evidence that the gate held.
+    for dim in taxonomy_dims:
+        for forbidden in forbidden_descriptor_values:
+            rec = _canonical_descriptor_vocab()
+            rec["image_taxonomy"][dim]["allowed_values"][0] = forbidden
+            with tempfile.TemporaryDirectory() as raw_td:
+                td = Path(raw_td)
+                p = _write(td, "vocab.json", rec)
+                errs = []
+                _validate(
+                    json.loads(p.read_text()), vocab_schema, "<root>", errs
+                )
+                results.append(_expect(
+                    f"T3: forbidden value refused in "
+                    f"image_taxonomy.{dim}.allowed_values: {forbidden!r}",
+                    any(
+                        "not in enum" in e or "does not match pattern" in e
+                        for e in errs
+                    ),
+                    f"errs={errs!r}",
+                ))
+
+    # T4: each documented forbidden value is refused when injected into
+    # a synthetic_requests[*].<dim> slot. Same closed-enum + deny-pattern
+    # surface; either failure is acceptable evidence.
+    for dim in taxonomy_dims:
+        for forbidden in forbidden_descriptor_values:
+            rec = _canonical_descriptor_vocab()
+            rec["synthetic_requests"][0][dim] = forbidden
+            with tempfile.TemporaryDirectory() as raw_td:
+                td = Path(raw_td)
+                p = _write(td, "vocab.json", rec)
+                errs = []
+                _validate(
+                    json.loads(p.read_text()), vocab_schema, "<root>", errs
+                )
+                results.append(_expect(
+                    f"T4: forbidden value refused in "
+                    f"synthetic_requests[0].{dim}: {forbidden!r}",
+                    any(
+                        "not in enum" in e or "does not match pattern" in e
+                        for e in errs
+                    ),
+                    f"errs={errs!r}",
+                ))
+
+    # T5: a shape-valid but out-of-taxonomy value (e.g. "drawing") is
+    # refused by the per-dimension closed enum. This isolates the enum
+    # lock so a future loosening of the descriptor pattern would still
+    # be caught by the enum.
+    out_of_taxonomy_value = "drawing"
+    for dim in taxonomy_dims:
+        rec = _canonical_descriptor_vocab()
+        rec["synthetic_requests"][0][dim] = out_of_taxonomy_value
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            p = _write(td, "vocab.json", rec)
+            errs = []
+            _validate(
+                json.loads(p.read_text()), vocab_schema, "<root>", errs
+            )
+            results.append(_expect(
+                f"T5: shape-valid but out-of-taxonomy value refused in "
+                f"synthetic_requests[0].{dim}: {out_of_taxonomy_value!r}",
+                any("not in enum" in e for e in errs),
+                f"errs={errs!r}",
+            ))
+
+    # T6: omitting the optional 'modifier' in a synthetic_request still
+    # validates clean (modifier is the only optional dimension).
+    rec = _canonical_descriptor_vocab()
+    rec["synthetic_requests"][0].pop("modifier")
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        p = _write(td, "vocab.json", rec)
+        errs = []
+        _validate(json.loads(p.read_text()), vocab_schema, "<root>", errs)
+        results.append(_expect(
+            "T6: synthetic_request with optional 'modifier' omitted "
+            "validates clean",
+            errs == [],
+            f"errs={errs!r}",
+        ))
+
+    # T7: appending a duplicate to allowed_values overflows the
+    # fixed-length lock (maxItems). Proves a tampered file cannot widen
+    # the surface even with otherwise-legal tokens.
+    expected_lengths = {
+        "rendering_style": 5,
+        "palette_family": 5,
+        "image_role": 5,
+        "layout_pattern": 5,
+        "modifier": 4,
+    }
+    for dim, want_len in expected_lengths.items():
+        rec = _canonical_descriptor_vocab()
+        rec["image_taxonomy"][dim]["allowed_values"].append(
+            rec["image_taxonomy"][dim]["allowed_values"][0]
+        )
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            p = _write(td, "vocab.json", rec)
+            errs = []
+            _validate(
+                json.loads(p.read_text()), vocab_schema, "<root>", errs
+            )
+            results.append(_expect(
+                f"T7: image_taxonomy.{dim}.allowed_values overflow "
+                f"refused (maxItems={want_len})",
+                any(f"maxItems is {want_len}" in e for e in errs),
+                f"errs={errs!r}",
+            ))
+
+    # T8: removing a required dimension from image_taxonomy is refused.
+    for dim in taxonomy_dims:
+        rec = _canonical_descriptor_vocab()
+        rec["image_taxonomy"].pop(dim)
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            p = _write(td, "vocab.json", rec)
+            errs = []
+            _validate(
+                json.loads(p.read_text()), vocab_schema, "<root>", errs
+            )
+            results.append(_expect(
+                f"T8: missing image_taxonomy.{dim} refused (required lock)",
+                any(
+                    f"missing required property '{dim}'" in e for e in errs
+                ),
+                f"errs={errs!r}",
+            ))
+
+    # T9: an additional property on synthetic_requests[0] is refused
+    # (additionalProperties: false at the request shape).
+    rec = _canonical_descriptor_vocab()
+    rec["synthetic_requests"][0]["smuggled"] = "anything"
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        p = _write(td, "vocab.json", rec)
+        errs = []
+        _validate(json.loads(p.read_text()), vocab_schema, "<root>", errs)
+        results.append(_expect(
+            "T9: extra property in synthetic_requests[0] refused "
+            "(additionalProperties: false)",
+            any(
+                "additional property 'smuggled' not allowed" in e
+                for e in errs
+            ),
+            f"errs={errs!r}",
+        ))
+
+    # T10: a noncanonical allowed_values array that ships duplicates is
+    # refused by the uniqueItems lock. Without uniqueItems, the schema
+    # would false-green an array like ["flat_vector"] * 5 — the items
+    # all match items.enum and the array satisfies minItems == maxItems,
+    # but the canonical set is gone. uniqueItems combined with
+    # items.enum of length N and minItems == maxItems == N forces the
+    # array to be a permutation of the canonical set, closing the gap
+    # Codex stop-time review flagged.
+    for dim in taxonomy_dims:
+        rec = _canonical_descriptor_vocab()
+        canonical_first = rec["image_taxonomy"][dim]["allowed_values"][0]
+        # Overwrite the second slot with a duplicate of the first; the
+        # array still satisfies length + items.enum + items.pattern
+        # individually, but uniqueItems must refuse the duplicate.
+        rec["image_taxonomy"][dim]["allowed_values"][1] = canonical_first
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            p = _write(td, "vocab.json", rec)
+            errs = []
+            _validate(
+                json.loads(p.read_text()), vocab_schema, "<root>", errs
+            )
+            results.append(_expect(
+                f"T10: duplicate in image_taxonomy.{dim}.allowed_values "
+                f"refused by uniqueItems "
+                f"(noncanonical-allowed_values false-green closed)",
+                any(
+                    "duplicate element refused under uniqueItems" in e
+                    for e in errs
+                ),
+                f"errs={errs!r}",
+            ))
+
+    # T10b: the noncanonical extreme case — an allowed_values array
+    # that ships the SAME canonical value N times (e.g. ["flat_vector",
+    # "flat_vector", "flat_vector", "flat_vector", "flat_vector"]).
+    # This is the exact shape the Codex review named: every element is
+    # in items.enum, length is exact, but uniqueItems must refuse it.
+    for dim in taxonomy_dims:
+        rec = _canonical_descriptor_vocab()
+        first = rec["image_taxonomy"][dim]["allowed_values"][0]
+        rec["image_taxonomy"][dim]["allowed_values"] = [
+            first for _ in rec["image_taxonomy"][dim]["allowed_values"]
+        ]
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            p = _write(td, "vocab.json", rec)
+            errs = []
+            _validate(
+                json.loads(p.read_text()), vocab_schema, "<root>", errs
+            )
+            results.append(_expect(
+                f"T10b: image_taxonomy.{dim}.allowed_values ship the "
+                f"same canonical value N times refused by uniqueItems",
+                any(
+                    "duplicate element refused under uniqueItems" in e
+                    for e in errs
+                ),
+                f"errs={errs!r}",
             ))
 
     return results

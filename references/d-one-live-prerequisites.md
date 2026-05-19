@@ -182,6 +182,89 @@ token resolvable from `design_system.json` at runtime; the schema
 records only the lowercase-identifier shape, the runtime validator
 (when wired) handles the design-system cross-check.
 
+### 4.1 Image-request taxonomy (V6 — clean-room dimensions)
+
+- **Schema:** the same
+  `schemas/d_one_descriptor_vocabulary.schema.json` carries an
+  `image_taxonomy` block (required) and an optional
+  `synthetic_requests` block.
+- **Synthetic placeholder:**
+  `examples/d_one_descriptor_vocabulary_template.json` ships both
+  blocks with the canonical clean-room values below plus two
+  composed example requests.
+- **Five clean-room dimensions** — each a closed enumeration:
+  - `rendering_style` (5 values): `flat_vector`, `line_diagram`,
+    `isometric_lite`, `low_poly`, `solid_shape`;
+  - `palette_family` (5 values): `neutral_grey`, `accent_only`,
+    `dual_tone`, `mono_brand`, `palette_default`;
+  - `image_role` (5 values): `decorative_accent`, `metaphor_icon`,
+    `divider_motif`, `kpi_emblem`, `cover_motif`;
+  - `layout_pattern` (5 values): `single_center`, `left_anchor`,
+    `right_anchor`, `top_band`, `bottom_band`;
+  - `modifier` (4 values, optional in a request): `low_contrast`,
+    `soft_edges`, `grid_aligned`, `negative_space`.
+- **Schema-layer locks (defense in depth):**
+  - per-dimension `allowed_values` arrays are pinned to a fixed
+    length (`minItems == maxItems`) so a tampered file cannot
+    widen the surface;
+  - per-value `enum` lock pins the canonical set at the schema
+    layer (redundant with the file-level `allowed_values` array
+    for the same defense-in-depth posture as `kind_enum` ↔
+    `descriptors[*].kind`);
+  - per-value `pattern` lock re-applies the descriptor-layer
+    positive whitelist + forbidden-token deny clause, so a
+    future schema-edit that loosened the enum would still trip
+    the deny pattern on any unsafe token (`public_upload`,
+    `raw_source`, `full_slide`, `image_search`, `web_generation`,
+    `customer_acme`, `confidential_report`, URL-like shapes, and
+    free-form raw-source text are all refused at this layer);
+  - `uniqueItems: true` is set on every `allowed_values` array,
+    so a noncanonical array that ships the same canonical value N
+    times (e.g. `["flat_vector"] * 5`) is refused at the schema
+    layer — without this lock, an array satisfying length +
+    items.enum + items.pattern individually could still be
+    noncanonical, false-greening the contract. Combined with
+    `minItems == maxItems == N` (where N matches the length of
+    `items.enum`), `uniqueItems` forces every `allowed_values`
+    array to be a permutation of the canonical set — the
+    canonical-set-membership invariant. `scripts/validate_artifacts.py`
+    learned `uniqueItems` in the same paired change so the
+    schema-PASS command actually enforces this gate;
+  - `synthetic_requests[*]` is `additionalProperties: false` with
+    per-dimension enum + pattern locks identical to the
+    `allowed_values` lock, so a request cannot smuggle a value
+    outside the canonical taxonomy.
+- **Validation:** `python3 scripts/validate_artifacts.py --schema
+  schemas/d_one_descriptor_vocabulary.schema.json <file>` for the
+  schema-PASS check. The probe matrix lives inside
+  `python3 scripts/validate_d_one_live_run_evidence.py
+  --self-test` as the T1-T10 block — T1 confirms the canonical
+  synthetic vocabulary validates clean; T2-T4 confirm each
+  documented forbidden value (`public_upload`, `raw_source`,
+  `full_slide`, `image_search`, `web_generation`, `customer_acme`,
+  `confidential_report`, `https://example.com`,
+  `file:///etc/passwd`, and a free-form raw-source sentence) is
+  refused at the schema layer when injected into the descriptor
+  value slot, any `allowed_values` slot, and any
+  `synthetic_requests` slot; T5 confirms a shape-valid but
+  out-of-taxonomy value (`drawing`) is refused by the per-
+  dimension `enum`; T6 confirms the optional `modifier` field can
+  be omitted; T7 confirms a tampered `allowed_values` length is
+  refused by the `maxItems` lock; T8 confirms a missing required
+  dimension is refused; T9 confirms an extra property on a
+  synthetic_request is refused; T10 confirms a single duplicate
+  inside `allowed_values` is refused by the `uniqueItems` lock,
+  and T10b confirms the noncanonical extreme case (an
+  `allowed_values` array of length N that ships the same
+  canonical value N times — e.g. `["flat_vector"] * 5`) is also
+  refused by the same lock, closing the false-green Codex
+  stop-time review flagged. The V3 closed-enumeration runtime
+  cross-check (the prompt assembler refusing a request value not
+  in `image_taxonomy.<dim>.allowed_values`; the live runner
+  re-checking at its own boundary) is still part of the live-mode
+  wiring TODO and is NOT wired today — real D-One remains
+  **UNVERIFIED**.
+
 ## 5. Live-run preflight contract (audit-out path placement + M1-M4 + R1 / V1 pins)
 
 - **Schema:** `schemas/d_one_preflight_audit.schema.json`.

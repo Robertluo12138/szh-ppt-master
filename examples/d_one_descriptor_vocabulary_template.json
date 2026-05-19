@@ -44,5 +44,69 @@
       "kind": "composition_adjective",
       "value": "off_axis"
     }
+  ],
+  "image_taxonomy": {
+    "rendering_style": {
+      "allowed_values": [
+        "flat_vector",
+        "line_diagram",
+        "isometric_lite",
+        "low_poly",
+        "solid_shape"
+      ]
+    },
+    "palette_family": {
+      "allowed_values": [
+        "neutral_grey",
+        "accent_only",
+        "dual_tone",
+        "mono_brand",
+        "palette_default"
+      ]
+    },
+    "image_role": {
+      "allowed_values": [
+        "decorative_accent",
+        "metaphor_icon",
+        "divider_motif",
+        "kpi_emblem",
+        "cover_motif"
+      ]
+    },
+    "layout_pattern": {
+      "allowed_values": [
+        "single_center",
+        "left_anchor",
+        "right_anchor",
+        "top_band",
+        "bottom_band"
+      ]
+    },
+    "modifier": {
+      "allowed_values": [
+        "low_contrast",
+        "soft_edges",
+        "grid_aligned",
+        "negative_space"
+      ]
+    }
+  },
+  "synthetic_requests": [
+    {
+      "id": "cover_motif_neutral",
+      "rendering_style": "flat_vector",
+      "palette_family": "neutral_grey",
+      "image_role": "cover_motif",
+      "layout_pattern": "single_center",
+      "modifier": "negative_space"
+    },
+    {
+      "id": "kpi_emblem_accent",
+      "rendering_style": "solid_shape",
+      "palette_family": "accent_only",
+      "image_role": "kpi_emblem",
+      "layout_pattern": "top_band",
+      "modifier": "grid_aligned"
+    }
   ]
 }
