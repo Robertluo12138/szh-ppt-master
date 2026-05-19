@@ -1,0 +1,14 @@
+{
+  "schema_version": "1",
+  "assets": [
+    {
+      "id": "synthetic_figure_alpha",
+      "source_ref": "synthetic_source",
+      "local_path": "input/assets/synthetic_figure_alpha.png",
+      "destination_path": "assets/synthetic_figure_alpha.png",
+      "media_type": "image/png",
+      "byte_count": 67,
+      "sha256": "9e06841c34ddad66f50c9bf12a6c2e39bfe50b932e882e34d5d235a15f188a0d"
+    }
+  ]
+}

@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "source_image_asset.schema.json",
+  "title": "Source Image Asset Propagation Registry",
+  "description": "Clean-room registry shape. Records the local PNG / JPG / JPEG image assets that arrived attached to the workspace source (e.g. figures pre-extracted alongside input/source.md) and how they propagate forward to image_manifest.json and scripts/materialize_image_assets.py. The registry does NOT carry image bytes; it only records workspace-relative pointers + byte_count + sha256 so a downstream consumer can verify integrity. A read-only stdlib-only validator ships at scripts/validate_source_image_assets.py (schema + unique-id + source-manifest backlink + path-safety + no-symlink + on-disk byte_count/sha256 + media_type/magic-byte + optional image_manifest alignment); no producer / propagation helper ships. The runtime path remains: scripts/init_workspace.py writes input/source.md + source_manifest.json (source-body intake only — no image intake today); the agent places asset bytes locally; scripts/init_image_manifest.py + scripts/materialize_image_assets.py enforce the same magic-byte and path-safety gates that gate any other local asset. Out of scope (and explicitly forbidden by the field shapes below): URL / file:// / data: schemes, absolute paths, '..' traversal, symlinks, public upload, telemetry, image generation, model API calls.",
+  "type": "object",
+  "required": ["schema_version", "assets"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1"],
+      "description": "Registry schema version. Bump only with a paired contract change."
+    },
+    "assets": {
+      "type": "array",
+      "uniqueItems": false,
+      "description": "One entry per source-attached image. An empty list is valid (declares 'no source-attached images for this source'). Cross-checking uniqueness of id is enforced at runtime by scripts/validate_source_image_assets.py (G3) and is documented in references/source-image-asset-policy.md.",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "source_ref",
+          "local_path",
+          "destination_path",
+          "media_type",
+          "byte_count",
+          "sha256"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]*$",
+            "description": "Stable identifier for this asset. The same id MUST be used downstream in image_manifest.images[].id when the asset is referenced by a slide. ASCII letters, digits, underscore, dot, hyphen; must not start with a separator. Mirrors source_manifest.source.id."
+          },
+          "source_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]*$",
+            "description": "Stable backlink to the source this image came from. The value MUST equal source_manifest.source.id; it is the same allow-list deck_brief.source_refs[] declares. Cross-checking against source_manifest is enforced at runtime by scripts/validate_source_image_assets.py (G4) when a sibling source_manifest.json is present, and is documented in references/source-image-asset-policy.md."
+          },
+          "local_path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^input/assets/[A-Za-z0-9][A-Za-z0-9_.\\-]*\\.(png|jpg|jpeg)$",
+            "description": "Workspace-relative path where the source-attached image bytes live BEFORE propagation. The pattern locks to 'input/assets/<safe-filename>.<png|jpg|jpeg>' so unsafe shapes (absolute path / leading slash / leading backslash / URI scheme / '..' segment / surrounding whitespace / nested subdirectory / mixed-case extension / unsupported extension) cannot slip past schema validation with a false-green. The same shape passes scripts/validate_scaffold.local_path_is_safe; scripts/validate_source_image_assets.py additionally calls scripts/validate_scaffold._resolves_within against the workspace and refuses symlinks at the path leaf or any parent segment (G5 + G6) — defense-in-depth, same anti-pattern materialize_image_assets.py applies on the runtime side."
+          },
+          "destination_path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^assets/[A-Za-z0-9][A-Za-z0-9_.\\-]*\\.(png|jpg|jpeg)$",
+            "description": "Workspace-relative path where the asset will live AFTER propagation, i.e. exactly the value image_manifest.images[].local_path is expected to carry once the agent references this asset from a slide. Locked to 'assets/<safe-filename>.<png|jpg|jpeg>' for the same reasons local_path is locked. The lowercase-extension lock mirrors scripts/materialize_image_assets.SUPPORTED_EXTENSIONS so a destination this contract accepts is also a destination materialize will accept."
+          },
+          "media_type": {
+            "type": "string",
+            "enum": ["image/png", "image/jpeg"],
+            "description": "RFC 6838 media type, restricted to the embed surface scripts/export_pptx.py supports today. 'image/jpeg' covers both .jpg and .jpeg extensions. SVG / GIF / WebP / TIFF / BMP / ICO are intentionally outside this enum because the PPTX exporter falls back to the placeholder shape for them."
+          },
+          "byte_count": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Byte length of the asset file at local_path. Zero-length files are refused (no useful image). scripts/validate_source_image_assets.py compares this against the on-disk length of <workspace>/<local_path> (G8); the runtime materialize step already enforces magic-byte agreement, so byte_count is the cheap defense-in-depth integrity gate. The destination leaf at <workspace>/<destination_path> is intentionally NOT inspected by the validator — that remains the materialize gate."
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex sha256 of the asset bytes. Defense-in-depth: a downstream consumer can re-hash <workspace>/<local_path> and <workspace>/<destination_path> and compare. Mirrors source_manifest.source.sha256."
+          }
+        }
+      }
+    }
+  }
+}
