@@ -3006,10 +3006,16 @@ def negative_render_model_tempfixture_checks() -> list[CheckResult]:
     closed on each forbidden mutation: schema-level rejections
     (unsupported kind, missing bounds, invalid token refs, URLs / file:// /
     absolute paths / path traversal in image_ref, arbitrary SVG-like
-    fields) and runtime cross-checks (kind-payload mismatch, bounds
-    outside canvas, unknown slot_id, slot.primitive_kind mismatch,
-    image_ref not declared in manifest, palette token not in
-    design_system, duplicate primitive ids)."""
+    fields, chart_placeholder schema gates [missing / empty caption,
+    unknown / empty chart_kind, foreign data-spec fields like data /
+    labels / values / series, zero or negative bounds]) and runtime
+    cross-checks (kind-payload mismatch, bounds outside canvas, unknown
+    slot_id, slot.primitive_kind mismatch, image_ref not declared in
+    manifest, palette token not in design_system, duplicate primitive
+    ids, chart-specific runtime checks [kind=chart_placeholder paired
+    with text payload, duplicate chart_placeholder ids, chart_placeholder
+    bounds outside canvas, chart_placeholder with a sibling table
+    payload])."""
     import tempfile
     out: list[CheckResult] = []
 
@@ -3064,6 +3070,62 @@ def negative_render_model_tempfixture_checks() -> list[CheckResult]:
          lambda rm: rm.__setitem__("xmlns", "http://www.w3.org/2000/svg")),
         ("arbitrary SVG-like field at root (defs)",
          lambda rm: rm.__setitem__("defs", [])),
+        # chart_placeholder schema probes: the controlled primitive
+        # surface is intentionally tiny (caption + chart_kind), and
+        # data-driven chart specs (labels/values/series/data) are NOT
+        # part of the contract. Every mutation below confirms a
+        # mis-shaped chart slot fails closed at the schema layer
+        # rather than being silently lowered to a renderer fallback.
+        ("chart_placeholder missing required caption",
+         lambda rm: _swap_to_chart_placeholder(rm, {"chart_kind": "bar"})),
+        ("chart_placeholder empty caption (minLength=1)",
+         lambda rm: _swap_to_chart_placeholder(
+             rm, {"caption": "", "chart_kind": "bar"})),
+        ("chart_placeholder unknown chart_kind 'radar'",
+         lambda rm: _swap_to_chart_placeholder(
+             rm, {"caption": "synthetic", "chart_kind": "radar"})),
+        ("chart_placeholder unknown chart_kind 'donut'",
+         lambda rm: _swap_to_chart_placeholder(
+             rm, {"caption": "synthetic", "chart_kind": "donut"})),
+        ("chart_placeholder unknown chart_kind 'scatter'",
+         lambda rm: _swap_to_chart_placeholder(
+             rm, {"caption": "synthetic", "chart_kind": "scatter"})),
+        ("chart_placeholder empty chart_kind string",
+         lambda rm: _swap_to_chart_placeholder(
+             rm, {"caption": "synthetic", "chart_kind": ""})),
+        ("chart_placeholder with foreign data-spec field 'data'",
+         lambda rm: _swap_to_chart_placeholder(
+             rm,
+             {"caption": "synthetic", "chart_kind": "bar",
+              "data": [1, 2, 3]})),
+        ("chart_placeholder with foreign 'labels' field",
+         lambda rm: _swap_to_chart_placeholder(
+             rm,
+             {"caption": "synthetic", "chart_kind": "bar",
+              "labels": ["q1", "q2"]})),
+        ("chart_placeholder with foreign 'values' field",
+         lambda rm: _swap_to_chart_placeholder(
+             rm,
+             {"caption": "synthetic", "chart_kind": "bar",
+              "values": [10, 20]})),
+        ("chart_placeholder with foreign 'series' field",
+         lambda rm: _swap_to_chart_placeholder(
+             rm,
+             {"caption": "synthetic", "chart_kind": "bar",
+              "series": [{"name": "A", "values": [1]}]})),
+        ("chart_placeholder bounds with zero width "
+         "(exclusiveMinimum=0)",
+         lambda rm: _swap_to_chart_placeholder(
+             rm, {"caption": "synthetic", "chart_kind": "bar"},
+             bounds={"x": 100, "y": 100, "w": 0, "h": 200})),
+        ("chart_placeholder bounds with negative width",
+         lambda rm: _swap_to_chart_placeholder(
+             rm, {"caption": "synthetic", "chart_kind": "bar"},
+             bounds={"x": 100, "y": 100, "w": -10, "h": 200})),
+        ("chart_placeholder bounds with negative height",
+         lambda rm: _swap_to_chart_placeholder(
+             rm, {"caption": "synthetic", "chart_kind": "bar"},
+             bounds={"x": 100, "y": 100, "w": 200, "h": -10})),
     ]
     for label, mutator in schema_negatives:
         with tempfile.TemporaryDirectory() as td:
@@ -3330,6 +3392,151 @@ def negative_render_model_tempfixture_checks() -> list[CheckResult]:
         )
         out.append(CheckResult(
             "tempfixture: duplicate primitive id is detected",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # H. kind=chart_placeholder paired with the WRONG payload field
+    # (a `text` block instead of a `chart_placeholder` block). The
+    # runtime kind-payload cross-check must fire — the schema alone
+    # does not reject this combination because both fields are
+    # individually-valid optional properties on a primitive.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        rm = json.loads((ws / "render_models" / "01.json").read_text())
+        prim = rm["primitives"][0]
+        prim["kind"] = "chart_placeholder"
+        prim.pop("slot_id", None)
+        # Leave the baseline `text` payload in place to trigger the
+        # kind/payload mismatch.
+        (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "payload field matches kind" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: kind=chart_placeholder paired with a text "
+            "payload (no chart_placeholder block) is detected as a "
+            "kind-payload mismatch",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # I. Two chart_placeholder primitives that share an id. Proves the
+    # primitive-id uniqueness check fires regardless of kind, so a
+    # caller cannot smuggle a second chart by reusing an existing id.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        rm = json.loads((ws / "render_models" / "01.json").read_text())
+        rm["primitives"] = [
+            {
+                "id": "chart_a",
+                "kind": "chart_placeholder",
+                "bounds": {"x": 100, "y": 100, "w": 400, "h": 200},
+                "chart_placeholder": {
+                    "caption": "first", "chart_kind": "bar",
+                },
+            },
+            {
+                "id": "chart_a",
+                "kind": "chart_placeholder",
+                "bounds": {"x": 100, "y": 400, "w": 400, "h": 200},
+                "chart_placeholder": {
+                    "caption": "second", "chart_kind": "pie",
+                },
+            },
+        ]
+        (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "id is unique within this render_model" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: two chart_placeholder primitives sharing "
+            "an id is detected (uniqueness applies to every kind)",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # J. chart_placeholder bounds that exceed the canvas must trip
+    # the bounds-fit check. Confirms the bounds gate covers
+    # chart-shaped primitives, not only text/image/kpi.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        rm = json.loads((ws / "render_models" / "01.json").read_text())
+        rm["primitives"][0] = {
+            "id": "headline",
+            "kind": "chart_placeholder",
+            "bounds": {"x": 0, "y": 0, "w": 9999, "h": 9999},
+            "chart_placeholder": {
+                "caption": "overflow", "chart_kind": "column",
+            },
+        }
+        (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "bounds fit inside canvas" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: chart_placeholder bounds outside canvas "
+            "are detected by the bounds-fit gate",
+            detected,
+            "; ".join(f"{r.name}" for r in results if not r.ok),
+        ))
+
+    # K. kind=chart_placeholder paired with a sibling table payload
+    # block on the same primitive. Both keys are schema-known, so the
+    # schema's additionalProperties=false does NOT reject the pair
+    # alone; the runtime kind-payload cross-check is what catches it
+    # ("present=['chart_placeholder', 'table'], expected=
+    # ['chart_placeholder']"). Proves a chart slot cannot smuggle a
+    # table data spec via a sibling block.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tr = root / "templates"
+        tr.mkdir()
+        _build_render_model_template(tr)
+        ws = root / "ws"
+        _baseline_render_model_workspace(ws)
+        rm = json.loads((ws / "render_models" / "01.json").read_text())
+        rm["primitives"][0] = {
+            "id": "headline",
+            "kind": "chart_placeholder",
+            "bounds": {"x": 100, "y": 100, "w": 400, "h": 200},
+            "chart_placeholder": {
+                "caption": "synthetic", "chart_kind": "bar",
+            },
+            "table": {"columns": ["a"], "rows": [["1"]]},
+        }
+        (ws / "render_models" / "01.json").write_text(json.dumps(rm))
+        results = check_render_models(ws, tr)
+        detected = any(
+            "payload field matches kind" in r.name and not r.ok
+            for r in results
+        )
+        out.append(CheckResult(
+            "tempfixture: chart_placeholder with a sibling table "
+            "payload is detected as a kind-payload mismatch (proves "
+            "a chart slot cannot smuggle tabular data via a sibling "
+            "block)",
             detected,
             "; ".join(f"{r.name}" for r in results if not r.ok),
         ))
@@ -5461,6 +5668,37 @@ def _swap_to_image_slot(rm: dict, image_ref: str) -> None:
     }
 
 
+def _swap_to_chart_placeholder(
+    rm: dict,
+    payload: dict,
+    *,
+    bounds: dict | None = None,
+    extra_primitive_keys: dict | None = None,
+) -> None:
+    """Mutator helper: replace the baseline text primitive with a
+    chart_placeholder primitive whose payload is the supplied dict
+    (verbatim — including any forbidden keys the caller wants the
+    schema to reject). The baseline slot_id ('headline') is dropped so
+    the runtime slot.primitive_kind cross-check does not also fire and
+    mask the schema-level signal the chart probes are exercising.
+
+    `bounds` defaults to a valid 200x200 box; callers override it to
+    exercise the negative-geometry path. `extra_primitive_keys` lets a
+    caller drop additional keys onto the primitive itself (e.g. a
+    forbidden `table` payload alongside a `chart_placeholder` payload)
+    so the kind-payload mismatch probes can be expressed inline."""
+    prim = {
+        "id": "headline",
+        "kind": "chart_placeholder",
+        "bounds": bounds if bounds is not None
+        else {"x": 100, "y": 100, "w": 200, "h": 200},
+        "chart_placeholder": payload,
+    }
+    if extra_primitive_keys:
+        prim.update(extra_primitive_keys)
+    rm["primitives"][0] = prim
+
+
 def _build_generator_workspace(ws: Path, *, kind: str = "happy") -> None:
     """Build a tiny synthetic workspace that the render_model generator can
     actually run against. `kind` selects the mutation applied:
@@ -6324,10 +6562,17 @@ def main(argv: list[str]) -> int:
         ("negative tempfixtures (render_model): unsupported kind, missing "
          "bounds, invalid token refs, external URL / file:// / absolute "
          "path / path traversal in image_ref, arbitrary SVG-like fields, "
-         "kind-payload mismatch, bounds outside canvas, unknown slot_id, "
-         "slot.primitive_kind mismatch, image_ref not in manifest, "
-         "unknown palette token, source_refs cross-check fails closed when "
-         "deck_brief is missing / malformed / empty, duplicate primitive ids",
+         "chart_placeholder schema gates (missing / empty caption, "
+         "unknown / empty chart_kind, foreign data-spec fields, zero or "
+         "negative bounds), kind-payload mismatch, bounds outside "
+         "canvas, unknown slot_id, slot.primitive_kind mismatch, "
+         "image_ref not in manifest, unknown palette token, source_refs "
+         "cross-check fails closed when deck_brief is missing / "
+         "malformed / empty, duplicate primitive ids (including "
+         "chart_placeholder pairs); chart_placeholder runtime "
+         "cross-checks (kind=chart_placeholder + text payload, "
+         "chart_placeholder bounds outside canvas, chart_placeholder "
+         "with sibling table payload)",
          negative_render_model_tempfixture_checks()),
         ("negative tempfixtures (render_model coverage): partial-drift "
          "workspace (some generator-supported slides missing render_models) "
