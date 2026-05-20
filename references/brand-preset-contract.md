@@ -143,6 +143,52 @@ The validator NEVER writes to disk, NEVER calls any network, NEVER invokes
 D-One / Qoder / MCP / model APIs / image search / image generation, and
 NEVER mutates the preset file or any workspace artifact.
 
+### 5.1 Authoring-bundle reference (read-only, optional)
+
+`scripts/validate_authoring_bundle.py --bundle <dir>` accepts an OPTIONAL
+`brand_preset_ref` field in the bundle's `brief.json`:
+
+```
+{
+  "title": "...",
+  "audience": "...",
+  "objective": "...",
+  "brand_preset_ref": {
+    "id":   "synthetic_neutral_minimal",
+    "path": "examples/brand_preset_template.json"
+  }
+}
+```
+
+This is **authoring-time reference validation, NOT style application**.
+The `path` field uses the form `<registry-root>/<file>` — the first
+segment names a registered root (currently `examples` or `templates`)
+and the rest is resolved under that root. The bundle gate confirms the
+ref's `id` shape (the same `^synthetic_[a-z0-9][a-z0-9_]*$` pattern
+this contract uses for `preset_id`), refuses real-brand / credential
+/ public-upload wording in the id at the same canonical-form layer
+used by P4 / P7 / P11, refuses unsafe paths through
+`local_path_is_safe`, refuses paths whose first segment does NOT name
+one of the registered roots (so an authoring slip like
+`not_a_registry/foo.json` or a bare `foo.json` with no separator
+fails closed before any disk access), additionally verifies the
+joined path resolves under the matched root (defense-in-depth against
+symlink escape inside the registry tree), runs the resolved file
+through `validate_brand_preset` (P1..P11), and cross-checks that the
+file's `preset_id` matches `brand_preset_ref.id` so a rename or typo
+fails closed.
+
+The preset is NEVER projected onto `design_system.json`,
+`slide_plans/*.json`, `render_models/*.json`, `previews/*.svg`, or
+`deck.pptx`. The bundle gate is the only authoring-time consumer; the
+runtime pipeline ignores `brand_preset_ref` entirely (no script reads
+it after the bundle gate). Omitting the field skips the check.
+
+The explicit-flag CLI surface
+(`scripts/validate_authoring_bundle.py --source ... --plan-spec ...`)
+does NOT expose a flag for the ref — the field is `brief.json`-only by
+design so the explicit-flag path stays narrow.
+
 ## 6. Out of scope
 
 The following are NOT implemented and are NOT covered by this contract:
@@ -180,3 +226,6 @@ runtime application is approved.
   the runtime design-token contracts a future projection would target.
 - `examples/brand_preset_template.json` — the single synthetic fixture.
 - `scripts/validate_brand_preset.py` — the read-only validator.
+- `scripts/validate_authoring_bundle.py` — the bundle-gate consumer of
+  the optional `brand_preset_ref` field; reference-only, never applies
+  the preset to any downstream artifact.

@@ -1,6 +1,10 @@
 {
   "approximate_slide_count": 7,
   "audience": "Internal pipeline smoke-test reviewers",
+  "brand_preset_ref": {
+    "id": "synthetic_neutral_minimal",
+    "path": "examples/brand_preset_template.json"
+  },
   "language": "en",
   "objective": "Exercise the explicit-input authoring bundle gate end-to-end on a synthetic, non-sensitive narrative.",
   "source_id": "synthetic_trial_source",

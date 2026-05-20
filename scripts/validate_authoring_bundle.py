@@ -20,6 +20,33 @@ and validates them **structurally** before any workspace is created. The goal
 is to let an agent-authored bundle fail at authoring time rather than after a
 six-stage prep run.
 
+Under ``--bundle <dir>``, ``brief.json`` may OPTIONALLY declare
+``brand_preset_ref = {id, path}`` against a synthetic preset under the
+local registry roots ``examples/`` or ``templates/``. The path uses the
+form ``<registry-root>/<file>``; the first segment names the
+registered root. The gate validates the ref READ-ONLY:
+
+  - the id matches the schema's ``preset_id`` pattern
+    ``^synthetic_[a-z0-9][a-z0-9_]*$`` and carries no real-brand,
+    credential, or public-upload wording (canonical-form match,
+    mirroring ``validate_brand_preset`` P4 / P7 / P11);
+  - the path passes ``local_path_is_safe``, names a registered root,
+    and resolves under that root (defense-in-depth against symlink
+    escape);
+  - the resolved file is a regular non-symlink that passes
+    ``scripts/validate_brand_preset.py`` (P1..P11), surfaced as
+    bundle ERROR findings;
+  - the file's ``preset_id`` equals ``ref.id`` (registry-lookup drift
+    detection — rename / typo fails closed).
+
+The preset is NEVER projected onto ``design_system.json`` /
+``slide_plans/*.json`` / ``render_models/*.json`` / SVG previews /
+``.pptx``. This is authoring-time reference validation only; no
+script in this repo applies a preset at runtime. The explicit-flag
+CLI surface does NOT expose a flag for the ref — the field is
+``brief.json``-only by design so the explicit-flag path stays
+narrow.
+
 This is **a validation gate, not generation**. The script NEVER:
 
   - creates or modifies a workspace, ``deck_brief.json``, ``deck_plan.json``,
@@ -99,6 +126,10 @@ from validate_scaffold import (  # noqa: E402
     _resolves_within,
     _slide_plan_against_layout,
 )
+from validate_brand_preset import (  # noqa: E402
+    PresetLoadError as _BrandPresetLoadError,
+    validate_preset as _validate_brand_preset_file,
+)
 
 # Lazy-import the render-model generator's supported-layout tuple plus the
 # small list-of-items capacity constants so the authoring gate and the
@@ -121,6 +152,60 @@ LAYOUT_SCHEMA = SCHEMAS_DIR / "layout.schema.json"
 # bundle this gate passes can use the same id at Stage 1 without surprise.
 _SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
 _URI_SCHEME_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
+
+# Brand preset reference (authoring-time, READ-ONLY contract).
+#
+# An OPTIONAL brief.json field ``brand_preset_ref`` declares a {id, path}
+# pair pointing at a local synthetic brand preset. This is a reference
+# CHECK ONLY — no script in this repo projects a preset onto
+# design_system / slide_plans / render_models / SVG / PPTX, and the
+# bundle gate likewise never reads the preset for style application.
+# It only confirms the ref's id-shape, the path-safety of the path,
+# that the resolved file passes validate_brand_preset (P1..P11), and
+# that the file's preset_id equals ref.id (registry lookup).
+_BRAND_PRESET_ID_PATTERN = re.compile(r"^synthetic_[a-z0-9][a-z0-9_]*$")
+_BRAND_PRESET_NON_ALPHANUM = re.compile(r"[^a-z0-9]")
+# The "local synthetic brand preset template/registry" today is the two
+# committed roots that hold synthetic content: examples/ (single fixture
+# at examples/brand_preset_template.json) and templates/. A
+# brand_preset_ref.path takes the form ``<root-basename>/<file>`` (e.g.
+# ``examples/brand_preset_template.json``); the first segment names
+# which root resolves the rest. Any path naming a root NOT in this
+# list fails closed — the contract is local, synthetic, and registry-
+# bound on purpose. The list is mutable so the self-test can extend it
+# with a uniquely-named tempdir (the only valid mutation surface);
+# production code NEVER mutates it. Adding a permanent root requires
+# updating this list AND updating references/brand-preset-contract.md.
+_BRAND_PRESET_REGISTRY_ROOTS: list[Path] = [
+    REPO_ROOT / "examples",
+    REPO_ROOT / "templates",
+]
+# Denylists mirror the small validate_brand_preset gates relevant to the
+# id field (a single string under our control). Canonical form is
+# lowercase ASCII alphanumeric (mirrors validate_brand_preset._canonical
+# and validate_source_image_assets G12), so every separator / case /
+# word-order variant collapses to the same shape.
+_BRAND_PRESET_REF_REAL_BRAND_TOKENS: tuple[str, ...] = (
+    "google", "anthropic", "claude", "openai", "chatgpt",
+    "microsoft", "powerpoint", "apple", "keynote", "adobe", "figma",
+)
+_BRAND_PRESET_REF_CREDENTIAL_TOKENS: tuple[str, ...] = (
+    "apikey", "apitoken", "accesstoken", "authtoken",
+    "secret", "bearer", "password", "token",
+)
+_BRAND_PRESET_REF_PUBLIC_MARKER = "public"
+_BRAND_PRESET_REF_PROPAGATION_VERB_MARKERS: tuple[str, ...] = (
+    "upload", "share", "sharing", "url", "link", "post",
+    "publish", "distribut", "host",
+)
+_BRAND_PRESET_REF_ALLOWED_FIELDS = frozenset(("id", "path"))
+
+
+def _brand_preset_canonical(value: str) -> str:
+    """Lower-case ``value`` and drop every non-alphanumeric character.
+    Mirrors validate_brand_preset._canonical so the id-side denylist
+    sees the same canonical form the file-side P4/P7/P11 gates do."""
+    return _BRAND_PRESET_NON_ALPHANUM.sub("", value.lower())
 
 # Forbidden-content tokens we scan every spec JSON body for. These are the
 # clean-room / privacy / no-network policy markers from CLAUDE.md +
@@ -420,6 +505,218 @@ def _check_brief_metadata(
         report.err(
             "brief.approximate_slide_count: not positive",
             f"got {approximate_slide_count}; minimum is 1",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Brand preset reference (authoring-time, READ-ONLY check). The ref is an
+# OPTIONAL brief.json field; this gate confirms the {id, path} pair is
+# shape-safe and that the referenced file passes validate_brand_preset and
+# matches the declared id. NOTHING here applies the preset to
+# design_system / slide_plans / render_models / SVG / PPTX — the
+# pipeline stages downstream do not read the preset at all. The gate is
+# defense-in-depth against an authoring slip (real-brand id, URL in
+# path, file outside the synthetic registry, drift between ref.id and
+# the file's preset_id).
+# ---------------------------------------------------------------------------
+
+
+def _check_brand_preset_ref(ref: object, report: Report) -> None:
+    """Validate an OPTIONAL brand_preset_ref declaration. ``ref`` is the
+    value as read from brief.json (None / absent means the check is a
+    no-op — the field is optional). Adds one ERROR finding per detected
+    problem and returns. The gate is READ-ONLY: it loads the resolved
+    preset file solely to (a) run validate_brand_preset's P1..P11 gates
+    and (b) cross-check preset_id == ref.id; it never reads the preset
+    for projection onto any downstream stage."""
+    if ref is None:
+        return
+    if not isinstance(ref, dict):
+        report.err(
+            "brief.brand_preset_ref: not a JSON object",
+            f"got {type(ref).__name__}; expected {{id, path}}",
+        )
+        return
+    extras = sorted(set(ref.keys()) - _BRAND_PRESET_REF_ALLOWED_FIELDS)
+    if extras:
+        report.err(
+            "brief.brand_preset_ref: unknown field(s)",
+            f"{extras}; allowed: {sorted(_BRAND_PRESET_REF_ALLOWED_FIELDS)}",
+        )
+        return
+    missing = [k for k in sorted(_BRAND_PRESET_REF_ALLOWED_FIELDS) if k not in ref]
+    if missing:
+        report.err(
+            "brief.brand_preset_ref: missing required field(s)",
+            f"{missing}; both 'id' and 'path' are required when "
+            f"brand_preset_ref is supplied",
+        )
+        return
+
+    preset_id = ref["id"]
+    preset_path_raw = ref["path"]
+
+    if not isinstance(preset_id, str):
+        report.err(
+            "brief.brand_preset_ref.id: not a string",
+            f"got {type(preset_id).__name__}",
+        )
+        return
+    if not isinstance(preset_path_raw, str):
+        report.err(
+            "brief.brand_preset_ref.path: not a string",
+            f"got {type(preset_path_raw).__name__}",
+        )
+        return
+
+    # id shape — must match the same pattern brand_preset.schema.json
+    # enforces on preset_id (synthetic_ prefix is a fail-closed gate
+    # against real-brand authorship at the schema layer).
+    if not _BRAND_PRESET_ID_PATTERN.match(preset_id):
+        report.err(
+            "brief.brand_preset_ref.id: fails synthetic_ pattern",
+            f"got {preset_id!r}; must match "
+            f"^synthetic_[a-z0-9][a-z0-9_]*$ (rejects real-brand authorship)",
+        )
+        return
+
+    canon = _brand_preset_canonical(preset_id)
+    for token in _BRAND_PRESET_REF_REAL_BRAND_TOKENS:
+        if token in canon:
+            report.err(
+                "brief.brand_preset_ref.id: real-brand wording",
+                f"got {preset_id!r} (canonical {canon!r}) contains "
+                f"real-brand token {token!r}",
+            )
+            return
+    for token in _BRAND_PRESET_REF_CREDENTIAL_TOKENS:
+        if token in canon:
+            report.err(
+                "brief.brand_preset_ref.id: credential-shape wording",
+                f"got {preset_id!r} (canonical {canon!r}) contains "
+                f"credential-shape token {token!r}",
+            )
+            return
+    if _BRAND_PRESET_REF_PUBLIC_MARKER in canon:
+        for token in _BRAND_PRESET_REF_PROPAGATION_VERB_MARKERS:
+            if token in canon:
+                report.err(
+                    "brief.brand_preset_ref.id: public-upload wording",
+                    f"got {preset_id!r} (canonical {canon!r}) combines "
+                    f"'public' with propagation verb {token!r}",
+                )
+                return
+
+    # path shape — local_path_is_safe rejects URI schemes, leading
+    # '/' / '\\' / '//', whitespace, and '..' segments in one helper.
+    if not local_path_is_safe(preset_path_raw):
+        report.err(
+            "brief.brand_preset_ref.path: fails local_path_is_safe",
+            f"got {preset_path_raw!r}; refused by local_path_is_safe "
+            f"(URI scheme, absolute path, '..', or whitespace)",
+        )
+        return
+
+    # Path form — '<registry-root-basename>/<file>'. The first segment
+    # names which registry root resolves the rest; an unknown first
+    # segment fails closed. This makes the registry list actually
+    # consulted (the older "join onto each root in turn" form always
+    # matched the FIRST root because any clean relative path resolves
+    # within any base, so 'templates/...' could never be reached).
+    parts = preset_path_raw.split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        known = sorted({r.name for r in _BRAND_PRESET_REGISTRY_ROOTS})
+        report.err(
+            "brief.brand_preset_ref.path: not in '<registry-root>/<file>' form",
+            f"got {preset_path_raw!r}; first segment must name a registry "
+            f"root ({known}) and at least one path component must follow",
+        )
+        return
+    root_name, rel_path = parts
+    matched_root: Path | None = None
+    for r in _BRAND_PRESET_REGISTRY_ROOTS:
+        if r.name == root_name:
+            matched_root = r
+            break
+    if matched_root is None:
+        known = sorted({r.name for r in _BRAND_PRESET_REGISTRY_ROOTS})
+        report.err(
+            "brief.brand_preset_ref.path: outside the synthetic registry",
+            f"got {preset_path_raw!r}; first segment {root_name!r} must "
+            f"name one of {known}",
+        )
+        return
+    # Anti-escape: ``rel_path`` joined onto ``matched_root`` must
+    # resolve under ``matched_root`` (defense-in-depth against a
+    # symlinked subdirectory inside the registry root or a future
+    # local_path_is_safe relaxation that leaks something exotic past
+    # the first guard).
+    if not _resolves_within(matched_root, rel_path):
+        report.err(
+            "brief.brand_preset_ref.path: escapes its registry root",
+            f"got {preset_path_raw!r}; '{rel_path}' must resolve under "
+            f"{matched_root.name}/",
+        )
+        return
+
+    resolved = matched_root / rel_path
+    if resolved.is_symlink():
+        report.err(
+            "brief.brand_preset_ref.path: is a symlink (refused)",
+            f"got {resolved}",
+        )
+        return
+    if not resolved.exists():
+        report.err(
+            "brief.brand_preset_ref.path: file does not exist",
+            str(resolved),
+        )
+        return
+    if not resolved.is_file():
+        report.err(
+            "brief.brand_preset_ref.path: not a regular file",
+            str(resolved),
+        )
+        return
+
+    # Delegate to validate_brand_preset for P1..P11. PresetLoadError
+    # signals a P1 (load-time) failure; both P1 and the per-gate list
+    # are surfaced as plain ERROR findings so the agent sees the same
+    # diagnostic the standalone validator would print.
+    try:
+        gate_errors = _validate_brand_preset_file(resolved)
+    except _BrandPresetLoadError as exc:
+        report.err(
+            "brief.brand_preset_ref: preset fails validate_brand_preset P1",
+            f"{resolved}: {exc}",
+        )
+        return
+    if gate_errors:
+        for e in gate_errors:
+            report.err(
+                "brief.brand_preset_ref: preset fails validate_brand_preset",
+                f"{resolved}: {e}",
+            )
+        return
+
+    # Registry-lookup match — the preset_id in the file MUST equal the
+    # ref's declared id, so a rename / typo / drift between brief.json
+    # and the registered file fails closed. Re-read the file rather
+    # than reach into validate_brand_preset's private _load_preset.
+    try:
+        preset_data = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        report.err(
+            "brief.brand_preset_ref: preset re-read failed",
+            f"{resolved}: {type(exc).__name__}: {exc}",
+        )
+        return
+    file_id = preset_data.get("preset_id") if isinstance(preset_data, dict) else None
+    if file_id != preset_id:
+        report.err(
+            "brief.brand_preset_ref: id mismatch with referenced preset",
+            f"brief.brand_preset_ref.id={preset_id!r} but "
+            f"{resolved}.preset_id={file_id!r}",
         )
 
 
@@ -1594,6 +1891,7 @@ def validate_authoring_bundle(
     tone: str | None = None,
     language: str | None = None,
     approximate_slide_count: int | None = None,
+    brand_preset_ref: object | None = None,
 ) -> Report:
     report = Report()
 
@@ -1615,6 +1913,12 @@ def validate_authoring_bundle(
     _check_brief_metadata(
         title, audience, objective, tone, language, approximate_slide_count, report,
     )
+    # Optional authoring-time brand preset reference (READ-ONLY). The
+    # ref's only effect is to add findings to the report; it never
+    # mutates the bundle, never applies the preset to design_system /
+    # slide_plans / render_models / SVG / PPTX, and never invokes any
+    # network / D-One / model / Qoder behavior.
+    _check_brand_preset_ref(brand_preset_ref, report)
 
     # 2. Template root + plan.
     template_root_ok = _check_template_root(template_root, report)
@@ -1712,6 +2016,10 @@ _BUNDLE_IMAGE_MANIFEST_SPEC_NAME = "image_manifest_spec.json"
 _BUNDLE_BRIEF_ALLOWED_FIELDS = frozenset((
     "title", "audience", "objective",
     "tone", "language", "approximate_slide_count", "source_id",
+    # Optional authoring-time, READ-ONLY synthetic brand preset
+    # reference. Validated by _check_brand_preset_ref; never applied
+    # to design_system / slide_plans / render_models / SVG / PPTX.
+    "brand_preset_ref",
 ))
 _BUNDLE_BRIEF_REQUIRED_FIELDS = ("title", "audience", "objective")
 
@@ -1917,6 +2225,11 @@ def _resolve_bundle(
         "design_system_spec": design_system_spec,
         "slide_specs_dir": slide_specs_dir,
         "image_manifest_spec": image_manifest_spec,
+        # Optional authoring-time, READ-ONLY brand-preset reference.
+        # Pass the raw value through; _check_brand_preset_ref runs
+        # every shape / type / id-pattern / path-safety / registry /
+        # validate_brand_preset / id-match gate.
+        "brand_preset_ref": brief.get("brand_preset_ref"),
     }, None
 
 
@@ -1980,10 +2293,16 @@ def main(argv: list[str]) -> int:
              "directory. Canonical layout: <dir>/source.md (or "
              "source.txt), <dir>/brief.json (JSON object with title / "
              "audience / objective and optional tone / language / "
-             "approximate_slide_count / source_id), <dir>/plan_spec.json, "
+             "approximate_slide_count / source_id / brand_preset_ref), "
+             "<dir>/plan_spec.json, "
              "<dir>/design_system_spec.json (omit when "
              "--theme-from-template is passed), <dir>/slide_specs/, "
-             "<dir>/image_manifest_spec.json. Mutually exclusive with the "
+             "<dir>/image_manifest_spec.json. brand_preset_ref is an "
+             "OPTIONAL {id, path} object that triggers a READ-ONLY "
+             "authoring-time check against scripts/validate_brand_preset.py "
+             "— the preset is NEVER applied to design_system / "
+             "slide_plans / render_models / SVG / PPTX. "
+             "Mutually exclusive with the "
              "explicit per-input flags; --template-root remains required "
              "and --theme-from-template / --strict still apply.",
     )
@@ -2082,6 +2401,10 @@ def main(argv: list[str]) -> int:
         args.design_system_spec = resolved["design_system_spec"]
         args.slide_specs_dir = resolved["slide_specs_dir"]
         args.image_manifest_spec = resolved["image_manifest_spec"]
+        # Resolved only on the --bundle path. The explicit-flag path
+        # never declares a brand_preset_ref (the field is brief.json
+        # only by design — the explicit-flag surface stays narrow).
+        args.brand_preset_ref = resolved["brand_preset_ref"]
 
     missing = [
         name for name, value in (
@@ -2119,6 +2442,9 @@ def main(argv: list[str]) -> int:
         tone=args.tone,
         language=args.language,
         approximate_slide_count=args.approximate_slide_count,
+        # Explicit-flag path never declares brand_preset_ref (None);
+        # --bundle path may set it from brief.json before this call.
+        brand_preset_ref=getattr(args, "brand_preset_ref", None),
     )
     print(_format_report(report))
     if report.errors:
@@ -4350,6 +4676,413 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:
             "closed with clean diagnostic (bool rejected)",
             ok,
             f"code={code}, stderr={stderr!r}",
+        ))
+
+    # ---------------------------------------------------------------------
+    # Brand preset reference scenarios (BR1..BR12). The ref is an OPTIONAL
+    # brief.json field; the gate is READ-ONLY (no projection onto
+    # design_system / slide_plans / render_models / SVG / PPTX) and lives
+    # entirely inside validate_authoring_bundle. The positive scenario
+    # exercises the committed examples/brand_preset_template.json fixture;
+    # each negative scenario flips ONE shape so the diagnostic is
+    # unambiguous and the test names what is being refused.
+    # ---------------------------------------------------------------------
+
+    def _set_brand_ref(bdir: Path, ref: object) -> None:
+        brief = json.loads((bdir / _BUNDLE_BRIEF_NAME).read_text())
+        if ref is None:
+            brief.pop("brand_preset_ref", None)
+        else:
+            brief["brand_preset_ref"] = ref
+        (bdir / _BUNDLE_BRIEF_NAME).write_text(
+            json.dumps(brief, indent=2, sort_keys=True) + "\n",
+        )
+
+    _GOOD_BRAND_REF = {
+        "id": "synthetic_neutral_minimal",
+        "path": "examples/brand_preset_template.json",
+    }
+
+    # BR1. Happy path: a valid brand_preset_ref pointing at the committed
+    # synthetic preset under examples/ resolves to 0 findings.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, _GOOD_BRAND_REF)
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = code == 0 and "OK: no findings" in stdout
+        results.append(_scenario(
+            "brand_preset_ref: valid {id, path} against committed synthetic "
+            "preset resolves cleanly (read-only reference check)",
+            ok,
+            f"code={code}, stdout={stdout!r}, stderr={stderr!r}",
+        ))
+
+    # BR2. Unsafe id: real-brand wording in the id ("synthetic_googleish")
+    # — passes the synthetic_ prefix pattern but trips the real-brand
+    # denylist canonical-form match. Fails closed.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, {
+            "id": "synthetic_googleish",
+            "path": "examples/brand_preset_template.json",
+        })
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "brand_preset_ref.id: real-brand wording" in stdout
+            and "google" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: real-brand wording in id fails closed "
+            "(synthetic_googleish refused under real-brand denylist)",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR3. Unsafe id: missing synthetic_ prefix.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, {
+            "id": "evil_preset",
+            "path": "examples/brand_preset_template.json",
+        })
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "brand_preset_ref.id: fails synthetic_ pattern" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: id without synthetic_ prefix fails closed",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR4. Credential-shaped id ("synthetic_api_key_thing"). Canonical
+    # form contains the "apikey" compound — fails closed at the id-side
+    # credential denylist before the file is opened.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, {
+            "id": "synthetic_api_key_thing",
+            "path": "examples/brand_preset_template.json",
+        })
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "brand_preset_ref.id: credential-shape wording" in stdout
+            and "apikey" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: credential-shape token in id fails closed "
+            "(api_key compound caught by canonical-form match)",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR5. public + upload wording in id. Canonical form combines
+    # 'public' with 'upload' — fails closed at the public-upload gate.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, {
+            "id": "synthetic_public_upload",
+            "path": "examples/brand_preset_template.json",
+        })
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "brand_preset_ref.id: public-upload wording" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: public-upload wording in id fails closed",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR6. Unsafe path: URL in path. local_path_is_safe rejects the URI
+    # scheme prefix.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, {
+            "id": "synthetic_neutral_minimal",
+            "path": "https://attacker.example/preset.json",
+        })
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "brand_preset_ref.path: fails local_path_is_safe" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: URL in path fails closed via local_path_is_safe",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR7. Unsafe path: absolute path.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, {
+            "id": "synthetic_neutral_minimal",
+            "path": "/etc/passwd",
+        })
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "brand_preset_ref.path: fails local_path_is_safe" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: absolute path fails closed",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR8. Unsafe path: parent traversal.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, {
+            "id": "synthetic_neutral_minimal",
+            "path": "../../etc/passwd",
+        })
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "brand_preset_ref.path: fails local_path_is_safe" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: parent traversal in path fails closed",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR9. Path whose first segment names no registered root. The
+    # registry roots are 'examples/' and 'templates/'; a path like
+    # 'not_a_registry/preset.json' clears local_path_is_safe but
+    # selects an unknown root and is refused at the registry-lookup
+    # step. Proves the registry list is actually consulted (i.e.
+    # neither 'examples/' nor 'templates/' is hard-coded as a
+    # fallback) and that an unknown first segment fails closed
+    # WITHOUT touching disk.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, {
+            "id": "synthetic_neutral_minimal",
+            "path": "not_a_registry/preset.json",
+        })
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "brand_preset_ref.path: outside the synthetic registry" in stdout
+            and "'not_a_registry'" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: unknown first-segment registry root fails closed "
+            "(registry list is consulted exhaustively, not first-root-wins)",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR10. Referenced preset itself fails validate_brand_preset (P4 —
+    # real-brand wording). Materialised entirely under a fresh
+    # tempfile.TemporaryDirectory so the self-test NEVER writes to the
+    # live repo. The mutable _BRAND_PRESET_REGISTRY_ROOTS list is
+    # extended (and reverted in finally) so the bundle path
+    # 'br10_fake_registry/bad_preset.json' resolves to the tempdir
+    # fixture. The extension is the only valid mutation surface for
+    # the registry list; production code never touches it.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        fake_registry = td / "br10_fake_registry"
+        fake_registry.mkdir()
+        bad_preset_path = fake_registry / "bad_preset.json"
+        bad = json.loads(
+            (REPO_ROOT / "examples" / "brand_preset_template.json").read_text()
+        )
+        # Inject a real-brand token into a freeform field to trip P4.
+        # Use a synthetic-prefixed id so the BR-side id-shape gate
+        # passes and validate_brand_preset is the side that refuses.
+        bad["preset_id"] = "synthetic_bad_for_self_test"
+        bad["display_name"] = "Synthetic Anthropicish Variant"
+        bad_preset_path.write_text(json.dumps(bad, indent=2, sort_keys=True) + "\n")
+        _set_brand_ref(bdir, {
+            "id": "synthetic_bad_for_self_test",
+            "path": "br10_fake_registry/bad_preset.json",
+        })
+        _BRAND_PRESET_REGISTRY_ROOTS.append(fake_registry)
+        try:
+            code, stdout, stderr = _run_main([
+                "--bundle", str(bdir),
+                "--template-root", str(template_root),
+            ])
+        finally:
+            _BRAND_PRESET_REGISTRY_ROOTS.pop()
+        ok = (
+            code == 1
+            and "preset fails validate_brand_preset" in stdout
+            # The diagnostic includes the validate_brand_preset gate
+            # label (e.g. "P4:") which is the read-through evidence.
+            and "P4" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: referenced preset failing validate_brand_preset "
+            "(P4 real-brand) is surfaced as a failing ref (tempdir-only fixture, "
+            "no live-repo mutation)",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR11. id mismatch with the referenced preset's preset_id. Drift /
+    # rename detection — the file exists, validates cleanly, but its
+    # preset_id != ref.id.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, {
+            "id": "synthetic_renamed_id",
+            "path": "examples/brand_preset_template.json",
+        })
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "id mismatch with referenced preset" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: ref.id != file.preset_id fails closed "
+            "(registry-lookup drift caught)",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR12. brand_preset_ref omitted entirely. Optional field; gate is
+    # a no-op and the bundle still resolves cleanly. Pairs with BR1 to
+    # prove the field's optionality.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        # _write_minimal_bundle does not set brand_preset_ref; explicit
+        # for clarity:
+        _set_brand_ref(bdir, None)
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = code == 0 and "OK: no findings" in stdout
+        results.append(_scenario(
+            "brand_preset_ref: field omitted → gate is a no-op (optional)",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR13. brand_preset_ref unknown sub-field (typo defense). Carries
+    # the canonical {id, path} PLUS an unexpected key — fails closed
+    # before any file is opened.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, {
+            "id": "synthetic_neutral_minimal",
+            "path": "examples/brand_preset_template.json",
+            "apply_to_design_system": True,
+        })
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "brand_preset_ref: unknown field" in stdout
+            and "apply_to_design_system" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: unknown sub-field fails closed "
+            "(typo defense; apply_to_design_system rejected — the ref is "
+            "read-only and never applied)",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR14. brand_preset_ref non-object (e.g. string). Type-shape gate.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, "synthetic_neutral_minimal")
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "brand_preset_ref: not a JSON object" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: scalar value fails closed (must be object)",
+            ok,
+            f"code={code}, stdout={stdout!r}",
+        ))
+
+    # BR15. brand_preset_ref.path with no '/' separator. The path must
+    # be of the form '<registry-root>/<file>'; a bare 'foo.json' is
+    # refused at the form-check step (before any registry lookup or
+    # disk access). Closes the gap where a caller might naively pass
+    # just a filename and expect the gate to "find" it.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        _set_brand_ref(bdir, {
+            "id": "synthetic_neutral_minimal",
+            "path": "brand_preset_template.json",
+        })
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 1
+            and "not in '<registry-root>/<file>' form" in stdout
+        )
+        results.append(_scenario(
+            "brand_preset_ref: path missing the '<root>/<file>' separator "
+            "fails closed (no implicit registry root)",
+            ok,
+            f"code={code}, stdout={stdout!r}",
         ))
 
     return results

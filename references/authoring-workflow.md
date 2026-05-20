@@ -235,7 +235,7 @@ Required fields per entry are `id`, `local_path`, and `source`. The `source` enu
 
 Before invoking the deterministic pipeline, the agent runs through this loop. Each item maps to a machine-checked gate downstream (so the loop is also a "fail fast at authoring time" trick), or to a source-fidelity / safety rule the machine cannot check on its own.
 
-Machine-checkable (the deterministic pipeline will enforce these — running them at authoring time saves a six-stage retry). The bundled helper `scripts/validate_authoring_bundle.py` runs items 1–12 plus the curated forbidden-token / full-slide raster / raw-source-leakage scans in one shot, without creating a workspace or generating any artifact:
+Machine-checkable (the deterministic pipeline will enforce items 1–12 — running them at authoring time saves a six-stage retry; item 13 is enforced **only** by `scripts/validate_authoring_bundle.py --bundle` and no downstream stage applies the referenced preset). The bundled helper `scripts/validate_authoring_bundle.py` runs items 1–13 plus the curated forbidden-token / full-slide raster / raw-source-leakage scans in one shot, without creating a workspace or generating any artifact:
 
 ```
 python3 scripts/validate_authoring_bundle.py \
@@ -259,15 +259,16 @@ The gate emits `ERROR` findings (exit 1) and `WARN` findings (informational; exi
 10. Every `slide_plan.image_refs[*]` value is in `image_manifest.images[].id`.
 11. Every `image_manifest.images[].local_path` resolves inside the workspace to an existing regular non-symlink file.
 12. The design system path is exactly one of `--design-system-spec` / `--theme-from-template`.
+13. **Optional brand preset reference (READ-ONLY)**: under `--bundle <dir>`, `brief.json` may OPTIONALLY declare `brand_preset_ref = {id, path}` against a synthetic preset under the registry roots `examples/` or `templates/`. The `path` uses the form `<registry-root>/<file>`. When present, the bundle gate confirms: `id` matches `^synthetic_[a-z0-9][a-z0-9_]*$` and carries no real-brand / credential / public-upload wording; `path` passes `local_path_is_safe`, names a registered root, and resolves under that root (defense-in-depth against symlink escape); the resolved file passes `scripts/validate_brand_preset.py` (P1..P11); the file's `preset_id` equals `ref.id` (rename / typo drift). This is **authoring-time reference validation, NOT style application** — the preset is never projected onto `design_system.json` / `slide_plans/*.json` / `render_models/*.json` / SVG / `.pptx`, and the explicit-flag CLI does NOT expose a flag for the ref (brief.json-only by design). Omit the field to skip the check. See `references/brand-preset-contract.md` § 5.1.
 
 Agent-managed (machine cannot check):
 
-13. Every slide title, summary, key point, kpi, and table cell traces to its declared `source_refs`. No fabricated statistics, dates, names, or quotations.
-14. No raw customer / account / employee names or sensitive figures unless the user explicitly confirmed they are safe.
-15. No raw source paragraphs are copied into any artifact — only short paraphrased summaries.
-16. `alt_text`, `intended_use`, and any sidecar image prompts are abstracted; they carry no raw source text.
-17. No slide is a full-slide raster or all-image slide. Every slide carries editable native shapes (the PPTX exporter's `minimal_evidence.every_slide_has_native_shape` gate enforces this on the output, but the agent should not even author such a slide).
-18. The agent did **not** read, copy, paraphrase, or summarize anything from `/Users/robert/ppt-master` (or any similarly named prior implementation). See `references/clean-room-policy.md`.
+14. Every slide title, summary, key point, kpi, and table cell traces to its declared `source_refs`. No fabricated statistics, dates, names, or quotations.
+15. No raw customer / account / employee names or sensitive figures unless the user explicitly confirmed they are safe.
+16. No raw source paragraphs are copied into any artifact — only short paraphrased summaries.
+17. `alt_text`, `intended_use`, and any sidecar image prompts are abstracted; they carry no raw source text.
+18. No slide is a full-slide raster or all-image slide. Every slide carries editable native shapes (the PPTX exporter's `minimal_evidence.every_slide_has_native_shape` gate enforces this on the output, but the agent should not even author such a slide).
+19. The agent did **not** read, copy, paraphrase, or summarize anything from `/Users/robert/ppt-master` (or any similarly named prior implementation). See `references/clean-room-policy.md`.
 
 If any check fails, the agent fixes the spec and re-runs the loop. Only when every check passes does the agent invoke the deterministic pipeline.
 
