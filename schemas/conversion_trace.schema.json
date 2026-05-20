@@ -1,0 +1,265 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "conversion_trace.schema.json",
+  "title": "PPTX Conversion Trace Report (future contract; not active export instrumentation)",
+  "description": "Clean-room SHAPE contract for a per-primitive PPTX conversion trace report. This schema is intentionally idea-only today: scripts/export_pptx.py does NOT emit a trace yet, and no other script in this repo reads one. The contract pins what a future trace MUST carry so that, when runtime tracing is wired in, the writer and any reader agree on the on-disk shape from the first commit. The pipeline_status literal 'future_contract_only' locks that intent at the file boundary; the read-only validator at scripts/validate_conversion_trace.py re-applies the same gate so a future runtime path cannot silently re-interpret an existing trace as if it were live. Every record describes one render_model primitive's attempted conversion to a PPTX surface: the source slide_index / primitive_id, the primitive_kind from the render_model allow-list, the expected_pptx_kind the exporter would have produced, the conversion status (editable / rejected / degraded / skipped), a closed-enum reason_code when status != editable, and evidence fields that can be sampled without opening PowerPoint (booleans on supported-ness and bounds, integer counts, the relationship type the primitive would have triggered). Trace, deck, and generator ids are forced to start with the literal 'synthetic_' prefix so a trace can never be authored under a real document id. No URL / file path / data: URI / credential-shape / public-upload / raw-source / confidential wording is permitted anywhere; the schema patterns refuse the obvious shapes and the validator re-applies the same canonical-form gates. This is NOT upstream parity (no upstream trace schema was opened) and NOT active export instrumentation (export_pptx.py and validate_pptx_contract.py do not consume or produce this file today). See references/conversion-trace-contract.md.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "trace_id",
+    "pipeline_status",
+    "generated_by",
+    "deck",
+    "records",
+    "summary"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1"],
+      "description": "Trace schema version. Bump only with a paired contract change."
+    },
+    "trace_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^synthetic_[a-z0-9][a-z0-9_]*$",
+      "description": "Stable trace identifier. The forced 'synthetic_' prefix refuses any real-document id at the schema layer; the validator denylist mirrors it. Lowercase ASCII letters, digits, and underscore only."
+    },
+    "pipeline_status": {
+      "type": "string",
+      "enum": ["future_contract_only"],
+      "description": "Hard literal. This field locks the document at the SHAPE-only contract layer — no script in this repo writes or reads a trace as runtime state today. The validator re-asserts the literal so a future runtime path must flip it in a paired contract change rather than silently reusing the existing value."
+    },
+    "generated_by": {
+      "type": "object",
+      "required": ["name", "mode"],
+      "additionalProperties": false,
+      "description": "Identifier for the synthetic writer of the trace. 'name' carries the forced 'synthetic_' prefix; 'mode' is a closed enum that names whether the trace was assembled by a self-test scenario or by manual authoring against the fixture pattern.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^synthetic_[a-z0-9][a-z0-9_]*$"
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["simulated", "self_test_fixture"]
+        }
+      }
+    },
+    "deck": {
+      "type": "object",
+      "required": ["deck_id", "slide_count", "layouts_attempted"],
+      "additionalProperties": false,
+      "description": "Deck-level metadata the trace describes. slide_count is informational (cross-checked against the maximum record.slide_index by the validator). layouts_attempted is the closed set of layout ids the exporter is expected to consume today — chart-only or otherwise unsupported layouts are not in this allow-list.",
+      "properties": {
+        "deck_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^synthetic_[a-z0-9][a-z0-9_]*$"
+        },
+        "slide_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "layouts_attempted": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "cover",
+              "section_divider",
+              "executive_summary",
+              "key_message",
+              "two_column",
+              "kpi_dashboard",
+              "timeline",
+              "agenda",
+              "conclusion",
+              "comparison_table"
+            ]
+          }
+        }
+      }
+    },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Ordered list of per-primitive conversion records. Every entry describes one render_model primitive attempt. Validator enforces uniqueness of (slide_index, primitive_id) across all records and reason_code consistency vs. status.",
+      "items": {
+        "type": "object",
+        "required": [
+          "slide_index",
+          "slide_layout",
+          "primitive_id",
+          "primitive_kind",
+          "expected_pptx_kind",
+          "status",
+          "reason_code",
+          "evidence"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "slide_index": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-based slide index that ties this record back to render_models/<idx:02d>_<layout>.json (and to deck_plan.slides[].index)."
+          },
+          "slide_layout": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "description": "Layout id this slide uses. Closed enum is enforced at the deck.layouts_attempted level; here the field is left as the generic layout-id pattern so a future schema extension can widen the allow-list in one place."
+          },
+          "primitive_id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "description": "Stable primitive id, ties to render_model.primitives[].id. Unique within (slide_index, primitive_id) across the whole trace; the validator enforces this."
+          },
+          "primitive_kind": {
+            "type": "string",
+            "enum": [
+              "text",
+              "shape",
+              "line",
+              "image_slot",
+              "table",
+              "kpi",
+              "chart_placeholder"
+            ],
+            "description": "Mirror of the render_model.primitives[].kind closed enum. New kinds may not be added without a schema bump on both render_model.schema.json and here."
+          },
+          "expected_pptx_kind": {
+            "type": "string",
+            "enum": [
+              "native_text_shape",
+              "native_shape",
+              "native_line",
+              "native_image_placeholder",
+              "native_kpi_group",
+              "native_table_graphic_frame",
+              "raster_fallback",
+              "none"
+            ],
+            "description": "Closed enum naming the surface the exporter is expected to emit for this primitive. 'native_image_placeholder' reflects today's exporter — image_slot is a placeholder shape carrying alt_text, with media embedding TODO. 'raster_fallback' is reserved for a future degraded path; 'none' is used with status=rejected/skipped when no PPTX surface is emitted."
+          },
+          "status": {
+            "type": "string",
+            "enum": ["editable", "rejected", "degraded", "skipped"],
+            "description": "Closed enum. editable: the primitive was emitted as a native, in-PowerPoint editable surface. rejected: the exporter refused the primitive (fail-closed contract gate). degraded: emitted, but with a known loss vs. the render_model (e.g. raster fallback). skipped: the primitive was intentionally omitted (e.g. media embedding TODO)."
+          },
+          "reason_code": {
+            "type": ["null", "string"],
+            "enum": [
+              null,
+              "primitive_kind_unsupported",
+              "layout_unsupported",
+              "bounds_out_of_canvas",
+              "image_ref_undeclared",
+              "table_row_width_mismatch",
+              "style_ref_unresolved",
+              "chart_renderer_todo",
+              "media_embedding_todo",
+              "font_overflow_todo",
+              "other_synthetic_probe"
+            ],
+            "description": "MUST be null when status=editable; MUST be one of the closed enum strings when status in {rejected, degraded, skipped}. The validator re-asserts this consistency rule; the schema only enforces enum membership."
+          },
+          "evidence": {
+            "type": "object",
+            "required": [
+              "primitive_kind_supported",
+              "layout_supported",
+              "bounds_within_canvas",
+              "shape_count_delta",
+              "text_run_count",
+              "table_row_count",
+              "image_alt_text_present",
+              "relationship_type"
+            ],
+            "additionalProperties": false,
+            "description": "Evidence fields that can be sampled without opening PowerPoint. Boolean gates (supported / within-canvas / alt-text-present) and small integer counts (shape / text-run / table-row deltas) are obtainable by reading the OOXML XML parts directly. Nullable fields use null when the field is not meaningful for the primitive kind (e.g. text_run_count is null for a line primitive).",
+            "properties": {
+              "primitive_kind_supported": {
+                "type": "boolean"
+              },
+              "layout_supported": {
+                "type": "boolean"
+              },
+              "bounds_within_canvas": {
+                "type": "boolean"
+              },
+              "shape_count_delta": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 64
+              },
+              "text_run_count": {
+                "type": ["null", "integer"],
+                "minimum": 0,
+                "maximum": 64
+              },
+              "table_row_count": {
+                "type": ["null", "integer"],
+                "minimum": 0,
+                "maximum": 64
+              },
+              "image_alt_text_present": {
+                "type": ["null", "boolean"]
+              },
+              "relationship_type": {
+                "type": ["null", "string"],
+                "enum": [
+                  null,
+                  "officeDocument",
+                  "slide",
+                  "slideMaster",
+                  "slideLayout",
+                  "theme",
+                  "image"
+                ],
+                "description": "Closed enum mirrors scripts/validate_pptx_contract.py relationships.allow_list. null when this primitive did not trigger a package relationship."
+              }
+            }
+          },
+          "note": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 280,
+            "description": "Optional terse synthetic note. Validator refuses URL / file path / credential / public-upload / raw-source / confidential wording here, same as the rest of the trace."
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "editable_count",
+        "rejected_count",
+        "degraded_count",
+        "skipped_count"
+      ],
+      "additionalProperties": false,
+      "description": "Per-status totals. Validator cross-checks these against the records list — a trace whose summary disagrees with its own records is refused.",
+      "properties": {
+        "editable_count": { "type": "integer", "minimum": 0 },
+        "rejected_count": { "type": "integer", "minimum": 0 },
+        "degraded_count": { "type": "integer", "minimum": 0 },
+        "skipped_count":  { "type": "integer", "minimum": 0 }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 280,
+      "description": "Optional trace-level note. Same content gates as record.note."
+    }
+  }
+}

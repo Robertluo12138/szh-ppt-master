@@ -1,0 +1,164 @@
+{
+  "schema_version": "1",
+  "trace_id": "synthetic_conversion_trace_a",
+  "pipeline_status": "future_contract_only",
+  "generated_by": {
+    "name": "synthetic_self_test",
+    "mode": "self_test_fixture"
+  },
+  "deck": {
+    "deck_id": "synthetic_demo_deck",
+    "slide_count": 3,
+    "layouts_attempted": [
+      "cover",
+      "kpi_dashboard",
+      "comparison_table"
+    ]
+  },
+  "records": [
+    {
+      "slide_index": 1,
+      "slide_layout": "cover",
+      "primitive_id": "title",
+      "primitive_kind": "text",
+      "expected_pptx_kind": "native_text_shape",
+      "status": "editable",
+      "reason_code": null,
+      "evidence": {
+        "primitive_kind_supported": true,
+        "layout_supported": true,
+        "bounds_within_canvas": true,
+        "shape_count_delta": 1,
+        "text_run_count": 1,
+        "table_row_count": null,
+        "image_alt_text_present": null,
+        "relationship_type": null
+      },
+      "note": "Synthetic baseline text primitive."
+    },
+    {
+      "slide_index": 1,
+      "slide_layout": "cover",
+      "primitive_id": "title_divider",
+      "primitive_kind": "line",
+      "expected_pptx_kind": "native_line",
+      "status": "editable",
+      "reason_code": null,
+      "evidence": {
+        "primitive_kind_supported": true,
+        "layout_supported": true,
+        "bounds_within_canvas": true,
+        "shape_count_delta": 1,
+        "text_run_count": null,
+        "table_row_count": null,
+        "image_alt_text_present": null,
+        "relationship_type": null
+      }
+    },
+    {
+      "slide_index": 1,
+      "slide_layout": "cover",
+      "primitive_id": "accent_image",
+      "primitive_kind": "image_slot",
+      "expected_pptx_kind": "native_image_placeholder",
+      "status": "skipped",
+      "reason_code": "media_embedding_todo",
+      "evidence": {
+        "primitive_kind_supported": true,
+        "layout_supported": true,
+        "bounds_within_canvas": true,
+        "shape_count_delta": 1,
+        "text_run_count": null,
+        "table_row_count": null,
+        "image_alt_text_present": true,
+        "relationship_type": null
+      },
+      "note": "Placeholder shape emitted with alt_text; media bytes not embedded yet."
+    },
+    {
+      "slide_index": 2,
+      "slide_layout": "kpi_dashboard",
+      "primitive_id": "revenue_kpi",
+      "primitive_kind": "kpi",
+      "expected_pptx_kind": "native_kpi_group",
+      "status": "editable",
+      "reason_code": null,
+      "evidence": {
+        "primitive_kind_supported": true,
+        "layout_supported": true,
+        "bounds_within_canvas": true,
+        "shape_count_delta": 3,
+        "text_run_count": 3,
+        "table_row_count": null,
+        "image_alt_text_present": null,
+        "relationship_type": null
+      }
+    },
+    {
+      "slide_index": 2,
+      "slide_layout": "kpi_dashboard",
+      "primitive_id": "trend_chart",
+      "primitive_kind": "chart_placeholder",
+      "expected_pptx_kind": "none",
+      "status": "rejected",
+      "reason_code": "chart_renderer_todo",
+      "evidence": {
+        "primitive_kind_supported": false,
+        "layout_supported": true,
+        "bounds_within_canvas": true,
+        "shape_count_delta": 0,
+        "text_run_count": null,
+        "table_row_count": null,
+        "image_alt_text_present": null,
+        "relationship_type": null
+      },
+      "note": "Chart rendering remains TODO; primitive refused at the exporter gate."
+    },
+    {
+      "slide_index": 3,
+      "slide_layout": "comparison_table",
+      "primitive_id": "options_table",
+      "primitive_kind": "table",
+      "expected_pptx_kind": "native_table_graphic_frame",
+      "status": "editable",
+      "reason_code": null,
+      "evidence": {
+        "primitive_kind_supported": true,
+        "layout_supported": true,
+        "bounds_within_canvas": true,
+        "shape_count_delta": 1,
+        "text_run_count": null,
+        "table_row_count": 4,
+        "image_alt_text_present": null,
+        "relationship_type": null
+      }
+    },
+    {
+      "slide_index": 3,
+      "slide_layout": "comparison_table",
+      "primitive_id": "footer_caption",
+      "primitive_kind": "text",
+      "expected_pptx_kind": "raster_fallback",
+      "status": "degraded",
+      "reason_code": "font_overflow_todo",
+      "evidence": {
+        "primitive_kind_supported": true,
+        "layout_supported": true,
+        "bounds_within_canvas": false,
+        "shape_count_delta": 1,
+        "text_run_count": 1,
+        "table_row_count": null,
+        "image_alt_text_present": null,
+        "relationship_type": null
+      },
+      "note": "Synthetic probe: glyph-level overflow detection is TODO."
+    }
+  ],
+  "summary": {
+    "editable_count": 4,
+    "rejected_count": 1,
+    "degraded_count": 1,
+    "skipped_count": 1
+  },
+  "notes": "Synthetic fixture for the conversion-trace contract; no runtime emits this file."
+}
