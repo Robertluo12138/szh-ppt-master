@@ -1,0 +1,138 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "brand_preset.schema.json",
+  "title": "Brand / Design Preset (synthetic-only contract)",
+  "description": "Clean-room, idea-only brand/design preset shape. This schema describes a SHAPE the szh-ppt-master pipeline could one day project onto a design_system.json; it is NOT a runtime preset application contract. The runtime today resolves design tokens via templates/<name>/theme.json and scripts/init_design_system.py only; no script reads a brand_preset.json. The schema deliberately refuses real-brand wording, external URLs, file:// or data: URI schemes, absolute paths, '..' segments, public-upload wording, image-generation prompts, and raw-source / business-confidential wording at the field-shape level. A read-only stdlib-only validator ships at scripts/validate_brand_preset.py and re-applies the same gates plus a small denylist of well-known real-brand tokens, a public-hosting marker (`public` co-occurring with `host` / `hosted` / `hosting` is refused alongside the existing upload / share / publish / distribut verbs), and a validator-only credential-shape denylist (qualifier-prefixed token compounds, `secret`, `bearer`, `password`, the bare marker `token`, plus `sk-...`-prefixed API-key shapes; the schema has no field-shape pattern for credential wording, so these gates run at the validator layer alone). See references/brand-preset-contract.md for the policy envelope.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "preset_id",
+    "display_name",
+    "runtime_status",
+    "palette_tokens",
+    "typography_tokens",
+    "spacing_style",
+    "radius_style",
+    "chart_style_hints",
+    "allowed_layout_mood"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1"],
+      "description": "Preset schema version. Bump only with a paired contract change."
+    },
+    "preset_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^synthetic_[a-z0-9][a-z0-9_]*$",
+      "description": "Stable identifier. Forced to start with the literal prefix 'synthetic_' so a preset can never be authored under a real brand id; the rest is lowercase ASCII letters, digits, and underscore. The prefix is a fail-closed gate against real-brand authorship at the schema layer, mirrored by the validator denylist."
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9 _\\-]*$",
+      "description": "Human-readable label. The pattern excludes punctuation that real brand marks frequently use (registered / trademark glyphs, parentheses, ampersand, dot, comma, slash, colon) and excludes URL-like shapes; the validator additionally enforces a real-brand denylist and refuses URL-shaped values."
+    },
+    "runtime_status": {
+      "type": "string",
+      "enum": ["non_runtime_contract"],
+      "description": "Hard literal. This field locks the document at the SHAPE-only contract layer — there is no 'runtime' / 'applied' state today. The literal mirrors the contract envelope documented in references/brand-preset-contract.md and is asserted again by the validator so a future runtime path cannot quietly read a non_runtime_contract preset as if it were applied."
+    },
+    "palette_tokens": {
+      "type": "object",
+      "required": ["primary", "background", "text"],
+      "additionalProperties": false,
+      "description": "Closed set of palette tokens. The token NAMES are fixed (no free-form keys via additionalProperties: false); the VALUES are constrained to 6-digit hex colors so neither URLs nor named-color brand wording can slip in. Mirrors the palette shape in schemas/design_system.schema.json so a projection helper, if ever written, would be straightforward.",
+      "properties": {
+        "primary":    { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "secondary":  { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "accent":     { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "background": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "text":       { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" }
+      }
+    },
+    "typography_tokens": {
+      "type": "object",
+      "required": ["heading", "body"],
+      "additionalProperties": false,
+      "description": "Closed set of typography tokens. heading/body each carry a CSS-style font fallback chain plus a positive numeric point size. The pattern excludes URL-shaped or path-shaped values; the validator additionally refuses any token whose first entry matches a real-brand denylist.",
+      "properties": {
+        "heading": {
+          "type": "object",
+          "required": ["font_family", "size_pt"],
+          "additionalProperties": false,
+          "properties": {
+            "font_family": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "pattern": "^[A-Za-z][A-Za-z0-9 \\-]*(\\s*,\\s*[A-Za-z][A-Za-z0-9 \\-]*)*$",
+              "description": "CSS-style fallback chain, preferred -> fallback. The pattern excludes punctuation typical of URLs (':', '/', '?', '#'), path separators ('\\\\'), and quotes; only ASCII letters, digits, hyphen, and a single space inside each entry are allowed."
+            },
+            "size_pt": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        },
+        "body": {
+          "type": "object",
+          "required": ["font_family", "size_pt"],
+          "additionalProperties": false,
+          "properties": {
+            "font_family": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "pattern": "^[A-Za-z][A-Za-z0-9 \\-]*(\\s*,\\s*[A-Za-z][A-Za-z0-9 \\-]*)*$"
+            },
+            "size_pt": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        }
+      }
+    },
+    "spacing_style": {
+      "type": "string",
+      "enum": ["compact", "balanced", "airy"],
+      "description": "Closed enum. A hint about visual density; the runtime DOES NOT apply it today."
+    },
+    "radius_style": {
+      "type": "string",
+      "enum": ["sharp", "soft", "rounded"],
+      "description": "Closed enum. A hint about corner radius style; the runtime DOES NOT apply it today."
+    },
+    "chart_style_hints": {
+      "type": "object",
+      "required": ["series_palette_role", "emphasis"],
+      "additionalProperties": false,
+      "description": "Closed set of chart-style hints. The runtime has NO chart rendering today (chart_placeholder fails closed); this block is shape-only and the validator refuses URL / path / real-brand wording.",
+      "properties": {
+        "series_palette_role": {
+          "type": "string",
+          "enum": ["primary_only", "primary_accent", "dual_tone", "neutral_series"]
+        },
+        "emphasis": {
+          "type": "string",
+          "enum": ["minimal", "moderate", "high_contrast"]
+        }
+      }
+    },
+    "allowed_layout_mood": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["minimal", "editorial", "analytical", "narrative"]
+      },
+      "description": "Closed enum set. Captures the layout-mood subset a preset opts into; e.g. an analytical preset might allow ['analytical', 'minimal']. Used as a SHAPE hint only — no runtime layout selector reads it today."
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 280,
+      "description": "Optional short author note. The validator refuses URL-shaped values, file:// or data: URIs, real-brand denylist matches, public-upload wording (now including `public` co-occurring with `host` / `hosted` / `hosting`), image-generation prompt wording, raw-source / business-confidential wording, and credential-shaped wording (qualifier-prefixed token compounds like `access_token` / `api_token`, the bare marker `token`, plus `secret` / `bearer` / `password` and `sk-...`-prefixed API-key shapes). Keep it terse and synthetic."
+    }
+  }
+}

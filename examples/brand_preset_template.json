@@ -1,0 +1,31 @@
+{
+  "schema_version": "1",
+  "preset_id": "synthetic_neutral_minimal",
+  "display_name": "Synthetic Neutral Minimal",
+  "runtime_status": "non_runtime_contract",
+  "palette_tokens": {
+    "primary":    "#2A2A2A",
+    "secondary":  "#5A5A5A",
+    "accent":     "#888888",
+    "background": "#FFFFFF",
+    "text":       "#1A1A1A"
+  },
+  "typography_tokens": {
+    "heading": {
+      "font_family": "Calibri, Helvetica Neue, Arial, sans-serif",
+      "size_pt": 28
+    },
+    "body": {
+      "font_family": "Calibri, Helvetica Neue, Arial, sans-serif",
+      "size_pt": 14
+    }
+  },
+  "spacing_style": "balanced",
+  "radius_style": "soft",
+  "chart_style_hints": {
+    "series_palette_role": "primary_accent",
+    "emphasis": "moderate"
+  },
+  "allowed_layout_mood": ["minimal", "analytical"],
+  "notes": "Synthetic placeholder preset for contract testing only. Not a runtime preset."
+}
