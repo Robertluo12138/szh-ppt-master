@@ -1,0 +1,9 @@
+{
+  "approximate_slide_count": 7,
+  "audience": "Internal pipeline smoke-test reviewers",
+  "language": "en",
+  "objective": "Exercise the explicit-input authoring bundle gate end-to-end on a synthetic, non-sensitive narrative.",
+  "source_id": "synthetic_trial_source",
+  "title": "Synthetic Authoring Trial",
+  "tone": "neutral-professional"
+}

@@ -44,11 +44,15 @@ Gate behavior
 Each check emits one or more *findings*. A finding has a severity:
 
   - ``ERROR`` — bundle would fail the runtime pipeline, OR violates a
-    privacy / clean-room rule the agent owns. The gate exits non-zero.
+    privacy / clean-room rule the agent owns (this includes every block
+    the render-model generator would silently drop — a ``chart_ref`` of
+    any kind, an anonymous block with no ``id``, or a block whose ``id``
+    is not declared by the resolved layout's slots). The gate exits
+    non-zero.
   - ``WARN``  — agent should review before running, but the bundle is not
-    structurally invalid (e.g. a ``chart_ref`` block that the current
-    render-model generator cannot project). The gate exits 0 unless
-    ``--strict`` is passed (which promotes every WARN to ERROR).
+    structurally invalid (e.g. a slide spec whose filename does not match
+    the canonical ``<index:02d>_<layout>.json`` pattern). The gate exits
+    0 unless ``--strict`` is passed (which promotes every WARN to ERROR).
 
 Exit codes:
 
@@ -96,10 +100,15 @@ from validate_scaffold import (  # noqa: E402
     _slide_plan_against_layout,
 )
 
-# Lazy-import the render-model generator's supported-layout tuple so the
-# authoring gate and the generator stay in sync (mirrors the lazy import
-# in scripts/validate_workspace.py::check_generator_render_model_coverage).
-from generate_render_models import SUPPORTED_LAYOUTS as _RENDER_SUPPORTED_LAYOUTS  # noqa: E402
+# Lazy-import the render-model generator's supported-layout tuple plus the
+# small list-of-items capacity constants so the authoring gate and the
+# generator stay in lockstep (mirrors the lazy import in
+# scripts/validate_workspace.py::check_generator_render_model_coverage).
+from generate_render_models import (  # noqa: E402
+    SUPPORTED_LAYOUTS as _RENDER_SUPPORTED_LAYOUTS,
+    LAYOUT_FALLBACK_BOUNDS as _RENDER_LAYOUT_FALLBACK_BOUNDS,
+    LIST_ITEM_MIN_H as _RENDER_LIST_ITEM_MIN_H,
+)
 
 DECK_PLAN_SCHEMA = SCHEMAS_DIR / "deck_plan.schema.json"
 DESIGN_SYSTEM_SCHEMA = SCHEMAS_DIR / "design_system.schema.json"
@@ -825,6 +834,443 @@ def _check_plan_template_chain(
 
 
 # ---------------------------------------------------------------------------
+# Generator-grounded per-kind block-structure check. Mirrors the per-kind
+# block-shape guards in scripts/generate_render_models.py so an authoring
+# bundle whose blocks are structurally incompatible with the render-model
+# generator (chart_ref kind anywhere, duplicate / anonymous / unknown-slot-
+# id blocks, kind drift on optional slots, malformed text / callout / list
+# / kpi / table / image_ref payloads, and a list slot whose item count
+# would overflow LIST_ITEM_MIN_H per slot height) fails closed at authoring
+# time instead. The schema's `additionalProperties: false` on each block
+# already covers unknown KEYS; this helper covers unknown / mis-shaped
+# CONTENT and per-layout slot fit.
+#
+# This is NOT full generator parity. The generator additionally enforces
+# integer-arithmetic gates (KPI tile-width positivity in `_kpi_tile_bounds`,
+# slot-bounds presence in `_check_slot_present`, palette / typography token
+# resolution against the design_system) that are layout / token concerns
+# rather than per-block authoring concerns; those remain runtime-only.
+# Anything not enumerated below is reported by the runtime helpers, not
+# by this gate.
+# ---------------------------------------------------------------------------
+
+# Block kinds that carry a render-model-affecting payload (chart / image /
+# kpi / table). When one of these appears on a layout slot the layout does
+# NOT declare, the agent likely intended a chart/image/table/kpi to render
+# on this slide and the generator would silently drop it — the diagnostic
+# calls out the payload-smuggling intent so the agent can fix the slot id.
+# Plain text/list/callout blocks with an unknown id also fail as ERROR
+# (the generator would still drop them, leaving the agent's content
+# invisible), but the diagnostic frames the issue as "dead content" rather
+# than "smuggled payload" so the agent sees the right fix.
+_SMUGGLEABLE_KINDS: frozenset[str] = frozenset({"image_ref", "table", "kpi"})
+
+
+def _check_block_structure(
+    rel: str,
+    spec: dict,
+    layout_name: str,
+    layouts_by_name: dict[str, dict] | None,
+    report: Report,
+) -> None:
+    """Walk spec.blocks once and apply the generator-grounded per-block
+    rules enumerated below. Each rule mirrors a specific runtime helper
+    in scripts/generate_render_models.py; rules NOT enumerated here
+    (KPI tile-width arithmetic, palette / typography token resolution,
+    layout slot-presence checks the generator itself hardcodes) remain
+    runtime-only and are documented in the helper's banner comment.
+
+    Rules applied (in order, per block):
+      1. Block must be an object (schema gate already reports otherwise;
+         we skip such entries here).
+      2. block.kind == 'chart_ref' → ERROR everywhere (no SUPPORTED layout
+         maps to the chart_placeholder primitive today).
+      3. block.id absent / empty → ERROR (the generator builds blocks_by_id
+         only from blocks with a string id; anonymous blocks are silently
+         dropped at runtime, so the authoring bundle is structurally
+         incompatible with the generator).
+      4. block.id duplicated within this spec → ERROR (the generator's
+         blocks_by_id dict would silently overwrite earlier entries with
+         the last one, producing a wrong visual without warning).
+      5. block.id present but the layout has no slot with that id → ERROR
+         in every case (the generator silently drops blocks whose id is
+         not consumed by the layout's slots). The diagnostic distinguishes
+         two failure modes so the agent sees the right fix:
+           - block.kind in _SMUGGLEABLE_KINDS (chart/image/table/kpi)
+             frames the issue as payload smuggling — the agent likely
+             expected the chart/image/table/kpi to render;
+           - text/list/callout frames the issue as dead content — the
+             block would have no visual effect on the slide.
+      6. block.kind != slot.type for the resolved layout slot → ERROR
+         (the generator's per-kind helpers — _text_block_content,
+         _callout_block_content, _list_block_content — would refuse the
+         drift; covers required AND optional slots, where the schema-
+         layer _slide_plan_against_layout gate only fires for required).
+      7. Per-kind content rules, mirroring the generator's per-helper
+         assertions exactly:
+           - text / callout / image_ref: content must be a non-empty string.
+           - list: content must be a non-empty list of non-empty strings.
+           - kpi: content must be a non-empty list of dicts; each dict
+             must declare non-empty string `label` and `value`; optional
+             `delta` (when present) must be a non-empty string; no other
+             keys (the generator silently ignores extras — flagging here
+             so the agent does not believe a smuggled chart/image
+             payload on a kpi entry actually rendered).
+           - table: content must be a dict with non-empty `headers`
+             (list of non-empty strings) and non-empty `rows` (list of
+             non-empty lists of non-empty string cells); every row's
+             cell count must equal len(headers); no other keys.
+      8. List capacity rule (list kind only, slot known, slot bounds
+         resolvable). Mirrors `_list_item_bounds` in the render-model
+         generator: `slot_height // count` must be at least
+         `LIST_ITEM_MIN_H` (28 px today), otherwise the generator
+         refuses with "list slot too short for N items". Slot bounds
+         are resolved from `slot.bounds` when present, else from
+         `LAYOUT_FALLBACK_BOUNDS[layout_name][slot_id]` (the same
+         fallback table the generator's `_bounds_or_fallback` reads).
+         When neither is available (no slot match, no bounds at all,
+         non-integer height), the capacity check is skipped rather
+         than asserted — the runtime helpers re-fire downstream and
+         this gate degrades to its earlier coverage instead of
+         tracebacking on missing layout metadata.
+
+    When layouts_by_name is None or layout_name is unknown, rules 5,
+    6, and 8 are skipped (we don't have the slot map or bounds to
+    compare against) and rules 1-4 and 7 still apply. Earlier checks
+    in the gate already reported the missing layout, so this is fail-
+    closed degradation, not a false-pass."""
+    blocks = spec.get("blocks")
+    if not isinstance(blocks, list):
+        return  # schema gate already reported
+
+    slot_by_id: dict[str, dict] = {}
+    if layouts_by_name is not None and layout_name in layouts_by_name:
+        layout = layouts_by_name[layout_name]
+        slots = layout.get("slots") if isinstance(layout, dict) else None
+        if isinstance(slots, list):
+            for s in slots:
+                if isinstance(s, dict) and isinstance(s.get("id"), str):
+                    slot_by_id[s["id"]] = s
+    have_layout = layouts_by_name is not None and layout_name in layouts_by_name
+
+    seen_ids: dict[str, int] = {}
+    for i, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            continue  # schema gate reported
+        kind = block.get("kind")
+        bid = block.get("id")
+
+        # Rule 4 (duplicate id) is evaluated up front so the diagnostic
+        # references the *second* occurrence's position.
+        if isinstance(bid, str) and bid:
+            if bid in seen_ids:
+                report.err(
+                    f"slide_spec.{rel}: blocks[{i}] duplicate block id",
+                    f"id {bid!r} already declared by blocks[{seen_ids[bid]}]; "
+                    f"the render-model generator's blocks_by_id dict would "
+                    f"silently keep only the last occurrence",
+                )
+            else:
+                seen_ids[bid] = i
+
+        # Rule 2: chart_ref kind anywhere.
+        if kind == "chart_ref":
+            report.err(
+                f"slide_spec.{rel}: blocks[{i}] uses kind 'chart_ref'",
+                "the render-model generator has no SUPPORTED layout that "
+                "maps to the chart_placeholder primitive today; the PPTX "
+                "exporter would fail closed on this slide",
+            )
+            continue
+
+        # Rule 3: anonymous block.
+        if not isinstance(bid, str) or not bid:
+            report.err(
+                f"slide_spec.{rel}: blocks[{i}] has no string id",
+                f"the render-model generator builds blocks_by_id only from "
+                f"blocks with a string id; this block (kind={kind!r}) would "
+                f"be silently dropped at runtime",
+            )
+            continue
+
+        # Rules 5 / 6: slot-fit checks (only when we have the layout).
+        if have_layout:
+            slot = slot_by_id.get(bid)
+            if slot is None:
+                if kind in _SMUGGLEABLE_KINDS:
+                    report.err(
+                        f"slide_spec.{rel}: blocks[{i}] id {bid!r} is not "
+                        f"declared by layout {layout_name!r}",
+                        f"kind {kind!r} carries a chart/image/table/kpi "
+                        f"payload the agent likely expected to render; the "
+                        f"render-model generator silently drops blocks "
+                        f"whose id is not consumed by the layout's slots "
+                        f"({sorted(slot_by_id)})",
+                    )
+                else:
+                    report.err(
+                        f"slide_spec.{rel}: blocks[{i}] id {bid!r} is not "
+                        f"declared by layout {layout_name!r}",
+                        f"kind {kind!r} would be silently dropped by the "
+                        f"render-model generator (dead content — no visual "
+                        f"effect on the slide); declared layout slots are "
+                        f"{sorted(slot_by_id)}",
+                    )
+                continue
+            slot_type = slot.get("type")
+            if isinstance(slot_type, str) and kind != slot_type:
+                report.err(
+                    f"slide_spec.{rel}: blocks[{i}] kind drift vs layout "
+                    f"{layout_name!r} slot {bid!r}",
+                    f"layout slot expects kind {slot_type!r}; got kind "
+                    f"{kind!r}; the render-model generator's per-kind "
+                    f"helper would refuse this at runtime",
+                )
+                continue
+
+        # Rule 7: per-kind content rules. Schema enum already restricted
+        # kind ∈ {text,list,kpi,table,image_ref,chart_ref,callout}; chart_ref
+        # was handled at rule 2 so it cannot reach this branch.
+        _check_block_content(rel, i, bid, kind, block.get("content"), report)
+
+        # Rule 8: list-slot capacity (only when we have the layout AND the
+        # block is a list AND its content is a non-empty list of strings —
+        # rule 7 would have errored otherwise; in that case rule 8 is
+        # silently skipped to avoid piling on noise).
+        if have_layout and kind == "list":
+            content = block.get("content")
+            if isinstance(content, list) and content and all(
+                isinstance(item, str) and item for item in content
+            ):
+                _check_list_slot_capacity(
+                    rel, i, bid, layout_name, slot_by_id.get(bid),
+                    len(content), report,
+                )
+
+
+def _check_block_content(
+    rel: str,
+    i: int,
+    bid: str,
+    kind: object,
+    content: object,
+    report: Report,
+) -> None:
+    """Apply the per-kind content-shape rules from the render-model
+    generator. Each branch mirrors the generator's runtime assertions
+    so an authoring bundle that would crash the per-slide generator
+    fails closed here first."""
+    label_prefix = f"slide_spec.{rel}: blocks[{i}] (id={bid!r}, kind={kind!r})"
+
+    if kind in ("text", "callout", "image_ref"):
+        if not isinstance(content, str) or not content:
+            report.err(
+                f"{label_prefix} content must be a non-empty string",
+                f"got {type(content).__name__}: {content!r}; the render-model "
+                f"generator's per-kind helper would refuse this at runtime",
+            )
+        return
+
+    if kind == "list":
+        if not isinstance(content, list) or not content:
+            report.err(
+                f"{label_prefix} content must be a non-empty list of strings",
+                f"got {type(content).__name__}: {content!r}; the render-model "
+                f"generator's _list_block_content would refuse this at runtime",
+            )
+            return
+        for j, item in enumerate(content):
+            if not isinstance(item, str) or not item:
+                report.err(
+                    f"{label_prefix} content[{j}] is not a non-empty string",
+                    f"got {type(item).__name__}: {item!r}; every list entry "
+                    f"must be a non-empty string",
+                )
+        return
+
+    if kind == "kpi":
+        if not isinstance(content, list) or not content:
+            report.err(
+                f"{label_prefix} content must be a non-empty list of "
+                f"{{label, value, delta?}} objects",
+                f"got {type(content).__name__}: {content!r}; the render-model "
+                f"generator's kpi_dashboard helper would refuse this at runtime",
+            )
+            return
+        for j, entry in enumerate(content):
+            if not isinstance(entry, dict):
+                report.err(
+                    f"{label_prefix} content[{j}] is not an object",
+                    f"got {type(entry).__name__}: {entry!r}; every kpi entry "
+                    f"must be a {{label, value, delta?}} object",
+                )
+                continue
+            label = entry.get("label")
+            value = entry.get("value")
+            delta = entry.get("delta")
+            if not isinstance(label, str) or not label:
+                report.err(
+                    f"{label_prefix} content[{j}].label is not a non-empty string",
+                    f"got {type(label).__name__}: {label!r}",
+                )
+            if not isinstance(value, str) or not value:
+                report.err(
+                    f"{label_prefix} content[{j}].value is not a non-empty string",
+                    f"got {type(value).__name__}: {value!r}",
+                )
+            if delta is not None and (not isinstance(delta, str) or not delta):
+                report.err(
+                    f"{label_prefix} content[{j}].delta must be a non-empty "
+                    f"string when set",
+                    f"got {type(delta).__name__}: {delta!r}",
+                )
+            extras = sorted(set(entry.keys()) - {"label", "value", "delta"})
+            if extras:
+                report.err(
+                    f"{label_prefix} content[{j}] declares unsupported key(s) "
+                    f"{extras}",
+                    "the render-model generator only reads label / value / "
+                    "delta; extra keys (chart payloads, image hints, etc.) "
+                    "would be silently dropped — refusing here so smuggled "
+                    "payloads cannot masquerade as rendered KPI fields",
+                )
+        return
+
+    if kind == "table":
+        if not isinstance(content, dict):
+            report.err(
+                f"{label_prefix} content must be an object with "
+                f"'headers' (non-empty list of strings) and 'rows' "
+                f"(non-empty list of equal-length row arrays)",
+                f"got {type(content).__name__}: {content!r}",
+            )
+            return
+        headers = content.get("headers")
+        rows_raw = content.get("rows")
+        col_count: int | None = None
+        if not isinstance(headers, list) or not headers:
+            report.err(
+                f"{label_prefix} content.headers must be a non-empty list "
+                f"of non-empty strings",
+                f"got {type(headers).__name__}: {headers!r}",
+            )
+        else:
+            col_count = len(headers)
+            for j, h in enumerate(headers):
+                if not isinstance(h, str) or not h:
+                    report.err(
+                        f"{label_prefix} content.headers[{j}] is not a "
+                        f"non-empty string",
+                        f"got {type(h).__name__}: {h!r}",
+                    )
+        if not isinstance(rows_raw, list) or not rows_raw:
+            report.err(
+                f"{label_prefix} content.rows must be a non-empty list "
+                f"of row arrays",
+                f"got {type(rows_raw).__name__}: {rows_raw!r}",
+            )
+        else:
+            for r_i, row in enumerate(rows_raw):
+                if not isinstance(row, list) or not row:
+                    report.err(
+                        f"{label_prefix} content.rows[{r_i}] must be a "
+                        f"non-empty list",
+                        f"got {type(row).__name__}: {row!r}",
+                    )
+                    continue
+                if col_count is not None and len(row) != col_count:
+                    report.err(
+                        f"{label_prefix} content.rows[{r_i}] has {len(row)} "
+                        f"cell(s) but content.headers declares {col_count} "
+                        f"column(s)",
+                        "every row must match the column count; the render-"
+                        "model generator's comparison_table helper would "
+                        "refuse this at runtime",
+                    )
+                for c_i, cell in enumerate(row):
+                    if not isinstance(cell, str) or not cell:
+                        report.err(
+                            f"{label_prefix} content.rows[{r_i}][{c_i}] is "
+                            f"not a non-empty string",
+                            f"got {type(cell).__name__}: {cell!r}; cell "
+                            f"payloads must be non-empty strings — numeric "
+                            f"or rich-text payloads are not yet supported",
+                        )
+        extras = sorted(set(content.keys()) - {"headers", "rows"})
+        if extras:
+            report.err(
+                f"{label_prefix} content declares unsupported key(s) {extras}",
+                "the render-model generator only reads headers / rows; "
+                "extra keys (chart configs, formatting payloads, etc.) "
+                "would be silently dropped — refusing here so smuggled "
+                "payloads cannot masquerade as rendered table fields",
+            )
+        return
+
+    # An unknown kind would have been caught by the schema enum; do nothing
+    # here as a defensive no-op so the gate cannot traceback on an
+    # unexpected kind value.
+
+
+def _resolve_list_slot_height(
+    slot: dict | None, layout_name: str, slot_id: str,
+) -> int | None:
+    """Mirror the render-model generator's `_bounds_or_fallback` for the
+    height field only. Prefer `slot.bounds.h` when fully integer; else
+    look up `LAYOUT_FALLBACK_BOUNDS[layout_name][slot_id]` (the same
+    fallback table the generator reads). Returns None when no integer
+    height can be resolved (the capacity check then degrades to a no-op
+    rather than a false-pass)."""
+    if isinstance(slot, dict):
+        b = slot.get("bounds")
+        if isinstance(b, dict):
+            h = b.get("h")
+            if isinstance(h, int) and not isinstance(h, bool):
+                return h
+    fb = _RENDER_LAYOUT_FALLBACK_BOUNDS.get(layout_name)
+    if isinstance(fb, dict):
+        entry = fb.get(slot_id)
+        if isinstance(entry, tuple) and len(entry) == 4:
+            h = entry[3]
+            if isinstance(h, int) and not isinstance(h, bool):
+                return h
+    return None
+
+
+def _check_list_slot_capacity(
+    rel: str,
+    i: int,
+    bid: str,
+    layout_name: str,
+    slot: dict | None,
+    count: int,
+    report: Report,
+) -> None:
+    """Apply the render-model generator's `_list_item_bounds` capacity
+    rule at authoring time. The generator distributes `count` items
+    inside a slot of height `slot_h` and refuses when
+    `slot_h // count < LIST_ITEM_MIN_H` ("list slot too short for N
+    items"). Mirror that here so the agent sees the failure before a
+    six-stage prep run."""
+    if count <= 0:
+        return
+    slot_h = _resolve_list_slot_height(slot, layout_name, bid)
+    if slot_h is None:
+        return
+    item_h = slot_h // count
+    if item_h < _RENDER_LIST_ITEM_MIN_H:
+        report.err(
+            f"slide_spec.{rel}: blocks[{i}] (id={bid!r}, kind='list') "
+            f"has too many items for the {layout_name!r} slot",
+            f"slot height {slot_h}px / {count} item(s) = {item_h}px per "
+            f"item; the render-model generator's _list_item_bounds "
+            f"requires at least {_RENDER_LIST_ITEM_MIN_H}px per item "
+            f"and would fail closed with 'list slot too short for "
+            f"{count} items' at runtime",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Slide-specs coverage (mirrors init_slide_plans 1:1 coverage gate plus the
 # per-layout slot-coverage gate via _slide_plan_against_layout).
 # ---------------------------------------------------------------------------
@@ -921,17 +1367,14 @@ def _check_slide_specs(
                     f"slide_spec.{rel}: layout {layout!r} required-slot coverage",
                     p,
                 )
-        # Block-kind advisory: chart_ref blocks cannot be projected to a
-        # render_model by the current generator (no SUPPORTED layout uses
-        # the chart_placeholder primitive); flag at authoring time.
-        for i, block in enumerate(spec.get("blocks") or []):
-            if isinstance(block, dict) and block.get("kind") == "chart_ref":
-                report.err(
-                    f"slide_spec.{rel}: blocks[{i}] uses kind 'chart_ref'",
-                    "the render-model generator has no SUPPORTED layout that "
-                    "maps to the chart_placeholder primitive today; the "
-                    "PPTX exporter would fail closed on this slide",
-                )
+        # Generator-grounded per-kind block-structure checks. Mirrors the
+        # specific per-block rules in scripts/generate_render_models.py
+        # (chart_ref kind anywhere, anonymous / duplicate / unknown-slot-id
+        # blocks, kind drift on optional slots, per-kind content-shape
+        # rules, list-slot capacity vs LIST_ITEM_MIN_H). This is NOT full
+        # generator parity — see _check_block_structure's banner comment
+        # for the runtime-only rules that remain out of scope.
+        _check_block_structure(rel, spec, layout, layouts_by_name, report)
         accepted[idx] = spec
     # Final coverage: every plan slide must have one spec.
     declared_indices = sorted(plan_by_index.keys())
@@ -1258,6 +1701,225 @@ def validate_authoring_bundle(
 # ---------------------------------------------------------------------------
 
 
+# Canonical bundle layout under ``--bundle <dir>``. Names are fixed so the
+# trial directory shape (and any other agent-authored bundle) is portable.
+_BUNDLE_SOURCE_CANDIDATES = ("source.md", "source.txt")
+_BUNDLE_BRIEF_NAME = "brief.json"
+_BUNDLE_PLAN_SPEC_NAME = "plan_spec.json"
+_BUNDLE_DESIGN_SYSTEM_SPEC_NAME = "design_system_spec.json"
+_BUNDLE_SLIDE_SPECS_NAME = "slide_specs"
+_BUNDLE_IMAGE_MANIFEST_SPEC_NAME = "image_manifest_spec.json"
+_BUNDLE_BRIEF_ALLOWED_FIELDS = frozenset((
+    "title", "audience", "objective",
+    "tone", "language", "approximate_slide_count", "source_id",
+))
+_BUNDLE_BRIEF_REQUIRED_FIELDS = ("title", "audience", "objective")
+
+
+def _resolve_bundle(
+    bundle_dir: Path, *, theme_from_template: bool,
+) -> tuple[dict | None, str | None]:
+    """Resolve the canonical bundle layout into a kwargs dict that
+    matches ``validate_authoring_bundle``'s keyword arguments.
+
+    Returns ``(kwargs, None)`` on success, ``(None, message)`` on any
+    failure — symlinked bundle, missing required entry, brief.json
+    malformed or missing required fields, design-system mode conflict.
+
+    The helper is read-only; it never writes to the bundle. Brief
+    metadata is read from ``<dir>/brief.json``; every other input maps
+    1:1 to the explicit ``--*-spec`` flags.
+
+    Path safety: the bundle directory itself must be a real directory
+    (URI-shaped paths, symlinks, and non-directories are refused) and
+    every required entry must be a non-symlink regular file / directory.
+    Symlinks anywhere in the canonical layout would let an attacker who
+    controls the bundle redirect reads outside it; downstream init_*
+    helpers refuse symlinks for the same reason."""
+    if _has_uri_scheme(str(bundle_dir)):
+        return None, (
+            f"--bundle looks like a URI: {bundle_dir} — only local "
+            f"directory paths are accepted"
+        )
+    if bundle_dir.is_symlink():
+        return None, f"--bundle is a symlink (refused): {bundle_dir}"
+    if not bundle_dir.exists():
+        return None, f"--bundle does not exist: {bundle_dir}"
+    if not bundle_dir.is_dir():
+        return None, f"--bundle is not a directory: {bundle_dir}"
+
+    def _check_regular_file(name: str) -> tuple[Path | None, str | None]:
+        path = bundle_dir / name
+        if path.is_symlink():
+            return None, (
+                f"--bundle entry {name} is a symlink (refused): {path}"
+            )
+        if not path.exists():
+            return None, f"--bundle is missing required entry {name}: {path}"
+        if not path.is_file():
+            return None, (
+                f"--bundle entry {name} is not a regular file: {path}"
+            )
+        return path, None
+
+    def _check_directory(name: str) -> tuple[Path | None, str | None]:
+        path = bundle_dir / name
+        if path.is_symlink():
+            return None, (
+                f"--bundle entry {name}/ is a symlink (refused): {path}"
+            )
+        if not path.exists():
+            return None, (
+                f"--bundle is missing required entry {name}/: {path}"
+            )
+        if not path.is_dir():
+            return None, (
+                f"--bundle entry {name}/ is not a directory: {path}"
+            )
+        return path, None
+
+    # Source: exactly one of source.md / source.txt; symlinks refused.
+    present_sources: list[Path] = []
+    for cand in _BUNDLE_SOURCE_CANDIDATES:
+        cand_path = bundle_dir / cand
+        if cand_path.is_symlink():
+            return None, (
+                f"--bundle entry {cand} is a symlink (refused): {cand_path}"
+            )
+        if cand_path.exists():
+            if not cand_path.is_file():
+                return None, (
+                    f"--bundle entry {cand} is not a regular file: "
+                    f"{cand_path}"
+                )
+            present_sources.append(cand_path)
+    if not present_sources:
+        return None, (
+            f"--bundle is missing a source body: expected one of "
+            f"{list(_BUNDLE_SOURCE_CANDIDATES)} under {bundle_dir}"
+        )
+    if len(present_sources) > 1:
+        return None, (
+            f"--bundle declares more than one source body "
+            f"({[p.name for p in present_sources]}); keep exactly one of "
+            f"{list(_BUNDLE_SOURCE_CANDIDATES)} under {bundle_dir}"
+        )
+    source = present_sources[0]
+
+    brief_path, err = _check_regular_file(_BUNDLE_BRIEF_NAME)
+    if err is not None:
+        return None, err
+    plan_spec, err = _check_regular_file(_BUNDLE_PLAN_SPEC_NAME)
+    if err is not None:
+        return None, err
+    slide_specs_dir, err = _check_directory(_BUNDLE_SLIDE_SPECS_NAME)
+    if err is not None:
+        return None, err
+    image_manifest_spec, err = _check_regular_file(_BUNDLE_IMAGE_MANIFEST_SPEC_NAME)
+    if err is not None:
+        return None, err
+
+    # Design-system mode resolution. The bundle's design_system_spec.json
+    # selects --design-system-spec mode; --theme-from-template lets the
+    # caller opt out, but mixing both is ambiguous so we refuse.
+    ds_path = bundle_dir / _BUNDLE_DESIGN_SYSTEM_SPEC_NAME
+    if ds_path.is_symlink():
+        return None, (
+            f"--bundle entry {_BUNDLE_DESIGN_SYSTEM_SPEC_NAME} is a "
+            f"symlink (refused): {ds_path}"
+        )
+    ds_present = ds_path.exists()
+    if ds_present and not ds_path.is_file():
+        return None, (
+            f"--bundle entry {_BUNDLE_DESIGN_SYSTEM_SPEC_NAME} is not a "
+            f"regular file: {ds_path}"
+        )
+    if theme_from_template and ds_present:
+        return None, (
+            f"--bundle includes {_BUNDLE_DESIGN_SYSTEM_SPEC_NAME} but "
+            f"--theme-from-template was also passed; pick exactly one "
+            f"design-system mode"
+        )
+    if not theme_from_template and not ds_present:
+        return None, (
+            f"--bundle is missing {_BUNDLE_DESIGN_SYSTEM_SPEC_NAME} and "
+            f"--theme-from-template was not passed: {ds_path}"
+        )
+    design_system_spec = ds_path if ds_present else None
+
+    # Read brief.json.
+    try:
+        raw_brief = brief_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, (
+            f"--bundle entry {_BUNDLE_BRIEF_NAME} is not UTF-8 readable: "
+            f"{brief_path}: {type(exc).__name__}: {exc}"
+        )
+    try:
+        brief = json.loads(raw_brief)
+    except json.JSONDecodeError as exc:
+        return None, (
+            f"--bundle entry {_BUNDLE_BRIEF_NAME} is malformed JSON: "
+            f"{brief_path}: {exc}"
+        )
+    if not isinstance(brief, dict):
+        return None, (
+            f"--bundle entry {_BUNDLE_BRIEF_NAME} top-level value is not "
+            f"a JSON object; got {type(brief).__name__} at {brief_path}"
+        )
+    missing = [k for k in _BUNDLE_BRIEF_REQUIRED_FIELDS if k not in brief]
+    if missing:
+        return None, (
+            f"--bundle entry {_BUNDLE_BRIEF_NAME} is missing required "
+            f"field(s): {', '.join(missing)} at {brief_path}"
+        )
+    unknown = sorted(set(brief.keys()) - _BUNDLE_BRIEF_ALLOWED_FIELDS)
+    if unknown:
+        return None, (
+            f"--bundle entry {_BUNDLE_BRIEF_NAME} contains unknown "
+            f"field(s): {', '.join(unknown)} at {brief_path}; allowed: "
+            f"{sorted(_BUNDLE_BRIEF_ALLOWED_FIELDS)}"
+        )
+
+    # Type-validate the optional fields the bundle resolves verbatim into
+    # explicit kwargs. The explicit-flag path is already type-coerced by
+    # argparse (--source-id type=str, --approximate-slide-count type=int);
+    # the --bundle shortcut reads brief.json untyped, so without this gate
+    # a malformed value would surface as a downstream TypeError / schema
+    # crash rather than a clean CLI diagnostic. ``bool`` is rejected for
+    # approximate_slide_count even though ``isinstance(True, int)`` is
+    # True — a literal JSON ``true`` is not a slide count.
+    if "source_id" in brief and not isinstance(brief["source_id"], str):
+        return None, (
+            f"--bundle entry {_BUNDLE_BRIEF_NAME} field source_id must be "
+            f"a string if present; got "
+            f"{type(brief['source_id']).__name__} at {brief_path}"
+        )
+    if "approximate_slide_count" in brief:
+        value = brief["approximate_slide_count"]
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None, (
+                f"--bundle entry {_BUNDLE_BRIEF_NAME} field "
+                f"approximate_slide_count must be an integer if present; "
+                f"got {type(value).__name__} at {brief_path}"
+            )
+
+    return {
+        "source": source,
+        "source_id": brief.get("source_id"),
+        "title": brief["title"],
+        "audience": brief["audience"],
+        "objective": brief["objective"],
+        "tone": brief.get("tone"),
+        "language": brief.get("language"),
+        "approximate_slide_count": brief.get("approximate_slide_count"),
+        "plan_spec": plan_spec,
+        "design_system_spec": design_system_spec,
+        "slide_specs_dir": slide_specs_dir,
+        "image_manifest_spec": image_manifest_spec,
+    }, None
+
+
 def _format_report(report: Report) -> str:
     lines: list[str] = []
     if not report.findings:
@@ -1313,6 +1975,19 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--slide-specs-dir", type=Path, default=None)
     parser.add_argument("--image-manifest-spec", type=Path, default=None)
     parser.add_argument(
+        "--bundle", type=Path, default=None,
+        help="Resolve every explicit-input spec from a single bundle "
+             "directory. Canonical layout: <dir>/source.md (or "
+             "source.txt), <dir>/brief.json (JSON object with title / "
+             "audience / objective and optional tone / language / "
+             "approximate_slide_count / source_id), <dir>/plan_spec.json, "
+             "<dir>/design_system_spec.json (omit when "
+             "--theme-from-template is passed), <dir>/slide_specs/, "
+             "<dir>/image_manifest_spec.json. Mutually exclusive with the "
+             "explicit per-input flags; --template-root remains required "
+             "and --theme-from-template / --strict still apply.",
+    )
+    parser.add_argument(
         "--strict", action="store_true",
         help="Promote every WARN finding to ERROR (exit 1 on any warning).",
     )
@@ -1332,6 +2007,7 @@ def main(argv: list[str]) -> int:
             args.approximate_slide_count, args.plan_spec,
             args.design_system_spec, args.template_root,
             args.slide_specs_dir, args.image_manifest_spec,
+            args.bundle,
         )
         if any(v is not None for v in orchestration_args) or args.theme_from_template or args.strict:
             print(
@@ -1357,6 +2033,55 @@ def main(argv: list[str]) -> int:
             f"the agent should fix before invoking the runtime pipeline."
         )
         return 0
+
+    if args.bundle is not None:
+        # --bundle is a shortcut: every explicit per-input flag must be
+        # absent so precedence is unambiguous and the caller picks one
+        # mode. --template-root, --theme-from-template, and --strict are
+        # the only flags that compose with --bundle.
+        conflicting = [
+            name for name, value in (
+                ("--source", args.source),
+                ("--source-id", args.source_id),
+                ("--title", args.title),
+                ("--audience", args.audience),
+                ("--objective", args.objective),
+                ("--tone", args.tone),
+                ("--language", args.language),
+                ("--approximate-slide-count", args.approximate_slide_count),
+                ("--plan-spec", args.plan_spec),
+                ("--design-system-spec", args.design_system_spec),
+                ("--slide-specs-dir", args.slide_specs_dir),
+                ("--image-manifest-spec", args.image_manifest_spec),
+            )
+            if value is not None
+        ]
+        if conflicting:
+            print(
+                f"FAIL: --bundle is mutually exclusive with the explicit "
+                f"per-input flags ({', '.join(conflicting)}); pass one or "
+                f"the other, not both",
+                file=sys.stderr,
+            )
+            return 2
+        resolved, err = _resolve_bundle(
+            args.bundle, theme_from_template=args.theme_from_template,
+        )
+        if err is not None:
+            print(f"FAIL: {err}", file=sys.stderr)
+            return 2
+        args.source = resolved["source"]
+        args.source_id = resolved["source_id"]
+        args.title = resolved["title"]
+        args.audience = resolved["audience"]
+        args.objective = resolved["objective"]
+        args.tone = resolved["tone"]
+        args.language = resolved["language"]
+        args.approximate_slide_count = resolved["approximate_slide_count"]
+        args.plan_spec = resolved["plan_spec"]
+        args.design_system_spec = resolved["design_system_spec"]
+        args.slide_specs_dir = resolved["slide_specs_dir"]
+        args.image_manifest_spec = resolved["image_manifest_spec"]
 
     missing = [
         name for name, value in (
@@ -2358,6 +3083,654 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:
             f"errors={[(f.name, f.detail) for f in report.errors]}",
         ))
 
+    # ---------------------------------------------------------------------
+    # Generator-level per-kind block-structure gates. Each scenario builds
+    # the happy-path bundle and mutates one slide spec so the new gate must
+    # surface a specific ERROR (or WARN) without tracebacking. The gates
+    # mirror scripts/generate_render_models.py per-kind helpers so an
+    # authoring bundle that would crash the generator at runtime fails
+    # closed at authoring time first.
+    # ---------------------------------------------------------------------
+
+    # G1. text block content is an empty string. Generator's
+    # _text_block_content refuses; the gate must flag it as ERROR.
+    def mut_text_empty(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "01_cover.json"
+        spec = json.loads(spec_path.read_text())
+        for b in spec["blocks"]:
+            if b.get("id") == "title":
+                b["content"] = ""
+        _write_json(spec_path, spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_text_empty)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "kind='text'")
+            and _has_error(report, "non-empty string")
+        )
+        results.append(_scenario(
+            "block-structure: text block with empty content flagged as ERROR",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G2. text block content is a non-string (a number). Generator's
+    # _text_block_content refuses on the isinstance check.
+    def mut_text_number(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "01_cover.json"
+        spec = json.loads(spec_path.read_text())
+        for b in spec["blocks"]:
+            if b.get("id") == "title":
+                b["content"] = 42
+        _write_json(spec_path, spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_text_number)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "kind='text'")
+            and _has_error(report, "non-empty string")
+        )
+        results.append(_scenario(
+            "block-structure: text block with numeric content flagged as ERROR",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G3. callout block content is an empty string. Generator's
+    # _callout_block_content refuses.
+    def mut_callout_empty(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        spec = json.loads(spec_path.read_text())
+        for b in spec["blocks"]:
+            if b.get("id") == "message":
+                b["content"] = ""
+        _write_json(spec_path, spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_callout_empty)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "kind='callout'")
+            and _has_error(report, "non-empty string")
+        )
+        results.append(_scenario(
+            "block-structure: callout block with empty content flagged as ERROR",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G4. list block content with an empty-string entry. Generator's
+    # _list_block_content refuses every non-string-or-empty item.
+    def mut_list_empty_item(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        spec = json.loads(spec_path.read_text())
+        # Add a list block via a known optional slot — supporting_text is
+        # a text slot so reuse the message slot context: we'll mutate the
+        # plan and the spec so the slide becomes an executive_summary.
+        # Simpler: replace 02_key_message's plan/layout so it's
+        # executive_summary for this scenario.
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["slides"][1]["layout"] = "executive_summary"
+        plan["slides"][1]["title"] = "Trial Summary"
+        _write_json(bundle["plan_spec"], plan)
+        new_spec = {
+            "index": 2, "layout": "executive_summary", "title": "Trial Summary",
+            "blocks": [
+                {"id": "title",   "kind": "text", "content": "Trial Summary"},
+                {"id": "summary", "kind": "text", "content": "Summary text."},
+                {"id": "key_points", "kind": "list",
+                 "content": ["valid first point", ""]},  # empty entry
+            ],
+        }
+        spec_path.unlink()
+        _write_json(spec_path.parent / "02_executive_summary.json", new_spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_list_empty_item)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "kind='list'")
+            and _has_error(report, "content[1] is not a non-empty string")
+        )
+        results.append(_scenario(
+            "block-structure: list block with an empty-string entry flagged as ERROR",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G5. list block content is an empty list. Generator's
+    # _list_block_content refuses.
+    def mut_list_empty(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["slides"][1]["layout"] = "agenda"
+        plan["slides"][1]["title"] = "Agenda"
+        _write_json(bundle["plan_spec"], plan)
+        new_spec = {
+            "index": 2, "layout": "agenda", "title": "Agenda",
+            "blocks": [
+                {"id": "title", "kind": "text", "content": "Agenda"},
+                {"id": "agenda_items", "kind": "list", "content": []},
+            ],
+        }
+        spec_path.unlink()
+        _write_json(spec_path.parent / "02_agenda.json", new_spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_list_empty)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "non-empty list of strings")
+        )
+        results.append(_scenario(
+            "block-structure: list block with empty content list flagged as ERROR",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G6. kpi block content with a missing required field (value). Generator
+    # refuses on the isinstance check inside the per-entry loop.
+    def mut_kpi_missing_value(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["slides"][1]["layout"] = "kpi_dashboard"
+        plan["slides"][1]["title"] = "Counters"
+        _write_json(bundle["plan_spec"], plan)
+        new_spec = {
+            "index": 2, "layout": "kpi_dashboard", "title": "Counters",
+            "blocks": [
+                {"id": "title", "kind": "text", "content": "Counters"},
+                {"id": "kpis", "kind": "kpi",
+                 "content": [
+                     {"label": "slides", "value": "7"},
+                     {"label": "sections"},  # missing value
+                 ]},
+            ],
+        }
+        spec_path.unlink()
+        _write_json(spec_path.parent / "02_kpi_dashboard.json", new_spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_kpi_missing_value)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "content[1].value is not a non-empty string")
+        )
+        results.append(_scenario(
+            "block-structure: kpi entry missing required `value` flagged as ERROR",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G7. kpi block content with an empty-string delta. Generator's
+    # kpi_dashboard refuses delta != non-empty-string-when-set.
+    def mut_kpi_empty_delta(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["slides"][1]["layout"] = "kpi_dashboard"
+        plan["slides"][1]["title"] = "Counters"
+        _write_json(bundle["plan_spec"], plan)
+        new_spec = {
+            "index": 2, "layout": "kpi_dashboard", "title": "Counters",
+            "blocks": [
+                {"id": "title", "kind": "text", "content": "Counters"},
+                {"id": "kpis", "kind": "kpi",
+                 "content": [
+                     {"label": "slides", "value": "7", "delta": ""},
+                 ]},
+            ],
+        }
+        spec_path.unlink()
+        _write_json(spec_path.parent / "02_kpi_dashboard.json", new_spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_kpi_empty_delta)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "content[0].delta must be a non-empty string")
+        )
+        results.append(_scenario(
+            "block-structure: kpi entry with empty `delta` string flagged as ERROR "
+            "(closes the README's known quality gap)",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G8. kpi entry with an unsupported extra key (payload smuggling — e.g.
+    # a chart payload glued to a kpi entry that the generator would
+    # silently drop).
+    def mut_kpi_extra_key(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["slides"][1]["layout"] = "kpi_dashboard"
+        plan["slides"][1]["title"] = "Counters"
+        _write_json(bundle["plan_spec"], plan)
+        new_spec = {
+            "index": 2, "layout": "kpi_dashboard", "title": "Counters",
+            "blocks": [
+                {"id": "title", "kind": "text", "content": "Counters"},
+                {"id": "kpis", "kind": "kpi",
+                 "content": [
+                     {"label": "slides", "value": "7",
+                      "chart_payload": {"kind": "bar", "values": [1, 2, 3]}},
+                 ]},
+            ],
+        }
+        spec_path.unlink()
+        _write_json(spec_path.parent / "02_kpi_dashboard.json", new_spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_kpi_extra_key)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "unsupported key(s)")
+            and _has_error(report, "chart_payload")
+        )
+        results.append(_scenario(
+            "block-structure: kpi entry with extra `chart_payload` key flagged as "
+            "ERROR (chart payload smuggling)",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G9. table block content with mismatched row column count. Generator's
+    # comparison_table refuses rows whose len != len(headers).
+    def mut_table_short_row(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["slides"][1]["layout"] = "comparison_table"
+        plan["slides"][1]["title"] = "Compare"
+        _write_json(bundle["plan_spec"], plan)
+        new_spec = {
+            "index": 2, "layout": "comparison_table", "title": "Compare",
+            "blocks": [
+                {"id": "title", "kind": "text", "content": "Compare"},
+                {"id": "table", "kind": "table",
+                 "content": {
+                     "headers": ["A", "B", "C"],
+                     "rows": [
+                         ["1", "2", "3"],
+                         ["x", "y"],  # short row
+                     ],
+                 }},
+            ],
+        }
+        spec_path.unlink()
+        _write_json(spec_path.parent / "02_comparison_table.json", new_spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_table_short_row)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "content.rows[1] has 2 cell(s)")
+            and _has_error(report, "headers declares 3 column(s)")
+        )
+        results.append(_scenario(
+            "block-structure: table row count mismatch with headers flagged as ERROR",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G10. table block content with empty-string cell. Generator's
+    # comparison_table refuses empty / non-string cells.
+    def mut_table_empty_cell(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["slides"][1]["layout"] = "comparison_table"
+        plan["slides"][1]["title"] = "Compare"
+        _write_json(bundle["plan_spec"], plan)
+        new_spec = {
+            "index": 2, "layout": "comparison_table", "title": "Compare",
+            "blocks": [
+                {"id": "title", "kind": "text", "content": "Compare"},
+                {"id": "table", "kind": "table",
+                 "content": {
+                     "headers": ["A", "B"],
+                     "rows": [["x", ""]],  # empty cell
+                 }},
+            ],
+        }
+        spec_path.unlink()
+        _write_json(spec_path.parent / "02_comparison_table.json", new_spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_table_empty_cell)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "content.rows[0][1] is not a non-empty string")
+        )
+        results.append(_scenario(
+            "block-structure: table cell with empty-string content flagged as ERROR",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G11. table content with an unsupported extra key (e.g. a chart config
+    # smuggled alongside headers / rows that the generator would silently
+    # drop).
+    def mut_table_extra_key(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["slides"][1]["layout"] = "comparison_table"
+        plan["slides"][1]["title"] = "Compare"
+        _write_json(bundle["plan_spec"], plan)
+        new_spec = {
+            "index": 2, "layout": "comparison_table", "title": "Compare",
+            "blocks": [
+                {"id": "title", "kind": "text", "content": "Compare"},
+                {"id": "table", "kind": "table",
+                 "content": {
+                     "headers": ["A", "B"],
+                     "rows": [["x", "y"]],
+                     "chart_config": {"kind": "bar", "values": [1, 2]},
+                 }},
+            ],
+        }
+        spec_path.unlink()
+        _write_json(spec_path.parent / "02_comparison_table.json", new_spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_table_extra_key)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "unsupported key(s)")
+            and _has_error(report, "chart_config")
+        )
+        results.append(_scenario(
+            "block-structure: table content with extra `chart_config` key flagged "
+            "as ERROR (chart payload smuggling)",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G12. Duplicate block id within the same spec. The render-model
+    # generator's blocks_by_id dict silently keeps the last; flag at
+    # authoring time so the agent sees both intended primitives, not
+    # the silently-overwritten last one.
+    def mut_duplicate_block_id(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "01_cover.json"
+        spec = json.loads(spec_path.read_text())
+        spec["blocks"].append(
+            {"id": "title", "kind": "text", "content": "Duplicate Title"},
+        )
+        _write_json(spec_path, spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_duplicate_block_id)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "duplicate block id")
+            and _has_error(report, "'title'")
+        )
+        results.append(_scenario(
+            "block-structure: duplicate block id within a spec flagged as ERROR",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G13. Image_ref smuggled into a layout that has no image_ref slot
+    # (key_message has only title/message/supporting_text slots). The
+    # generator would silently drop the block; flag at authoring time so
+    # the agent doesn't believe the image rendered.
+    def mut_image_ref_smuggled(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        spec = json.loads(spec_path.read_text())
+        spec["blocks"].append(
+            {"id": "logo", "kind": "image_ref", "content": "manifest_logo"},
+        )
+        spec["image_refs"] = ["manifest_logo"]
+        _write_json(spec_path, spec)
+        _write_json(bundle["image_manifest_spec"], {
+            "images": [
+                {"id": "manifest_logo", "local_path": "assets/logo.svg",
+                 "source": "synthetic"},
+            ],
+        })
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_image_ref_smuggled)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "id 'logo' is not declared by layout 'key_message'")
+        )
+        results.append(_scenario(
+            "block-structure: image_ref smuggled onto a layout without an image "
+            "slot flagged as ERROR (payload smuggling)",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G14. Table block smuggled onto a non-comparison_table layout. Only
+    # comparison_table consumes a `table` block; an agent who attached a
+    # table to a key_message slide would see nothing rendered.
+    def mut_table_smuggled(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        spec = json.loads(spec_path.read_text())
+        spec["blocks"].append(
+            {"id": "details", "kind": "table",
+             "content": {"headers": ["A"], "rows": [["x"]]}},
+        )
+        _write_json(spec_path, spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_table_smuggled)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "id 'details' is not declared by layout 'key_message'")
+        )
+        results.append(_scenario(
+            "block-structure: table block smuggled onto a non-comparison_table "
+            "layout flagged as ERROR (payload smuggling)",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G15. Kind drift on an optional slot. cover.subtitle is an optional
+    # text slot; if the agent supplies kind='list' there, the schema's
+    # _slide_plan_against_layout check (required-only) silently passes,
+    # but the generator's _text_block_content would refuse it.
+    def mut_optional_kind_drift(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "01_cover.json"
+        spec = json.loads(spec_path.read_text())
+        spec["blocks"].append(
+            {"id": "subtitle", "kind": "list", "content": ["one", "two"]},
+        )
+        _write_json(spec_path, spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_optional_kind_drift)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "kind drift vs layout 'cover' slot 'subtitle'")
+        )
+        results.append(_scenario(
+            "block-structure: kind drift on optional cover.subtitle slot flagged "
+            "as ERROR (closes the gap left by required-only slot coverage)",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G16. Anonymous block (no id). The generator builds blocks_by_id only
+    # from id-bearing blocks; anonymous blocks are silently dropped at
+    # runtime, so the authoring bundle is structurally incompatible with
+    # the generator and must fail closed at the preflight as ERROR.
+    def mut_anonymous_block(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "01_cover.json"
+        spec = json.loads(spec_path.read_text())
+        spec["blocks"].append(
+            {"kind": "text", "content": "Orphan block — no id."},
+        )
+        _write_json(spec_path, spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_anonymous_block)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "has no string id")
+        )
+        results.append(_scenario(
+            "block-structure: anonymous block (no id) flagged as ERROR — generator "
+            "silently drops these",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G17. Unknown slot id with a non-payload kind (text on a slot the
+    # layout does not declare). The generator silently drops it — ERROR
+    # (dead content; the agent's text would never reach a primitive).
+    def mut_unknown_text_slot(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "01_cover.json"
+        spec = json.loads(spec_path.read_text())
+        spec["blocks"].append(
+            {"id": "footer", "kind": "text", "content": "Footer text."},
+        )
+        _write_json(spec_path, spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_unknown_text_slot)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "id 'footer' is not declared by layout 'cover'")
+        )
+        results.append(_scenario(
+            "block-structure: unknown text slot id flagged as ERROR — generator "
+            "silently drops these",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G18. Image_ref content is an empty string. Generator's cover helper
+    # refuses an image_ref block whose content is not a non-empty string.
+    def mut_image_ref_empty(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "01_cover.json"
+        spec = json.loads(spec_path.read_text())
+        spec["blocks"].append(
+            {"id": "accent", "kind": "image_ref", "content": ""},
+        )
+        _write_json(spec_path, spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_image_ref_empty)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "kind='image_ref'")
+            and _has_error(report, "non-empty string")
+        )
+        results.append(_scenario(
+            "block-structure: image_ref block with empty content flagged as ERROR",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G19a. list-slot capacity overflow on executive_summary.key_points.
+    # The render-model generator's _list_item_bounds refuses when
+    # slot_h // count < LIST_ITEM_MIN_H. The executive_summary.key_points
+    # slot has h=580 px; 21 items → 27 px per item → 27 < 28 → fail.
+    # The gate must mirror that check at authoring time so the agent
+    # does not wait for a six-stage prep run to learn the list is too
+    # long for the slot.
+    def mut_list_overflow(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["slides"][1]["layout"] = "executive_summary"
+        plan["slides"][1]["title"] = "Long Summary"
+        _write_json(bundle["plan_spec"], plan)
+        new_spec = {
+            "index": 2, "layout": "executive_summary", "title": "Long Summary",
+            "blocks": [
+                {"id": "title", "kind": "text", "content": "Long Summary"},
+                {"id": "summary", "kind": "text", "content": "Synthetic narrative."},
+                {"id": "key_points", "kind": "list",
+                 "content": [f"item {i:02d}" for i in range(21)]},
+            ],
+        }
+        spec_path.unlink()
+        _write_json(spec_path.parent / "02_executive_summary.json", new_spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_list_overflow)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "too many items for the 'executive_summary' slot")
+        )
+        results.append(_scenario(
+            "block-structure: list-slot capacity overflow flagged as ERROR "
+            "(mirrors _list_item_bounds LIST_ITEM_MIN_H gate; closes runtime "
+            "false-pass on N=21 key_points)",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G19b. List-slot capacity check uses LAYOUT_FALLBACK_BOUNDS for
+    # bound-less slots: agenda.agenda_items has no bounds in the layout
+    # JSON, but the generator falls back to (64, 260, 1792, 700). With
+    # 26 items, 700 // 26 = 26 px < 28 → fail. The gate must catch this
+    # too, since the fallback table is the generator's source of truth
+    # for these slots.
+    def mut_list_overflow_fallback(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["slides"][1]["layout"] = "agenda"
+        plan["slides"][1]["title"] = "Agenda"
+        _write_json(bundle["plan_spec"], plan)
+        new_spec = {
+            "index": 2, "layout": "agenda", "title": "Agenda",
+            "blocks": [
+                {"id": "title", "kind": "text", "content": "Agenda"},
+                {"id": "agenda_items", "kind": "list",
+                 "content": [f"item {i:02d}" for i in range(26)]},
+            ],
+        }
+        spec_path.unlink()
+        _write_json(spec_path.parent / "02_agenda.json", new_spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_list_overflow_fallback)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "too many items for the 'agenda' slot")
+        )
+        results.append(_scenario(
+            "block-structure: list-slot capacity check uses generator's "
+            "fallback bounds for bound-less layout slots (agenda.agenda_items)",
+            ok,
+            f"crash={crash}, errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # G19. comparison_table without a table block — generator refuses. The
+    # existing _slide_plan_against_layout (required-slot coverage) handles
+    # this; the scenario confirms the new gate does not regress that.
+    def mut_table_missing(td, bundle):
+        spec_path = bundle["slide_specs_dir"] / "02_key_message.json"
+        plan = json.loads(bundle["plan_spec"].read_text())
+        plan["slides"][1]["layout"] = "comparison_table"
+        plan["slides"][1]["title"] = "Compare"
+        _write_json(bundle["plan_spec"], plan)
+        new_spec = {
+            "index": 2, "layout": "comparison_table", "title": "Compare",
+            "blocks": [
+                {"id": "title", "kind": "text", "content": "Compare"},
+                # no `table` block — required by the layout
+            ],
+        }
+        spec_path.unlink()
+        _write_json(spec_path.parent / "02_comparison_table.json", new_spec)
+    with tempfile.TemporaryDirectory() as raw_td:
+        report, crash = _run_gate_no_crash(Path(raw_td), mut_table_missing)
+        ok = (
+            crash is None
+            and not report.ok
+            and _has_error(report, "missing required slot 'table'")
+        )
+        results.append(_scenario(
+            "block-structure: comparison_table missing required `table` block "
+            "still flagged as ERROR (no regression on required-slot coverage)",
+            ok,
+            f"crash={crash}, errors={[f.name for f in report.errors]}",
+        ))
+
     # 43. Overclaim: automatic prompt-to-* assertion in slide_plan notes.
     # The suffix is intentionally NOT one of the specific "prompt-to-<x>"
     # tokens — those would trip first and the scanner returns on the
@@ -2380,6 +3753,603 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:
             "prompt-to-* automation)",
             ok,
             f"errors={[(f.name, f.detail) for f in report.errors]}",
+        ))
+
+    # 44. The committed examples/synthetic_authoring_trial/ bundle MUST
+    # still validate cleanly under the new ERROR semantics (no anonymous
+    # blocks, no undeclared slot ids, no chart_ref). This is the
+    # regression gate that proves the WARN→ERROR promotion did not break
+    # the canonical synthetic bundle — same shape every other gate in
+    # this repo exercises (acceptance_smoke, run_explicit_pipeline).
+    trial_dir = REPO_ROOT / "examples" / "synthetic_authoring_trial"
+    if not trial_dir.is_dir():
+        results.append(_scenario(
+            "regression: synthetic_authoring_trial bundle exists",
+            False,
+            f"missing {trial_dir}",
+        ))
+    else:
+        report = validate_authoring_bundle(
+            source=trial_dir / "source.md",
+            title="Synthetic Authoring Trial",
+            audience="Internal pipeline smoke-test reviewers",
+            objective=(
+                "Exercise the explicit-input authoring bundle gate end-to-end "
+                "on a synthetic, non-sensitive narrative."
+            ),
+            plan_spec=trial_dir / "plan_spec.json",
+            slide_specs_dir=trial_dir / "slide_specs",
+            image_manifest_spec=trial_dir / "image_manifest_spec.json",
+            template_root=template_root,
+            design_system_spec=trial_dir / "design_system_spec.json",
+            source_id="synthetic_trial_source",
+            tone="neutral-professional",
+            language="en",
+            approximate_slide_count=7,
+        )
+        # No ERROR findings; only the (optional) filename advisory is
+        # allowed as a WARN — and the committed bundle uses canonical
+        # filenames so even that should be silent. The trial is the
+        # canonical "happy path against real committed inputs".
+        ok = report.ok
+        results.append(_scenario(
+            "regression: synthetic_authoring_trial bundle validates cleanly "
+            "under the new ERROR semantics (no anonymous blocks, no "
+            "undeclared slot ids, no chart_ref)",
+            ok,
+            f"errors={[(f.name, f.detail) for f in report.errors]}, "
+            f"warnings={[(f.name, f.detail) for f in report.warnings]}",
+        ))
+
+    # ---------------------------------------------------------------------
+    # --bundle <dir> shortcut coverage. The bundle mode resolves the same
+    # explicit inputs from a canonical directory layout; these scenarios
+    # exercise the happy path against the committed trial, then every
+    # fail-closed branch (missing required entry, malformed brief.json,
+    # symlinked layout, mode conflict). They invoke main() with a built
+    # argv so the dispatch + _resolve_bundle wiring is covered end-to-end.
+    # ---------------------------------------------------------------------
+
+    import contextlib  # local: only the bundle scenarios need it
+    import io  # local: only the bundle scenarios need it
+
+    def _run_main(argv: list[str]) -> tuple[int, str, str]:
+        out = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = main(argv)
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 2
+        return code, out.getvalue(), err.getvalue()
+
+    # B1. Happy path: --bundle on the committed trial resolves cleanly.
+    if trial_dir.is_dir() and (trial_dir / _BUNDLE_BRIEF_NAME).is_file():
+        code, stdout, stderr = _run_main([
+            "--bundle", str(trial_dir),
+            "--template-root", str(template_root),
+        ])
+        ok = code == 0 and "OK: no findings" in stdout
+        results.append(_scenario(
+            "bundle: --bundle on committed synthetic_authoring_trial "
+            "resolves canonical layout and validates cleanly",
+            ok,
+            f"code={code}, stdout={stdout!r}, stderr={stderr!r}",
+        ))
+    else:
+        results.append(_scenario(
+            "bundle: --bundle on committed synthetic_authoring_trial "
+            "(skipped — trial dir or brief.json missing)",
+            False,
+            f"trial_dir={trial_dir}, "
+            f"brief_exists={(trial_dir / _BUNDLE_BRIEF_NAME).is_file()}",
+        ))
+
+    def _write_minimal_bundle(td: Path, *, source_id: str = "fixture_source") -> Path:
+        """Build a complete --bundle layout under ``td/bundle`` using the
+        same two-slide fixture _build_bundle produces, plus brief.json
+        and design_system_spec.json so --bundle mode works without any
+        --theme-from-template fallback."""
+        bundle = _build_bundle(td, source_id=source_id)
+        bdir = td / "bundle"
+        bdir.mkdir()
+        # Rename/copy fixture files into the canonical layout.
+        (bdir / _BUNDLE_BRIEF_NAME).write_text(json.dumps({
+            "title": bundle["title"],
+            "audience": bundle["audience"],
+            "objective": bundle["objective"],
+            "source_id": source_id,
+        }, indent=2, sort_keys=True) + "\n")
+        (bdir / "source.md").write_text(bundle["source"].read_text())
+        (bdir / "plan_spec.json").write_text(bundle["plan_spec"].read_text())
+        (bdir / "image_manifest_spec.json").write_text(
+            bundle["image_manifest_spec"].read_text(),
+        )
+        specs_dir = bdir / "slide_specs"
+        specs_dir.mkdir()
+        for spec_file in bundle["slide_specs_dir"].iterdir():
+            (specs_dir / spec_file.name).write_text(spec_file.read_text())
+        # design_system_spec.json: complete enough to schema-validate.
+        _write_json(bdir / "design_system_spec.json", {
+            "palette": {"primary": "#112233", "secondary": "#445566",
+                        "accent": "#778899", "background": "#FFFFFF",
+                        "text": "#000000"},
+            "typography": {
+                "heading": {"font_family": "Inter, sans-serif", "size_pt": 24},
+                "body": {"font_family": "Inter, sans-serif", "size_pt": 12},
+            },
+            "grid": {"width_px": 1920, "height_px": 1080, "margin_px": 80},
+        })
+        return bdir
+
+    # B2. --bundle pointing at a non-existent directory fails closed.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        code, stdout, stderr = _run_main([
+            "--bundle", str(td / "does_not_exist"),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "--bundle does not exist" in stderr
+        )
+        results.append(_scenario(
+            "bundle: --bundle on a missing directory fails closed (exit 2)",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B3. --bundle pointing at a regular file (not a directory) fails closed.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        not_a_dir = td / "not_a_dir.txt"
+        not_a_dir.write_text("hello")
+        code, stdout, stderr = _run_main([
+            "--bundle", str(not_a_dir),
+            "--template-root", str(template_root),
+        ])
+        ok = code == 2 and "is not a directory" in stderr
+        results.append(_scenario(
+            "bundle: --bundle pointing at a regular file fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B4. --bundle is a symlink (refused).
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        real_bundle = _write_minimal_bundle(td)
+        link = td / "bundle_link"
+        link.symlink_to(real_bundle, target_is_directory=True)
+        code, stdout, stderr = _run_main([
+            "--bundle", str(link),
+            "--template-root", str(template_root),
+        ])
+        ok = code == 2 and "symlink" in stderr
+        results.append(_scenario(
+            "bundle: --bundle that is itself a symlink fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B5. --bundle missing source.md / source.txt.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        (bdir / "source.md").unlink()
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = code == 2 and "missing a source body" in stderr
+        results.append(_scenario(
+            "bundle: --bundle missing source.md/source.txt fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B6. --bundle declares BOTH source.md AND source.txt.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        (bdir / "source.txt").write_text("alt body\n")
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "more than one source body" in stderr
+        )
+        results.append(_scenario(
+            "bundle: --bundle with both source.md and source.txt fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B7. --bundle missing brief.json.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        (bdir / _BUNDLE_BRIEF_NAME).unlink()
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "missing required entry brief.json" in stderr
+        )
+        results.append(_scenario(
+            "bundle: --bundle missing brief.json fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B8. brief.json is malformed JSON.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        (bdir / _BUNDLE_BRIEF_NAME).write_text("{not: valid")
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = code == 2 and "malformed JSON" in stderr
+        results.append(_scenario(
+            "bundle: brief.json malformed JSON fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B9. brief.json missing required field (objective).
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        brief = json.loads((bdir / _BUNDLE_BRIEF_NAME).read_text())
+        brief.pop("objective")
+        (bdir / _BUNDLE_BRIEF_NAME).write_text(
+            json.dumps(brief, indent=2, sort_keys=True) + "\n",
+        )
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "missing required field" in stderr
+            and "objective" in stderr
+        )
+        results.append(_scenario(
+            "bundle: brief.json missing required field fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B10. brief.json contains an unknown field (typo defense).
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        brief = json.loads((bdir / _BUNDLE_BRIEF_NAME).read_text())
+        brief["unknown_field"] = "oops"
+        (bdir / _BUNDLE_BRIEF_NAME).write_text(
+            json.dumps(brief, indent=2, sort_keys=True) + "\n",
+        )
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "unknown field" in stderr
+            and "unknown_field" in stderr
+        )
+        results.append(_scenario(
+            "bundle: brief.json with an unknown field fails closed "
+            "(typo defense)",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B11. source.md is a symlink (refused).
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        real_source = bdir / "real_source.md"
+        (bdir / "source.md").rename(real_source)
+        (bdir / "source.md").symlink_to(real_source)
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = code == 2 and "source.md is a symlink" in stderr
+        results.append(_scenario(
+            "bundle: source.md that is a symlink fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B12. design_system_spec.json missing AND --theme-from-template not set.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        (bdir / _BUNDLE_DESIGN_SYSTEM_SPEC_NAME).unlink()
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "design_system_spec.json" in stderr
+            and "--theme-from-template was not passed" in stderr
+        )
+        results.append(_scenario(
+            "bundle: missing design_system_spec.json without "
+            "--theme-from-template fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B13. Mode conflict: bundle ships design_system_spec.json AND caller
+    # passes --theme-from-template.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+            "--theme-from-template",
+        ])
+        ok = (
+            code == 2
+            and "pick exactly one design-system mode" in stderr
+        )
+        results.append(_scenario(
+            "bundle: bundle.design_system_spec.json + "
+            "--theme-from-template fails closed (mode conflict)",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B14. --bundle + an explicit --title (or any per-input flag) is
+    # refused so precedence is unambiguous.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+            "--title", "Override",
+        ])
+        ok = (
+            code == 2
+            and "mutually exclusive" in stderr
+            and "--title" in stderr
+        )
+        results.append(_scenario(
+            "bundle: --bundle alongside an explicit per-input flag fails "
+            "closed (no mixed mode)",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B15. --bundle with --theme-from-template AND no design_system_spec.json
+    # in the bundle is a valid composition (theme-mode shortcut).
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        (bdir / _BUNDLE_DESIGN_SYSTEM_SPEC_NAME).unlink()
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+            "--theme-from-template",
+        ])
+        ok = code == 0 and "OK: no findings" in stdout
+        results.append(_scenario(
+            "bundle: --bundle + --theme-from-template (no "
+            "design_system_spec.json in bundle) validates cleanly",
+            ok,
+            f"code={code}, stdout={stdout!r}, stderr={stderr!r}",
+        ))
+
+    # B16. --bundle missing plan_spec.json fails closed.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        (bdir / "plan_spec.json").unlink()
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "missing required entry plan_spec.json" in stderr
+        )
+        results.append(_scenario(
+            "bundle: --bundle missing plan_spec.json fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B17. --bundle missing slide_specs/ directory fails closed.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        for child in (bdir / "slide_specs").iterdir():
+            child.unlink()
+        (bdir / "slide_specs").rmdir()
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "missing required entry slide_specs/" in stderr
+        )
+        results.append(_scenario(
+            "bundle: --bundle missing slide_specs/ fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B18. --bundle missing image_manifest_spec.json fails closed.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        (bdir / "image_manifest_spec.json").unlink()
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "missing required entry image_manifest_spec.json" in stderr
+        )
+        results.append(_scenario(
+            "bundle: --bundle missing image_manifest_spec.json fails closed",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B19. --bundle uses a URI-shaped path (refused before any read).
+    code, stdout, stderr = _run_main([
+        "--bundle", "https://example.com/bundle",
+        "--template-root", str(template_root),
+    ])
+    ok = code == 2 and "looks like a URI" in stderr
+    results.append(_scenario(
+        "bundle: --bundle that looks like a URI fails closed",
+        ok,
+        f"code={code}, stderr={stderr!r}",
+    ))
+
+    # B20. --bundle propagates the brief's source_id (regression: the
+    # canonical trial uses source.md but source_id='synthetic_trial_source',
+    # so a bundle that forgot to write source_id into brief.json would
+    # otherwise silently derive 'source' from the source.md stem).
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td, source_id="custom_source_id")
+        # Mutate plan_spec.slides[*].source_refs to depend on the bundle's
+        # source_id propagating. If brief.source_id were ignored and the
+        # gate fell back to the file stem ('source'), the source_refs
+        # subset check would fire.
+        plan = json.loads((bdir / "plan_spec.json").read_text())
+        for s in plan["slides"]:
+            s["source_refs"] = ["custom_source_id"]
+        (bdir / "plan_spec.json").write_text(
+            json.dumps(plan, indent=2, sort_keys=True) + "\n",
+        )
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = code == 0 and "OK: no findings" in stdout
+        results.append(_scenario(
+            "bundle: brief.source_id propagates into source_refs derivation "
+            "(no silent fall-back to source.md stem)",
+            ok,
+            f"code={code}, stdout={stdout!r}, stderr={stderr!r}",
+        ))
+
+    # B21. --self-test does not accept --bundle (regression for the
+    # self-test guard).
+    code, stdout, stderr = _run_main([
+        "--self-test",
+        "--bundle", str(trial_dir),
+    ])
+    ok = code == 2 and "--self-test does not take any other argument" in stderr
+    results.append(_scenario(
+        "bundle: --self-test rejects --bundle alongside it",
+        ok,
+        f"code={code}, stderr={stderr!r}",
+    ))
+
+    # B22. brief.json source_id is a non-string (regression: the explicit
+    # --source-id flag is argparse type=str, but the --bundle shortcut
+    # used to accept whatever JSON type the brief carried and would only
+    # crash downstream with a TypeError. A clean CLI diagnostic must fire
+    # before any downstream call.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        brief = json.loads((bdir / _BUNDLE_BRIEF_NAME).read_text())
+        brief["source_id"] = 7
+        (bdir / _BUNDLE_BRIEF_NAME).write_text(
+            json.dumps(brief, indent=2, sort_keys=True) + "\n",
+        )
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "source_id must be a string" in stderr
+            and "int" in stderr
+            and "Traceback" not in stderr
+        )
+        results.append(_scenario(
+            "bundle: brief.json non-string source_id fails closed with "
+            "clean diagnostic (no traceback)",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B23. brief.json approximate_slide_count is a non-integer (regression:
+    # the explicit --approximate-slide-count flag is argparse type=int, so
+    # the bundle shortcut must reject "seven" before it reaches the
+    # report which expects an int).
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        brief = json.loads((bdir / _BUNDLE_BRIEF_NAME).read_text())
+        brief["approximate_slide_count"] = "seven"
+        (bdir / _BUNDLE_BRIEF_NAME).write_text(
+            json.dumps(brief, indent=2, sort_keys=True) + "\n",
+        )
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "approximate_slide_count must be an integer" in stderr
+            and "str" in stderr
+            and "Traceback" not in stderr
+        )
+        results.append(_scenario(
+            "bundle: brief.json non-integer approximate_slide_count fails "
+            "closed with clean diagnostic (no traceback)",
+            ok,
+            f"code={code}, stderr={stderr!r}",
+        ))
+
+    # B24. brief.json approximate_slide_count = true is rejected (bool is
+    # an int subclass in Python; treating it as a slide count would be a
+    # surprise. Belt-and-braces alongside B23.).
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bdir = _write_minimal_bundle(td)
+        brief = json.loads((bdir / _BUNDLE_BRIEF_NAME).read_text())
+        brief["approximate_slide_count"] = True
+        (bdir / _BUNDLE_BRIEF_NAME).write_text(
+            json.dumps(brief, indent=2, sort_keys=True) + "\n",
+        )
+        code, stdout, stderr = _run_main([
+            "--bundle", str(bdir),
+            "--template-root", str(template_root),
+        ])
+        ok = (
+            code == 2
+            and "approximate_slide_count must be an integer" in stderr
+            and "bool" in stderr
+            and "Traceback" not in stderr
+        )
+        results.append(_scenario(
+            "bundle: brief.json approximate_slide_count = JSON true fails "
+            "closed with clean diagnostic (bool rejected)",
+            ok,
+            f"code={code}, stderr={stderr!r}",
         ))
 
     return results

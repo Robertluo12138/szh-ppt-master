@@ -16,6 +16,7 @@ This directory is an agent-authored input bundle for the explicit-input PPT pipe
 | File | Role |
 | --- | --- |
 | `source.md` | Synthetic markdown source body. Body text never leaks beyond `<workspace>/input/source.md`. |
+| `brief.json` | Brief metadata for the `--bundle` shortcut: `title`, `audience`, `objective`, plus optional `tone`, `language`, `approximate_slide_count`, `source_id`. Not consumed by the explicit per-flag form. |
 | `plan_spec.json` | `deck_plan` candidate. 7 slides across 6 sections; single source ref `synthetic_trial_source`. |
 | `design_system_spec.json` | `design_system` candidate (the `--design-system-spec` mode). Use `--theme-from-template` against `templates/layouts` for the alternative. |
 | `slide_specs/01_cover.json` ... `07_conclusion.json` | Per-slide `slide_plan` candidates against the `business_review` template's layout vocabulary. |
@@ -28,7 +29,16 @@ Layouts exercised: `cover`, `executive_summary`, `key_message`, `two_column`, `k
 From the repo root:
 
 ```bash
-# 1. Pre-pipeline structural gate (non-mutating)
+# 1. Pre-pipeline structural gate (non-mutating). The --bundle shortcut
+# resolves the canonical layout (source.md, brief.json, plan_spec.json,
+# design_system_spec.json, slide_specs/, image_manifest_spec.json) from
+# a single directory.
+env PYTHONDONTWRITEBYTECODE=1 python3 scripts/validate_authoring_bundle.py \
+  --bundle examples/synthetic_authoring_trial \
+  --template-root templates/layouts
+
+# The same gate also accepts the explicit per-input flags; both forms
+# resolve to the same inputs.
 env PYTHONDONTWRITEBYTECODE=1 python3 scripts/validate_authoring_bundle.py \
   --source examples/synthetic_authoring_trial/source.md \
   --source-id synthetic_trial_source \
@@ -66,9 +76,11 @@ env PYTHONDONTWRITEBYTECODE=1 python3 scripts/run_explicit_pipeline.py \
 
 `--workspace`, `--output`, and `--report-dir` must live OUTSIDE the repo. Each run requires a fresh (non-existent or empty) `--workspace`.
 
-## Known quality gap
+## Authoring gate vs. runtime generator
 
-The authoring bundle gate validates `slide_plan` blocks against `schemas/slide_plan.schema.json`, which leaves `blocks[*].content` intentionally loose ("Free-form in the scaffold. TODO: tighten per kind"). The render-model generator applies stricter per-kind rules — for example, a `kpi` block whose `content[*].delta` is an empty string is refused at render-time. The gate cannot catch that today; an agent who authors `delta: ""` will see the failure at Stage 7 (`generate_render_models`), not at the pre-flight. Tightening the gate to mirror the generator's per-kind rules is out of scope for this trial.
+The authoring bundle gate validates `slide_plan` blocks against `schemas/slide_plan.schema.json` AND re-applies the *per-block* shape rules in `scripts/generate_render_models.py`. Every block the render-model generator would silently drop at runtime now fails closed at the preflight as an **ERROR**: `chart_ref` kind anywhere (no SUPPORTED layout maps to the `chart_placeholder` primitive today), duplicate block ids within a spec, anonymous blocks with no `id` (the generator builds `blocks_by_id` only from id-bearing blocks, so anonymous blocks would be silently dropped at runtime), and any block whose `id` is not declared by the resolved layout's slots (the generator silently drops the block — payload smuggling for chart/image/table/kpi kinds, dead content for text/list/callout kinds; the diagnostic distinguishes the two so the agent sees the right fix). The gate also enforces kind drift on optional layout slots, per-kind content shapes (text / callout / image_ref non-empty string, list non-empty list of non-empty strings, kpi list-of-dicts with non-empty `label` / `value` and optional non-empty `delta` with no extra keys, table with non-empty `headers` and equal-length rows of non-empty cells with no extra keys), and list-slot capacity vs. `LIST_ITEM_MIN_H`. An agent who authors `kpi.delta: ""`, a `comparison_table` row whose cell count disagrees with `headers`, an `image_ref` block on a layout without an image slot, a duplicate `block.id`, kind drift on an optional layout slot, an anonymous block, a block whose `id` is not a declared layout slot, or a list whose item count would overflow the slot height will see the failure at the pre-flight rather than at Stage 7.
+
+This is **not full generator parity**. The render-model generator additionally enforces integer-arithmetic gates (KPI tile-width positivity in `_kpi_tile_bounds`, palette / typography token resolution against `design_system.json`, slot-presence checks the generator itself hardcodes per layout) that are layout / token concerns rather than per-block authoring concerns; those remain runtime-only. This remains authoring validation, not automatic generation — every block body is caller-authored via the JSON spec files.
 
 ## What this trial does NOT do
 
