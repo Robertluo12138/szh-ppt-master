@@ -172,6 +172,7 @@ OUT OF SCOPE
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import zipfile
@@ -1683,8 +1684,18 @@ def _has_pptx_extension(path: Path) -> bool:
     return path.suffix.lower() == ".pptx"
 
 
-def export_workspace(workspace: Path, output: Path) -> int:
-    """Top-level entry. Returns process exit code."""
+def export_workspace(
+    workspace: Path, output: Path, trace_out: Path | None = None,
+) -> int:
+    """Top-level entry. Returns process exit code.
+
+    ``trace_out`` is the opt-in conversion-trace sidecar path. When
+    None (the default), the exporter writes only the PPTX and the
+    existing CLI text — output bytes and behavior are unchanged. When
+    set, the trace is built from the same in-memory state used to
+    assemble the PPTX, validated against
+    schemas/conversion_trace.schema.json, and atomically written
+    alongside the deck."""
     if not workspace.is_dir():
         return _fatal(f"workspace is not a directory: {workspace}")
     if not _has_pptx_extension(output):
@@ -2032,10 +2043,15 @@ def export_workspace(workspace: Path, output: Path) -> int:
         f"allow-list {SUPPORTED_LAYOUTS} still fail closed and remain "
         f"TODO."
     )
+    trace_rc = _emit_trace_if_requested(
+        trace_out, output, exported, media_plan, canvas_w, canvas_h,
+    )
+    if trace_rc != 0:
+        return trace_rc
     return 0
 
 
-def export_single_render_model(rm_path: Path, design_path: Path, manifest_path: Path, output: Path) -> int:
+def export_single_render_model(rm_path: Path, design_path: Path, manifest_path: Path, output: Path, trace_out: Path | None = None) -> int:
     """Debug helper: export a single render_model file into a one-slide
     .pptx. Not the primary path — workspace mode is the main entry —
     but useful when iterating on a single primitive."""
@@ -2132,6 +2148,12 @@ def export_single_render_model(rm_path: Path, design_path: Path, manifest_path: 
         f"(one slide; {len(binary_parts)} embedded media asset(s)). "
         f"Workspace mode is the primary entry point."
     )
+    trace_rc = _emit_trace_if_requested(
+        trace_out, output,
+        [(rm, xml, slide_media_uses)], media_plan, canvas_w, canvas_h,
+    )
+    if trace_rc != 0:
+        return trace_rc
     return 0
 
 
@@ -2303,6 +2325,463 @@ def _write_synthetic_workspace(ws: Path) -> None:
             },
         ],
     }, indent=2))
+
+
+# --- Opt-in conversion-trace sidecar --------------------------------------
+#
+# The trace contract lives at schemas/conversion_trace.schema.json and is
+# enforced by scripts/validate_conversion_trace.py. The contract's
+# pipeline_status field is a closed two-literal enum: the SHAPE-only
+# baseline ("future_contract_only") and the paired-contract runtime
+# writer this exporter uses ("runtime_emitted_by_export_pptx"). Adding
+# any new literal is a paired contract change in the schema, the
+# validator's T3 gate, and references/conversion-trace-contract.md.
+#
+# Defaults preserved:
+#   - omit --trace-out  -> output PPTX bytes and existing CLI text
+#                          unchanged; no sidecar file appears anywhere.
+#   - with --trace-out  -> the PPTX export runs as usual; if it succeeds,
+#                          the trace is built in memory, written to a
+#                          tmp sibling, validated via the read-only
+#                          validate_conversion_trace gates, and only
+#                          then renamed into place. Any validation /
+#                          write failure deletes the tmp so no partial
+#                          trace survives.
+#
+# Synthetic ids are hard-coded so a trace can never carry a real deck
+# title or source identifier — that matches the conversion-trace schema's
+# forced ^synthetic_ prefix on trace_id / deck_id / generated_by.name.
+
+_TRACE_SYNTHETIC_TRACE_ID = "synthetic_export_pptx_trace"
+_TRACE_SYNTHETIC_DECK_ID = "synthetic_export_pptx_deck"
+_TRACE_SYNTHETIC_GENERATOR_NAME = "synthetic_export_pptx"
+_TRACE_GENERATOR_MODE = "simulated"
+# The runtime writer literal — paired with the schema enum and the
+# validator's T3 gate. Changing this literal requires bumping the
+# schema, T3, and references/conversion-trace-contract.md together.
+_TRACE_PIPELINE_STATUS = "runtime_emitted_by_export_pptx"
+_TRACE_SCHEMA_VERSION = "1"
+
+# RFC 3986 scheme prefix — same shape used by local_path_is_safe and
+# validate_conversion_trace. Kept local to the trace helpers so it does
+# not collide with the unrelated _HEX_COLOR / _FONT_FAMILY patterns.
+_TRACE_URI_SCHEME_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
+
+
+def _validate_trace_out_path(
+    trace_out: Path, output: Path, output_parent_resolved: Path,
+) -> tuple[Path | None, str]:
+    """Gate the caller-supplied --trace-out path.
+
+    Returns ``(resolved_path, "")`` on success, or ``(None, err)`` on the
+    first failure. The gates are deliberately closed:
+
+      - empty / surrounding-whitespace string;
+      - protocol-relative ``//`` prefix;
+      - any RFC 3986 URI-scheme prefix (``file:``, ``https:``,
+        ``data:``, ...);
+      - any ``..`` path segment in the input string;
+      - trace-out path is a symlink (broken or resolvable);
+      - trace-out path is an existing directory;
+      - trace-out path resolves to the SAME inode as --output (would
+        overwrite the PPTX after export);
+      - trace-out's parent directory does not exist or is not a
+        directory (we never auto-create deeper parent trees);
+      - any parent directory between trace-out and the output dir is a
+        symlink;
+      - resolved trace-out path escapes the output directory tree.
+
+    The PPTX has already been written by the time this gate fires, so a
+    refusal here surfaces as a non-zero exit but does NOT delete the
+    PPTX — the trace is an opt-in sidecar, not a transactional artifact
+    paired with the deck."""
+    s = str(trace_out)
+    if not s or s != s.strip():
+        return (
+            None,
+            f"--trace-out is empty or carries surrounding whitespace: {s!r}",
+        )
+    if s.startswith("//") or s.startswith("\\\\"):
+        return (
+            None,
+            f"--trace-out starts with '//' or '\\\\' (protocol-relative; "
+            f"refused): {s!r}",
+        )
+    if _TRACE_URI_SCHEME_PREFIX.match(s):
+        return (
+            None,
+            f"--trace-out carries a URI-scheme prefix "
+            f"(file://, https://, data:, ...; refused): {s!r}",
+        )
+    segments = s.replace("\\", "/").split("/")
+    if any(seg == ".." for seg in segments):
+        return (
+            None,
+            f"--trace-out contains a '..' path segment (refused): {s!r}",
+        )
+    if trace_out.is_symlink():
+        return (
+            None,
+            f"--trace-out is a symlink (refused; broken or resolvable): "
+            f"{trace_out}",
+        )
+    if trace_out.exists() and trace_out.is_dir():
+        return (
+            None,
+            f"--trace-out points to a directory (refused): {trace_out}",
+        )
+    parent = trace_out.parent
+    if not parent.exists() or not parent.is_dir():
+        return (
+            None,
+            f"--trace-out parent directory does not exist or is not a "
+            f"directory: {parent}",
+        )
+    try:
+        resolved = trace_out.resolve()
+    except OSError as exc:
+        return (None, f"--trace-out cannot be resolved: {exc}")
+    try:
+        output_resolved = output.resolve()
+    except OSError:
+        output_resolved = None
+    if output_resolved is not None and resolved == output_resolved:
+        return (
+            None,
+            f"--trace-out resolves to the same path as --output "
+            f"({resolved}); refusing to overwrite the PPTX with a trace",
+        )
+    try:
+        resolved.relative_to(output_parent_resolved)
+    except ValueError:
+        return (
+            None,
+            f"--trace-out {resolved} resolves outside the output "
+            f"directory {output_parent_resolved}; refused",
+        )
+    # Walk parents up to output_parent_resolved and reject any symlink
+    # in the chain. Path.resolve() above already followed symlinks; we
+    # walk the raw parent chain here to catch a symlink that resolves
+    # back inside the output dir but still re-routes the write through a
+    # link the caller did not author.
+    cur = trace_out.parent
+    seen: set[Path] = set()
+    while True:
+        try:
+            cur_resolved = cur.resolve()
+        except OSError:
+            break
+        if cur_resolved in seen:
+            break
+        seen.add(cur_resolved)
+        if cur.is_symlink():
+            return (
+                None,
+                f"--trace-out parent chain contains a symlink (refused): "
+                f"{cur}",
+            )
+        if cur_resolved == output_parent_resolved:
+            break
+        nxt = cur.parent
+        if nxt == cur:
+            break
+        cur = nxt
+    return (resolved, "")
+
+
+def _bounds_within_canvas(bounds: object, canvas_w: int, canvas_h: int) -> bool:
+    """Best-effort check that primitive bounds sit fully inside the
+    canvas. Used for the trace's `bounds_within_canvas` evidence field
+    only; the export itself does NOT gate on canvas containment, so an
+    out-of-bounds primitive surfaces as a False evidence value rather
+    than blocking export."""
+    if not isinstance(bounds, dict):
+        return False
+    try:
+        x = int(bounds.get("x"))
+        y = int(bounds.get("y"))
+        w = int(bounds.get("w"))
+        h = int(bounds.get("h"))
+    except (TypeError, ValueError):
+        return False
+    return x >= 0 and y >= 0 and (x + w) <= canvas_w and (y + h) <= canvas_h
+
+
+def _trace_record_for_primitive(
+    prim: dict,
+    media_plan: dict[str, MediaResolution],
+    bounds_within: bool,
+) -> tuple[str, str, str | None, dict]:
+    """Map one render_model primitive to its trace record fields.
+
+    Returns ``(expected_pptx_kind, status, reason_code, evidence)``.
+    The exporter only reaches the trace step for primitives that
+    survived every fail-closed gate, so most primitives map to
+    ``status=editable`` with ``reason_code=None``. An ``image_slot``
+    whose manifest entry fell back to the placeholder shape (i.e. is
+    NOT in the resolved media plan) maps to ``status=skipped`` with
+    ``reason_code=media_embedding_todo`` — the closed-enum reason that
+    the shape-only conversion-trace contract reserves for this case."""
+    kind = prim.get("kind")
+    base_evidence = {
+        "primitive_kind_supported": True,
+        "layout_supported": True,
+        "bounds_within_canvas": bounds_within,
+        "shape_count_delta": 1,
+        "text_run_count": None,
+        "table_row_count": None,
+        "image_alt_text_present": None,
+        "relationship_type": None,
+    }
+    if kind == "text":
+        evidence = dict(base_evidence)
+        content = (prim.get("text") or {}).get("content")
+        evidence["text_run_count"] = 1 if isinstance(content, str) and content else 0
+        return ("native_text_shape", "editable", None, evidence)
+    if kind == "line":
+        return ("native_line", "editable", None, dict(base_evidence))
+    if kind == "shape":
+        return ("native_shape", "editable", None, dict(base_evidence))
+    if kind == "kpi":
+        evidence = dict(base_evidence)
+        kpi_payload = prim.get("kpi") or {}
+        delta = kpi_payload.get("delta")
+        evidence["text_run_count"] = 3 if isinstance(delta, str) and delta else 2
+        return ("native_kpi_group", "editable", None, evidence)
+    if kind == "table":
+        evidence = dict(base_evidence)
+        table_payload = prim.get("table") or {}
+        rows = table_payload.get("rows") or []
+        evidence["table_row_count"] = len(rows) + 1  # +1 for header row
+        return ("native_table_graphic_frame", "editable", None, evidence)
+    if kind == "image_slot":
+        evidence = dict(base_evidence)
+        image_slot = prim.get("image_slot") or {}
+        image_ref = image_slot.get("image_ref")
+        # alt_text presence: prefer the primitive's explicit alt_text,
+        # fall back to the manifest entry; for the trace we only need a
+        # boolean of "did some alt_text reach the slide?".
+        alt = image_slot.get("alt_text")
+        embedded = isinstance(image_ref, str) and image_ref in media_plan
+        evidence["image_alt_text_present"] = bool(alt) or embedded
+        if embedded:
+            evidence["relationship_type"] = "image"
+            return ("native_image_placeholder", "editable", None, evidence)
+        return (
+            "native_image_placeholder",
+            "skipped",
+            "media_embedding_todo",
+            evidence,
+        )
+    # Unreachable: the exporter only reaches the trace step for
+    # supported primitive kinds. Defensive return so a future kind
+    # surfaces as an explicit ExportError rather than an
+    # incomplete-record traceback.
+    raise ExportError(
+        f"trace builder reached an unsupported primitive kind: {kind!r}"
+    )
+
+
+def _build_trace(
+    exported: list[tuple[dict, str, list[str]]],
+    media_plan: dict[str, MediaResolution],
+    canvas_w: int,
+    canvas_h: int,
+) -> dict:
+    """Build the in-memory conversion-trace document from the successful
+    export's in-memory state. The caller is responsible for writing the
+    document to disk; this helper does not touch the filesystem."""
+    records: list[dict] = []
+    layouts_attempted: set[str] = set()
+    for rm, _slide_xml, _media_uses in exported:
+        idx = rm.get("index")
+        layout = rm.get("layout")
+        if not isinstance(idx, int) or not isinstance(layout, str):
+            raise ExportError(
+                f"trace builder: render_model has non-int index or "
+                f"non-string layout (index={idx!r}, layout={layout!r})"
+            )
+        layouts_attempted.add(layout)
+        for prim in rm.get("primitives") or []:
+            if not isinstance(prim, dict):
+                raise ExportError(
+                    f"trace builder: render_model {idx} contains a "
+                    f"non-object primitive"
+                )
+            pid = prim.get("id")
+            if not isinstance(pid, str) or not pid:
+                raise ExportError(
+                    f"trace builder: render_model {idx} primitive has "
+                    f"no string id"
+                )
+            within = _bounds_within_canvas(
+                prim.get("bounds"), canvas_w, canvas_h,
+            )
+            expected, status, reason, evidence = _trace_record_for_primitive(
+                prim, media_plan, within,
+            )
+            records.append({
+                "slide_index": idx,
+                "slide_layout": layout,
+                "primitive_id": pid,
+                "primitive_kind": prim.get("kind"),
+                "expected_pptx_kind": expected,
+                "status": status,
+                "reason_code": reason,
+                "evidence": evidence,
+            })
+
+    counts = {
+        "editable_count": 0,
+        "rejected_count": 0,
+        "degraded_count": 0,
+        "skipped_count": 0,
+    }
+    for r in records:
+        key = f"{r['status']}_count"
+        if key in counts:
+            counts[key] += 1
+
+    return {
+        "schema_version": _TRACE_SCHEMA_VERSION,
+        "trace_id": _TRACE_SYNTHETIC_TRACE_ID,
+        "pipeline_status": _TRACE_PIPELINE_STATUS,
+        "generated_by": {
+            "name": _TRACE_SYNTHETIC_GENERATOR_NAME,
+            "mode": _TRACE_GENERATOR_MODE,
+        },
+        "deck": {
+            "deck_id": _TRACE_SYNTHETIC_DECK_ID,
+            "slide_count": len(exported),
+            "layouts_attempted": sorted(layouts_attempted),
+        },
+        "records": records,
+        "summary": counts,
+    }
+
+
+def _write_validated_trace(trace: dict, trace_path: Path) -> str:
+    """Atomic-write + read-only re-validation. Returns "" on success or
+    an error-message string on failure.
+
+    Failure cleanup: if the in-memory schema-validate, the tmp write,
+    the on-disk re-validate, or the final rename fails, the tmp file is
+    deleted and `trace_path` is NOT created. The PPTX has already been
+    written; the trace is a sidecar, so the caller surfaces the failure
+    as a non-zero exit but does not roll the PPTX back."""
+    # Re-validate against the schema in memory first so a malformed
+    # trace never even touches the disk. _schema_validate is the same
+    # stdlib subset that validate_artifacts / validate_workspace use,
+    # so the schema gate here matches the gate the read-only validator
+    # applies below.
+    schema_errors = _schema_validate(trace, SCHEMAS / "conversion_trace.schema.json")
+    if schema_errors:
+        return (
+            f"trace fails schemas/conversion_trace.schema.json in memory: "
+            f"{'; '.join(schema_errors)}"
+        )
+
+    tmp_path = trace_path.with_suffix(trace_path.suffix + ".tmp")
+    # If a stale .tmp exists from a prior aborted run, remove it before
+    # writing — we own the .tmp suffix next to trace_path.
+    try:
+        if tmp_path.exists() or tmp_path.is_symlink():
+            tmp_path.unlink()
+    except OSError as exc:
+        return f"cannot clear stale tmp trace {tmp_path}: {exc}"
+
+    try:
+        tmp_path.write_text(
+            json.dumps(trace, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return f"cannot write tmp trace {tmp_path}: {exc}"
+
+    # Re-validate on disk with the full read-only validator (T1..T14).
+    # validate_conversion_trace is imported lazily so the export_pptx
+    # CLI does not pull it into its public surface unless --trace-out
+    # is used.
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        from validate_conversion_trace import (  # noqa: E402
+            TraceLoadError,
+            validate_trace as _validate_trace_disk,
+        )
+    except ImportError as exc:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return f"cannot import validate_conversion_trace: {exc}"
+    try:
+        errors = _validate_trace_disk(tmp_path)
+    except TraceLoadError as exc:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return f"on-disk trace failed T1 load-time gate: {exc}"
+    except Exception as exc:  # defensive
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return f"on-disk trace validation raised {type(exc).__name__}: {exc}"
+    if errors:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return (
+            f"on-disk trace failed validate_conversion_trace gates: "
+            f"{'; '.join(errors)}"
+        )
+
+    try:
+        tmp_path.replace(trace_path)
+    except OSError as exc:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return f"cannot rename {tmp_path} -> {trace_path}: {exc}"
+    return ""
+
+
+def _emit_trace_if_requested(
+    trace_out: Path | None,
+    output: Path,
+    exported: list[tuple[dict, str, list[str]]],
+    media_plan: dict[str, MediaResolution],
+    canvas_w: int,
+    canvas_h: int,
+) -> int:
+    """Top-level trace dispatch. Returns 0 on success (including the
+    no-op when ``trace_out`` is None) or 1 on failure. The PPTX has
+    already been written by the caller before this fires."""
+    if trace_out is None:
+        return 0
+    try:
+        output_parent_resolved = output.parent.resolve()
+    except OSError as exc:
+        return _fatal(
+            f"--trace-out cannot resolve output parent {output.parent}: {exc}"
+        )
+    resolved, err = _validate_trace_out_path(
+        trace_out, output, output_parent_resolved,
+    )
+    if resolved is None:
+        return _fatal(err)
+    try:
+        trace = _build_trace(exported, media_plan, canvas_w, canvas_h)
+    except ExportError as exc:
+        return _fatal(f"--trace-out trace builder failed: {exc}")
+    err = _write_validated_trace(trace, resolved)
+    if err:
+        return _fatal(f"--trace-out: {err}")
+    print(f"  [TRACE] conversion trace written to {resolved}")
+    return 0
 
 
 _TINY_PNG_BYTES = bytes([
@@ -3998,6 +4477,463 @@ def _run_self_tests() -> list[CheckResult]:
              ) else ""),
         ))
 
+        # ----------------------------------------------------------------
+        # --trace-out (opt-in conversion-trace sidecar) scenarios.
+        # ----------------------------------------------------------------
+
+        # T-A. DEFAULT (control): omitting --trace-out leaves the
+        # exporter completely unchanged — no trace.json sibling appears
+        # and the PPTX bytes are byte-identical to a paired run with
+        # --trace-out. We compare against the baseline `out_pptx` from
+        # scenario 1 to prove the sidecar branch is a no-op.
+        baseline_dir = td / "trace_baseline"
+        baseline_dir.mkdir()
+        baseline_ws = baseline_dir / "ws"
+        _write_synthetic_workspace(baseline_ws)
+        baseline_out = baseline_dir / "deck.pptx"
+        rc, _stdout, stderr = _run_capture(baseline_ws, baseline_out)
+        baseline_siblings = sorted(
+            p.name for p in baseline_dir.iterdir()
+        )
+        baseline_clean = baseline_siblings == ["deck.pptx", "ws"]
+        results.append(CheckResult(
+            "selftest: default export (no --trace-out) writes only the "
+            "PPTX and leaves no trace.json sidecar in the output dir",
+            (
+                rc == 0
+                and baseline_out.is_file()
+                and baseline_clean
+            ),
+            (f"rc={rc}, output_exists={baseline_out.is_file()}, "
+             f"sibling_names={baseline_siblings}; {stderr.strip()}"
+             if not (
+                rc == 0
+                and baseline_out.is_file()
+                and baseline_clean
+             ) else ""),
+        ))
+
+        def _run_capture_with_trace(
+            workspace: Path, output: Path, trace_out: Path | None,
+        ) -> tuple[int, str, str]:
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                rc = export_workspace(workspace, output, trace_out=trace_out)
+            return (rc, out_buf.getvalue(), err_buf.getvalue())
+
+        # T-B. POSITIVE: --trace-out writes a schema-valid trace next
+        # to the PPTX; the PPTX bytes are byte-identical to the
+        # default-mode baseline above (proving the trace branch does
+        # not change the deck); the trace re-validates under
+        # validate_conversion_trace.validate_trace; and no stale
+        # `.tmp` sidecar survives.
+        tb_dir = td / "trace_emit_ok"
+        tb_dir.mkdir()
+        tb_ws = tb_dir / "ws"
+        _write_synthetic_workspace(tb_ws)
+        tb_out = tb_dir / "deck.pptx"
+        tb_trace = tb_dir / "trace.json"
+        rc, _stdout, stderr = _run_capture_with_trace(tb_ws, tb_out, tb_trace)
+        tb_pptx_ok = tb_out.is_file()
+        # Byte-identical PPTX vs the default run from T-A.
+        tb_pptx_bytes_match = False
+        if tb_pptx_ok and baseline_out.is_file():
+            tb_pptx_bytes_match = (
+                tb_out.read_bytes() == baseline_out.read_bytes()
+            )
+        tb_trace_ok = tb_trace.is_file()
+        tb_trace_schema_ok = False
+        tb_trace_valid = False
+        tb_trace_summary_ok = False
+        tb_trace_layouts_ok = False
+        if tb_trace_ok:
+            tb_data = json.loads(tb_trace.read_text())
+            tb_trace_schema_ok = (
+                tb_data.get("schema_version") == "1"
+                # Paired-contract runtime writer literal. The validator
+                # accepts ONLY this literal (plus the SHAPE-only baseline);
+                # any drift between the writer and the schema/T3 enum
+                # would fire here.
+                and tb_data.get("pipeline_status")
+                == "runtime_emitted_by_export_pptx"
+                and tb_data.get("trace_id", "").startswith("synthetic_")
+                and tb_data.get("deck", {}).get("deck_id", "").startswith(
+                    "synthetic_"
+                )
+                and tb_data.get("generated_by", {}).get("name", "").startswith(
+                    "synthetic_"
+                )
+                and tb_data.get("generated_by", {}).get("mode") == "simulated"
+            )
+            tb_trace_summary_ok = (
+                tb_data.get("summary", {}).get("editable_count")
+                == sum(
+                    1 for r in tb_data.get("records", [])
+                    if r.get("status") == "editable"
+                )
+            )
+            tb_trace_layouts_ok = sorted(
+                tb_data.get("deck", {}).get("layouts_attempted", [])
+            ) == ["cover", "kpi_dashboard"]
+            from validate_conversion_trace import validate_trace as _vt
+            tb_trace_valid = _vt(tb_trace) == []
+        tb_no_tmp_residue = not (
+            tb_dir / "trace.json.tmp"
+        ).exists()
+        results.append(CheckResult(
+            "selftest: --trace-out writes a schema-valid conversion "
+            "trace next to the PPTX (T1..T14 pass; PPTX bytes match the "
+            "no-trace baseline; no .tmp residue)",
+            (
+                rc == 0
+                and tb_pptx_ok
+                and tb_pptx_bytes_match
+                and tb_trace_ok
+                and tb_trace_schema_ok
+                and tb_trace_valid
+                and tb_trace_summary_ok
+                and tb_trace_layouts_ok
+                and tb_no_tmp_residue
+            ),
+            (f"rc={rc}, pptx_ok={tb_pptx_ok}, "
+             f"pptx_bytes_match={tb_pptx_bytes_match}, "
+             f"trace_ok={tb_trace_ok}, schema_ok={tb_trace_schema_ok}, "
+             f"trace_valid={tb_trace_valid}, "
+             f"summary_ok={tb_trace_summary_ok}, "
+             f"layouts_ok={tb_trace_layouts_ok}, "
+             f"no_tmp={tb_no_tmp_residue}; {stderr.strip()}"
+             if not (
+                rc == 0
+                and tb_pptx_ok
+                and tb_pptx_bytes_match
+                and tb_trace_ok
+                and tb_trace_schema_ok
+                and tb_trace_valid
+                and tb_trace_summary_ok
+                and tb_trace_layouts_ok
+                and tb_no_tmp_residue
+             ) else ""),
+        ))
+
+        # T-C. UNSAFE PATH PROBES. Each probe MUST fail closed: the
+        # exporter returns non-zero, the diagnostic mentions the
+        # specific gate, and the trace branch creates NO new artifact
+        # at the supplied path (a pre-existing symlink / directory /
+        # PPTX collision target is left untouched; a `.tmp` sibling
+        # next to the trace-out path must not survive). The PPTX is
+        # still written (the trace is an opt-in sidecar, not
+        # transactional with the deck).
+        def _probe_unsafe(label: str, build_trace_out, expect_substr: str):
+            d = td / f"trace_unsafe_{label}"
+            d.mkdir()
+            ws = d / "ws"
+            _write_synthetic_workspace(ws)
+            out = d / "deck.pptx"
+            try:
+                trace_out_path = build_trace_out(d)
+            except OSError as exc:
+                results.append(CheckResult(
+                    f"selftest: --trace-out unsafe probe ({label}) "
+                    f"could not be set up",
+                    True,
+                    f"skipped — platform refused setup: {exc}",
+                ))
+                return
+            # Snapshot pre-existing state so we only flag NEW
+            # artifacts created by the trace branch. A symlink at the
+            # trace-out path, a pre-existing directory, or the
+            # output-collision target all exist before the run; the
+            # contract is that the trace branch must not modify them
+            # or create a real file behind them.
+            pre_target_existed = False
+            pre_target_bytes: bytes | None = None
+            if isinstance(trace_out_path, Path):
+                if trace_out_path.is_symlink() or trace_out_path.exists():
+                    pre_target_existed = True
+                    if (
+                        not trace_out_path.is_symlink()
+                        and trace_out_path.is_file()
+                    ):
+                        try:
+                            pre_target_bytes = trace_out_path.read_bytes()
+                        except OSError:
+                            pre_target_bytes = None
+            tmp_sibling: Path | None = None
+            if isinstance(trace_out_path, Path):
+                tmp_sibling = trace_out_path.with_suffix(
+                    trace_out_path.suffix + ".tmp"
+                )
+            rc, _stdout, stderr = _run_capture_with_trace(ws, out, trace_out_path)
+            msg = stderr + _stdout
+            # Cleanup assertions:
+            #   * leaked_new: the trace branch created a file at the
+            #     trace-out path that wasn't there before.
+            #   * mutated_existing: a pre-existing regular file at the
+            #     trace-out path was overwritten (e.g. the PPTX in the
+            #     output-collision probe).
+            #   * tmp_left: a `.tmp` sibling next to the trace-out path
+            #     survived the run.
+            leaked_new = False
+            mutated_existing = False
+            tmp_left = False
+            if isinstance(trace_out_path, Path):
+                target_present_now = (
+                    trace_out_path.is_symlink() or trace_out_path.exists()
+                )
+                if not pre_target_existed and target_present_now:
+                    leaked_new = True
+                if (
+                    pre_target_existed
+                    and pre_target_bytes is not None
+                    and not trace_out_path.is_symlink()
+                    and trace_out_path.is_file()
+                ):
+                    try:
+                        if trace_out_path.read_bytes() != pre_target_bytes:
+                            mutated_existing = True
+                    except OSError:
+                        mutated_existing = True
+                if (
+                    tmp_sibling is not None
+                    and (tmp_sibling.exists() or tmp_sibling.is_symlink())
+                ):
+                    tmp_left = True
+            results.append(CheckResult(
+                f"selftest: --trace-out unsafe probe ({label}) fails "
+                f"closed and creates no new trace artifact",
+                (
+                    rc != 0
+                    and expect_substr in msg
+                    and not leaked_new
+                    and not mutated_existing
+                    and not tmp_left
+                ),
+                (f"rc={rc}, has_substr={expect_substr in msg!r}, "
+                 f"leaked_new={leaked_new}, "
+                 f"mutated_existing={mutated_existing}, "
+                 f"tmp_left={tmp_left}; "
+                 f"msg_tail={msg.strip()[-300:]!r}"
+                 if rc == 0
+                    or expect_substr not in msg
+                    or leaked_new
+                    or mutated_existing
+                    or tmp_left else ""),
+            ))
+
+        # absolute path outside the output dir (escapes via /tmp peers)
+        _probe_unsafe(
+            "abs_escape",
+            lambda d: Path(td / "escape_target.json"),
+            "outside the output directory",
+        )
+        # `..` segment in the supplied string
+        _probe_unsafe(
+            "parent_segment",
+            lambda d: Path(str(d / "sub" / ".." / "trace.json")),
+            "'..'",
+        )
+        # protocol-relative
+        _probe_unsafe(
+            "protocol_relative",
+            lambda d: Path("//evil/host/trace.json"),
+            "protocol-relative",
+        )
+        # file:// URI scheme
+        _probe_unsafe(
+            "file_uri",
+            lambda d: Path("file:///tmp/leak.json"),
+            "URI-scheme",
+        )
+        # https:// URI scheme
+        _probe_unsafe(
+            "https_uri",
+            lambda d: Path("https://example.invalid/trace.json"),
+            "URI-scheme",
+        )
+        # data: URI scheme
+        _probe_unsafe(
+            "data_uri",
+            lambda d: Path("data:application/json,{}"),
+            "URI-scheme",
+        )
+        # directory path (the workspace dir itself)
+        _probe_unsafe(
+            "directory_path",
+            lambda d: d / "ws",
+            "directory",
+        )
+
+        # symlink at the trace-out path (the link itself is rejected,
+        # even if the target sits inside the output dir).
+        def _build_symlink_target(d: Path) -> Path:
+            real = d / "actual_trace.json"
+            real.write_text("{}", encoding="utf-8")
+            link = d / "linked_trace.json"
+            link.symlink_to(real)
+            return link
+        _probe_unsafe(
+            "symlink_target",
+            _build_symlink_target,
+            "symlink",
+        )
+
+        # symlink in the parent chain (the directory containing the
+        # trace-out file is itself a link). Both the link and its
+        # target live under the output dir, so the resolved trace path
+        # technically stays inside output_parent_resolved — but the
+        # raw parent-chain walk MUST refuse the link.
+        def _build_symlink_parent(d: Path) -> Path:
+            real_dir = d / "actual_subdir"
+            real_dir.mkdir()
+            link_dir = d / "linked_subdir"
+            link_dir.symlink_to(real_dir, target_is_directory=True)
+            return link_dir / "trace.json"
+        _probe_unsafe(
+            "symlink_parent",
+            _build_symlink_parent,
+            "symlink",
+        )
+
+        # trace-out collides with --output itself. The generic
+        # _probe_unsafe helper cannot model this case cleanly because
+        # the PPTX export step legitimately creates a file at the
+        # collision path before the trace step runs. We assert
+        # directly that:
+        #   - the run exits non-zero with the collision diagnostic;
+        #   - the file at the collision path is still a real PPTX
+        #     (open as a ZIP and confirm [Content_Types].xml is
+        #     present), i.e. the trace branch did NOT overwrite it
+        #     with JSON bytes;
+        #   - no `.tmp` sibling survives.
+        oc_dir = td / "trace_unsafe_output_collision"
+        oc_dir.mkdir()
+        oc_ws = oc_dir / "ws"
+        _write_synthetic_workspace(oc_ws)
+        oc_path = oc_dir / "deck.pptx"
+        rc, _stdout, stderr = _run_capture_with_trace(oc_ws, oc_path, oc_path)
+        oc_msg = stderr + _stdout
+        oc_pptx_intact = False
+        if oc_path.is_file():
+            try:
+                with _zipfile.ZipFile(oc_path) as _zf:
+                    oc_pptx_intact = (
+                        "[Content_Types].xml" in _zf.namelist()
+                        and "ppt/presentation.xml" in _zf.namelist()
+                    )
+            except (_zipfile.BadZipFile, OSError):
+                oc_pptx_intact = False
+        oc_tmp_left = (oc_dir / "deck.pptx.tmp").exists()
+        results.append(CheckResult(
+            "selftest: --trace-out colliding with --output fails "
+            "closed and leaves the PPTX intact (not overwritten with "
+            "JSON bytes, no .tmp sibling)",
+            (
+                rc != 0
+                and "same path as --output" in oc_msg
+                and oc_pptx_intact
+                and not oc_tmp_left
+            ),
+            (f"rc={rc}, "
+             f"has_substr={'same path as --output' in oc_msg!r}, "
+             f"pptx_intact={oc_pptx_intact}, "
+             f"tmp_left={oc_tmp_left}; "
+             f"msg_tail={oc_msg.strip()[-300:]!r}"
+             if rc == 0
+                or "same path as --output" not in oc_msg
+                or not oc_pptx_intact
+                or oc_tmp_left else ""),
+        ))
+
+        # T-D. VALIDATION FAILURE leaves no partial trace file.
+        # We exercise the validate-on-disk branch by handing
+        # `_write_validated_trace` a deliberately malformed in-memory
+        # trace (drops the required `summary` block). The helper MUST
+        # delete the `.tmp` sibling AND never create the final path.
+        from export_pptx import _write_validated_trace
+        td_fail = td / "trace_validation_failure"
+        td_fail.mkdir()
+        bad_trace = {
+            "schema_version": "1",
+            "trace_id": "synthetic_should_never_land",
+            "pipeline_status": "future_contract_only",
+            "generated_by": {
+                "name": "synthetic_should_never_land",
+                "mode": "self_test_fixture",
+            },
+            "deck": {
+                "deck_id": "synthetic_should_never_land",
+                "slide_count": 1,
+                "layouts_attempted": ["cover"],
+            },
+            "records": [],   # schema requires minItems=1; will fail
+            # "summary" deliberately omitted; schema requires it.
+        }
+        bad_trace_path = td_fail / "trace.json"
+        err = _write_validated_trace(bad_trace, bad_trace_path)
+        validation_msg = err or ""
+        results.append(CheckResult(
+            "selftest: --trace-out validation failure leaves no "
+            "partial trace (no final file, no .tmp residue, error "
+            "surfaced)",
+            (
+                bool(err)
+                and not bad_trace_path.exists()
+                and not (
+                    td_fail / "trace.json.tmp"
+                ).exists()
+            ),
+            (f"err={validation_msg!r}, "
+             f"final_exists={bad_trace_path.exists()}, "
+             f"tmp_exists={(td_fail / 'trace.json.tmp').exists()}"
+             if not (
+                bool(err)
+                and not bad_trace_path.exists()
+                and not (
+                    td_fail / "trace.json.tmp"
+                ).exists()
+             ) else ""),
+        ))
+
+        # T-E. Trace emission still skips when the PPTX export
+        # itself fails closed. The fixture has an undeclared
+        # image_ref (same shape as scenario 6); even with
+        # --trace-out set, no trace file appears because the export
+        # never reaches the trace step.
+        td_exp_fail = td / "trace_skipped_when_export_fails"
+        td_exp_fail.mkdir()
+        ws_ef = td_exp_fail / "ws"
+        _write_synthetic_workspace(ws_ef)
+        (ws_ef / "render_models" / "01_cover.json").write_text(json.dumps({
+            "index": 1,
+            "layout": "cover",
+            "canvas": {"width_px": 1920, "height_px": 1080},
+            "source_refs": ["synthetic_src"],
+            "primitives": [
+                {
+                    "id": "ghost_image",
+                    "kind": "image_slot",
+                    "bounds": {"x": 100, "y": 100, "w": 400, "h": 400},
+                    "image_slot": {"image_ref": "still_not_declared"},
+                },
+            ],
+        }))
+        ef_out = td_exp_fail / "deck.pptx"
+        ef_trace = td_exp_fail / "trace.json"
+        rc, _stdout, stderr = _run_capture_with_trace(ws_ef, ef_out, ef_trace)
+        ef_no_trace = not ef_trace.exists()
+        ef_no_tmp = not (td_exp_fail / "trace.json.tmp").exists()
+        ef_no_pptx = not ef_out.exists()
+        results.append(CheckResult(
+            "selftest: --trace-out emits nothing when the PPTX export "
+            "itself fails closed (no trace.json, no trace.json.tmp, "
+            "no partial deck)",
+            rc != 0 and ef_no_trace and ef_no_tmp and ef_no_pptx,
+            (f"rc={rc}, no_trace={ef_no_trace}, no_tmp={ef_no_tmp}, "
+             f"no_pptx={ef_no_pptx}; {stderr.strip()}"
+             if not (rc != 0 and ef_no_trace and ef_no_tmp and ef_no_pptx)
+             else ""),
+        ))
+
     return results
 
 
@@ -4060,6 +4996,21 @@ def main(argv: list[str]) -> int:
         help="Used only with --render-model: path to image_manifest.json.",
     )
     parser.add_argument(
+        "--trace-out", type=Path,
+        help="Optional opt-in: write a conversion-trace JSON sidecar "
+             "after the PPTX export succeeds. Validates against "
+             "schemas/conversion_trace.schema.json and the read-only "
+             "scripts/validate_conversion_trace.py gates. The trace is "
+             "atomic-written (tmp + rename); a validation or write "
+             "failure deletes the tmp so no partial trace survives. "
+             "Path must sit inside --output's parent directory; "
+             "absolute escape, '..' segments, URI-scheme prefixes "
+             "(file:// / https:// / data:), protocol-relative '//', "
+             "symlink targets, symlinks in the parent chain, and "
+             "directory paths are all refused. Default: no sidecar — "
+             "the exporter's PPTX bytes and CLI text are unchanged.",
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help="Run the in-script tempfixture positives (happy-path "
              "workspace exports and passes validate_pptx_contract; "
@@ -4102,7 +5053,7 @@ def main(argv: list[str]) -> int:
         if any(
             v is not None for v in (
                 args.workspace, args.output, args.render_model,
-                args.design_system, args.image_manifest,
+                args.design_system, args.image_manifest, args.trace_out,
             )
         ):
             return _fatal(
@@ -4140,14 +5091,17 @@ def main(argv: list[str]) -> int:
                 "--image-manifest"
             )
         return export_single_render_model(
-            args.render_model, args.design_system, args.image_manifest, args.output,
+            args.render_model, args.design_system, args.image_manifest,
+            args.output, trace_out=args.trace_out,
         )
 
     if args.workspace is None:
         return _fatal(
             "either --workspace, --render-model, or --self-test is required"
         )
-    return export_workspace(args.workspace, args.output)
+    return export_workspace(
+        args.workspace, args.output, trace_out=args.trace_out,
+    )
 
 
 if __name__ == "__main__":

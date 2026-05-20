@@ -1,6 +1,6 @@
-# PPTX Conversion Trace Contract (Clean-Room, Future-Only)
+# PPTX Conversion Trace Contract (Clean-Room)
 
-This document defines a SHAPE contract for a future per-primitive PPTX
+This document defines the SHAPE contract for the per-primitive PPTX
 **conversion trace report** in szh-ppt-master. It is **clean-room** — no
 file, schema, prompt, validator, example, or wording from
 `hugohe3/ppt-master`, a local `ppt-master` checkout, or any other
@@ -9,10 +9,23 @@ preparing it.
 
 ## 1. Status
 
-- **This is a future trace contract, not active export instrumentation.**
-  `scripts/export_pptx.py` does NOT emit a conversion trace today, and
-  no other script in this repo reads one. The exporter's behavior is
-  unchanged by this contract; runtime tracing remains a TODO.
+- **The contract recognises exactly two writers today.** The
+  `pipeline_status` field is a closed two-literal enum:
+  - `future_contract_only` — the SHAPE-only baseline; the committed
+    example fixture (`examples/synthetic_conversion_trace.json`) and
+    any hand-authored shape probe carry this literal. No runtime
+    script writes a trace under this literal.
+  - `runtime_emitted_by_export_pptx` — the paired-contract runtime
+    path. `scripts/export_pptx.py` writes a trace under this literal
+    when the caller passes `--trace-out <path>`. The exporter's PPTX
+    bytes are unchanged whether or not `--trace-out` is set; the
+    sidecar is opt-in and atomic-written (tmp + rename) so a
+    validation or write failure leaves no partial trace.
+- Adding a third writer (or extending the enum at all) requires
+  another paired contract change in the schema, in
+  `scripts/validate_conversion_trace.py` (T3), and in this document.
+  A silent reuse of an existing literal by a new writer is precisely
+  what T3 refuses.
 - **This is not upstream parity.** The general idea that a PPT-export
   pipeline could one day persist a per-primitive trace for debugging
   is the only thing reflected here; the specific field names, value
@@ -22,16 +35,13 @@ preparing it.
   relationship allow-list, and the content-gate vocabulary already
   shared across `scripts/validate_brand_preset.py` and
   `scripts/validate_source_image_assets.py` — not from any upstream file.
-- **The contract is shape-only.** The literal
-  `pipeline_status: "future_contract_only"` in every trace locks that
-  intent at the file boundary; the validator re-asserts it so a future
-  runtime path MUST flip the literal in a paired contract change rather
-  than silently re-interpreting an existing trace.
 - **No new public-network behavior.** This contract does not call
   D-One, MCP, image search, telemetry, model APIs, the Qoder runtime,
-  or PPTX export. It does not generate images. It does not read raw
-  source body text. See `references/security-policy.md` and
-  `SECURITY.md`.
+  or any external service. It does not generate images. It does not
+  read raw source body text. The runtime writer in
+  `scripts/export_pptx.py` derives the trace entirely from local
+  in-memory render-model / media-plan state and never opens the
+  source body. See `references/security-policy.md` and `SECURITY.md`.
 
 ## 2. What the contract covers
 
@@ -43,7 +53,7 @@ primitive's attempted conversion.
 | ------------------------------------ | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | `schema_version`                     | string enum `["1"]`                                                            | Bump only with a paired contract change.                                                                                 |
 | `trace_id`                           | string `^synthetic_[a-z0-9][a-z0-9_]*$`                                        | Forced `synthetic_` prefix; refuses any real-document id at the schema layer.                                            |
-| `pipeline_status`                    | string enum `["future_contract_only"]`                                         | Hard literal that locks the file as shape-only.                                                                          |
+| `pipeline_status`                    | string enum `["future_contract_only", "runtime_emitted_by_export_pptx"]`        | Closed two-literal enum. `future_contract_only` marks the SHAPE-only baseline; `runtime_emitted_by_export_pptx` is the paired runtime path. |
 | `generated_by.name`                  | string `^synthetic_[a-z0-9][a-z0-9_]*$`                                        | Identifier of the synthetic writer.                                                                                      |
 | `generated_by.mode`                  | string enum `["simulated", "self_test_fixture"]`                               | Closed enum.                                                                                                             |
 | `deck.deck_id`                       | string `^synthetic_[a-z0-9][a-z0-9_]*$`                                        | Forced `synthetic_` prefix.                                                                                              |
@@ -90,7 +100,7 @@ express:
 | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | T1   | Symlink at the trace path, non-object root, non-JSON / non-UTF-8 bytes, missing file. Exits 2 (invocation / file / parse error).                      |
 | T2   | Schema-subset violation (re-uses `scripts/validate_artifacts._validate`). Unknown `status` or unknown `reason_code` values fail here via schema enums. |
-| T3   | `pipeline_status` not equal to the literal `"future_contract_only"`.                                                                                  |
+| T3   | `pipeline_status` not in the closed two-literal set `{"future_contract_only", "runtime_emitted_by_export_pptx"}`.                                     |
 | T4   | `trace_id` / `deck.deck_id` / `generated_by.name` missing the required `synthetic_` prefix shape.                                                     |
 | T5   | `status == editable` carrying a non-null `reason_code`, OR `status in {rejected, degraded, skipped}` carrying a null / non-enum `reason_code`.        |
 | T6   | Duplicate `(slide_index, primitive_id)` tuple across `records`.                                                                                       |
@@ -110,43 +120,72 @@ Exit codes:
 
 ## 4. Out of scope (explicitly refused)
 
-- Emitting a trace at runtime from `scripts/export_pptx.py` (the
-  exporter is unchanged; emission remains TODO).
+- Any writer other than the two literals listed in Section 1. A new
+  writer is not allowed without another paired contract change in the
+  schema, in `scripts/validate_conversion_trace.py` (T3), and in this
+  document.
 - Reading a trace as runtime state in any script (no consumer exists
-  today and none is planned in this contract).
+  today; the trace is a write-only diagnostic sidecar from
+  `scripts/export_pptx.py`).
 - Calling D-One / Qoder / MCP / any image generator / model API /
-  image search / public network / external service.
-- Generating any PPTX / package / pipeline-report artifact.
+  image search / public network / external service. The runtime
+  writer in `scripts/export_pptx.py` derives the trace from local
+  in-memory state only.
+- Generating any PPTX / package / pipeline-report artifact beyond
+  the trace itself. The trace is OPT-IN: omitting `--trace-out`
+  leaves the PPTX bytes and the exporter's CLI text byte-identical
+  to a no-trace run.
 - Mutating the trace or any pipeline artifact (the validator is
-  read-only).
+  read-only; the runtime writer atomic-writes via a `.tmp` sibling
+  and cleans up on any failure).
+- Changing the default export contract. Without `--trace-out`, no
+  sidecar file is written and the existing PPTX export behavior is
+  unchanged.
 
-A future runtime path that wires `scripts/export_pptx.py` to emit a
-trace MUST be a paired change: bump the schema, flip the
-`pipeline_status` enum, add the writer, add the reader, extend this
-document and the validator together. A silent reuse of the existing
-`"future_contract_only"` literal as if it were live is precisely what
-T3 refuses.
+Adding a new writer (or extending the `pipeline_status` enum at all)
+MUST be a paired change across the schema, the validator's T3 gate,
+and this document. A silent reuse of an existing literal by an
+unauthorised new writer is precisely what T3 refuses.
 
-## 5. Example fixture
+## 5. Example fixture and runtime path
 
 `examples/synthetic_conversion_trace.json` carries one synthetic
-fixture covering all four `status` values across the supported
-primitive surface:
+fixture under the SHAPE-only `pipeline_status =
+"future_contract_only"` literal, covering all four `status` values
+across the supported primitive surface:
 
 - `editable` — `text`, `line`, `kpi`, and `table` primitives across
   the `cover`, `kpi_dashboard`, and `comparison_table` layouts.
 - `skipped` — an `image_slot` primitive on the `cover` layout, with
   `reason_code = media_embedding_todo` (mirrors the exporter's
-  current placeholder-only behavior).
+  placeholder fallback for non-embeddable image extensions).
 - `rejected` — a `chart_placeholder` primitive on the `kpi_dashboard`
   layout, with `reason_code = chart_renderer_todo` (mirrors the
-  exporter's fail-closed gate).
+  exporter's fail-closed gate; a runtime trace will never carry this
+  shape because the exporter aborts before reaching the trace step
+  when a `chart_placeholder` is present).
 - `degraded` — a `text` primitive that overflows its bounds, with
   `reason_code = font_overflow_todo` and
   `expected_pptx_kind = raster_fallback` (synthetic probe; no such
   fallback exists in the exporter today).
 
 The fixture validates cleanly under `scripts/validate_conversion_trace.py`.
+
+The runtime writer in `scripts/export_pptx.py` (invoked as
+`--trace-out <path>`) emits a trace under
+`pipeline_status = "runtime_emitted_by_export_pptx"`. Because the
+trace step only runs after a successful PPTX export, every runtime
+record carries `status = "editable"` (with `reason_code = null`) for
+the supported primitive kinds (`text`, `line`, `shape`, `kpi`,
+`table`, and embedded `image_slot` with
+`relationship_type = "image"`), and `status = "skipped"` with
+`reason_code = "media_embedding_todo"` for `image_slot` primitives
+that fell back to the placeholder shape. Synthetic ids are hard-coded
+(`trace_id = "synthetic_export_pptx_trace"`,
+`deck.deck_id = "synthetic_export_pptx_deck"`,
+`generated_by.name = "synthetic_export_pptx"`,
+`generated_by.mode = "simulated"`) so a runtime trace can never carry
+a real deck title or source identifier.
 
 ## 6. Validator usage
 

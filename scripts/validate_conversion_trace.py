@@ -4,9 +4,15 @@
 Stdlib-only. NETWORK-FREE. NO-D-ONE. NO-Qoder. NO model API.
 NO PPTX export. NO image generation. NO telemetry.
 
-The conversion-trace contract is intentionally idea-only today:
-``scripts/export_pptx.py`` does NOT emit a trace and no other script in
-this repo reads one. This validator gates a candidate trace JSON against
+The conversion-trace contract recognises exactly two writers today:
+the SHAPE-only baseline (``pipeline_status="future_contract_only"`` —
+committed example fixtures and hand-authored shape probes) AND the
+paired-contract runtime path that ``scripts/export_pptx.py`` follows
+when invoked with ``--trace-out`` (``pipeline_status=
+"runtime_emitted_by_export_pptx"``). No other writer / reader is
+allowed without another paired contract change in the schema, here,
+and in ``references/conversion-trace-contract.md``. This validator
+gates a candidate trace JSON against
 ``schemas/conversion_trace.schema.json`` plus a small set of content
 gates documented in ``references/conversion-trace-contract.md``.
 
@@ -24,12 +30,14 @@ file AND enforces the following gates:
       the same stdlib subset that ``scripts/validate_artifacts.py``
       applies (no ``$ref`` / ``oneOf`` / ``format``).
 
-  T3 pipeline_status_is_future_contract_only
-    - ``pipeline_status`` MUST equal the literal
-      ``"future_contract_only"``. The schema enum already enforces this;
-      the runtime gate mirrors it so the diagnostic is the same
-      regardless of which side detects the divergence. A future runtime
-      path MUST flip this literal in a paired contract change.
+  T3 pipeline_status_is_in_closed_enum
+    - ``pipeline_status`` MUST be one of the closed two-literal set
+      ``{"future_contract_only", "runtime_emitted_by_export_pptx"}``.
+      The schema enum already enforces this; the runtime gate mirrors
+      it so the diagnostic is the same regardless of which side detects
+      the divergence. Adding a third writer requires another paired
+      contract change in the schema, here, and in
+      ``references/conversion-trace-contract.md``.
 
   T4 ids_are_synthetic
     - ``trace_id`` / ``deck.deck_id`` / ``generated_by.name`` MUST each
@@ -109,13 +117,17 @@ file AND enforces the following gates:
       ``paragraph`` / ``excerpt``. Same shape as P9 in
       ``validate_brand_preset.py``.
 
-Out of scope (and explicitly refused, not implemented):
+Out of scope for THIS validator (and explicitly refused here):
 
   - calling D-One / Qoder / MCP / any image generator / model API /
     image search / public network / external service;
   - mutating the trace or any pipeline artifact (read-only validator);
-  - any runtime emission of a trace from ``export_pptx.py`` (the
-    exporter is unchanged; emission remains TODO);
+  - emitting a trace from this script (trace emission lives in
+    ``scripts/export_pptx.py`` and is OPT-IN via ``--trace-out``;
+    omitting ``--trace-out`` leaves the default PPTX export behavior
+    unchanged and writes no sidecar — this validator validates the
+    resulting trace JSON regardless of which of the two writers
+    produced it);
   - any chart rendering / PPTX export / SVG generation behavior.
 
 Exit codes:
@@ -335,13 +347,29 @@ def _gate_schema_subset_valid(data: dict) -> list[str]:
     return [f"T2: {e}" for e in errors]
 
 
+_PIPELINE_STATUS_ENUM: frozenset[str] = frozenset({
+    "future_contract_only",
+    "runtime_emitted_by_export_pptx",
+})
+
+
 def _gate_pipeline_status(data: dict) -> list[str]:
-    """T3 — pipeline_status MUST equal 'future_contract_only'."""
+    """T3 — pipeline_status MUST be one of the closed two-literal set.
+
+    'future_contract_only' marks the SHAPE-only baseline (committed
+    example fixtures and hand-authored shape probes). 'runtime_emitted_
+    by_export_pptx' marks the paired-contract runtime path that
+    scripts/export_pptx.py uses when invoked with --trace-out. Any other
+    literal is refused; adding a third writer requires another paired
+    contract change in the schema, here, and in
+    references/conversion-trace-contract.md."""
     value = data.get("pipeline_status")
-    if value != "future_contract_only":
+    if value not in _PIPELINE_STATUS_ENUM:
         return [
-            f"T3: pipeline_status must equal 'future_contract_only' "
-            f"(got {value!r}); this contract is shape-only today"
+            f"T3: pipeline_status must be one of "
+            f"{sorted(_PIPELINE_STATUS_ENUM)!r} "
+            f"(got {value!r}); a new literal requires a paired contract "
+            f"change in the schema, validator, and contract doc"
         ]
     return []
 
@@ -809,13 +837,32 @@ def _self_test() -> int:
         return d
     results.append(_scenario("t2-unknown-reason-code", m_t2_reason, "T2"))
 
-    # T3 — pipeline_status flipped to a non-allowed literal. Schema
-    # enum (T2) AND the runtime gate (T3) both fire; either is evidence
-    # of fail-closed behavior.
+    # T3 — pipeline_status flipped to a literal outside the closed
+    # two-element enum. Schema enum (T2) AND the runtime gate (T3) both
+    # fire; either is evidence of fail-closed behavior. The literal
+    # 'runtime_emitted' (the obvious typo for the paired
+    # 'runtime_emitted_by_export_pptx' writer) is intentionally NOT
+    # accepted — a writer that picked the wrong name must trip the gate.
     def m_t3(d):
         d["pipeline_status"] = "runtime_emitted"
         return d
     results.append(_scenario("t3-pipeline-flipped", m_t3, ("T2", "T3")))
+
+    # T3 — positive sweep across every accepted literal. The schema
+    # enum and the validator's T3 gate must accept BOTH literals — the
+    # SHAPE-only baseline ('future_contract_only') AND the paired
+    # runtime path ('runtime_emitted_by_export_pptx'). A regression
+    # that narrows the enum back to a single literal would fire here.
+    for _ok in (
+        "future_contract_only",
+        "runtime_emitted_by_export_pptx",
+    ):
+        def _mut(d, lit=_ok):
+            d["pipeline_status"] = lit
+            return d
+        results.append(_scenario(
+            f"t3-pipeline-accepted-{_ok}", _mut, "",
+        ))
 
     # T4 — non-synthetic trace_id.
     def m_t4(d):
