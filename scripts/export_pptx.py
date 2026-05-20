@@ -2866,7 +2866,22 @@ def _run_self_tests() -> list[CheckResult]:
         in the media filename is unmistakable;
       - SVG manifest entry: image_slot still falls back to the
         placeholder `<p:sp>` (the SVG branch remains TODO), and
-        `ppt/media/` carries no entry."""
+        `ppt/media/` carries no entry.
+
+    Text-editability probes (read-only; no exporter behavior change):
+      - text + kpi: in the synthetic fixture, each `text` primitive
+        emits 1 `<a:p>` / 1 `<a:r>` whose run text equals the
+        declared `text.content` verbatim (one paragraph per
+        primitive, NOT per content line — the exporter does NOT
+        split a `\\n`-containing `text.content` into multiple
+        `<a:p>` paragraphs today); a kpi with delta omitted emits
+        2 `<a:p>` (label, value) with 1 `<a:r>` each; a kpi with
+        delta set emits 3 `<a:p>` (label, value, delta) with
+        1 `<a:r>` each;
+      - table cells: every `<a:tc>` emitted by the synthetic
+        comparison_table fixture carries 1 `<a:p>` / 1 `<a:r>`
+        whose run text equals the declared cell string verbatim
+        (after XML round-trip)."""
     import io
     import json
     import tempfile
@@ -4475,6 +4490,234 @@ def _run_self_tests() -> list[CheckResult]:
                 and only_expected_siblings
                 and workspace_clean
              ) else ""),
+        ))
+
+        # ----------------------------------------------------------------
+        # Text-editability probe (read-only; no exporter behavior change).
+        # ----------------------------------------------------------------
+        #
+        # Inspired only at the level of the high-level idea that
+        # paragraph-like text in a PPTX should land in the package as
+        # an editable text frame whose run/paragraph structure does
+        # not need to be merged back together before the user can
+        # click in and edit the wording.
+        #
+        # What today's emitters actually produce (asserted below):
+        #
+        #   - `text` primitive   -> 1 `<p:sp>` / 1 `<a:p>` / 1 `<a:r>`,
+        #     i.e. one paragraph PER PRIMITIVE — not per "line" of
+        #     content. The whole `text.content` string lands in a
+        #     single `<a:t>` element; any `\n` it carries is passed
+        #     through `xml.sax.saxutils.escape` (which by default
+        #     only escapes `&`, `<`, `>`) and stays as a literal LF
+        #     byte inside that one element — the exporter does NOT
+        #     emit `<a:br/>` and does NOT split multi-line content
+        #     into multiple `<a:p>` paragraphs today. Whether
+        #     PowerPoint should render a literal LF as a soft line
+        #     break, or whether `\n` should become a paragraph
+        #     boundary, is intentionally OUT OF SCOPE for this
+        #     probe — either would be a behavior change that would
+        #     need an explicit opt-in;
+        #   - `kpi` primitive    -> 1 `<p:sp>` / one `<a:p>` per
+        #     declared field (label, value, and `delta` when set),
+        #     each `<a:p>` carrying exactly 1 `<a:r>`;
+        #   - `table` cell       -> 1 `<a:tc>` / 1 `<a:p>` / 1 `<a:r>`,
+        #     i.e. one paragraph per cell with one run carrying the
+        #     declared cell string.
+        #
+        # Because the exporter already emits one `<a:r>` per `<a:p>`
+        # for these primitives, no opt-in CLI flag is needed today
+        # and default behavior is untouched by this probe. The
+        # probe's job is to make the per-primitive / per-field /
+        # per-cell shape explicit so a future change that fragments
+        # one of these surfaces into multiple runs (or drops a
+        # declared kpi field) fails loudly instead of silently
+        # degrading editability in PowerPoint.
+        #
+        # Scope caveat: the assertions cover the title `text`
+        # primitives, both kpi primitives, and every cell of the
+        # comparison_table fixture. They do NOT prove the same
+        # shape for every conceivable `text.content` (notably
+        # multi-line content, which the exporter does not currently
+        # split into paragraphs).
+
+        _A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+        _P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+
+        def _txbody_paragraph_runs(host_el, *, host_kind: str) -> list[list[str]]:
+            """Return [[run_text, ...], ...] for every <a:p> inside
+            the element's txBody. `host_kind="sp"` reads from
+            `<p:sp><p:txBody>`; `host_kind="tc"` reads from
+            `<a:tc><a:txBody>`."""
+            txbody_ns = _P_NS if host_kind == "sp" else _A_NS
+            txbody = host_el.find(f"{txbody_ns}txBody")
+            if txbody is None:
+                return []
+            out: list[list[str]] = []
+            for p_el in txbody.findall(f"{_A_NS}p"):
+                runs: list[str] = []
+                for r_el in p_el.findall(f"{_A_NS}r"):
+                    t_el = r_el.find(f"{_A_NS}t")
+                    runs.append("" if t_el is None or t_el.text is None else t_el.text)
+                out.append(runs)
+            return out
+
+        def _find_sp_by_name(slide_root, name_value: str):
+            for sp in slide_root.iter(f"{_P_NS}sp"):
+                nv = sp.find(f"{_P_NS}nvSpPr")
+                if nv is None:
+                    continue
+                c = nv.find(f"{_P_NS}cNvPr")
+                if c is not None and c.get("name") == name_value:
+                    return sp
+            return None
+
+        # P-A. text + kpi probe: re-export the happy fixture into a
+        # dedicated dir so the probe's findings do not depend on
+        # earlier mutations under `td`. The cover slide carries one
+        # `text` primitive (id=title); the kpi_dashboard slide
+        # carries one `text` primitive (id=title), a kpi primitive
+        # with delta (id=kpi_01), and a kpi primitive without delta
+        # (id=kpi_02).
+        text_probe_ws = td / "text_editability_probe"
+        _write_synthetic_workspace(text_probe_ws)
+        text_probe_out = td / "text_editability_probe.pptx"
+        rc, _stdout, stderr = _run_capture(text_probe_ws, text_probe_out)
+        text_findings: list[str] = []
+        if rc != 0 or not text_probe_out.is_file():
+            text_findings.append(
+                f"happy workspace export failed: rc={rc} {stderr.strip()}"
+            )
+        else:
+            with _zipfile.ZipFile(text_probe_out) as _zf:
+                slide1_root = _ET.fromstring(
+                    _zf.read("ppt/slides/slide1.xml")
+                )
+                slide2_root = _ET.fromstring(
+                    _zf.read("ppt/slides/slide2.xml")
+                )
+            expectations = [
+                (slide1_root, "text:title",    [["Synthetic Cover"]]),
+                (slide2_root, "text:title",    [["Synthetic Metrics"]]),
+                (slide2_root, "kpi:kpi_01",    [["alpha"], ["<value>"], ["<delta>"]]),
+                (slide2_root, "kpi:kpi_02",    [["beta"], ["<value>"]]),
+            ]
+            for slide_root, name_value, want in expectations:
+                sp = _find_sp_by_name(slide_root, name_value)
+                if sp is None:
+                    text_findings.append(
+                        f"<p:sp> name={name_value!r} not found"
+                    )
+                    continue
+                got = _txbody_paragraph_runs(sp, host_kind="sp")
+                if got != want:
+                    text_findings.append(
+                        f"{name_value} paragraphs/runs were {got!r}, "
+                        f"expected {want!r}"
+                    )
+        results.append(CheckResult(
+            "selftest: text-editability probe — in the synthetic "
+            "fixture, each `text` primitive emits 1 <a:p> / 1 <a:r> "
+            "carrying the declared `text.content` verbatim (one "
+            "paragraph per primitive, NOT per content line), and "
+            "each `kpi` primitive emits one <a:p> per declared "
+            "field (label, value, and `delta` when set) with "
+            "exactly one <a:r> per paragraph",
+            not text_findings,
+            "; ".join(text_findings),
+        ))
+
+        # P-B. table-cell probe: every <a:tc> emitted by a
+        # comparison_table render_model must carry exactly one
+        # <a:p> with one <a:r>, and the run text must match the
+        # declared cell string (after XML round-trip). Tables are
+        # the most run-heavy text surface today, so a regression
+        # that fragmented per-cell text would surface here first.
+        cell_probe_ws = td / "cell_editability_probe"
+        _write_synthetic_workspace(cell_probe_ws)
+        (cell_probe_ws / "render_models" / "02_kpi_dashboard.json").unlink()
+        _write_synthetic_deck_plan(
+            cell_probe_ws, [(1, "cover"), (2, "comparison_table")],
+        )
+        (cell_probe_ws / "render_models" / "02_comparison_table.json").write_text(
+            json.dumps({
+                "index": 2,
+                "layout": "comparison_table",
+                "canvas": {"width_px": 1920, "height_px": 1080},
+                "source_refs": ["synthetic_src"],
+                "primitives": [
+                    {
+                        "id": "title",
+                        "slot_id": "title",
+                        "kind": "text",
+                        "bounds": {"x": 64, "y": 80, "w": 1792, "h": 120},
+                        "style": {
+                            "color_token": "palette.text",
+                            "typography_token": "typography.heading",
+                        },
+                        "text": {
+                            "content": "Cells stay single-run",
+                            "role": "heading",
+                        },
+                    },
+                    {
+                        "id": "tbl",
+                        "slot_id": "table",
+                        "kind": "table",
+                        "bounds": {"x": 64, "y": 240, "w": 1792, "h": 760},
+                        "style": {"color_token": "palette.text"},
+                        "table": {
+                            "columns": ["metric", "before", "after"],
+                            "rows": [
+                                ["alpha", "old", "new"],
+                                ["beta", "<v1>", "<v2>"],
+                            ],
+                        },
+                    },
+                ],
+            })
+        )
+        cell_probe_out = td / "cell_editability_probe.pptx"
+        rc, _stdout, stderr = _run_capture(cell_probe_ws, cell_probe_out)
+        cell_findings: list[str] = []
+        # Header columns first, then row 0 left-to-right, then row 1
+        # left-to-right — matches the loop order in
+        # _render_table_graphicframe.
+        expected_cells = [
+            "metric", "before", "after",
+            "alpha", "old", "new",
+            "beta", "<v1>", "<v2>",
+        ]
+        if rc != 0 or not cell_probe_out.is_file():
+            cell_findings.append(
+                f"comparison_table export failed: rc={rc} {stderr.strip()}"
+            )
+        else:
+            with _zipfile.ZipFile(cell_probe_out) as _zf:
+                slide2_root = _ET.fromstring(
+                    _zf.read("ppt/slides/slide2.xml")
+                )
+            tcs = list(slide2_root.iter(f"{_A_NS}tc"))
+            if len(tcs) != len(expected_cells):
+                cell_findings.append(
+                    f"expected {len(expected_cells)} <a:tc> cells, "
+                    f"found {len(tcs)}"
+                )
+            else:
+                for idx, (tc, want) in enumerate(zip(tcs, expected_cells)):
+                    got = _txbody_paragraph_runs(tc, host_kind="tc")
+                    if got != [[want]]:
+                        cell_findings.append(
+                            f"cell[{idx}] paragraphs/runs were {got!r}, "
+                            f"expected [[{want!r}]]"
+                        )
+        results.append(CheckResult(
+            "selftest: text-editability probe — every "
+            "comparison_table cell emits 1 <a:p> / 1 <a:r> carrying "
+            "the declared cell string verbatim (one paragraph per "
+            "cell)",
+            not cell_findings,
+            "; ".join(cell_findings),
         ))
 
         # ----------------------------------------------------------------
