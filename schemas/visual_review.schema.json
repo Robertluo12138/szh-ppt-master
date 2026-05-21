@@ -1,0 +1,170 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "visual_review.schema.json",
+  "title": "Per-Slide Visual Review Rubric Report",
+  "description": "Clean-room SHAPE contract for a per-slide visual-review rubric report. The contract pins what a review MUST carry so that the author and any reader agree on the on-disk shape from the first commit. Every record describes ONE slide's rubric assessment: the slide_index (1-based, tied to deck_plan.slides[].index) and slide_layout, a closed status (pass / warn / fail), a closed issue_type drawn from the static-metadata rubric, a closed severity (info / low / medium / high), a closed evidence_basis (today pinned to the single literal local_artifact_metadata_only — the only basis this contract recognises), and a closed recommended_action. review_id / deck.deck_id / generated_by.name are forced to start with the literal 'synthetic_' prefix so a review can never be authored under a real document id. evidence_basis is the contract pin that says THIS REVIEW IS NOT A SCREENSHOT REVIEW: it is read against local pipeline artifacts (deck_plan, slide_plan, render_model, conversion_trace) only, with no screenshot, browser, model API, image-generation, D-One, Qoder, MCP, or external-service call. The read-only validator at scripts/validate_visual_review.py re-applies the same closed-set gates, the per-slide coverage rule (records cover slide_index 1..deck.slide_count exactly), the duplicate-slide_index gate, the summary-vs-records consistency rule, and a set of content-gate denylists that mirror those in scripts/validate_brand_preset.py / scripts/validate_conversion_trace.py — URL/URI/scheme refusal, unsafe-path refusal, public-upload wording, credential-shaped wording, raw-source/confidential wording, plus a dedicated denylist for any claim that a screenshot, browser, model API, D-One, Qoder, MCP, or external service was used. This is NOT upstream parity (no upstream visual-review schema, rubric, prompt, validator, or example was opened, copied, or paraphrased). See references/visual-review-contract.md.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "review_id",
+    "evidence_basis",
+    "generated_by",
+    "deck",
+    "records",
+    "summary"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1"],
+      "description": "Review schema version. Bump only with a paired contract change in this schema, scripts/validate_visual_review.py, and references/visual-review-contract.md."
+    },
+    "review_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^synthetic_[a-z0-9][a-z0-9_]*$",
+      "description": "Stable review identifier. The forced 'synthetic_' prefix refuses any real-document id at the schema layer; the validator denylist mirrors it. Lowercase ASCII letters, digits, and underscore only."
+    },
+    "evidence_basis": {
+      "type": "string",
+      "enum": ["local_artifact_metadata_only"],
+      "description": "Closed single-literal enum. This contract recognises exactly one evidence basis today: 'local_artifact_metadata_only' — every finding MUST be derivable from inspecting committed local pipeline artifacts (deck_plan, slide_plan, render_model, conversion_trace) without opening PowerPoint, capturing a screenshot, calling a browser / model API / image generator / D-One / Qoder / MCP / public network / external service. Adding a second basis requires a paired contract change in the schema, validator (V3), and contract doc."
+    },
+    "generated_by": {
+      "type": "object",
+      "required": ["name", "mode"],
+      "additionalProperties": false,
+      "description": "Identifier for the synthetic author / writer of the review. 'name' carries the forced 'synthetic_' prefix; 'mode' is a closed enum naming whether the review was assembled by a self-test scenario or by a manual static inspection pass.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^synthetic_[a-z0-9][a-z0-9_]*$"
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["self_test_fixture", "manual_static_inspection"]
+        }
+      }
+    },
+    "deck": {
+      "type": "object",
+      "required": ["deck_id", "slide_count"],
+      "additionalProperties": false,
+      "description": "Deck-level metadata the review covers. slide_count pins the expected slide-coverage envelope: the validator refuses a review whose records skip a slide_index in 1..slide_count OR carry an extra slide_index outside that range.",
+      "properties": {
+        "deck_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^synthetic_[a-z0-9][a-z0-9_]*$"
+        },
+        "slide_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        }
+      }
+    },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Ordered list of per-slide rubric records. Exactly ONE record per slide; the validator enforces uniqueness on slide_index AND full coverage of 1..deck.slide_count. A record describes one slide's rubric finding; if a slide has multiple candidate issues, the author MUST pick the single most relevant issue_type (or use 'other_synthetic_probe' as the catch-all) — this contract is deliberately one-record-per-slide so 'missing coverage' and 'duplicate slide_index' are unambiguous.",
+      "items": {
+        "type": "object",
+        "required": [
+          "slide_index",
+          "slide_layout",
+          "status",
+          "issue_type",
+          "severity",
+          "evidence_basis",
+          "recommended_action"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "slide_index": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-based slide index. Ties back to deck_plan.slides[].index and to render_models/<idx:02d>_<layout>.json."
+          },
+          "slide_layout": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "description": "Layout id this slide uses. Generic id-shape pattern; this schema does NOT pin a closed layout enum here so the rubric is independent of the exporter's supported-layout list."
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pass", "warn", "fail"],
+            "description": "Closed three-literal enum. 'pass': the slide passes the rubric for this issue_type. 'warn': the slide raises a concern worth a human eyeball. 'fail': the slide must be addressed before the deck ships."
+          },
+          "issue_type": {
+            "type": "string",
+            "enum": [
+              "text_density",
+              "overflow_risk",
+              "contrast_risk",
+              "image_only_risk",
+              "editability_risk",
+              "layout_mismatch",
+              "media_risk",
+              "trace_mismatch",
+              "other_synthetic_probe"
+            ],
+            "description": "Closed enum of rubric categories. All categories are derivable from local artifact metadata: text_density and overflow_risk from render_model text primitives + canvas bounds; contrast_risk from design_system palette + render_model fill/stroke colors; image_only_risk from render_model.primitives kind distribution; editability_risk from render_model primitive_kind vs. exporter allow-list (mirrors conversion_trace status=rejected/degraded); layout_mismatch from render_model.layout vs. deck_plan.slides[].layout; media_risk from image_manifest declaration vs. render_model image_slot refs; trace_mismatch from cross-reading a conversion_trace sidecar against the render_model; other_synthetic_probe is the catch-all so the rubric never has to be widened to silence a one-off probe."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["info", "low", "medium", "high"],
+            "description": "Closed four-literal enum. Author picks per record. This schema does NOT couple severity to status — the validator only enforces enum membership."
+          },
+          "evidence_basis": {
+            "type": "string",
+            "enum": ["local_artifact_metadata_only"],
+            "description": "Closed single-literal enum, mirroring the root-level field. Per-record duplication is intentional: a future schema relaxation that widened either side independently would still be caught by V3."
+          },
+          "recommended_action": {
+            "type": "string",
+            "enum": [
+              "inspect_source",
+              "adjust_copy",
+              "adjust_layout",
+              "rerun_export",
+              "inspect_trace",
+              "no_action"
+            ],
+            "description": "Closed six-literal enum. Names the next step the author recommends. Deliberately small — every action MUST be a local-only pipeline step. There is no 'request_screenshot' / 'ask_model' / 'open_in_browser' option because those are out of scope for this contract."
+          },
+          "note": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 280,
+            "description": "Optional terse synthetic note. Validator refuses URL / file path / data URI / credential / public-upload / raw-source / confidential / out-of-scope-tool-claim wording, same as the rest of the review."
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["pass_count", "warn_count", "fail_count"],
+      "additionalProperties": false,
+      "description": "Per-status totals across records. Validator cross-checks these against the records list — a review whose summary disagrees with its own records is refused.",
+      "properties": {
+        "pass_count": { "type": "integer", "minimum": 0 },
+        "warn_count": { "type": "integer", "minimum": 0 },
+        "fail_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 280,
+      "description": "Optional review-level note. Same content gates as record.note."
+    }
+  }
+}

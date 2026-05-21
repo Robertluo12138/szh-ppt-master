@@ -1,0 +1,51 @@
+{
+  "schema_version": "1",
+  "review_id": "synthetic_visual_review_a",
+  "evidence_basis": "local_artifact_metadata_only",
+  "generated_by": {
+    "name": "synthetic_self_test",
+    "mode": "self_test_fixture"
+  },
+  "deck": {
+    "deck_id": "synthetic_demo_deck",
+    "slide_count": 3
+  },
+  "records": [
+    {
+      "slide_index": 1,
+      "slide_layout": "cover",
+      "status": "pass",
+      "issue_type": "other_synthetic_probe",
+      "severity": "info",
+      "evidence_basis": "local_artifact_metadata_only",
+      "recommended_action": "no_action",
+      "note": "Cover slide baseline; render_model carries title text and divider line, both in canvas bounds."
+    },
+    {
+      "slide_index": 2,
+      "slide_layout": "kpi_dashboard",
+      "status": "warn",
+      "issue_type": "text_density",
+      "severity": "low",
+      "evidence_basis": "local_artifact_metadata_only",
+      "recommended_action": "adjust_copy",
+      "note": "KPI captions total above the comfortable density floor for this layout; trim caption copy."
+    },
+    {
+      "slide_index": 3,
+      "slide_layout": "comparison_table",
+      "status": "fail",
+      "issue_type": "overflow_risk",
+      "severity": "high",
+      "evidence_basis": "local_artifact_metadata_only",
+      "recommended_action": "adjust_layout",
+      "note": "Footer caption bounds escape the canvas per render_model bounds inspection; widen footer slot or shrink type."
+    }
+  ],
+  "summary": {
+    "pass_count": 1,
+    "warn_count": 1,
+    "fail_count": 1
+  },
+  "notes": "Synthetic fixture for the visual-review contract; local artifact metadata only."
+}
