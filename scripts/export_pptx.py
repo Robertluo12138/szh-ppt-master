@@ -738,6 +738,75 @@ def _paragraph_xml(content: str, run_pr: str) -> str:
     )
 
 
+# --- Opt-in text paragraph merge (see references/pptx-text-paragraph-merge.md) ---
+#
+# `_paragraphs_split_xml` is the opt-in companion of `_paragraph_xml`. It
+# is reached only when the caller threads `text_paragraph_merge=True`
+# through the export entry point (`--text-paragraph-merge` on the CLI).
+# The default code path always calls `_paragraph_xml` directly, so the
+# PPTX bytes for any workspace that does not opt in are byte-identical
+# to a build that predates this helper.
+#
+# Contract:
+#   - The input is a single `text.content` string from the controlled
+#     render-model primitive (schema-valid, minLength: 1).
+#   - The string is split on the literal `"\n"` (no `\r\n` normalization).
+#     For every line:
+#       * non-empty -> one <a:p><a:r>{run_pr}<a:t>{escape(line)}</a:t></a:r></a:p>
+#         (same shape as `_paragraph_xml`, only with the literal line as
+#         its `<a:t>` content)
+#       * empty     -> one <a:p><a:endParaRPr lang="en-US"/></a:p>
+#         (no <a:r>, so PowerPoint shows a blank line that is still
+#         editable as a paragraph break — matching the existing empty
+#         paragraph emission inside `_render_shape_sp`)
+#   - The order is preserved exactly so the original content can be
+#     reconstructed by joining each paragraph's `<a:t>` text (treating an
+#     empty paragraph as ""), separated by `"\n"`. No text loss.
+#
+# Fail-closed gate (only reached when the opt-in is set):
+#   - If the split yields zero non-empty paragraphs (e.g. content="\n",
+#     content="\n\n"), the helper raises `ExportError` so the run aborts
+#     before any partial deck is written. This keeps the contract
+#     validator's `minimal_evidence.editable_text` gate from tripping on
+#     a textbox with no <a:t> content.
+#
+# Out of scope (kept narrow on purpose):
+#   - Rich runs within a paragraph (bold spans, color spans, ...). The
+#     opt-in only widens the *paragraph* axis; every run still inherits
+#     the primitive's single resolved run-properties block.
+#   - `\r\n` normalization, tab-based indentation, or any other
+#     whitespace transformation. The exporter accepts `\n` exactly as
+#     declared and refuses to silently rewrite the caller's bytes.
+#   - Schema changes. The render_model schema's `text.content` already
+#     accepts any non-empty string; the opt-in changes how the exporter
+#     *interprets* that string, not what is allowed.
+def _paragraphs_split_xml(content: str, run_pr: str) -> str:
+    """Opt-in: split `content` on `\\n` and emit one <a:p> per line.
+
+    Returns the concatenated XML for every paragraph. Empty lines emit
+    `<a:p><a:endParaRPr/></a:p>` so the visual line break survives the
+    round trip. Raises `ExportError` if every line is empty after the
+    split (the resulting textbox would carry no editable text)."""
+    lines = content.split("\n")
+    if not any(line for line in lines):
+        raise ExportError(
+            "text_paragraph_merge: text.content has no non-empty line "
+            "after splitting on '\\n'; refusing to emit a textbox with "
+            "zero editable paragraphs"
+        )
+    parts: list[str] = []
+    for line in lines:
+        if line:
+            parts.append(
+                f'<a:p>'
+                f'<a:r>{run_pr}<a:t>{xml_escape(line)}</a:t></a:r>'
+                f'</a:p>'
+            )
+        else:
+            parts.append('<a:p><a:endParaRPr lang="en-US"/></a:p>')
+    return "".join(parts)
+
+
 def _txbody_open(*, anchor: str = "t") -> str:
     """<p:txBody> with bodyPr + empty lstStyle. anchor="t" is top, "ctr"
     centers vertically."""
@@ -757,8 +826,22 @@ def _txbody_close() -> str:
 
 # --- Per-primitive emitters ------------------------------------------------
 
-def _render_text_sp(prim: dict, design: dict, shape_id: int) -> str:
-    """text primitive -> editable text box <p:sp>. role=heading is bold."""
+def _render_text_sp(
+    prim: dict,
+    design: dict,
+    shape_id: int,
+    *,
+    text_paragraph_merge: bool = False,
+) -> str:
+    """text primitive -> editable text box <p:sp>. role=heading is bold.
+
+    ``text_paragraph_merge`` is the opt-in flag (default False, threaded
+    from the CLI). When False the body is byte-identical to the
+    pre-flag exporter: a single <a:p> with a single <a:r> carrying the
+    full content verbatim. When True the content is split on `"\\n"`
+    via `_paragraphs_split_xml` so each line becomes its own native
+    PPTX paragraph; every run still inherits the same resolved
+    `<a:rPr>` block."""
     bounds = prim["bounds"]
     off_x, off_y, ext_cx, ext_cy = _bounds_to_xfrm(bounds)
     style = _as_dict(prim.get("style")) or {}
@@ -780,6 +863,11 @@ def _render_text_sp(prim: dict, design: dict, shape_id: int) -> str:
         raise ExportError("text primitive has no non-empty content")
     bold = role == "heading"
     pid = prim.get("id") or "text"
+    run_pr = _run_pr_xml(size_cp=size_cp, hex_color=color, bold=bold, font_first=family)
+    if text_paragraph_merge:
+        paragraphs_xml = _paragraphs_split_xml(text_content, run_pr)
+    else:
+        paragraphs_xml = _paragraph_xml(text_content, run_pr)
     return (
         f'<p:sp>'
         f'{_nv_sp_pr_xml(shape_id, f"text:{pid}", tx_box=True)}'
@@ -788,7 +876,7 @@ def _render_text_sp(prim: dict, design: dict, shape_id: int) -> str:
         f'<a:noFill/>'
         f'</p:spPr>'
         f'{_txbody_open(anchor="t")}'
-        f'{_paragraph_xml(text_content, _run_pr_xml(size_cp=size_cp, hex_color=color, bold=bold, font_first=family))}'
+        f'{paragraphs_xml}'
         f'{_txbody_close()}'
         f'</p:sp>'
     )
@@ -1227,10 +1315,15 @@ def _render_primitive(
     manifest_paths: dict,
     media_plan: dict,
     slide_media_uses: list[str],
+    *,
+    text_paragraph_merge: bool = False,
 ) -> str:
     kind = prim.get("kind")
     if kind == "text":
-        return _render_text_sp(prim, design, shape_id)
+        return _render_text_sp(
+            prim, design, shape_id,
+            text_paragraph_merge=text_paragraph_merge,
+        )
     if kind == "line":
         return _render_line_cxn(prim, design, shape_id)
     if kind == "shape":
@@ -1261,6 +1354,8 @@ def _slide_xml(
     manifest_alts: dict,
     manifest_paths: dict,
     media_plan: dict,
+    *,
+    text_paragraph_merge: bool = False,
 ) -> tuple[str, list[str]]:
     """Build the per-slide XML for a supported render_model.
 
@@ -1295,6 +1390,7 @@ def _slide_xml(
             _render_primitive(
                 prim, design, next_id, manifest_alts, manifest_paths,
                 media_plan, slide_media_uses,
+                text_paragraph_merge=text_paragraph_merge,
             )
         )
         next_id += 1
@@ -1685,7 +1781,11 @@ def _has_pptx_extension(path: Path) -> bool:
 
 
 def export_workspace(
-    workspace: Path, output: Path, trace_out: Path | None = None,
+    workspace: Path,
+    output: Path,
+    trace_out: Path | None = None,
+    *,
+    text_paragraph_merge: bool = False,
 ) -> int:
     """Top-level entry. Returns process exit code.
 
@@ -1695,7 +1795,16 @@ def export_workspace(
     set, the trace is built from the same in-memory state used to
     assemble the PPTX, validated against
     schemas/conversion_trace.schema.json, and atomically written
-    alongside the deck."""
+    alongside the deck.
+
+    ``text_paragraph_merge`` is the opt-in paragraph-merge flag (default
+    False; bound to ``--text-paragraph-merge`` on the CLI). When False
+    every `text` primitive is emitted exactly as before — one <a:p>
+    holding one <a:r><a:t> with the literal content — so the PPTX bytes
+    are byte-identical to a build that predates the flag. When True the
+    exporter splits each `text.content` on ``\\n`` and emits one native
+    PPTX paragraph per line via ``_paragraphs_split_xml``; see
+    references/pptx-text-paragraph-merge.md for the full contract."""
     if not workspace.is_dir():
         return _fatal(f"workspace is not a directory: {workspace}")
     if not _has_pptx_extension(output):
@@ -1988,6 +2097,7 @@ def export_workspace(
         try:
             xml, slide_media_uses = _slide_xml(
                 rm, design, manifest_alts, manifest_paths, media_plan,
+                text_paragraph_merge=text_paragraph_merge,
             )
         except ExportError as exc:
             fatal_errors.append(f"{rel} (index={idx}, {layout}): {exc}")
@@ -2051,10 +2161,23 @@ def export_workspace(
     return 0
 
 
-def export_single_render_model(rm_path: Path, design_path: Path, manifest_path: Path, output: Path, trace_out: Path | None = None) -> int:
+def export_single_render_model(
+    rm_path: Path,
+    design_path: Path,
+    manifest_path: Path,
+    output: Path,
+    trace_out: Path | None = None,
+    *,
+    text_paragraph_merge: bool = False,
+) -> int:
     """Debug helper: export a single render_model file into a one-slide
     .pptx. Not the primary path — workspace mode is the main entry —
-    but useful when iterating on a single primitive."""
+    but useful when iterating on a single primitive.
+
+    ``text_paragraph_merge`` mirrors the workspace-mode opt-in: when
+    False (default) the slide XML is byte-identical to the pre-flag
+    exporter; when True each `text.content` is split on ``\\n`` into
+    native PPTX paragraphs via ``_paragraphs_split_xml``."""
     if not _has_pptx_extension(output):
         return _fatal(
             f"output extension must be '.pptx' (case-insensitive); "
@@ -2134,6 +2257,7 @@ def export_single_render_model(rm_path: Path, design_path: Path, manifest_path: 
     try:
         xml, slide_media_uses = _slide_xml(
             rm, design, manifest_alts, manifest_paths, media_plan,
+            text_paragraph_merge=text_paragraph_merge,
         )
     except ExportError as exc:
         return _fatal(f"{rm_path}: {exc}")
@@ -5177,6 +5301,276 @@ def _run_self_tests() -> list[CheckResult]:
              else ""),
         ))
 
+        # --- Opt-in text paragraph merge (see references/pptx-text-paragraph-merge.md)
+        #
+        # The whole block exercises the `--text-paragraph-merge`
+        # opt-in. Every scenario builds its own workspace in a fresh
+        # subdirectory of `td` so we never mutate the happy-path
+        # fixture. The point of the four scenarios:
+        #
+        #   (A) default vs. opt-in on a workspace whose text content
+        #       carries no `\n`: byte-for-byte identical output. This
+        #       proves the opt-in does not perturb single-line text.
+        #   (B) default with `\n`-bearing content: the resulting
+        #       slide1.xml contains a single <a:p>/<a:r>/<a:t> whose
+        #       text equals the literal content (newlines and all),
+        #       matching pre-flag behavior. This proves the default
+        #       path is byte-stable even when content carries `\n`.
+        #   (C) opt-in with `\n`-bearing content: the same primitive
+        #       emits one <a:p> per line (with one <a:r> per
+        #       non-empty line); no <a:t> carries a literal `\n`; the
+        #       joined paragraph text reconstructs the original
+        #       content; the resulting PPTX still passes
+        #       validate_pptx_contract. This proves "multi-line text
+        #       as a controlled paragraph/run structure, no all-image
+        #       fallback, no text loss, contract validation passes".
+        #   (D) opt-in with empty-only content (just `\n`): the run
+        #       fails closed — no `.pptx` is written.
+
+        def _run_capture_with_merge(
+            workspace: Path, output: Path, *, merge: bool,
+        ) -> tuple[int, str, str]:
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                rc = export_workspace(
+                    workspace, output,
+                    text_paragraph_merge=merge,
+                )
+            return (rc, out_buf.getvalue(), err_buf.getvalue())
+
+        def _write_text_only_fixture(ws: Path, content: str) -> None:
+            """A minimal one-slide cover workspace whose only text
+            primitive carries the supplied `content`. Used by the
+            opt-in scenarios so the assertions can read the slide XML
+            without sifting through unrelated primitives."""
+            (ws / "render_models").mkdir(parents=True, exist_ok=True)
+            _write_synthetic_deck_plan(ws, [(1, "cover")])
+            (ws / "design_system.json").write_text(json.dumps({
+                "palette": {
+                    "primary":    "#1F3A5F",
+                    "background": "#FFFFFF",
+                    "text":       "#1A1A1A",
+                },
+                "typography": {
+                    "heading": {
+                        "font_family": "Calibri, Helvetica Neue, Arial, sans-serif",
+                        "size_pt": 28,
+                    },
+                    "body": {
+                        "font_family": "Calibri, Helvetica Neue, Arial, sans-serif",
+                        "size_pt": 14,
+                    },
+                },
+                "grid": {"width_px": 1920, "height_px": 1080, "margin_px": 64},
+            }, indent=2))
+            (ws / "image_manifest.json").write_text(
+                json.dumps({"images": []})
+            )
+            (ws / "render_models" / "01_cover.json").write_text(json.dumps({
+                "index": 1,
+                "layout": "cover",
+                "canvas": {"width_px": 1920, "height_px": 1080},
+                "source_refs": ["synthetic_src"],
+                "primitives": [
+                    {
+                        "id": "title",
+                        "slot_id": "title",
+                        "kind": "text",
+                        "bounds": {"x": 160, "y": 320, "w": 1280, "h": 240},
+                        "style": {
+                            "color_token": "palette.text",
+                            "typography_token": "typography.heading",
+                        },
+                        "text": {"content": content, "role": "heading"},
+                    },
+                ],
+            }, indent=2))
+
+        def _read_slide1_xml(pptx_path: Path) -> str:
+            with zipfile.ZipFile(pptx_path, "r") as zf:
+                return zf.read("ppt/slides/slide1.xml").decode("utf-8")
+
+        # (A) Byte-stability on a `\n`-free workspace.
+        single_line = "Synthetic single-line title"
+        bs_default_ws = td / "merge_bytestable_default"
+        bs_optin_ws = td / "merge_bytestable_optin"
+        _write_text_only_fixture(bs_default_ws, single_line)
+        _write_text_only_fixture(bs_optin_ws, single_line)
+        bs_default_out = td / "merge_bytestable_default.pptx"
+        bs_optin_out = td / "merge_bytestable_optin.pptx"
+        rc_a1, _, err_a1 = _run_capture_with_merge(
+            bs_default_ws, bs_default_out, merge=False,
+        )
+        rc_a2, _, err_a2 = _run_capture_with_merge(
+            bs_optin_ws, bs_optin_out, merge=True,
+        )
+        bytes_a_default = (
+            bs_default_out.read_bytes() if bs_default_out.exists() else b""
+        )
+        bytes_a_optin = (
+            bs_optin_out.read_bytes() if bs_optin_out.exists() else b""
+        )
+        results.append(CheckResult(
+            "selftest: paragraph-merge — workspace with `\\n`-free "
+            "text exports BYTE-IDENTICAL output whether the opt-in is "
+            "on or off (the flag must not perturb single-line text)",
+            (
+                rc_a1 == 0 and rc_a2 == 0
+                and bytes_a_default == bytes_a_optin
+                and len(bytes_a_default) > 0
+            ),
+            (f"rc_default={rc_a1}, rc_optin={rc_a2}, "
+             f"default_bytes={len(bytes_a_default)}, "
+             f"optin_bytes={len(bytes_a_optin)}; "
+             f"{err_a1.strip()} | {err_a2.strip()}"
+             if not (
+                 rc_a1 == 0 and rc_a2 == 0
+                 and bytes_a_default == bytes_a_optin
+                 and len(bytes_a_default) > 0
+             )
+             else ""),
+        ))
+
+        # (B) Default path still emits a single <a:p>/<a:r>/<a:t>
+        # carrying the literal newline-bearing content. This is the
+        # documented byte-stable default — a regression that started
+        # splitting on `\n` without the flag would trip this gate.
+        multi_line = "Line A\nLine B\n\nLine C"
+        default_ws = td / "merge_default_multiline"
+        _write_text_only_fixture(default_ws, multi_line)
+        default_out = td / "merge_default_multiline.pptx"
+        rc_b, _, err_b = _run_capture_with_merge(
+            default_ws, default_out, merge=False,
+        )
+        ok_b = False
+        detail_b = ""
+        if rc_b == 0 and default_out.is_file():
+            slide_b = _read_slide1_xml(default_out)
+            # Count paragraph + run + text occurrences in the slide XML.
+            n_p = slide_b.count("<a:p>")
+            n_r = slide_b.count("<a:r>")
+            n_t = slide_b.count("<a:t>")
+            # The literal `\n` must survive inside <a:t>; XML escape
+            # does not touch newline chars, so the on-the-wire payload
+            # carries it verbatim.
+            literal_kept = "Line A\nLine B\n\nLine C" in slide_b
+            ok_b = (n_p == 1 and n_r == 1 and n_t == 1 and literal_kept)
+            detail_b = (
+                f"n_p={n_p}, n_r={n_r}, n_t={n_t}, "
+                f"literal_kept={literal_kept}"
+            )
+        else:
+            detail_b = f"rc={rc_b}, exists={default_out.is_file()}; {err_b.strip()}"
+        results.append(CheckResult(
+            "selftest: paragraph-merge — default path (no opt-in) "
+            "emits ONE <a:p>/<a:r>/<a:t> carrying the literal "
+            "newline-bearing content verbatim (the flag-off contract "
+            "is byte-stable even with `\\n` in `text.content`)",
+            ok_b,
+            detail_b if not ok_b else "",
+        ))
+
+        # (C) Opt-in path on the same multi-line fixture: one <a:p>
+        # per line; no <a:t> carries a `\n`; reconstructed content
+        # equals the original; contract validation passes; no raster
+        # fallback (still <p:sp> text shapes, no <p:pic>).
+        optin_ws = td / "merge_optin_multiline"
+        _write_text_only_fixture(optin_ws, multi_line)
+        optin_out = td / "merge_optin_multiline.pptx"
+        rc_c, _, err_c = _run_capture_with_merge(
+            optin_ws, optin_out, merge=True,
+        )
+        ok_c = False
+        detail_c = ""
+        if rc_c == 0 and optin_out.is_file():
+            slide_c = _read_slide1_xml(optin_out)
+            # multi_line has 4 lines (one empty between B and C),
+            # so we expect 4 <a:p> and 3 <a:r> (the empty paragraph
+            # carries no run). The literal `\n` must NOT appear
+            # inside any <a:t>; the controlled <a:endParaRPr>
+            # paragraph carries the blank line instead.
+            n_p = slide_c.count("<a:p>")
+            n_r = slide_c.count("<a:r>")
+            no_newline_in_text = "\n" not in slide_c.split(
+                "<a:t>", 1
+            )[-1].split("</a:t>")[0] if "<a:t>" in slide_c else False
+            # Rebuild the content by reading every <a:t>...</a:t>:
+            import re as _re
+            t_texts = _re.findall(
+                r"<a:t>([^<]*)</a:t>", slide_c
+            )
+            has_endparapr = "<a:endParaRPr" in slide_c
+            # Reconstruct: split paragraphs from the slide XML on
+            # <a:p>; for each, either capture the <a:t> body or treat
+            # an endParaRPr-only paragraph as an empty line.
+            paragraphs = _re.findall(
+                r"<a:p>(.*?)</a:p>", slide_c, flags=_re.DOTALL,
+            )
+            reconstructed_lines: list[str] = []
+            for p in paragraphs:
+                m = _re.search(r"<a:t>([^<]*)</a:t>", p)
+                if m is not None:
+                    reconstructed_lines.append(m.group(1))
+                else:
+                    reconstructed_lines.append("")
+            reconstructed = "\n".join(reconstructed_lines)
+            # No raster fallback: at least one <p:sp>, no <p:pic> from
+            # the text primitive (this fixture has no image_slot).
+            has_sp = "<p:sp>" in slide_c
+            has_pic = "<p:pic>" in slide_c
+            # Contract validation: the exporter's package gates.
+            c_res = check_container(optin_out)
+            g_res = check_generated_pptx(optin_out)
+            contract_ok = (
+                all(r.ok for r in c_res) and all(r.ok for r in g_res)
+            )
+            ok_c = (
+                n_p == 4
+                and n_r == 3
+                and reconstructed == multi_line
+                and has_endparapr
+                and has_sp
+                and not has_pic
+                and contract_ok
+            )
+            detail_c = (
+                f"n_p={n_p}, n_r={n_r}, "
+                f"reconstructed={reconstructed!r}, "
+                f"has_endparapr={has_endparapr}, has_sp={has_sp}, "
+                f"has_pic={has_pic}, contract_ok={contract_ok}"
+            )
+        else:
+            detail_c = f"rc={rc_c}, exists={optin_out.is_file()}; {err_c.strip()}"
+        results.append(CheckResult(
+            "selftest: paragraph-merge — opt-in path splits "
+            "`Line A\\nLine B\\n\\nLine C` into 4 native PPTX "
+            "paragraphs (3 with runs, 1 endParaRPr-only blank) with "
+            "no text loss, no raster fallback, and the resulting "
+            "PPTX still passes validate_pptx_contract",
+            ok_c,
+            detail_c if not ok_c else "",
+        ))
+
+        # (D) Fail-closed: opt-in path refuses content that has no
+        # non-empty line after splitting (e.g. content="\n\n"). The
+        # exporter must return non-zero AND leave no `.pptx` on disk.
+        all_blank_ws = td / "merge_all_blank"
+        _write_text_only_fixture(all_blank_ws, "\n\n")
+        all_blank_out = td / "merge_all_blank.pptx"
+        rc_d, _, err_d = _run_capture_with_merge(
+            all_blank_ws, all_blank_out, merge=True,
+        )
+        ok_d = (rc_d != 0 and not all_blank_out.exists())
+        results.append(CheckResult(
+            "selftest: paragraph-merge — opt-in path fails closed "
+            "when `text.content` is just newlines (no non-empty "
+            "paragraph after split); no `.pptx` is written",
+            ok_d,
+            (f"rc={rc_d}, file_exists={all_blank_out.exists()}; "
+             f"{err_d.strip()}"
+             if not ok_d else ""),
+        ))
+
     return results
 
 
@@ -5254,6 +5648,21 @@ def main(argv: list[str]) -> int:
              "the exporter's PPTX bytes and CLI text are unchanged.",
     )
     parser.add_argument(
+        "--text-paragraph-merge", action="store_true",
+        help="Opt-in: split every text primitive's `text.content` on "
+             "the literal '\\n' character and emit one native PPTX "
+             "<a:p> paragraph per line (empty lines emit "
+             "<a:p><a:endParaRPr/></a:p> so the visual line break "
+             "survives). Without the flag the exporter keeps the "
+             "byte-stable default: a single <a:p>/<a:r>/<a:t> run "
+             "carrying the literal content verbatim. The opt-in path "
+             "fails closed when a content string contains no "
+             "non-empty line after splitting (e.g. just '\\n' or "
+             "'\\n\\n'). See references/pptx-text-paragraph-merge.md "
+             "for the full contract; the flag has no effect on kpi, "
+             "table, shape, line, or image_slot primitives.",
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help="Run the in-script tempfixture positives (happy-path "
              "workspace exports and passes validate_pptx_contract; "
@@ -5298,7 +5707,7 @@ def main(argv: list[str]) -> int:
                 args.workspace, args.output, args.render_model,
                 args.design_system, args.image_manifest, args.trace_out,
             )
-        ):
+        ) or args.text_paragraph_merge:
             return _fatal(
                 "--self-test does not take any other argument"
             )
@@ -5336,6 +5745,7 @@ def main(argv: list[str]) -> int:
         return export_single_render_model(
             args.render_model, args.design_system, args.image_manifest,
             args.output, trace_out=args.trace_out,
+            text_paragraph_merge=args.text_paragraph_merge,
         )
 
     if args.workspace is None:
@@ -5344,6 +5754,7 @@ def main(argv: list[str]) -> int:
         )
     return export_workspace(
         args.workspace, args.output, trace_out=args.trace_out,
+        text_paragraph_merge=args.text_paragraph_merge,
     )
 
 
