@@ -134,6 +134,11 @@ depth — any prompt or context that contains:
   `whole slide`, `slide background`, `page background`, `screenshot`,
   `render the slide`, `generate the slide`, and the rest of the existing
   full-slide deny list in `scripts/done_image_adapter.py`);
+- public upload / share / hosting wording (`upload to public`,
+  `public upload`, `share publicly`, `public hosting`, `publish to web`,
+  `public url`, `public link`, `public cdn`, `host on a public`,
+  `host publicly`, and the rest of the existing public-distribution
+  deny list in `scripts/done_image_adapter.py`);
 - any reference to an external customer name, internal product
   codename, partner name, deal name, account name, or unreleased
   feature codename;

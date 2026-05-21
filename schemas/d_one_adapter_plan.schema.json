@@ -44,7 +44,7 @@
           "prompt": {
             "type": "string",
             "minLength": 1,
-            "description": "Safety-scrubbed prompt. The adapter has already run the defense-in-depth deny list (URIs / file paths / raw-source markers / 40-char source shingles / credential and PII shapes / full-slide-page-screenshot wording) against this string before the plan was written; --validate-plan re-runs the same scan."
+            "description": "Safety-scrubbed prompt. The adapter has already run the defense-in-depth deny list (URIs / file paths / raw-source markers / 40-char source shingles / credential and PII shapes / full-slide-page-screenshot wording / public-distribution wording — 'upload to public' / 'public upload' / 'share publicly' / 'public hosting' / 'publish to web' / 'public url' / 'public link' / 'public cdn' / 'host publicly' and the documented variants) against this string before the plan was written; --validate-plan re-runs the same scan."
           },
           "manifest_local_path": {
             "type": "string",

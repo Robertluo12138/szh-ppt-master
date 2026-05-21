@@ -172,7 +172,10 @@ user request and a paired security review.
   post-assembly re-scan (the adapter's FULL deny list — URI
   schemes, file paths, raw-source markers, 40-char source
   shingles, credential / PII shapes, full-slide / page-generation
-  / screenshot wording — re-running on every assembled prompt
+  / screenshot wording, public-distribution wording — `upload to
+  public` / `public upload` / `share publicly` / `public hosting`
+  / `publish to web` / `public url` / `public link` / `public cdn`
+  / `host publicly` — re-running on every assembled prompt
   before the plan is written) is the adapter runtime's
   responsibility and remains TODO; the schema-layer deny narrows
   but does not replace it.

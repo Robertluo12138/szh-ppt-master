@@ -114,7 +114,11 @@ PASS-eligible only if the vocabulary in force satisfies all of:
 - **V4 — Re-scanned post-assembly.** Every assembled prompt re-passes
   the full adapter deny list (URIs, file paths, raw-source markers,
   40-char source shingles, credential shapes, PII shapes, full-slide /
-  page-generation / screenshot wording) AFTER assembly, BEFORE the plan
+  page-generation / screenshot wording, public-distribution wording —
+  `upload to public` / `public upload` / `share publicly` /
+  `public hosting` / `publish to web` / `public url` / `public link` /
+  `public cdn` / `host publicly` and the documented variants) AFTER
+  assembly, BEFORE the plan
   is written. The live runner re-runs the same scan one more time
   before the network call (per `d-one-live-integration-design.md` §5).
 - **V5 — Vocabulary changes are paired.** Adding, removing, or

@@ -24,7 +24,12 @@ have to satisfy before it ships. The adapter today:
     contact-id shapes (emails, phone numbers, SSN-like strings, UUIDs,
     explicit ``customer_id`` / ``account_id`` literals), AND full-slide
     / page-generation / screenshot wording (a D-One asset is a local
-    supporting illustration, never the slide itself);
+    supporting illustration, never the slide itself), AND public-
+    distribution wording (``upload to public`` / ``public upload`` /
+    ``share publicly`` / ``public hosting`` / ``publish to web`` /
+    ``public url`` / ``public link`` / ``public cdn`` and the
+    obvious variants — a D-One asset is local-only and may not be
+    uploaded, published, shared, or hosted publicly);
   - writes a deterministic dry-run plan to
     ``<workspace>/d_one_adapter_plan.json`` (or ``--plan-out``)
     recording the validated requests for downstream hand-off.
@@ -96,7 +101,11 @@ when any gate fires):
     * every request ``id`` must appear in ``image_manifest.images[*]``
       with ``source == "d_one_local"``;
     * every request ``prompt`` must pass the full forbidden-pattern
-      scan (see module-level constants for the exact patterns);
+      scan (see module-level constants for the exact patterns —
+      URIs, file paths, raw-source markers, 40-char input/source.md
+      shingles, credentials, customer/account/contact ids,
+      full-slide / page / screenshot wording, AND public-distribution
+      wording);
     * every request ``intended_use`` (if present) must not contain
       full-slide / screenshot / page-generation wording.
 
@@ -267,6 +276,36 @@ _PROMPT_PERSONAL_LITERALS: tuple[str, ...] = (
     "cust_id",
     "user_id",
     "user id:",
+)
+
+# Public upload / share / hosting wording. A D-One asset is local-only;
+# instructing the generator to upload, publish, host, or share the
+# result violates the no-public-network constraint at the prompt layer.
+# Same scope rationale as the full-slide deny list below — the patterns
+# here describe an action the local pipeline is forbidden to take, not
+# a description of the image itself. Kept as plain substrings so the
+# scan stays cheap; a reviewer can still negate-describe the boundary
+# in adjacent prose (e.g. "no public upload") because the negation does
+# NOT remove the substring. The longer-form structured-evidence
+# validator at scripts/validate_d_one_live_run_evidence.py applies a
+# richer regex with negation-exemption logic; this stub catches the
+# bare wording before any plan-file write.
+_PROMPT_PUBLIC_DISTRIBUTION_LITERALS: tuple[str, ...] = (
+    "upload to public",
+    "upload to a public",
+    "upload to the public",
+    "public upload",
+    "share publicly",
+    "share to public",
+    "public hosting",
+    "host on a public",
+    "host publicly",
+    "publish to web",
+    "publish to the web",
+    "publish publicly",
+    "public url",
+    "public link",
+    "public cdn",
 )
 
 # Full-slide / page-generation / screenshot wording. A D-One asset is a
@@ -452,6 +491,15 @@ def _scan_prompt_safety(
                 f"contains the full-slide/page/screenshot wording "
                 f"{literal!r}; D-One assets are local supporting "
                 f"illustrations, never whole slides"
+            )
+
+    # Public upload / share / hosting wording.
+    for literal in _PROMPT_PUBLIC_DISTRIBUTION_LITERALS:
+        if literal in lower:
+            violations.append(
+                f"contains the public-distribution wording {literal!r}; "
+                f"D-One assets are local-only and may not be uploaded, "
+                f"published, shared, or hosted publicly"
             )
 
     return violations
@@ -1002,8 +1050,12 @@ def validate_plan_file(
          full ``_scan_prompt_safety`` deny list (URIs, file paths,
          raw-source markers, 40-char ``input/source.md`` shingles,
          credential / PII shapes, full-slide / page / screenshot
-         wording); every ``intended_use`` (when present) passes the
-         full-slide-wording subset.
+         wording, AND public-distribution wording — ``upload to
+         public`` / ``public upload`` / ``share publicly`` /
+         ``public hosting`` / ``publish to web`` / ``public url`` /
+         ``public link`` / ``public cdn`` / ``host publicly`` and
+         the documented variants); every ``intended_use`` (when
+         present) passes the full-slide-wording subset.
 
     Post-condition: the manifest bytes and the plan bytes are
     byte-identical pre/post the call. A successful run returns
@@ -1678,6 +1730,50 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
             )
             results.append(_expect(
                 f"full-slide/page/screenshot wording {phrase!r} refused",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- 11b. public-distribution wording (upload / publish / host /
+    # share / public URL) refused. Each phrase here lives in
+    # _PROMPT_PUBLIC_DISTRIBUTION_LITERALS and is the bare-substring
+    # form the stub scan refuses; the richer negation-aware regex lives
+    # in scripts/validate_d_one_live_run_evidence.py for trace-level
+    # evidence. We trip the stub form here. ----
+    for phrase in (
+        "upload to public",
+        "public upload",
+        "share publicly",
+        "public hosting",
+        "publish to web",
+        "public url",
+        "public link",
+        "public cdn",
+        "host on a public",
+        "host publicly",
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_public_distribution"
+            _seed_workspace(ws, images=[
+                {"id": "x", "local_path": "a/x.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "x",
+                        "prompt": f"abstract pattern, then {phrase} after build",
+                    },
+                ],
+            })
+            rc, msg = done_image_adapter(workspace=ws, spec=spec)
+            ok = (
+                rc == 1
+                and "public-distribution wording" in msg
+                and not (ws / DEFAULT_PLAN_FILENAME).exists()
+            )
+            results.append(_expect(
+                f"public-distribution wording {phrase!r} refused",
                 ok, f"rc={rc}, msg={msg!r}",
             ))
 
@@ -2554,6 +2650,31 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
             ok, f"rc={rc}, msg={msg!r}",
         ))
 
+    # ---- 48b. cross-check: prompt containing public-distribution
+    # wording refused. Mirrors scenario 47 (credentials) and 48
+    # (full-slide) — the validate-plan path re-runs _scan_prompt_safety,
+    # so the new public-distribution deny list must trip the cross-check
+    # gate too. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws, plan_path = _seed_validate_workspace(td)
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["prompt"] = (
+            "abstract pattern, then upload to public hosting after build"
+        )
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and "safety scan" in msg
+            and "public-distribution wording" in msg
+        )
+        results.append(_expect(
+            "validate-plan: public-distribution wording in prompt "
+            "refused by cross-check safety scan",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
     # ---- 49. cross-check: intended_use containing forbidden wording
     # refused. ----
     with tempfile.TemporaryDirectory() as raw_td:
@@ -2679,8 +2800,12 @@ def main(argv: list[str]) -> int:
             "validates that every id matches a manifest entry with "
             "source='d_one_local', scans every prompt for URIs, file "
             "paths, raw-source markers, raw-source shingles, "
-            "credentials, customer/account/contact ids, and full-slide/"
-            "page/screenshot wording, and writes a deterministic "
+            "credentials, customer/account/contact ids, full-slide/"
+            "page/screenshot wording, AND public-distribution wording "
+            "('upload to public', 'public upload', 'share publicly', "
+            "'public hosting', 'publish to web', 'public url', "
+            "'public link', 'public cdn', 'host publicly' and the "
+            "documented variants), and writes a deterministic "
             "dry-run plan file. Does NOT call D-One / Qoder / any "
             "public network / any image-generation model / any "
             "external service. Does NOT generate any image bytes. "
@@ -2724,10 +2849,10 @@ def main(argv: list[str]) -> int:
              "manifest_local_path / manifest_source agree with the "
              "manifest entry byte-for-byte; every prompt re-passes the "
              "full URL / file-path / raw-source marker / 40-char source "
-             "shingle / credential / PII / full-slide wording deny list, "
-             "and every intended_use re-passes the full-slide wording "
-             "subset of that list — the same scope the write path "
-             "applies).",
+             "shingle / credential / PII / full-slide wording / "
+             "public-distribution wording deny list, and every "
+             "intended_use re-passes the full-slide wording subset of "
+             "that list — the same scope the write path applies).",
     )
     parser.add_argument(
         "--plan", type=Path, default=None,
@@ -2740,8 +2865,9 @@ def main(argv: list[str]) -> int:
         help="Run in-script tempfixture scenarios covering the happy "
              "path, determinism, unknown id, wrong manifest source, "
              "raw-source markers and shingles, URIs, file paths, "
-             "credential/PII shapes, full-slide wording, intended_use "
-             "wording, output-path-outside-workspace, symlinks at "
+             "credential/PII shapes, full-slide wording, public-"
+             "distribution wording, intended_use wording, output-path-"
+             "outside-workspace, symlinks at "
              "workspace/spec/plan/source, pre-existing plan, malformed "
              "/schema-invalid manifest, malformed spec, duplicate "
              "request ids, empty prompts, no-image-bytes guarantee, "
