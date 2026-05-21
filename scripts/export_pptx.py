@@ -5306,7 +5306,7 @@ def _run_self_tests() -> list[CheckResult]:
         # The whole block exercises the `--text-paragraph-merge`
         # opt-in. Every scenario builds its own workspace in a fresh
         # subdirectory of `td` so we never mutate the happy-path
-        # fixture. The point of the four scenarios:
+        # fixture. The point of the six scenarios:
         #
         #   (A) default vs. opt-in on a workspace whose text content
         #       carries no `\n`: byte-for-byte identical output. This
@@ -5326,6 +5326,17 @@ def _run_self_tests() -> list[CheckResult]:
         #       fallback, no text loss, contract validation passes".
         #   (D) opt-in with empty-only content (just `\n`): the run
         #       fails closed — no `.pptx` is written.
+        #   (E) combined opt-in: --trace-out AND --text-paragraph-merge
+        #       used together on the same `\n`-bearing fixture produce
+        #       a contract-valid PPTX whose slide XML carries the
+        #       paragraph-merge split AND a schema-valid trace whose
+        #       records mirror the exported render_model primitives;
+        #       no `.tmp` residue, no unexpected sidecar file.
+        #   (E-control) matched default with NEITHER opt-in on the same
+        #       fixture: no trace.json sidecar, single-paragraph
+        #       default text behavior. Together with (E) this proves
+        #       the two opt-ins are the ONLY drivers of the visible
+        #       behavior changes.
 
         def _run_capture_with_merge(
             workspace: Path, output: Path, *, merge: bool,
@@ -5569,6 +5580,205 @@ def _run_self_tests() -> list[CheckResult]:
             (f"rc={rc_d}, file_exists={all_blank_out.exists()}; "
              f"{err_d.strip()}"
              if not ok_d else ""),
+        ))
+
+        # (E) COMBINED opt-in: --trace-out AND --text-paragraph-merge
+        # used together on the same `\n`-bearing fixture must produce
+        # both signals safely in one run:
+        #   - the PPTX exists and passes validate_pptx_contract;
+        #   - the trace sidecar exists and passes
+        #     validate_conversion_trace.validate_trace (T2..T14);
+        #   - the slide XML carries the paragraph-merge split (4 <a:p>
+        #     paragraphs, 3 <a:r> runs, no literal `\n` inside any
+        #     <a:t> body, blank line carried by <a:endParaRPr>) —
+        #     proving the merge branch actually fired;
+        #   - the trace's records still match the exported slides /
+        #     primitives — one record per render_model primitive, the
+        #     (slide_index, slide_layout, primitive_id) triple set
+        #     equals the render_model's, summary.editable_count equals
+        #     the on-records tally, deck.layouts_attempted == ["cover"],
+        #     deck.slide_count == 1 — proving the trace contract is
+        #     unchanged by the paragraph-merge opt-in;
+        #   - no `.tmp` residue and no unexpected sidecar file remain
+        #     in the output dir (only `deck.pptx`, `trace.json`, and
+        #     the workspace dir).
+        combined_dir = td / "combined_optin"
+        combined_dir.mkdir()
+        combined_ws = combined_dir / "ws"
+        combined_content = "Alpha\nBeta\n\nGamma"
+        _write_text_only_fixture(combined_ws, combined_content)
+        combined_out = combined_dir / "deck.pptx"
+        combined_trace = combined_dir / "trace.json"
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            rc_e = export_workspace(
+                combined_ws, combined_out,
+                trace_out=combined_trace,
+                text_paragraph_merge=True,
+            )
+        err_e = err_buf.getvalue()
+        ok_e = False
+        detail_e = ""
+        if rc_e == 0 and combined_out.is_file() and combined_trace.is_file():
+            combined_siblings = sorted(
+                p.name for p in combined_dir.iterdir()
+            )
+            no_extra_siblings = combined_siblings == [
+                "deck.pptx", "trace.json", "ws",
+            ]
+            no_tmp_residue = not (
+                (combined_dir / "trace.json.tmp").exists()
+                or (combined_dir / "deck.pptx.tmp").exists()
+            )
+
+            slide_e = _read_slide1_xml(combined_out)
+            n_p_e = slide_e.count("<a:p>")
+            n_r_e = slide_e.count("<a:r>")
+            import re as _re_e
+            t_bodies = _re_e.findall(r"<a:t>([^<]*)</a:t>", slide_e)
+            no_newline_in_t = all("\n" not in b for b in t_bodies)
+            has_endparapr = "<a:endParaRPr" in slide_e
+            has_sp = "<p:sp>" in slide_e
+            has_pic = "<p:pic>" in slide_e
+
+            c_res_e = check_container(combined_out)
+            g_res_e = check_generated_pptx(combined_out)
+            contract_ok_e = (
+                all(r.ok for r in c_res_e) and all(r.ok for r in g_res_e)
+            )
+
+            from validate_conversion_trace import validate_trace as _vt_e
+            trace_validate_errors = _vt_e(combined_trace)
+            trace_valid_e = trace_validate_errors == []
+
+            trace_data = json.loads(combined_trace.read_text())
+            records = trace_data.get("records", [])
+            rec_keys = sorted(
+                (r.get("slide_index"), r.get("slide_layout"),
+                 r.get("primitive_id"))
+                for r in records
+            )
+            # The text-only fixture declares exactly one `title`
+            # primitive on slide 1 (cover); the trace must mirror it
+            # 1:1.
+            trace_records_match = rec_keys == [(1, "cover", "title")]
+            trace_summary_ok = (
+                trace_data.get("summary", {}).get("editable_count")
+                == sum(1 for r in records if r.get("status") == "editable")
+            )
+            trace_layouts_ok = (
+                sorted(trace_data.get("deck", {}).get(
+                    "layouts_attempted", []))
+                == ["cover"]
+            )
+            trace_slide_count_ok = (
+                trace_data.get("deck", {}).get("slide_count") == 1
+            )
+
+            ok_e = (
+                no_extra_siblings
+                and no_tmp_residue
+                and n_p_e == 4
+                and n_r_e == 3
+                and no_newline_in_t
+                and has_endparapr
+                and has_sp
+                and not has_pic
+                and contract_ok_e
+                and trace_valid_e
+                and trace_records_match
+                and trace_summary_ok
+                and trace_layouts_ok
+                and trace_slide_count_ok
+            )
+            detail_e = (
+                f"siblings={combined_siblings}, "
+                f"no_tmp={no_tmp_residue}, n_p={n_p_e}, n_r={n_r_e}, "
+                f"no_newline_in_t={no_newline_in_t}, "
+                f"has_endparapr={has_endparapr}, has_sp={has_sp}, "
+                f"has_pic={has_pic}, contract_ok={contract_ok_e}, "
+                f"trace_valid={trace_valid_e} "
+                f"({trace_validate_errors!r}), "
+                f"records_match={trace_records_match} ({rec_keys!r}), "
+                f"summary_ok={trace_summary_ok}, "
+                f"layouts_ok={trace_layouts_ok}, "
+                f"slide_count_ok={trace_slide_count_ok}"
+            )
+        else:
+            detail_e = (
+                f"rc={rc_e}, pptx_exists={combined_out.is_file()}, "
+                f"trace_exists={combined_trace.is_file()}; "
+                f"{err_e.strip()}"
+            )
+        results.append(CheckResult(
+            "selftest: combined opt-in — --trace-out + "
+            "--text-paragraph-merge on the same `\\n`-bearing fixture "
+            "produce a contract-valid PPTX whose slide XML carries "
+            "the paragraph-merge split AND a schema-valid trace whose "
+            "records mirror the exported render_model primitives "
+            "(no `.tmp` residue, no unexpected sidecar file)",
+            ok_e,
+            detail_e if not ok_e else "",
+        ))
+
+        # (E-control) Matched DEFAULT run on the SAME `\n`-bearing
+        # fixture with NEITHER opt-in set: no trace.json sibling is
+        # written and the slide XML reverts to the single
+        # <a:p>/<a:r>/<a:t> carrying the literal newline-bearing
+        # content. Pairing this with (E) proves the two opt-ins are
+        # the ONLY drivers of the visible behavior changes — omitting
+        # them is byte-stable and creates no sidecar.
+        control_dir = td / "combined_optin_control"
+        control_dir.mkdir()
+        control_ws = control_dir / "ws"
+        _write_text_only_fixture(control_ws, combined_content)
+        control_out = control_dir / "deck.pptx"
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            rc_ec = export_workspace(control_ws, control_out)
+        err_ec = err_buf.getvalue()
+        ok_ec = False
+        detail_ec = ""
+        if rc_ec == 0 and control_out.is_file():
+            control_siblings = sorted(
+                p.name for p in control_dir.iterdir()
+            )
+            no_trace = not (control_dir / "trace.json").exists()
+            no_tmp = not (
+                (control_dir / "trace.json.tmp").exists()
+                or (control_dir / "deck.pptx.tmp").exists()
+            )
+            slide_ctrl = _read_slide1_xml(control_out)
+            n_p_ctrl = slide_ctrl.count("<a:p>")
+            n_r_ctrl = slide_ctrl.count("<a:r>")
+            n_t_ctrl = slide_ctrl.count("<a:t>")
+            literal_kept_ctrl = combined_content in slide_ctrl
+            ok_ec = (
+                no_trace
+                and no_tmp
+                and n_p_ctrl == 1
+                and n_r_ctrl == 1
+                and n_t_ctrl == 1
+                and literal_kept_ctrl
+                and control_siblings == ["deck.pptx", "ws"]
+            )
+            detail_ec = (
+                f"siblings={control_siblings}, no_trace={no_trace}, "
+                f"no_tmp={no_tmp}, n_p={n_p_ctrl}, n_r={n_r_ctrl}, "
+                f"n_t={n_t_ctrl}, literal_kept={literal_kept_ctrl}"
+            )
+        else:
+            detail_ec = (
+                f"rc={rc_ec}, pptx_exists={control_out.is_file()}; "
+                f"{err_ec.strip()}"
+            )
+        results.append(CheckResult(
+            "selftest: combined opt-in CONTROL — omitting BOTH "
+            "--trace-out and --text-paragraph-merge on the same "
+            "`\\n`-bearing fixture writes NO trace sidecar AND keeps "
+            "the single-paragraph default text behavior",
+            ok_ec,
+            detail_ec if not ok_ec else "",
         ))
 
     return results

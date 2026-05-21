@@ -104,7 +104,7 @@ The opt-in is exercised entirely by the in-process self-test runner:
 TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 python3 scripts/export_pptx.py --self-test
 ```
 
-Four scenarios cover the contract:
+Six scenarios cover the contract:
 
 1. **Byte-stability**: a single-line text fixture exports identical
    bytes whether the flag is on or off.
@@ -118,6 +118,22 @@ Four scenarios cover the contract:
    container + minimal-evidence checks still pass.
 4. **Fail-closed**: a fixture whose `text.content` is `"\n\n"`
    exported WITH the flag returns non-zero and writes no `.pptx`.
+5. **Combined opt-in with `--trace-out`**: the same `\n`-bearing
+   fixture exported WITH BOTH `--text-paragraph-merge` AND
+   `--trace-out <path>` produces a contract-valid PPTX whose slide
+   XML carries the paragraph-merge split (4 `<a:p>`, 3 `<a:r>`, no
+   literal `\n` inside any `<a:t>`, blank line via `<a:endParaRPr>`)
+   AND a schema-valid conversion-trace sidecar that
+   `validate_conversion_trace.validate_trace` accepts; the trace's
+   records still cover the same `(slide_index, slide_layout,
+   primitive_id)` triple set as the exported render_model, the
+   summary tally matches the records, and the output directory
+   contains no `.tmp` residue and no unexpected sidecar file.
+6. **Combined opt-in control**: the same `\n`-bearing fixture
+   exported with NEITHER opt-in writes no `trace.json` sidecar and
+   keeps the single-paragraph default text behaviour, proving the
+   two opt-ins are the only drivers of the visible behaviour
+   change.
 
 ## 7. Out of scope
 
