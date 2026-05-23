@@ -35,6 +35,29 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     documented gate (missing image, wrong magic bytes, image_manifest
     id mismatch, unsafe local_path schemes, symlinked targets, etc.)
     must FIRE on the documented perturbation of the same baseline.
+  - ``scripts/image_taxonomy_acceptance_smoke.py`` — proves the
+    seven-dimensional clean-room D-One prompt-intent taxonomy
+    (``rendering_style`` / ``palette_family`` / ``image_role`` /
+    ``layout_pattern`` / ``modifier`` / ``text_policy`` /
+    ``subject_domain``) survives the same mock chain end-to-end:
+    ``done_image_adapter`` + ``run_d_one_generation`` +
+    ``materialize_image_assets`` + ``run_explicit_pipeline``, plus
+    in-process N1..N7 negative probes covering missing vocab,
+    out-of-vocabulary values, stale plan drift, schema_version lock,
+    and the descriptor-vocabulary forbidden-token / forbidden-phrase
+    schema patterns. MOCK / STUB ONLY — no real D-One.
+  - ``scripts/run_mock_image_pipeline.py`` — end-to-end runner that
+    seeds a staging workspace and drives the mockable D-One stub
+    chain through ``run_explicit_pipeline`` into a validated
+    editable ``.pptx``, with happy-path + 12 documented fail-closed
+    probes (missing ``--allow-synthetic-bytes``, taxonomy without
+    vocab, invalid text_policy / subject_domain, plan schema_version
+    downgrade, request-id mismatch, unsafe ``local_path`` URI scheme,
+    symlinked ``--output`` / ``--workspace`` / ``--report-dir``,
+    in-script ``sys.dont_write_bytecode=True`` flip closes the
+    bytecode hole without ``PYTHONDONTWRITEBYTECODE=1`` in env,
+    failure cleanup leaves no residue). MOCK / STUB ONLY — no real
+    D-One.
   - ``scripts/render_model_roundtrip_smoke.py`` — synthetic
     render_model -> editable .pptx round-trip exercising every
     primitive kind the exporter supports today (text, line, shape,
@@ -98,6 +121,8 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "image_asset_acceptance_smoke.py",
     SCRIPTS_DIR / "image_asset_trial_evidence.py",
     SCRIPTS_DIR / "image_asset_negative_probes_smoke.py",
+    SCRIPTS_DIR / "image_taxonomy_acceptance_smoke.py",
+    SCRIPTS_DIR / "run_mock_image_pipeline.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
     SCRIPTS_DIR / "trace_acceptance_smoke.py",
 )
@@ -325,7 +350,8 @@ def main(argv: list[str]) -> int:
             "smokes (source_image_asset_acceptance_smoke + "
             "image_asset_acceptance_smoke + image_asset_trial_evidence "
             "+ image_asset_negative_probes_smoke + "
-            "render_model_roundtrip_smoke + trace_acceptance_smoke). "
+            "image_taxonomy_acceptance_smoke + run_mock_image_pipeline "
+            "+ render_model_roundtrip_smoke + trace_acceptance_smoke). "
             "Runs each delegated smoke as a subprocess from REPO_ROOT; "
             "writes no .pptx / render_model / report / SVG / JSON "
             "artifacts of its own. Stdlib-only. NETWORK-FREE. "
