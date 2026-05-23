@@ -84,7 +84,8 @@ the assets-dir returns to its pre-call state):
   of the seven taxonomy fields: ``rendering_style`` / ``palette_family``
   / ``image_role`` / ``layout_pattern`` / ``modifier`` / ``text_policy``
   / ``subject_domain`` OR the optional ``custom_descriptor`` escape-
-  hatch field)
+  hatch field OR the optional ``placement_role`` field — closed
+  enumeration ``hero_page`` / ``local_region``)
     * when supplied, must be an existing regular non-symlink file whose
       bytes parse as JSON, decode to an object, and validate against
       ``schemas/d_one_descriptor_vocabulary.schema.json``; the runner
@@ -93,12 +94,18 @@ the assets-dir returns to its pre-call state):
       writer ran is re-run at the runner boundary AND the same
       ``custom_descriptors[].value`` allow-list re-check + the same
       separator-normalized safety re-scan against every
-      ``custom_descriptor``-bearing plan request is also re-run;
+      ``custom_descriptor``-bearing plan request is also re-run AND
+      the same ``image_taxonomy.placement_role.allowed_values`` check
+      against every ``placement_role``-bearing plan request is also
+      re-run (the overlay-reservation safety scan is gated by the
+      same placement_role peek the writer uses);
     * when omitted, a plan that carries taxonomy fields OR the
-      ``custom_descriptor`` escape-hatch field is refused by the
-      validator (the runner cannot certify a taxonomy / custom-
-      descriptor plan whose values it cannot re-check). A plan that
-      carries neither accepts the omitted flag without complaint.
+      ``custom_descriptor`` escape-hatch field OR the
+      ``placement_role`` field is refused by the validator (the
+      runner cannot certify a taxonomy / custom-descriptor /
+      placement_role plan whose values it cannot re-check). A plan
+      that carries none of these accepts the omitted flag without
+      complaint.
 
   --assets-dir
     * must be an existing directory; URI-shaped values refused; the
@@ -1954,12 +1961,16 @@ def main(argv: list[str]) -> int:
             "seven taxonomy fields (rendering_style / palette_family / "
             "image_role / layout_pattern / modifier / text_policy / "
             "subject_domain) OR the optional custom_descriptor escape-"
-            "hatch field; the runner refuses "
-            "to certify a taxonomy- or custom-descriptor-bearing plan "
-            "whose values cannot be re-checked against "
-            "image_taxonomy.<dim>.allowed_values or against the vocab's "
-            "custom_descriptors[].value allow-list, and the vocab bytes "
-            "are byte-identical pre/post a successful run. Real D-One / MCP / model-API integration is "
+            "hatch field OR the optional placement_role field (closed "
+            "enumeration hero_page / local_region); the runner refuses "
+            "to certify a taxonomy- / custom-descriptor- / placement-"
+            "role-bearing plan whose values cannot be re-checked "
+            "against image_taxonomy.<dim>.allowed_values, against the "
+            "vocab's custom_descriptors[].value allow-list, or against "
+            "image_taxonomy.placement_role.allowed_values (the "
+            "placement_role peek also gates the overlay-reservation "
+            "safety re-scan), and the vocab bytes are byte-identical "
+            "pre/post a successful run. Real D-One / MCP / model-API integration is "
             "intentionally TODO; this runner does NOT call D-One / "
             "Qoder / any public network / any image-generation model / "
             "any external service. Does NOT mutate image_manifest.json "
@@ -2011,10 +2022,20 @@ def main(argv: list[str]) -> int:
              "which requires it iff the plan carries any of the seven "
              "taxonomy fields (rendering_style / palette_family / "
              "image_role / layout_pattern / modifier / text_policy / "
-             "subject_domain) and refuses any taxonomy value not in "
-             "image_taxonomy.<dim>.allowed_values. Refused if "
-             "URI-shaped, symlinked, missing, or schema-invalid; "
-             "byte-identical pre/post a successful run.",
+             "subject_domain) OR the optional custom_descriptor "
+             "escape-hatch field OR the optional placement_role field "
+             "(closed enumeration hero_page / local_region). The "
+             "validator refuses any taxonomy value not in "
+             "image_taxonomy.<dim>.allowed_values, any "
+             "custom_descriptor value not in the vocab's "
+             "custom_descriptors[].value allow-list, and any "
+             "placement_role value not in the vocab's "
+             "image_taxonomy.placement_role.allowed_values; the "
+             "placement_role peek also gates the overlay-reservation "
+             "safety re-scan against every plan prompt + "
+             "intended_use + custom_descriptor. Refused if URI-shaped, "
+             "symlinked, missing, or schema-invalid; byte-identical "
+             "pre/post a successful run.",
     )
     parser.add_argument(
         "--self-test", action="store_true",

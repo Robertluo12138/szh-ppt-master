@@ -104,6 +104,12 @@
         "metric_emblem",
         "concept_diagram"
       ]
+    },
+    "placement_role": {
+      "allowed_values": [
+        "hero_page",
+        "local_region"
+      ]
     }
   },
   "custom_descriptors": [

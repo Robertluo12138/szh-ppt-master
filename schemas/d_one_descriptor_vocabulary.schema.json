@@ -280,9 +280,34 @@
             }
           },
           "description": "Dimension 7 — subject domain. Narrows the rendered subject at the most abstract level. Each value is a clean-room shape-language category; no industry / customer / product / brand tokens are admissible (the forbidden-token deny pattern refuses them at the schema layer in any case)."
+        },
+        "placement_role": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_values"],
+          "properties": {
+            "allowed_values": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "enum": [
+                  "hero_page",
+                  "local_region"
+                ],
+                "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+              },
+              "description": "Closed enumeration of permitted placement roles. The two values name the only image-on-slide placements the local pipeline supports: 'hero_page' (the image is a hero / cover-style asset that may reserve canvas space for the SLIDE's native title / text overlay — text-overlay reservation is a hero responsibility) and 'local_region' (the image is a region-block asset — schematic, diagram, accent, texture, scene — that DOES NOT host any slide-text overlay). Aligned only with upstream ppt-master image-generation's hero-page vs. local-region split; no upstream code / prompts / examples / assets / wording copied. The runtime gate fires on overlay-reservation cues (reserve calm/empty/right/lower-third/center space, SVG/PPT/native/editable text overlay, or title overlay) and refuses them unless the request's placement_role value is 'hero_page'."
+            }
+          },
+          "description": "Dimension 8 — placement role. OPTIONAL block. Declares which placement-role values a spec / plan request may carry. When the block is absent, the adapter has no allow-list for the field and refuses any request whose `placement_role` is set (the same 'no allow-list, no permission' contract `custom_descriptors[]` uses). When present, the allow-list MUST be `[hero_page, local_region]` (uniqueItems on a fixed-length 2-element enum permits only a permutation of the canonical set). Adding this OPTIONAL block does NOT bump the descriptor-vocabulary schema_version: existing vocab files that omit the block continue to validate, and the adapter refuses any placement_role-bearing request against such a vocab — the gate is additive, not a breaking change."
         }
       },
-      "description": "Image-request taxonomy. A synthetic image request is composed from seven clean-room dimensions: rendering_style, palette_family, image_role, layout_pattern, modifier, text_policy, subject_domain. Each dimension declares a fixed-length 'allowed_values' array whose entries are simultaneously enum-locked AND pattern-locked at the schema layer — the same positive whitelist + forbidden-token deny clause that descriptors[*].value uses. Canonical-set-membership invariant: every 'allowed_values' array carries minItems == maxItems == N AND uniqueItems == true AND items.enum of length N, where N is the canonical count (5 for rendering_style / palette_family / image_role / layout_pattern, 4 for modifier and subject_domain, 3 for text_policy). With N unique items drawn from an N-element enum, the only valid array is a permutation of the canonical set — a tampered file that ships `[\"flat_vector\"] * 5` would fail uniqueItems, and a file that omits a value would fail minItems; neither false-greens. Defense in depth: the runtime image-request gate IS wired today in mock mode — scripts/done_image_adapter.py cross-checks every dimension value supplied on a spec/plan request against the matching 'allowed_values' set (and refuses any value not present), and the schema's items.pattern + items.enum locks on every 'allowed_values' array are independently re-applied here as a post-write defense-in-depth gate. The live D-One image-request gate (real D-One / MCP / model-API) is NOT wired today and remains TODO. This taxonomy is intentionally minimal — seven dimensions × ≤5 values — and is not a mirror of any external image-style catalog. Adding, removing, or modifying a dimension or value is a paired schema / template / validator-probe change."
+      "description": "Image-request taxonomy. A synthetic image request is composed from seven required clean-room dimensions: rendering_style, palette_family, image_role, layout_pattern, modifier, text_policy, subject_domain — plus one OPTIONAL eighth dimension placement_role (closed enumeration `hero_page` / `local_region`) that gates the overlay-reservation safety scan. Each dimension declares a fixed-length 'allowed_values' array whose entries are simultaneously enum-locked AND pattern-locked at the schema layer — the same positive whitelist + forbidden-token deny clause that descriptors[*].value uses. Canonical-set-membership invariant: every 'allowed_values' array carries minItems == maxItems == N AND uniqueItems == true AND items.enum of length N, where N is the canonical count (5 for rendering_style / palette_family / image_role / layout_pattern, 4 for modifier and subject_domain, 3 for text_policy, 2 for placement_role). With N unique items drawn from an N-element enum, the only valid array is a permutation of the canonical set — a tampered file that ships `[\"flat_vector\"] * 5` would fail uniqueItems, and a file that omits a value would fail minItems; neither false-greens. Defense in depth: the runtime image-request gate IS wired today in mock mode — scripts/done_image_adapter.py cross-checks every dimension value supplied on a spec/plan request against the matching 'allowed_values' set (and refuses any value not present), and the schema's items.pattern + items.enum locks on every 'allowed_values' array are independently re-applied here as a post-write defense-in-depth gate. The live D-One image-request gate (real D-One / MCP / model-API) is NOT wired today and remains TODO. The seven required dimensions are intentionally minimal — ≤5 values each — and are not a mirror of any external image-style catalog. The optional placement_role dimension is additive: existing vocab files that omit the block continue to validate; the adapter refuses any placement_role-bearing request against a vocab whose placement_role block is absent. Adding, removing, or modifying a dimension or value is a paired schema / template / validator-probe change."
     },
     "custom_descriptors": {
       "type": "array",

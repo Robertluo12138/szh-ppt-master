@@ -39,21 +39,25 @@ Taxonomy contract preservation: when the ``--d-one-spec`` carries any
 of the seven taxonomy fields (``rendering_style`` / ``palette_family``
 / ``image_role`` / ``layout_pattern`` / ``modifier`` / ``text_policy``
 / ``subject_domain``) OR the optional ``custom_descriptor`` escape-hatch
-field, the runner requires ``--descriptor-vocabulary``, forwards it to
-BOTH ``done_image_adapter`` and ``run_d_one_generation``, and — before
-invoking ``run_explicit_pipeline.py`` — re-parses the produced
+field OR the optional ``placement_role`` field (closed enumeration
+``hero_page`` / ``local_region``), the runner requires
+``--descriptor-vocabulary``, forwards it to BOTH ``done_image_adapter``
+and ``run_d_one_generation``, and — before invoking
+``run_explicit_pipeline.py`` — re-parses the produced
 ``<staging>/d_one_adapter_plan.json`` and asserts:
 
-  * ``schema_version == 3`` (the value the plan schema's enum locks);
+  * ``schema_version == 4`` (the value the plan schema's enum locks);
   * every taxonomy field / value supplied on the spec request appears
     byte-identical on the corresponding plan request (no value drift,
     no silent re-ordering, no field dropped);
   * the ``custom_descriptor`` value, when supplied on the spec request,
+    appears byte-identical on the corresponding plan request;
+  * the ``placement_role`` value, when supplied on the spec request,
     appears byte-identical on the corresponding plan request.
 
-A taxonomy- OR custom_descriptor-bearing spec without
-``--descriptor-vocabulary`` is refused at the runner boundary BEFORE
-any subprocess fires.
+A taxonomy- OR custom_descriptor- OR placement_role-bearing spec
+without ``--descriptor-vocabulary`` is refused at the runner boundary
+BEFORE any subprocess fires.
 
 Output behavior:
 
@@ -159,25 +163,35 @@ TAXONOMY_FIELDS: tuple[str, ...] = (
 # custom_descriptors[] allow-list.
 CUSTOM_DESCRIPTOR_FIELD = "custom_descriptor"
 
-# Vocab-gated request fields: TAXONOMY_FIELDS + CUSTOM_DESCRIPTOR_FIELD.
-# Used by the runner-boundary check that refuses a vocab-bearing spec
-# without --descriptor-vocabulary BEFORE any subprocess fires.
+# Optional placement_role field. Same vocab-required semantic as the
+# taxonomy fields — present => --descriptor-vocabulary is required AND
+# the adapter refuses any value not in the vocab's
+# image_taxonomy.placement_role.allowed_values list (closed two-token
+# enumeration ``hero_page`` / ``local_region``).
+PLACEMENT_ROLE_FIELD = "placement_role"
+
+# Vocab-gated request fields: TAXONOMY_FIELDS + CUSTOM_DESCRIPTOR_FIELD
+# + PLACEMENT_ROLE_FIELD. Used by the runner-boundary check that
+# refuses a vocab-bearing spec without --descriptor-vocabulary BEFORE
+# any subprocess fires.
 VOCAB_GATED_FIELDS: tuple[str, ...] = (
     *TAXONOMY_FIELDS,
     CUSTOM_DESCRIPTOR_FIELD,
+    PLACEMENT_ROLE_FIELD,
 )
 
 # Locked plan-file schema version. The 1 -> 2 bump was the paired
 # change for the optional per-request taxonomy fields. The 2 -> 3 bump
-# is the paired change for the optional per-request custom_descriptor
-# escape-hatch field. An older reader with schema_version=2 would
-# reject the new property under the per-request additionalProperties:
-# false lock, so the shape change is not backward-compatible and gets
-# a new version. The runner re-asserts this value AFTER
-# done_image_adapter writes the plan AND BEFORE run_explicit_pipeline
-# is invoked, so a regression that downgrades the plan shape is caught
-# even if the plan validator itself drifts.
-LOCKED_PLAN_SCHEMA_VERSION = 3
+# was the paired change for the optional per-request custom_descriptor
+# escape-hatch field. The 3 -> 4 bump is the paired change for the
+# optional per-request placement_role field. An older reader with
+# schema_version=3 would reject the new property under the per-request
+# additionalProperties: false lock, so the shape change is not
+# backward-compatible and gets a new version. The runner re-asserts
+# this value AFTER done_image_adapter writes the plan AND BEFORE
+# run_explicit_pipeline is invoked, so a regression that downgrades
+# the plan shape is caught even if the plan validator itself drifts.
+LOCKED_PLAN_SCHEMA_VERSION = 4
 
 # Embed surface scripts/export_pptx.py supports today. The self-test
 # walks `ppt/media/` looking for any of these extensions; finding none
@@ -312,8 +326,9 @@ def _check_plan_taxonomy_preserved(
       * the file exists as a regular non-symlink JSON file;
       * ``schema_version == LOCKED_PLAN_SCHEMA_VERSION``;
       * every taxonomy field / value AND the optional
-        ``custom_descriptor`` value supplied on the spec request
-        appears byte-identical on the matching plan request (matched by
+        ``custom_descriptor`` value AND the optional
+        ``placement_role`` value supplied on the spec request appears
+        byte-identical on the matching plan request (matched by
         ``id``).
     Returns (ok, msg). msg names the first violation when ok=False."""
     if not (plan_path.is_file() and not plan_path.is_symlink()):
@@ -797,14 +812,25 @@ def main(argv: list[str]) -> int:
              "non-empty 'requests' list. Any request carrying a "
              "taxonomy field (rendering_style / palette_family / "
              "image_role / layout_pattern / modifier / text_policy / "
-             "subject_domain) forces --descriptor-vocabulary.",
+             "subject_domain) OR the optional custom_descriptor "
+             "escape-hatch field OR the optional placement_role field "
+             "(closed enumeration hero_page / local_region) forces "
+             "--descriptor-vocabulary.",
     )
     parser.add_argument(
         "--descriptor-vocabulary", type=Path, default=None,
         dest="descriptor_vocabulary",
         help="Optional. Forwarded verbatim to BOTH done_image_adapter "
              "and run_d_one_generation. Required iff --d-one-spec "
-             "carries any of the seven taxonomy fields.",
+             "carries any of the seven taxonomy fields, the optional "
+             "custom_descriptor escape-hatch field, or the optional "
+             "placement_role field. The placement_role gate also fires "
+             "the fail-closed overlay-reservation safety scan against "
+             "every prompt / intended_use / custom_descriptor: cues "
+             "that ask to reserve calm / empty / right / lower-third / "
+             "center space, SVG / PPT / native / editable text overlay, "
+             "or title overlay are accepted only with "
+             "placement_role='hero_page'.",
     )
     parser.add_argument(
         "--allow-synthetic-bytes", action="store_true",
@@ -828,7 +854,7 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--self-test", action="store_true",
-        help="Run 18 in-script tempfixture scenarios covering: the "
+        help="Run 22 in-script tempfixture scenarios covering: the "
              "happy-path mock chain (2-slide bundle with one "
              "d_one_local image carrying all 7 taxonomy dimensions; "
              "proves PPTX embeds an internal ppt/media PNG/JPG/JPEG "
@@ -846,7 +872,7 @@ def main(argv: list[str]) -> int:
              "lighting' / 'texture pattern') under "
              "text_policy='no_text' still pass the chain end-to-end "
              "and produce a PPTX with internal PNG/JPG/JPEG media, "
-             "schema_version=3 invariant on the produced plan "
+             "schema_version=4 invariant on the produced plan "
              "(downgrade refused indirectly via plan re-parse), "
              "an APPROVED custom_descriptor escape-hatch value matching "
              "the supplied vocab's custom_descriptors[] allow-list "
@@ -854,10 +880,23 @@ def main(argv: list[str]) -> int:
              "produced plan byte-identical to the spec, an UNAPPROVED "
              "custom_descriptor value is refused by done_image_adapter "
              "before any production workspace or PPTX is created, "
-             "missing fixture/request image id mismatch, unsafe "
-             "local_path/URL in the image-manifest spec, symlinked "
-             "--output / --workspace / --report-dir targets; a "
-             "no-repo-write snapshot probe that strips "
+             "placement_role='hero_page' + overlay-reservation cue "
+             "(calm space / title overlay) passes the chain end-to-end "
+             "and the value lands on the produced plan byte-identical "
+             "to the spec, placement_role='local_region' + overlay-"
+             "reservation cue is REFUSED before any production "
+             "workspace or PPTX is created (SVG/PPT text-overlay "
+             "reservation belongs to hero-page images, not local "
+             "region-block images), placement_role omitted + overlay-"
+             "reservation cue is also REFUSED (default-deny so "
+             "dropping the field does not bypass the gate), "
+             "placement_role='local_region' + ORDINARY schematic "
+             "prompt without overlay-reservation cues passes the chain "
+             "end-to-end (the gate is narrow, not a blanket ban on "
+             "local_region), missing fixture/request image id "
+             "mismatch, unsafe local_path/URL in the image-manifest "
+             "spec, symlinked --output / --workspace / --report-dir "
+             "targets; a no-repo-write snapshot probe that strips "
              "PYTHONDONTWRITEBYTECODE from the subprocess env and "
              "asserts scripts/__pycache__/ is byte-identical before "
              "and after the run (proves the in-script "
@@ -1220,6 +1259,10 @@ def _descriptor_vocabulary_body() -> dict:
             "subject_domain": {"allowed_values": [
                 "abstract_geometry", "process_motif",
                 "metric_emblem", "concept_diagram",
+            ]},
+            # Optional placement_role allow-list (8th dimension).
+            "placement_role": {"allowed_values": [
+                "hero_page", "local_region",
             ]},
         },
         # Approved custom-descriptor allow-list (escape-hatch). Same
@@ -1698,10 +1741,11 @@ def _scenario_boundary_safe_text_phrases_pass(td: Path) -> _Scenario:
 def _scenario_plan_schema_version_locked(td: Path) -> _Scenario:
     """The schema_version invariant is NOT directly probeable from the
     runner CLI — the runner always invokes done_image_adapter, which
-    writes schema_version=3 (the value LOCKED_PLAN_SCHEMA_VERSION
-    holds). We probe indirectly: a happy-path run must leave a
-    [PASS] taxonomy preservation marker AND its stdout must name
-    `plan.schema_version==3` (the assertion line in the formatted
+    writes schema_version=4 (the value LOCKED_PLAN_SCHEMA_VERSION
+    holds — bumped from 3 alongside the optional per-request
+    placement_role field). We probe indirectly: a happy-path run must
+    leave a [PASS] taxonomy preservation marker AND its stdout must
+    name `plan.schema_version==4` (the assertion line in the formatted
     output)."""
     bundle = _materialize_bundle(
         td / "schema_lock",
@@ -2059,6 +2103,193 @@ def _scenario_unapproved_custom_descriptor(td: Path) -> _Scenario:
     )
 
 
+_PLACEMENT_ROLE_OVERLAY_PROMPT = (
+    "abstract gradient pattern that leaves calm space on the right "
+    "for the title overlay; soft edges, no text"
+)
+_PLACEMENT_ROLE_ORDINARY_PROMPT = (
+    "ordinary schematic diagram of a generic process motif; soft "
+    "edges; no text"
+)
+
+
+def _scenario_placement_role_hero_overlay_passes(td: Path) -> _Scenario:
+    """``placement_role='hero_page'`` plus an overlay-reservation
+    prompt (calm space / title overlay) passes the chain end-to-end.
+    The produced plan persists placement_role byte-identical."""
+    spec_body = _d_one_spec_body_with_taxonomy()
+    spec_body["requests"][0]["prompt"] = _PLACEMENT_ROLE_OVERLAY_PROMPT
+    spec_body["requests"][0]["placement_role"] = "hero_page"
+    bundle = _materialize_bundle(
+        td / "pr_hero_ok", d_one_spec_body=spec_body,
+    )
+    ws = td / "pr_hero_ok_ws"
+    out = td / "pr_hero_ok.pptx"
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    if outcome.exit_code != 0:
+        return _Scenario(
+            "placement_role=hero_page + overlay-reservation prompt "
+            "passes the mock chain end-to-end",
+            False,
+            f"rc={outcome.exit_code}; "
+            f"stderr tail: {outcome.stderr.splitlines()[-10:]!r}; "
+            f"stdout tail: {outcome.stdout.splitlines()[-10:]!r}",
+        )
+    if not out.is_file() or out.is_symlink():
+        return _Scenario(
+            "placement_role=hero_page PPTX exists as regular non-"
+            "symlink file",
+            False, f"out={out}, is_file={out.is_file()}",
+        )
+    ok, msg = _pptx_embeds_internal_media_only(out)
+    if not ok:
+        return _Scenario(
+            "placement_role=hero_page PPTX embeds at least one "
+            "internal ppt/media/<name>.<png|jpg|jpeg> part with no "
+            "external/file/data/scheme relationships",
+            False, msg,
+        )
+    if "[PASS] taxonomy preservation check" not in outcome.stdout:
+        return _Scenario(
+            "placement_role=hero_page run leaves the [PASS] taxonomy "
+            "preservation marker on stdout",
+            False,
+            f"stdout tail: {outcome.stdout.splitlines()[-10:]!r}",
+        )
+    return _Scenario(
+        "placement_role=hero_page + overlay-reservation cue passes "
+        "end-to-end; PPTX embeds internal media, placement_role "
+        "preservation gate fires",
+        True,
+    )
+
+
+def _scenario_placement_role_local_overlay_refused(td: Path) -> _Scenario:
+    """``placement_role='local_region'`` plus an overlay-reservation
+    prompt MUST be refused by ``done_image_adapter`` BEFORE any
+    production workspace or PPTX is created. SVG/PPT text-overlay
+    reservation belongs to hero-page images, not local region-block
+    images."""
+    spec_body = _d_one_spec_body_with_taxonomy()
+    spec_body["requests"][0]["prompt"] = _PLACEMENT_ROLE_OVERLAY_PROMPT
+    spec_body["requests"][0]["placement_role"] = "local_region"
+    bundle = _materialize_bundle(
+        td / "pr_local_overlay", d_one_spec_body=spec_body,
+    )
+    ws = td / "pr_local_overlay_ws"
+    out = td / "pr_local_overlay.pptx"
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "overlay-reservation wording" in combined
+        and "placement_role='hero_page'" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "placement_role=local_region + overlay-reservation cue is "
+        "REFUSED by done_image_adapter before any production "
+        "workspace or PPTX is created (SVG/PPT text-overlay "
+        "reservation belongs to hero-page images, not local region-"
+        "block images)",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-10:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_placement_role_omitted_overlay_refused(td: Path) -> _Scenario:
+    """Omitting ``placement_role`` while the prompt carries an overlay-
+    reservation cue MUST also fail. Omitted role defaults to default-
+    deny so a caller cannot bypass the gate by simply dropping the
+    field."""
+    spec_body = _d_one_spec_body_with_taxonomy()
+    spec_body["requests"][0]["prompt"] = _PLACEMENT_ROLE_OVERLAY_PROMPT
+    # placement_role intentionally omitted; the taxonomy block is
+    # otherwise populated (so --descriptor-vocabulary is forwarded).
+    bundle = _materialize_bundle(
+        td / "pr_omitted_overlay", d_one_spec_body=spec_body,
+    )
+    ws = td / "pr_omitted_overlay_ws"
+    out = td / "pr_omitted_overlay.pptx"
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "overlay-reservation wording" in combined
+        and "placement_role='hero_page'" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "placement_role omitted + overlay-reservation cue is REFUSED "
+        "by done_image_adapter before any production workspace or "
+        "PPTX is created (default-deny so dropping the field does "
+        "not bypass the gate)",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-10:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_placement_role_local_ordinary_passes(td: Path) -> _Scenario:
+    """``placement_role='local_region'`` plus an ORDINARY schematic /
+    diagram / accent / texture / scene prompt with NO overlay-
+    reservation cues passes end-to-end. Proves the gate is narrow."""
+    spec_body = _d_one_spec_body_with_taxonomy()
+    spec_body["requests"][0]["prompt"] = _PLACEMENT_ROLE_ORDINARY_PROMPT
+    spec_body["requests"][0]["placement_role"] = "local_region"
+    bundle = _materialize_bundle(
+        td / "pr_local_ordinary", d_one_spec_body=spec_body,
+    )
+    ws = td / "pr_local_ordinary_ws"
+    out = td / "pr_local_ordinary.pptx"
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    if outcome.exit_code != 0:
+        return _Scenario(
+            "placement_role=local_region + ORDINARY prompt passes "
+            "end-to-end (the gate is narrow, not a blanket ban on "
+            "local_region)",
+            False,
+            f"rc={outcome.exit_code}; "
+            f"stderr tail: {outcome.stderr.splitlines()[-10:]!r}; "
+            f"stdout tail: {outcome.stdout.splitlines()[-10:]!r}",
+        )
+    if not out.is_file() or out.is_symlink():
+        return _Scenario(
+            "placement_role=local_region ordinary PPTX exists as "
+            "regular non-symlink file",
+            False, f"out={out}, is_file={out.is_file()}",
+        )
+    ok, msg = _pptx_embeds_internal_media_only(out)
+    if not ok:
+        return _Scenario(
+            "placement_role=local_region ordinary PPTX embeds at "
+            "least one internal ppt/media/<name>.<png|jpg|jpeg> part "
+            "with no external/file/data/scheme relationships",
+            False, msg,
+        )
+    return _Scenario(
+        "placement_role=local_region + ORDINARY schematic prompt "
+        "passes end-to-end; PPTX embeds internal media, no external "
+        "relationships, placement_role preservation gate fires",
+        True,
+    )
+
+
 def _scenario_failure_no_residue(td: Path) -> _Scenario:
     """After a downstream failure, no .pptx must exist at --output AND
     no staging tempdir must remain under the caller's tempdir."""
@@ -2113,6 +2344,10 @@ def _run_self_test() -> int:
             _scenario_plan_schema_version_locked(td),
             _scenario_approved_custom_descriptor(td),
             _scenario_unapproved_custom_descriptor(td),
+            _scenario_placement_role_hero_overlay_passes(td),
+            _scenario_placement_role_local_overlay_refused(td),
+            _scenario_placement_role_omitted_overlay_refused(td),
+            _scenario_placement_role_local_ordinary_passes(td),
             _scenario_request_id_mismatch(td),
             _scenario_unsafe_local_path(td),
             _scenario_symlinked_output(td),

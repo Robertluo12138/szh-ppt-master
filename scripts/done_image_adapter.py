@@ -17,19 +17,27 @@ have to satisfy before it ships. The adapter today:
     taxonomy fields ``rendering_style`` / ``palette_family`` /
     ``image_role`` / ``layout_pattern`` / ``modifier`` /
     ``text_policy`` / ``subject_domain`` OR the optional
-    ``custom_descriptor`` escape-hatch field; the file must parse,
-    decode to an object, and validate against the vocabulary
-    schema; every taxonomy value supplied in a spec request must
-    then be a member of the matching
-    ``image_taxonomy.<dim>.allowed_values`` list (the same closed
-    enumeration the vocabulary schema locks), AND every
+    ``custom_descriptor`` escape-hatch field OR the optional
+    ``placement_role`` field (closed enumeration ``hero_page`` /
+    ``local_region``); the file must parse, decode to an object,
+    and validate against the vocabulary schema; every taxonomy
+    value supplied in a spec request must then be a member of the
+    matching ``image_taxonomy.<dim>.allowed_values`` list (the same
+    closed enumeration the vocabulary schema locks), every
     ``custom_descriptor`` value must be a member of the vocab's
     ``custom_descriptors[*].value`` allow-list AND re-pass the full
     prompt safety scan on BOTH the raw value AND a separator-
     normalized form (so compound deny literals like ``slide title``
-    / ``body copy`` / ``render the slide`` / ``include text`` fire
-    on ``slide_title`` / ``body-copy`` / ``render.the.slide`` /
-    ``include_text`` and every separator stacking);
+    / ``body copy`` / ``render the slide`` / ``include text`` /
+    ``calm space`` / ``title overlay`` fire on ``slide_title`` /
+    ``body-copy`` / ``render.the.slide`` / ``include_text`` /
+    ``calm_space`` / ``title-overlay`` and every separator stacking),
+    AND every ``placement_role`` value must be a member of the
+    vocab's ``image_taxonomy.placement_role.allowed_values`` (a
+    vocab that omits the optional placement_role block has no
+    allow-list and the adapter refuses any placement_role-bearing
+    request — the same "no allow-list, no permission" gate the
+    custom_descriptor escape hatch uses);
   - validates every requested ``id`` matches an entry in
     ``image_manifest.images[]`` whose ``source == "d_one_local"`` (so
     a caller cannot smuggle a request for a ``local_asset`` /
@@ -49,7 +57,13 @@ have to satisfy before it ships. The adapter today:
     ``share publicly`` / ``public hosting`` / ``publish to web`` /
     ``public url`` / ``public link`` / ``public cdn`` and the
     obvious variants — a D-One asset is local-only and may not be
-    uploaded, published, shared, or hosted publicly);
+    uploaded, published, shared, or hosted publicly), AND — when
+    ``placement_role != "hero_page"`` or ``placement_role`` is absent
+    — overlay-reservation wording (asking the image to reserve
+    calm / empty / right / lower-third / center space, or to leave
+    room for an SVG / PPT / native / editable text overlay, or for
+    a title overlay; SVG/PPT text-overlay reservation belongs to
+    hero-page images, not local region-block images);
   - writes a deterministic dry-run plan to
     ``<workspace>/d_one_adapter_plan.json`` (or ``--plan-out``)
     recording the validated requests for downstream hand-off.
@@ -254,14 +268,38 @@ TAXONOMY_FIELDS: tuple[str, ...] = (
 # absent fields produce no key in the plan (no null projection).
 CUSTOM_DESCRIPTOR_FIELD = "custom_descriptor"
 
+# Optional per-request placement-role field. Aligned only with upstream
+# ppt-master image-generation's hero-page vs. local-region split; no
+# upstream code / prompts / examples / assets / wording were copied.
+# Closed enumeration `hero_page` / `local_region`. When supplied, the
+# adapter additionally fires the overlay-reservation safety scan: prompts
+# (and custom_descriptor values) that ask to reserve calm / empty /
+# right / lower-third / center space, or SVG / PPT / native / editable
+# text overlay, or title overlay are accepted ONLY when
+# placement_role == 'hero_page'; the same cues fail closed for
+# 'local_region' or omitted role. Like the taxonomy fields, the field is
+# OPTIONAL — absent placement_role produces no key in the plan and
+# treats the request as 'omitted role' (overlay-reservation cues are
+# refused).
+PLACEMENT_ROLE_FIELD = "placement_role"
+PLACEMENT_ROLE_HERO_PAGE = "hero_page"
+PLACEMENT_ROLE_LOCAL_REGION = "local_region"
+PLACEMENT_ROLE_ALLOWED: frozenset[str] = frozenset({
+    PLACEMENT_ROLE_HERO_PAGE,
+    PLACEMENT_ROLE_LOCAL_REGION,
+})
+
 # Vocab-gated request fields — every member forces
 # --descriptor-vocabulary to have been supplied and forces the adapter
 # to re-check the value against its matching allow-list. Today this is
 # TAXONOMY_FIELDS (checked against image_taxonomy.<dim>.allowed_values)
-# plus CUSTOM_DESCRIPTOR_FIELD (checked against custom_descriptors[].value).
+# plus CUSTOM_DESCRIPTOR_FIELD (checked against custom_descriptors[].value)
+# plus PLACEMENT_ROLE_FIELD (checked against
+# image_taxonomy.placement_role.allowed_values).
 VOCAB_GATED_FIELDS: tuple[str, ...] = (
     *TAXONOMY_FIELDS,
     CUSTOM_DESCRIPTOR_FIELD,
+    PLACEMENT_ROLE_FIELD,
 )
 
 # Only manifest entries whose source == "d_one_local" are eligible for
@@ -278,15 +316,17 @@ ELIGIBLE_MANIFEST_SOURCE = "d_one_local"
 # bump is the paired change for the optional per-request taxonomy
 # fields (rendering_style / palette_family / image_role /
 # layout_pattern / modifier / text_policy / subject_domain). The 2 -> 3
-# bump is the paired change for the new optional per-request
-# `custom_descriptor` escape-hatch field. An older reader with
-# PLAN_SCHEMA_VERSION = 2 would reject the new property under the
+# bump is the paired change for the optional per-request
+# `custom_descriptor` escape-hatch field. The 3 -> 4 bump is the paired
+# change for the new optional per-request `placement_role` field
+# (closed enumeration `hero_page` / `local_region`). An older reader
+# with PLAN_SCHEMA_VERSION = 3 would reject the new property under the
 # schema's additionalProperties:false lock, so the shape change is not
 # backward-compatible and gets a new version. Plan files without
-# `custom_descriptor` written by a current writer still ship with
-# schema_version=3 — the version reflects the schema shape, not the
+# `placement_role` written by a current writer still ship with
+# schema_version=4 — the version reflects the schema shape, not the
 # per-request payload.
-PLAN_SCHEMA_VERSION = 3
+PLAN_SCHEMA_VERSION = 4
 
 # The note we stamp into every plan so an audit of the file is
 # self-describing — "this came from a stub, no D-One call happened."
@@ -609,14 +649,89 @@ _PROMPT_NO_TEXT_REQUEST_LITERALS: tuple[str, ...] = (
     "writing on the image",
 )
 
+# Overlay-reservation cues — fail-closed gate keyed to placement_role.
+# A prompt (or a custom_descriptor value) carrying any of these
+# literals at a word-/phrase-boundary is REFUSED unless the request's
+# placement_role == 'hero_page'. The split mirrors the upstream ppt-
+# master image-generation policy direction: hero-page images may
+# reserve canvas space so the SLIDE's native title / text overlay can
+# sit on top of the rendered art; local_region images (schematic /
+# diagram / accent / texture / scene block art) must not reserve such
+# space — the slide layout positions any caption / label / title on
+# the slide chrome around the block, never on the block itself.
+# 'omitted role' is treated the same as local_region: default-deny.
+# Clean-room engineering literals; no upstream code / prompts /
+# examples / assets / wording copied. Matching is boundary-aware
+# (each literal must be flanked by word boundaries) AND negation-
+# exempt — see ``_occurrence_is_negated`` — so policy-reinforcement
+# wording like ``"no calm space"`` / ``"without title overlay"`` /
+# ``"text overlay is forbidden"`` does NOT fire, mirroring how the
+# editable-text / no-text rules below treat the same negations.
+_PROMPT_OVERLAY_RESERVATION_LITERALS: tuple[str, ...] = (
+    # Spatial reservations — "reserve <adj> space" canvas-area wording
+    # the existing editable-text rule does not cover.
+    "calm space",
+    "empty space",
+    "right space",
+    "left space",
+    "lower-third",
+    "lower third",
+    "center space",
+    "centre space",
+    "right-side space",
+    "left-side space",
+    # Overlay-region cues — name a region the SLIDE text will overlay.
+    # Some of these (``text overlay``, ``svg text overlay``, ``native
+    # text overlay``, ``svg-text overlay``, ``native-text overlay``,
+    # ``svg overlay text``) are also in _PROMPT_EDITABLE_TEXT_LITERALS
+    # (the universal in-image-text rule). For hero_page, the universal
+    # rule below skips this overlay subset because the prompt is
+    # reserving space, not asking the image to bake text. For
+    # local_region / omitted role, this gate fires AND the universal
+    # rule would also fire — either is sufficient to refuse.
+    "title overlay",
+    "text overlay",
+    "svg text overlay",
+    "svg-text overlay",
+    "svg overlay text",
+    "native text overlay",
+    "native-text overlay",
+    "ppt text overlay",
+    "ppt-text overlay",
+    "editable text overlay",
+    "editable-text overlay",
+)
+
+# The subset of _PROMPT_EDITABLE_TEXT_LITERALS that the universal in-
+# image-text rule EXEMPTS when placement_role == 'hero_page'. A hero-
+# page image legitimately reserves canvas space for the slide's native
+# title / text overlay; the same wording would otherwise fire the
+# universal rule because the substring matcher cannot distinguish
+# "ask the image to leave space for an overlay" (legitimate hero
+# request) from "ask the image to bake text into a text overlay"
+# (always refused). Resolved by exempting these literals from the
+# universal rule when placement_role == 'hero_page', and leaving the
+# new overlay-reservation gate to refuse them for local_region /
+# omitted role.
+_HERO_PAGE_UNIVERSAL_EXEMPT_LITERALS: frozenset[str] = frozenset({
+    "native-text overlay",
+    "native text overlay",
+    "svg text overlay",
+    "svg-text overlay",
+    "svg overlay text",
+    "text overlay",
+})
+
 # Negation-exemption pattern for the two policy-aware deny lists
 # above (``_PROMPT_EDITABLE_TEXT_LITERALS`` and
-# ``_PROMPT_NO_TEXT_REQUEST_LITERALS``). A prompt that re-states the
-# policy ("no visible text", "do not include text", "without
-# lettering", "caption text is forbidden") is NOT a request to bake
-# text into the image — it is policy reinforcement, and refusing it
-# would force callers to author awkward prompts to talk about what
-# the policy already forbids. Strict-adjacency matching mirrors the
+# ``_PROMPT_NO_TEXT_REQUEST_LITERALS``) AND the new overlay-
+# reservation gate (``_PROMPT_OVERLAY_RESERVATION_LITERALS``). A
+# prompt that re-states the policy ("no visible text", "do not
+# include text", "without lettering", "caption text is forbidden",
+# "no calm space reserved", "title overlay is forbidden") is NOT a
+# request to bake text or to reserve hero-only space — it is policy
+# reinforcement, and refusing it would force callers to author
+# awkward prompts to talk about what the policy already forbids. Strict-adjacency matching mirrors the
 # pattern documented at scripts/validate_d_one_live_run_evidence.py:
 # BEFORE-side a single negation word immediately adjacent (no
 # punctuation between the negation word and the literal — a comma,
@@ -818,25 +933,34 @@ def _load_descriptor_vocabulary(
 ) -> tuple[
     dict[str, set[str]] | None,
     set[str] | None,
+    set[str] | None,
     bytes | None,
     int,
     str,
 ]:
     """Validate ``vocab_path`` and project its ``image_taxonomy`` plus
-    its optional ``custom_descriptors`` allow-list into membership sets.
+    its optional ``custom_descriptors`` allow-list and its optional
+    ``image_taxonomy.placement_role.allowed_values`` allow-list into
+    membership sets.
 
     The helper runs the same string / filesystem / schema gates the rest
     of the adapter applies: URI-shape refused, symlink refused, exists,
     regular file, parses as JSON, decodes to an object, and validates
     against ``schemas/d_one_descriptor_vocabulary.schema.json``. Returns
-    ``(allowed_per_dim, allowed_custom, vocab_bytes, rc, msg)``; on
-    success ``rc == 0``, ``allowed_per_dim`` is keyed by every member of
-    ``TAXONOMY_FIELDS``, ``allowed_custom`` is the set of approved
+    ``(allowed_per_dim, allowed_custom, allowed_placement_role,
+    vocab_bytes, rc, msg)``; on success ``rc == 0``,
+    ``allowed_per_dim`` is keyed by every member of ``TAXONOMY_FIELDS``,
+    ``allowed_custom`` is the set of approved
     ``custom_descriptors[*].value`` strings (EMPTY set when the
     vocabulary omits / declares an empty ``custom_descriptors`` list —
     in that case the adapter refuses any request that carries
     ``custom_descriptor``, mirroring the same "no allow-list, no
-    permission" gate the taxonomy fields use), and ``vocab_bytes`` is
+    permission" gate the taxonomy fields use), and
+    ``allowed_placement_role`` is the set of approved
+    ``image_taxonomy.placement_role.allowed_values`` strings (EMPTY set
+    when the vocabulary omits the optional placement_role block — in
+    that case the adapter refuses any request that carries
+    ``placement_role``, mirroring the same gate). ``vocab_bytes`` is
     the exact byte content the loader read (used by callers as the
     canonical "before" snapshot for the byte-identical post-condition);
     on failure ``rc != 0``, ``msg`` is non-empty, and every other return
@@ -847,36 +971,36 @@ def _load_descriptor_vocabulary(
     negligible.
     """
     if _has_uri_scheme(str(vocab_path)):
-        return None, None, None, 2, (
+        return None, None, None, None, 2, (
             f"FAIL: --descriptor-vocabulary {vocab_path} looks like a URI; "
             f"done_image_adapter only accepts local file paths"
         )
     is_symlink, msg = _refuse_symlink(vocab_path, "--descriptor-vocabulary")
     if is_symlink:
-        return None, None, None, 2, msg
+        return None, None, None, None, 2, msg
     if not vocab_path.exists():
-        return None, None, None, 2, (
+        return None, None, None, None, 2, (
             f"FAIL: --descriptor-vocabulary {vocab_path} does not exist"
         )
     if not vocab_path.is_file():
-        return None, None, None, 2, (
+        return None, None, None, None, 2, (
             f"FAIL: --descriptor-vocabulary {vocab_path} is not a regular file"
         )
     try:
         vocab_bytes = vocab_path.read_bytes()
         vocab_doc = json.loads(vocab_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return None, None, None, 1, (
+        return None, None, None, None, 1, (
             f"FAIL: cannot read --descriptor-vocabulary {vocab_path}: {exc}"
         )
     if not isinstance(vocab_doc, dict):
-        return None, None, None, 1, (
+        return None, None, None, None, 1, (
             f"FAIL: --descriptor-vocabulary {vocab_path} did not decode to "
             f"an object (got {type(vocab_doc).__name__})"
         )
     vocab_errors = _schema_validate(vocab_doc, DESCRIPTOR_VOCAB_SCHEMA)
     if vocab_errors:
-        return None, None, None, 1, (
+        return None, None, None, None, 1, (
             f"FAIL: --descriptor-vocabulary {vocab_path} does not validate "
             f"against d_one_descriptor_vocabulary.schema.json: "
             + "; ".join(vocab_errors)
@@ -900,7 +1024,31 @@ def _load_descriptor_vocabulary(
             value = entry.get("value")
             if isinstance(value, str) and value:
                 allowed_custom.add(value)
-    return allowed_per_dim, allowed_custom, vocab_bytes, 0, ""
+    # placement_role is OPTIONAL on the vocab (schema allows
+    # image_taxonomy.placement_role to be absent so existing vocab
+    # files continue to validate without churn). When absent, the
+    # resulting allow-list is the empty set; the adapter then refuses
+    # any request that carries the placement_role field, mirroring
+    # the same "no allow-list, no permission" gate the custom_descriptor
+    # escape hatch uses. When present, the schema's items.enum +
+    # items.pattern locks the values to a permutation of the canonical
+    # ``hero_page`` / ``local_region`` set.
+    allowed_placement_role: set[str] = set()
+    placement_block = vocab_doc.get("image_taxonomy", {}).get(
+        PLACEMENT_ROLE_FIELD
+    )
+    if isinstance(placement_block, dict):
+        for v in placement_block.get("allowed_values", []) or []:
+            if isinstance(v, str) and v:
+                allowed_placement_role.add(v)
+    return (
+        allowed_per_dim,
+        allowed_custom,
+        allowed_placement_role,
+        vocab_bytes,
+        0,
+        "",
+    )
 
 
 def _scan_prompt_safety(
@@ -908,6 +1056,7 @@ def _scan_prompt_safety(
     *,
     source_text: str | None,
     text_policy: str | None = None,
+    placement_role: str | None = None,
 ) -> list[str]:
     """Return a list of safety violations for ``prompt``. Empty list ->
     safe. Every pattern table is consulted; we collect ALL violations
@@ -920,6 +1069,17 @@ def _scan_prompt_safety(
     fires when ``text_policy == 'no_text'``). ``text_policy=None`` is
     the safe default — no policy-aware check is run, only the
     universal rules.
+
+    When ``placement_role`` is the request's ``placement_role`` value
+    (``hero_page`` / ``local_region``) the scan also applies the
+    overlay-reservation gate. With ``placement_role == 'hero_page'``,
+    the universal editable-text rule additionally EXEMPTS its overlay
+    subset (the prompt may ask the image to leave space for the
+    slide's native overlay without tripping the universal rule). With
+    ``placement_role == 'local_region'`` or ``placement_role is None``
+    (omitted role), any overlay-reservation literal triggers a
+    violation — SVG/PPT text-overlay reservation belongs to hero-page
+    images, not local region-block images.
     """
     violations: list[str] = []
     lower = prompt.lower()
@@ -1019,7 +1179,22 @@ def _scan_prompt_safety(
     # so policy-reinforcement phrasings such as
     # ``"no slide title in this image"`` or
     # ``"body copy is forbidden"`` are NOT refused.
+    #
+    # Placement-role exemption: when ``placement_role == 'hero_page'``,
+    # the OVERLAY subset of this rule
+    # (``_HERO_PAGE_UNIVERSAL_EXEMPT_LITERALS``) is skipped. A hero-
+    # page image legitimately reserves canvas space for the slide's
+    # native title / text overlay, and the substring matcher cannot
+    # distinguish "leave room for the overlay" (legitimate) from
+    # "bake the text overlay into the image" (always refused). The
+    # exemption is narrow — only the overlay-region literals are
+    # exempted; ``slide title`` / ``body copy`` / ``exact text`` /
+    # ``data value`` / ``headline text`` / ... stay refused for every
+    # placement_role because that copy NEVER belongs in the raster.
+    is_hero_page = placement_role == PLACEMENT_ROLE_HERO_PAGE
     for literal in _PROMPT_EDITABLE_TEXT_LITERALS:
+        if is_hero_page and literal in _HERO_PAGE_UNIVERSAL_EXEMPT_LITERALS:
+            continue
         if _literal_present_unnegated(lower, literal):
             violations.append(
                 f"contains the editable-text wording {literal!r}; "
@@ -1027,6 +1202,36 @@ def _scan_prompt_safety(
                 f"rewordable, or data-faithful belongs in the native "
                 f"SVG / PPT text layer, not in the generated image"
             )
+
+    # Overlay-reservation rule. Any wording that asks the generated
+    # image to reserve canvas space (calm / empty / right / lower-third
+    # / center) or to leave room for an SVG / PPT / native / editable
+    # text overlay, or for a title overlay, is REFUSED unless
+    # ``placement_role == 'hero_page'``. SVG/PPT text-overlay
+    # reservation belongs to hero-page images, not local region-block
+    # images — local_region images must not host slide-text overlays.
+    # 'omitted role' (``placement_role is None``) is treated the same
+    # as ``local_region``: default-deny so a caller cannot bypass the
+    # gate by simply omitting the field. The match is boundary-aware
+    # AND negation-exempt — ``"no calm space"`` / ``"without title
+    # overlay"`` / ``"text overlay is forbidden"`` etc. are NOT
+    # refused (policy-reinforcement wording).
+    if not is_hero_page:
+        for literal in _PROMPT_OVERLAY_RESERVATION_LITERALS:
+            if _literal_present_unnegated(lower, literal):
+                violations.append(
+                    f"contains the overlay-reservation wording "
+                    f"{literal!r}; this cue is accepted only with "
+                    f"placement_role='hero_page' (hero-page images may "
+                    f"reserve canvas space for the slide's native "
+                    f"title / text overlay; local_region images and "
+                    f"placement_role-omitted requests must not — pass "
+                    f"--descriptor-vocabulary, declare placement_role "
+                    f"in image_taxonomy.placement_role.allowed_values, "
+                    f"and tag the request with "
+                    f"placement_role='hero_page', OR rewrite the prompt "
+                    f"to drop the overlay-reservation cue)"
+                )
 
     # Policy-aware in-image-text rule. When the request declares
     # text_policy == 'no_text', the prompt may not ask for visible
@@ -1060,6 +1265,7 @@ def _scan_custom_descriptor_safety(
     *,
     source_text: str | None,
     text_policy: str | None,
+    placement_role: str | None = None,
 ) -> list[str]:
     """Defense-in-depth safety scan for the ``custom_descriptor``
     escape-hatch value.
@@ -1093,13 +1299,19 @@ def _scan_custom_descriptor_safety(
     caller wrote them with `_`, `-`, `.`, or a mix.
     """
     raw_violations = _scan_prompt_safety(
-        value, source_text=source_text, text_policy=text_policy,
+        value,
+        source_text=source_text,
+        text_policy=text_policy,
+        placement_role=placement_role,
     )
     normalized = re.sub(r"[._\-]+", " ", value).strip()
     if not normalized or normalized == value:
         return raw_violations
     normalized_violations = _scan_prompt_safety(
-        normalized, source_text=source_text, text_policy=text_policy,
+        normalized,
+        source_text=source_text,
+        text_policy=text_policy,
+        placement_role=placement_role,
     )
     if not normalized_violations:
         return raw_violations
@@ -1112,7 +1324,11 @@ def _scan_custom_descriptor_safety(
     return out
 
 
-def _scan_intended_use(intended_use: str) -> list[str]:
+def _scan_intended_use(
+    intended_use: str,
+    *,
+    placement_role: str | None = None,
+) -> list[str]:
     """Subset of the prompt safety scan applied to ``intended_use``.
     Only the full-slide / screenshot wording and the universal
     editable-text rule matter here — the field is short and the
@@ -1122,15 +1338,27 @@ def _scan_intended_use(intended_use: str) -> list[str]:
     title, body copy, native-text overlay, or other copy that must
     remain editable / data-faithful — wording the manifest could
     never honour because such text must live in the native SVG /
-    PPT text layer, not in the generated raster."""
+    PPT text layer, not in the generated raster.
+
+    When ``placement_role == 'hero_page'`` the universal editable-
+    text rule EXEMPTS its overlay subset
+    (``_HERO_PAGE_UNIVERSAL_EXEMPT_LITERALS``) — a hero-page image
+    legitimately reserves canvas space for the slide's native title /
+    text overlay. The overlay-reservation rule also fires here for
+    non-hero placements (intended_use that asks for calm space /
+    title overlay / etc. without placement_role='hero_page' is
+    refused; the rule is editability-based, not script-based)."""
     violations: list[str] = []
     lower = intended_use.lower()
+    is_hero_page = placement_role == PLACEMENT_ROLE_HERO_PAGE
     for literal in _PROMPT_FULL_SLIDE_LITERALS:
         if literal in lower:
             violations.append(
                 f"intended_use contains forbidden wording {literal!r}"
             )
     for literal in _PROMPT_EDITABLE_TEXT_LITERALS:
+        if is_hero_page and literal in _HERO_PAGE_UNIVERSAL_EXEMPT_LITERALS:
+            continue
         if _literal_present_unnegated(lower, literal):
             violations.append(
                 f"intended_use contains the editable-text wording "
@@ -1139,6 +1367,17 @@ def _scan_intended_use(intended_use: str) -> list[str]:
                 f"the native SVG / PPT text layer, not in the "
                 f"generated image"
             )
+    if not is_hero_page:
+        for literal in _PROMPT_OVERLAY_RESERVATION_LITERALS:
+            if _literal_present_unnegated(lower, literal):
+                violations.append(
+                    f"intended_use contains the overlay-reservation "
+                    f"wording {literal!r}; this cue is accepted only "
+                    f"with placement_role='hero_page' (hero-page "
+                    f"images may reserve canvas space for the slide's "
+                    f"native title / text overlay; local_region images "
+                    f"and placement_role-omitted requests must not)"
+                )
     return violations
 
 
@@ -1149,10 +1388,11 @@ def _validate_spec_requests(
     source_text: str | None,
     taxonomy_allowed: dict[str, set[str]] | None,
     custom_descriptor_allowed: set[str] | None,
+    placement_role_allowed: set[str] | None,
 ) -> tuple[list[dict] | None, str]:
     """Validate ``spec['requests']`` against the manifest, the safety
     scans, and (when supplied) the descriptor vocabulary taxonomy +
-    custom-descriptor allow-list.
+    custom-descriptor allow-list + placement-role allow-list.
     Returns (validated_requests, error_msg). On error, validated_requests
     is None and error_msg is non-empty.
 
@@ -1169,7 +1409,21 @@ def _validate_spec_requests(
     ``custom_descriptors[*].value`` list. When ``None`` (no vocab
     supplied) OR ``set()`` (vocab supplied but no allow-list entries),
     any spec request that carries ``custom_descriptor`` is refused — the
-    escape hatch is only usable when an explicit approved entry exists."""
+    escape hatch is only usable when an explicit approved entry exists.
+
+    ``placement_role_allowed`` is the allow-list set produced by
+    ``_load_descriptor_vocabulary`` from the vocab's
+    ``image_taxonomy.placement_role.allowed_values`` list. When
+    ``None`` (no vocab supplied) OR ``set()`` (vocab supplied but no
+    placement_role block), any spec request that carries
+    ``placement_role`` is refused — the field is only usable when the
+    vocab declares the allowed values explicitly. When the value IS
+    accepted, it ALSO gates the overlay-reservation safety scan in
+    every prompt / intended_use / custom_descriptor field on the
+    request: ``placement_role == 'hero_page'`` exempts the universal
+    rule's overlay subset and lets overlay-reservation cues pass;
+    ``placement_role == 'local_region'`` keeps the universal rule strict
+    AND fires the overlay-reservation gate."""
     requests = spec.get("requests")
     if not isinstance(requests, list):
         return None, (
@@ -1185,7 +1439,7 @@ def _validate_spec_requests(
     allowed_keys = (
         {"id", "prompt", "intended_use", "width_px", "height_px"}
         | set(TAXONOMY_FIELDS)
-        | {CUSTOM_DESCRIPTOR_FIELD}
+        | {CUSTOM_DESCRIPTOR_FIELD, PLACEMENT_ROLE_FIELD}
     )
     required_keys = {"id", "prompt"}
 
@@ -1257,8 +1511,30 @@ def _validate_spec_requests(
         text_policy_peek = req.get("text_policy")
         if not isinstance(text_policy_peek, str) or not text_policy_peek.strip():
             text_policy_peek = None
+        # Peek at placement_role for the overlay-reservation safety
+        # gate. The peek only enables the hero_page exemption when the
+        # value is a non-empty string in the canonical enumeration; the
+        # full placement_role validation runs below (refuses unknown
+        # values, missing vocab, missing allow-list, malformed type),
+        # so a malformed placement_role still surfaces with its own
+        # diagnostic. A peek that lands outside the canonical
+        # ``hero_page`` / ``local_region`` enumeration is treated as
+        # ``None`` for the safety scan (default-deny on the overlay
+        # gate) so the most-strict gate fires while the placement_role
+        # validation below produces the precise error.
+        placement_role_peek_raw = req.get(PLACEMENT_ROLE_FIELD)
+        if (
+            isinstance(placement_role_peek_raw, str)
+            and placement_role_peek_raw in PLACEMENT_ROLE_ALLOWED
+        ):
+            placement_role_peek: str | None = placement_role_peek_raw
+        else:
+            placement_role_peek = None
         prompt_violations = _scan_prompt_safety(
-            prompt, source_text=source_text, text_policy=text_policy_peek,
+            prompt,
+            source_text=source_text,
+            text_policy=text_policy_peek,
+            placement_role=placement_role_peek,
         )
         if prompt_violations:
             return None, (
@@ -1274,7 +1550,9 @@ def _validate_spec_requests(
                     f"must be a non-empty string when present "
                     f"(got {intended_use!r})"
                 )
-            iu_violations = _scan_intended_use(intended_use)
+            iu_violations = _scan_intended_use(
+                intended_use, placement_role=placement_role_peek,
+            )
             if iu_violations:
                 return None, (
                     f"FAIL: requests[{i}].intended_use (id {req_id!r}) "
@@ -1330,6 +1608,75 @@ def _validate_spec_requests(
                         f"({sorted(taxonomy_allowed[dim])})."
                     )
 
+        # placement_role validation. Optional; when present, the
+        # request must satisfy four gates in this order:
+        #   (1) the value is a non-empty string;
+        #   (2) --descriptor-vocabulary must have been supplied — without
+        #       it the runtime has no allow-list to certify the value;
+        #   (3) the supplied vocab's image_taxonomy.placement_role
+        #       allow-list must be non-empty (i.e. the optional vocab
+        #       block must be declared) AND the value must be a member;
+        #   (4) defense in depth: the value must also lie inside the
+        #       canonical hardcoded enumeration PLACEMENT_ROLE_ALLOWED.
+        # The plan schema additionally enum-locks the field + applies
+        # the lowercase-identifier + forbidden-token pattern lock, so an
+        # unsafe shape that somehow slipped past the runtime scan is
+        # still caught by the post-write _schema_validate gate. The
+        # overlay-reservation safety scan that fires against the prompt
+        # / intended_use / custom_descriptor on this request already
+        # ran above using ``placement_role_peek`` — that peek only
+        # canonicalises to a member of PLACEMENT_ROLE_ALLOWED, so an
+        # unknown value defaults to None (the strictest gate) and
+        # surfaces here with the precise diagnostic.
+        placement_role: str | None = None
+        if PLACEMENT_ROLE_FIELD in req:
+            raw_pr = req[PLACEMENT_ROLE_FIELD]
+            if not isinstance(raw_pr, str) or not raw_pr.strip():
+                return None, (
+                    f"FAIL: requests[{i}].{PLACEMENT_ROLE_FIELD} "
+                    f"(id {req_id!r}) must be a non-empty string when "
+                    f"present (got {raw_pr!r})"
+                )
+            if placement_role_allowed is None:
+                return None, (
+                    f"FAIL: requests[{i}] (id {req_id!r}) carries "
+                    f"{PLACEMENT_ROLE_FIELD} but no "
+                    f"--descriptor-vocabulary was supplied; the "
+                    f"placement_role field is only accepted when "
+                    f"--descriptor-vocabulary points at a schema-valid "
+                    f"d_one_descriptor_vocabulary JSON whose "
+                    f"image_taxonomy.placement_role.allowed_values "
+                    f"explicitly declares the value."
+                )
+            if not placement_role_allowed:
+                return None, (
+                    f"FAIL: requests[{i}].{PLACEMENT_ROLE_FIELD} "
+                    f"(id {req_id!r}) value {raw_pr!r}: the supplied "
+                    f"--descriptor-vocabulary does not declare an "
+                    f"image_taxonomy.placement_role block, so no value "
+                    f"is approved. Add the block with allowed_values = "
+                    f"[hero_page, local_region] under the documented "
+                    f"vocabulary approval review and re-run."
+                )
+            if raw_pr not in placement_role_allowed:
+                return None, (
+                    f"FAIL: requests[{i}].{PLACEMENT_ROLE_FIELD} "
+                    f"(id {req_id!r}) value {raw_pr!r} is not in the "
+                    f"supplied --descriptor-vocabulary "
+                    f"image_taxonomy.placement_role.allowed_values "
+                    f"({sorted(placement_role_allowed)})."
+                )
+            if raw_pr not in PLACEMENT_ROLE_ALLOWED:
+                return None, (
+                    f"FAIL: requests[{i}].{PLACEMENT_ROLE_FIELD} "
+                    f"(id {req_id!r}) value {raw_pr!r} is not in the "
+                    f"canonical placement_role enumeration "
+                    f"({sorted(PLACEMENT_ROLE_ALLOWED)}); the supplied "
+                    f"vocabulary's allow-list drifted away from the "
+                    f"canonical set."
+                )
+            placement_role = raw_pr
+
         # custom_descriptor escape hatch. Optional; when present, the
         # request must satisfy four gates in this order:
         #   (1) the value is a non-empty string;
@@ -1340,7 +1687,9 @@ def _validate_spec_requests(
         #   (4) the value re-passes the full prompt safety scan (URI /
         #       file-path / source-marker / source-shingle / credential /
         #       PII / full-slide / public-distribution / editable-text
-        #       and — under text_policy='no_text' — visible-text wording).
+        #       and — under text_policy='no_text' — visible-text wording
+        #       AND — when placement_role != 'hero_page' — overlay-
+        #       reservation wording).
         # The plan schema additionally pattern-locks the field shape at
         # the lowercase-identifier + forbidden-token layer, so an
         # unsafe shape that somehow slipped past the runtime scan is
@@ -1406,6 +1755,7 @@ def _validate_spec_requests(
                 raw_cd,
                 source_text=source_text,
                 text_policy=text_policy_peek,
+                placement_role=placement_role,
             )
             if cd_violations:
                 return None, (
@@ -1425,6 +1775,7 @@ def _validate_spec_requests(
             "manifest_source": manifest_source,
             "taxonomy": present_taxonomy,
             "custom_descriptor": custom_descriptor,
+            "placement_role": placement_role,
         })
 
     return validated, ""
@@ -1439,13 +1790,14 @@ def _build_plan(validated_requests: list[dict]) -> dict:
     Taxonomy fields (TAXONOMY_FIELDS) are projected in the canonical
     order — the same tuple order TAXONOMY_FIELDS declares — only when
     the validated request carries them. The optional
-    ``custom_descriptor`` escape-hatch field is projected only when the
-    validated request carries a non-None value. Absent fields stay
-    absent (no null projection), so a spec without taxonomy / without
-    custom_descriptor produces a plan-file body byte-identical to the
-    pre-extension shape (modulo the schema_version field), preserving
-    the schema's `additionalProperties: false` and the existing
-    fixture set."""
+    ``custom_descriptor`` escape-hatch field and the optional
+    ``placement_role`` field are projected only when the validated
+    request carries a non-None value. Absent fields stay absent (no
+    null projection), so a spec without taxonomy / without
+    custom_descriptor / without placement_role produces a plan-file
+    body byte-identical to the pre-extension shape (modulo the
+    schema_version field), preserving the schema's
+    `additionalProperties: false` and the existing fixture set."""
     return {
         "schema_version": PLAN_SCHEMA_VERSION,
         "mode": "dry_run",
@@ -1468,6 +1820,11 @@ def _build_plan(validated_requests: list[dict]) -> dict:
                 **(
                     {CUSTOM_DESCRIPTOR_FIELD: r["custom_descriptor"]}
                     if r.get("custom_descriptor") is not None
+                    else {}
+                ),
+                **(
+                    {PLACEMENT_ROLE_FIELD: r["placement_role"]}
+                    if r.get("placement_role") is not None
                     else {}
                 ),
             }
@@ -1668,11 +2025,13 @@ def done_image_adapter(
     # just-written plan on a mismatch.
     taxonomy_allowed: dict[str, set[str]] | None = None
     custom_descriptor_allowed: set[str] | None = None
+    placement_role_allowed: set[str] | None = None
     vocab_bytes_before: bytes | None = None
     if descriptor_vocabulary is not None:
         (
             taxonomy_allowed,
             custom_descriptor_allowed,
+            placement_role_allowed,
             vocab_bytes_before,
             rc,
             msg,
@@ -1681,6 +2040,7 @@ def done_image_adapter(
             return rc, msg
         assert taxonomy_allowed is not None
         assert custom_descriptor_allowed is not None
+        assert placement_role_allowed is not None
         assert vocab_bytes_before is not None
 
     # Parse --spec.
@@ -1708,6 +2068,7 @@ def done_image_adapter(
         source_text=source_text,
         taxonomy_allowed=taxonomy_allowed,
         custom_descriptor_allowed=custom_descriptor_allowed,
+        placement_role_allowed=placement_role_allowed,
     )
     if err:
         return 1, err
@@ -1908,17 +2269,23 @@ def validate_plan_file(
          the file is additionally schema-validated against
          ``schemas/d_one_descriptor_vocabulary.schema.json``, its
          ``image_taxonomy`` projected into a per-dimension
-         allowed_values set, AND its ``custom_descriptors[].value``
-         list projected into the custom-descriptor allow-list set.
+         allowed_values set (including the optional
+         ``image_taxonomy.placement_role.allowed_values`` block when
+         present), its ``custom_descriptors[].value`` list projected
+         into the custom-descriptor allow-list set, AND its
+         placement-role list projected into the placement-role allow-
+         list set.
       3. ``schemas/d_one_adapter_plan.schema.json`` against the plan
          JSON — catches malformed plans, list-rooted plans, unknown
          top-level / per-request fields, missing required fields,
-         ``mode != "dry_run"``, ``schema_version != 3``, ``note``
+         ``mode != "dry_run"``, ``schema_version != 4``, ``note``
          missing the dry-run sentinel, ``manifest_source !=
          "d_one_local"``, non-positive ``width_px`` / ``height_px``,
          taxonomy values that fail the lowercase-identifier +
          forbidden-token pattern lock, AND ``custom_descriptor``
-         values that fail the same pattern lock.
+         values that fail the same pattern lock, AND ``placement_role``
+         values that fail the closed ``hero_page`` / ``local_region``
+         enum + pattern lock.
       4. Cross-checks the schema cannot express: ``request_count ==
          len(requests)``; no duplicate request ``id`` across the
          array; every ``id`` resolves to an ``images[].id`` in the
@@ -1936,8 +2303,10 @@ def validate_plan_file(
          public`` / ``public upload`` / ``share publicly`` /
          ``public hosting`` / ``publish to web`` / ``public url`` /
          ``public link`` / ``public cdn`` / ``host publicly`` and
-         the documented variants); every ``intended_use`` (when
-         present) passes the full-slide-wording subset; when ANY
+         the documented variants, plus the overlay-reservation scan
+         keyed to ``placement_role``); every ``intended_use`` (when
+         present) passes the full-slide-wording, universal editable-
+         text, and placement-role overlay-reservation subsets; when ANY
          plan request carries one or more of ``TAXONOMY_FIELDS``,
          ``--descriptor-vocabulary`` MUST have been supplied AND every
          present taxonomy value MUST be a member of the matching
@@ -1952,7 +2321,12 @@ def validate_plan_file(
          full ``_scan_prompt_safety`` deny list on BOTH the raw
          lowercased form AND a separator-normalized form (every run
          of ``.`` / ``_`` / ``-`` collapsed to a single space) — the
-         same dual-form safety scan the write path applies.
+         same dual-form safety scan the write path applies; AND when
+         ANY plan request carries ``placement_role``,
+         ``--descriptor-vocabulary`` MUST have been supplied AND the
+         value MUST be a member of the vocab's
+         ``image_taxonomy.placement_role.allowed_values`` allow-list
+         and the canonical closed enum.
 
     Post-condition: the manifest bytes and the plan bytes are
     byte-identical pre/post the call. A successful run returns
@@ -2016,11 +2390,13 @@ def validate_plan_file(
     # "before").
     taxonomy_allowed: dict[str, set[str]] | None = None
     custom_descriptor_allowed: set[str] | None = None
+    placement_role_allowed: set[str] | None = None
     vocab_bytes_before: bytes | None = None
     if descriptor_vocabulary is not None:
         (
             taxonomy_allowed,
             custom_descriptor_allowed,
+            placement_role_allowed,
             vocab_bytes_before,
             rc,
             msg,
@@ -2029,6 +2405,7 @@ def validate_plan_file(
             return rc, msg
         assert taxonomy_allowed is not None
         assert custom_descriptor_allowed is not None
+        assert placement_role_allowed is not None
         assert vocab_bytes_before is not None
 
     try:
@@ -2128,9 +2505,24 @@ def validate_plan_file(
         plan_text_policy_peek = req.get("text_policy")
         if not isinstance(plan_text_policy_peek, str) or not plan_text_policy_peek.strip():
             plan_text_policy_peek = None
+        # Peek at placement_role for the overlay-reservation safety
+        # scan; the full placement_role cross-check (vocab membership,
+        # canonical enumeration) runs below. The peek only canonicalises
+        # to a member of PLACEMENT_ROLE_ALLOWED so an unknown value
+        # defaults to None and triggers the strictest gate while the
+        # cross-check below produces the precise diagnostic.
+        plan_placement_role_raw = req.get(PLACEMENT_ROLE_FIELD)
+        if (
+            isinstance(plan_placement_role_raw, str)
+            and plan_placement_role_raw in PLACEMENT_ROLE_ALLOWED
+        ):
+            plan_placement_role_peek: str | None = plan_placement_role_raw
+        else:
+            plan_placement_role_peek = None
         prompt_violations = _scan_prompt_safety(
             req["prompt"], source_text=source_text,
             text_policy=plan_text_policy_peek,
+            placement_role=plan_placement_role_peek,
         )
         if prompt_violations:
             return 1, (
@@ -2140,7 +2532,9 @@ def validate_plan_file(
 
         intended_use = req.get("intended_use")
         if intended_use is not None:
-            iu_violations = _scan_intended_use(intended_use)
+            iu_violations = _scan_intended_use(
+                intended_use, placement_role=plan_placement_role_peek,
+            )
             if iu_violations:
                 return 1, (
                     f"FAIL: {plan} requests[{i}].intended_use "
@@ -2191,10 +2585,12 @@ def validate_plan_file(
         # value drifted away from the vocab's allow-list (e.g. the
         # reviewer removed an entry and the plan was not re-authored)
         # is refused here. The plan-prompt safety scan above already
-        # ran with the peeked text_policy; the same peeked value
-        # applies to the custom_descriptor re-scan so an in-image-text
-        # literal like 'calligraphy' under text_policy='no_text' is
-        # caught symmetrically with the write path.
+        # ran with the peeked text_policy + placement_role; the same
+        # peeked values apply to the custom_descriptor re-scan so an
+        # in-image-text literal like 'calligraphy' under
+        # text_policy='no_text' OR an overlay-reservation cue like
+        # 'calm_space' under placement_role='local_region' is caught
+        # symmetrically with the write path.
         plan_custom = req.get(CUSTOM_DESCRIPTOR_FIELD)
         if isinstance(plan_custom, str) and plan_custom:
             if custom_descriptor_allowed is None:
@@ -2230,12 +2626,65 @@ def validate_plan_file(
                 plan_custom,
                 source_text=source_text,
                 text_policy=plan_text_policy_peek,
+                placement_role=plan_placement_role_peek,
             )
             if cd_violations:
                 return 1, (
                     f"FAIL: {plan} requests[{i}].{CUSTOM_DESCRIPTOR_FIELD} "
                     f"(id {req_id!r}) value {plan_custom!r} failed the "
                     f"safety re-scan: " + "; ".join(cd_violations)
+                )
+
+        # placement_role cross-check. The schema already enum + pattern
+        # locked the field shape; the runtime additionally requires
+        # --descriptor-vocabulary AND that the value is present in the
+        # vocab's image_taxonomy.placement_role.allowed_values AND that
+        # the value lies inside the canonical hardcoded enumeration
+        # PLACEMENT_ROLE_ALLOWED. A plan whose placement_role drifted
+        # away from the vocab's allow-list (e.g. the vocab was edited
+        # after the plan was written) is refused here. The plan-prompt
+        # / intended_use / custom_descriptor safety scans above already
+        # ran with the peeked placement_role; this block produces the
+        # placement_role-specific diagnostic when the value itself is
+        # unrecognised by the vocab or the canonical enumeration.
+        if isinstance(plan_placement_role_raw, str) and plan_placement_role_raw:
+            if placement_role_allowed is None:
+                return 1, (
+                    f"FAIL: {plan} requests[{i}] (id {req_id!r}) "
+                    f"carries {PLACEMENT_ROLE_FIELD} but "
+                    f"--descriptor-vocabulary was not supplied; "
+                    f"--validate-plan refuses to certify a plan whose "
+                    f"placement_role value cannot be re-checked against "
+                    f"image_taxonomy.placement_role.allowed_values. "
+                    f"Re-run with --descriptor-vocabulary <path>."
+                )
+            if not placement_role_allowed:
+                return 1, (
+                    f"FAIL: {plan} requests[{i}].{PLACEMENT_ROLE_FIELD} "
+                    f"(id {req_id!r}) value {plan_placement_role_raw!r}: "
+                    f"the supplied --descriptor-vocabulary does not "
+                    f"declare an image_taxonomy.placement_role block, "
+                    f"so no value is approved. The plan placement_role "
+                    f"drifted from the supplied --descriptor-vocabulary."
+                )
+            if plan_placement_role_raw not in placement_role_allowed:
+                return 1, (
+                    f"FAIL: {plan} requests[{i}].{PLACEMENT_ROLE_FIELD} "
+                    f"(id {req_id!r}) value {plan_placement_role_raw!r} "
+                    f"is not in the supplied --descriptor-vocabulary "
+                    f"image_taxonomy.placement_role.allowed_values "
+                    f"({sorted(placement_role_allowed)}); the plan "
+                    f"placement_role drifted from the supplied "
+                    f"--descriptor-vocabulary."
+                )
+            if plan_placement_role_raw not in PLACEMENT_ROLE_ALLOWED:
+                return 1, (
+                    f"FAIL: {plan} requests[{i}].{PLACEMENT_ROLE_FIELD} "
+                    f"(id {req_id!r}) value {plan_placement_role_raw!r} "
+                    f"is not in the canonical placement_role enumeration "
+                    f"({sorted(PLACEMENT_ROLE_ALLOWED)}); the supplied "
+                    f"vocabulary's allow-list drifted away from the "
+                    f"canonical set."
                 )
 
     # Post-condition: nothing was written. A mismatch here would mean
@@ -3601,20 +4050,19 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
         ))
 
     # ---- 36. schema gate: wrong schema_version refused. Probe with
-    # 4 — the locked enum is currently [3] (the 2 -> 3 bump landed
-    # alongside the optional per-request custom_descriptor escape-hatch
-    # field), so 4 is a future unrecognized shape that the schema must
-    # refuse. ----
+    # 5 — the locked enum is currently [4] (the 3 -> 4 bump landed
+    # alongside the optional per-request placement_role field), so 5 is
+    # a future unrecognized shape that the schema must refuse. ----
     with tempfile.TemporaryDirectory() as raw_td:
         td = Path(raw_td)
         ws, plan_path = _seed_validate_workspace(td)
         plan_body = json.loads(plan_path.read_text())
-        plan_body["schema_version"] = 4
+        plan_body["schema_version"] = 5
         _overwrite_plan(plan_path, plan_body)
         rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
         ok = rc == 1 and "schema_version" in msg and "not in enum" in msg
         results.append(_expect(
-            "validate-plan: schema_version != 3 refused by schema enum "
+            "validate-plan: schema_version != 4 refused by schema enum "
             "(version drift must be a paired script change)",
             ok, f"rc={rc}, msg={msg!r}",
         ))
@@ -4092,6 +4540,17 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
                         "process_motif",
                         "metric_emblem",
                         "concept_diagram",
+                    ],
+                },
+                # Optional placement_role block — declares the
+                # closed two-token enumeration the adapter accepts on
+                # a request's placement_role field. Same gate as the
+                # other taxonomy blocks: present + canonical => the
+                # field on a request is permitted.
+                "placement_role": {
+                    "allowed_values": [
+                        "hero_page",
+                        "local_region",
                     ],
                 },
             },
@@ -4672,16 +5131,35 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
         original_loader = _mod2._load_descriptor_vocabulary
 
         def fake_loader(vocab_path: Path):
-            allowed, allowed_custom, real_bytes, rc, msg = (
-                original_loader(vocab_path)
-            )
+            (
+                allowed,
+                allowed_custom,
+                allowed_placement_role,
+                real_bytes,
+                rc,
+                msg,
+            ) = original_loader(vocab_path)
             if rc != 0:
-                return allowed, allowed_custom, real_bytes, rc, msg
+                return (
+                    allowed,
+                    allowed_custom,
+                    allowed_placement_role,
+                    real_bytes,
+                    rc,
+                    msg,
+                )
             # Return a doctored "before" snapshot that disagrees with
             # the bytes currently on disk. The post-condition re-reads
             # the real bytes and compares to this — they cannot match,
             # so the gate must fire and the plan must be rolled back.
-            return allowed, allowed_custom, real_bytes + b"X", rc, msg
+            return (
+                allowed,
+                allowed_custom,
+                allowed_placement_role,
+                real_bytes + b"X",
+                rc,
+                msg,
+            )
 
         _mod2._load_descriptor_vocabulary = fake_loader  # type: ignore[attr-defined]
         try:
@@ -5462,7 +5940,7 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
     # ---- CD1. approved custom_descriptor (write path): a spec carrying
     # a custom_descriptor that matches the vocab allow-list lands on the
     # plan request byte-identical to the spec. The plan re-parses to a
-    # schema-valid body whose schema_version is the locked 3. ----
+    # schema-valid body whose schema_version is the locked 4. ----
     with tempfile.TemporaryDirectory() as raw_td:
         td = Path(raw_td)
         ws = td / "ws_cd_valid"
@@ -5952,11 +6430,23 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
         original_loader_cd = _mod_cd._load_descriptor_vocabulary
 
         def fake_loader_cd(vocab_path: Path):
-            allowed, allowed_custom, real_bytes, rc, msg = (
-                original_loader_cd(vocab_path)
-            )
+            (
+                allowed,
+                allowed_custom,
+                allowed_placement_role,
+                real_bytes,
+                rc,
+                msg,
+            ) = original_loader_cd(vocab_path)
             if rc != 0:
-                return allowed, allowed_custom, real_bytes, rc, msg
+                return (
+                    allowed,
+                    allowed_custom,
+                    allowed_placement_role,
+                    real_bytes,
+                    rc,
+                    msg,
+                )
             assert allowed_custom is not None
             # Pretend the unsafe-shape value is on the allow-list so the
             # runtime gate accepts the request. The post-write schema
@@ -5964,6 +6454,7 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
             return (
                 allowed,
                 allowed_custom | {"public_motif"},
+                allowed_placement_role,
                 real_bytes,
                 rc,
                 msg,
@@ -6191,6 +6682,634 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
                 ok, f"rc={rc}, msg={msg!r}",
             ))
 
+    # =========================================================================
+    # Placement-role + overlay-reservation scenarios. The optional
+    # ``placement_role`` field (closed enumeration ``hero_page`` /
+    # ``local_region``) is the gate that splits hero-page images
+    # (slide-text overlay-friendly) from local_region block images
+    # (no overlay-reservation cues allowed). Same machinery the rest
+    # of the taxonomy uses: vocab-gated, schema-locked, validate-plan
+    # re-checked.
+    # =========================================================================
+
+    # ---- PR1. hero_page + overlay-reservation prompt (write path):
+    # canonical hero overlay cue accepts; the produced plan persists
+    # both the overlay cue and placement_role=hero_page byte-identical.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_pr_hero_ok"
+        _seed_workspace(ws, images=[
+            {"id": "cover", "local_path": "media/cover.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "cover",
+                    "prompt": (
+                        "abstract gradient pattern that leaves calm "
+                        "space on the right for the title overlay; "
+                        "soft edges, no text"
+                    ),
+                    "placement_role": "hero_page",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        plan_doc = (
+            json.loads((ws / DEFAULT_PLAN_FILENAME).read_text())
+            if rc == 0 else {}
+        )
+        req = plan_doc.get("requests", [{}])[0] if plan_doc else {}
+        ok = (
+            rc == 0
+            and plan_doc.get("schema_version") == PLAN_SCHEMA_VERSION
+            and req.get("placement_role") == "hero_page"
+            and "calm space" in req.get("prompt", "")
+            and "title overlay" in req.get("prompt", "")
+        )
+        results.append(_expect(
+            "placement_role=hero_page (write path): overlay-reservation "
+            "cue ('calm space', 'title overlay') is ACCEPTED; plan "
+            "persists placement_role + prompt byte-identical",
+            ok, f"rc={rc}, msg={msg!r}, req={req!r}",
+        ))
+
+    # ---- PR2. local_region + overlay-reservation prompt (write path):
+    # the same overlay cue is REFUSED before any plan file is written,
+    # with a clear overlay-reservation diagnostic citing
+    # placement_role='hero_page'. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_pr_local_overlay"
+        _seed_workspace(ws, images=[
+            {"id": "block", "local_path": "media/block.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "block",
+                    "prompt": (
+                        "diagram block that reserves calm space for "
+                        "the title overlay"
+                    ),
+                    "placement_role": "local_region",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "overlay-reservation wording" in msg
+            and "placement_role='hero_page'" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "placement_role=local_region (write path): the same overlay-"
+            "reservation cue is REFUSED before any plan file is written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- PR3. omitted placement_role + overlay-reservation prompt
+    # (write path): the same overlay cue is REFUSED — omitted role
+    # defaults to default-deny so a caller cannot bypass the gate by
+    # simply dropping the field. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_pr_omitted_overlay"
+        _seed_workspace(ws, images=[
+            {"id": "block", "local_path": "media/block.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "block",
+                    "prompt": (
+                        "abstract pattern that reserves calm space "
+                        "for the title overlay"
+                    ),
+                    # placement_role intentionally omitted.
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "overlay-reservation wording" in msg
+            and "placement_role='hero_page'" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "placement_role omitted (write path): the same overlay-"
+            "reservation cue is REFUSED — default-deny so dropping "
+            "the field does not bypass the gate",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- PR4. local_region + ORDINARY prompt (write path): a
+    # schematic / diagram / accent / texture / scene prompt with NO
+    # overlay-reservation cues PASSES end-to-end. Proves the gate is
+    # narrow — local_region is not a blanket ban on local_region
+    # requests, only on overlay-reservation wording for them. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_pr_local_ok"
+        _seed_workspace(ws, images=[
+            {"id": "block", "local_path": "media/block.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "block",
+                    "prompt": (
+                        "ordinary schematic diagram of a generic "
+                        "process motif; soft edges; no text"
+                    ),
+                    "placement_role": "local_region",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        plan_doc = (
+            json.loads((ws / DEFAULT_PLAN_FILENAME).read_text())
+            if rc == 0 else {}
+        )
+        req = plan_doc.get("requests", [{}])[0] if plan_doc else {}
+        ok = (
+            rc == 0
+            and req.get("placement_role") == "local_region"
+            and "schematic diagram" in req.get("prompt", "")
+        )
+        results.append(_expect(
+            "placement_role=local_region (write path): an ORDINARY "
+            "schematic prompt with no overlay-reservation cues PASSES; "
+            "the gate is narrow, not a blanket ban on local_region",
+            ok, f"rc={rc}, msg={msg!r}, req={req!r}",
+        ))
+
+    # ---- PR5. placement_role without --descriptor-vocabulary (write
+    # path) is REFUSED with a clear "--descriptor-vocabulary" diagnostic;
+    # no plan written. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_pr_no_vocab"
+        _seed_workspace(ws, images=[
+            {"id": "block", "local_path": "media/block.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "block",
+                    "prompt": "abstract pattern, no text",
+                    "placement_role": "hero_page",
+                },
+            ],
+        })
+        rc, msg = done_image_adapter(workspace=ws, spec=spec)
+        ok = (
+            rc == 1
+            and "placement_role" in msg
+            and "--descriptor-vocabulary" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "placement_role (write path): missing --descriptor-vocabulary "
+            "is refused; no plan written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- PR6. placement_role outside the vocab's allow-list (write
+    # path): a regex-shape-valid value (lowercase identifier, no
+    # forbidden token) that is not in the vocab's allow-list is REFUSED.
+    # The vocab here ships the canonical [hero_page, local_region] block
+    # so the runtime allow-list IS populated; the request supplies an
+    # unknown ``rogue_role`` value. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_pr_unknown"
+        _seed_workspace(ws, images=[
+            {"id": "block", "local_path": "media/block.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "block",
+                    "prompt": "abstract pattern, no text",
+                    "placement_role": "rogue_role",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "placement_role" in msg
+            and "rogue_role" in msg
+            and "image_taxonomy.placement_role.allowed_values" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "placement_role (write path): a regex-shape-valid value "
+            "outside image_taxonomy.placement_role.allowed_values is "
+            "refused; no plan written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- PR7. placement_role against a vocab that OMITS the optional
+    # placement_role block (write path): the request is REFUSED with a
+    # clear "no allow-list" diagnostic. Mirrors how the
+    # custom_descriptor field behaves when the vocab omits
+    # custom_descriptors[]. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_pr_no_block"
+        _seed_workspace(ws, images=[
+            {"id": "block", "local_path": "media/block.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "block",
+                    "prompt": "abstract pattern, no text",
+                    "placement_role": "hero_page",
+                },
+            ],
+        })
+        vocab_body = _canonical_vocab()
+        # Drop the optional placement_role block — backwards-
+        # compatibility default, the schema should still validate.
+        vocab_body["image_taxonomy"].pop("placement_role", None)
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, vocab_body)
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "placement_role" in msg
+            and (
+                "does not declare an image_taxonomy.placement_role block" in msg
+                or "no value is approved" in msg
+            )
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "placement_role (write path): a vocab that omits the "
+            "optional image_taxonomy.placement_role block refuses any "
+            "placement_role-bearing request",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- PR8. validate-plan re-checks placement_role: a plan with
+    # hero_page + overlay cue round-trips; the validator accepts it. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_pr_validate_hero_ok"
+        _seed_workspace(ws, images=[
+            {"id": "cover", "local_path": "media/cover.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "cover",
+                    "prompt": (
+                        "abstract gradient leaving calm space for the "
+                        "title overlay; no text"
+                    ),
+                    "placement_role": "hero_page",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc_w, msg_w = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        plan_path = ws / DEFAULT_PLAN_FILENAME
+        rc_v, msg_v = validate_plan_file(
+            workspace=ws, plan=plan_path, descriptor_vocabulary=vocab,
+        )
+        ok = rc_w == 0 and rc_v == 0
+        results.append(_expect(
+            "placement_role (validate-plan): hero_page + overlay-cue "
+            "plan round-trips byte-identically through the non-mutating "
+            "validator",
+            ok,
+            f"rc_w={rc_w}, msg_w={msg_w!r}; rc_v={rc_v}, msg_v={msg_v!r}",
+        ))
+
+    # ---- PR9. validate-plan drift: a plan with placement_role=hero_page
+    # is re-validated against a vocab whose placement_role block was
+    # dropped. The validator refuses the plan (the vocab can no longer
+    # certify the placement_role value). ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_pr_validate_drift"
+        _seed_workspace(ws, images=[
+            {"id": "cover", "local_path": "media/cover.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "cover",
+                    "prompt": "abstract pattern, no text",
+                    "placement_role": "hero_page",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc_w, msg_w = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        # Drop the placement_role block from the vocab AFTER the plan
+        # was written — the validator must refuse the plan now.
+        drifted_vocab = _canonical_vocab()
+        drifted_vocab["image_taxonomy"].pop("placement_role", None)
+        _write_vocab(vocab, drifted_vocab)
+        plan_path = ws / DEFAULT_PLAN_FILENAME
+        rc_v, msg_v = validate_plan_file(
+            workspace=ws, plan=plan_path, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc_w == 0
+            and rc_v == 1
+            and "placement_role" in msg_v
+            and "drifted" in msg_v
+        )
+        results.append(_expect(
+            "placement_role (validate-plan): drift detected when the "
+            "vocab's image_taxonomy.placement_role block disappears "
+            "after the plan was written",
+            ok,
+            f"rc_w={rc_w}, msg_w={msg_w!r}; rc_v={rc_v}, msg_v={msg_v!r}",
+        ))
+
+    # ---- PR10. validate-plan: a plan with placement_role but no
+    # --descriptor-vocabulary is REFUSED. Mirrors how taxonomy fields
+    # and custom_descriptor handle missing vocab on the validate path. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_pr_validate_no_vocab"
+        _seed_workspace(ws, images=[
+            {"id": "cover", "local_path": "media/cover.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "cover",
+                    "prompt": "abstract pattern, no text",
+                    "placement_role": "hero_page",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc_w, _ = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        plan_path = ws / DEFAULT_PLAN_FILENAME
+        rc_v, msg_v = validate_plan_file(
+            workspace=ws, plan=plan_path, descriptor_vocabulary=None,
+        )
+        ok = (
+            rc_w == 0
+            and rc_v == 1
+            and "placement_role" in msg_v
+            and "--descriptor-vocabulary" in msg_v
+        )
+        results.append(_expect(
+            "placement_role (validate-plan): a plan carrying "
+            "placement_role refuses without --descriptor-vocabulary",
+            ok,
+            f"rc_v={rc_v}, msg_v={msg_v!r}",
+        ))
+
+    # ---- PR11. write-path universal-rule exemption: a hero_page request
+    # whose prompt includes the EXACT existing universal literal
+    # "text overlay" (which would otherwise fire the universal in-image-
+    # text rule) is accepted because the placement_role exemption skips
+    # that subset. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_pr_universal_exempt"
+        _seed_workspace(ws, images=[
+            {"id": "cover", "local_path": "media/cover.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "cover",
+                    "prompt": (
+                        "abstract gradient leaving room for the "
+                        "svg text overlay on the right"
+                    ),
+                    "placement_role": "hero_page",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = rc == 0 and (ws / DEFAULT_PLAN_FILENAME).is_file()
+        results.append(_expect(
+            "placement_role=hero_page: universal in-image-text rule "
+            "EXEMPTS the overlay subset (e.g. 'svg text overlay') so a "
+            "legitimate hero-page reservation prompt is not refused by "
+            "the universal rule",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- PR12. local_region request with editable-text wording that is
+    # NOT an overlay (e.g. 'slide title' / 'body copy' / 'data value')
+    # is STILL refused — the exemption is narrow (only overlay literals)
+    # so the rest of the universal rule continues to refuse for every
+    # placement_role. ----
+    for editable_phrase in ("slide title", "body copy", "data value"):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_pr_universal_strict"
+            _seed_workspace(ws, images=[
+                {"id": "cover", "local_path": "media/cover.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "cover",
+                        "prompt": (
+                            f"abstract pattern that holds the "
+                            f"{editable_phrase}"
+                        ),
+                        "placement_role": "hero_page",
+                    },
+                ],
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = (
+                rc == 1
+                and "editable-text wording" in msg
+                and not (ws / DEFAULT_PLAN_FILENAME).exists()
+            )
+            results.append(_expect(
+                f"placement_role=hero_page: editable-text wording NOT "
+                f"in the overlay subset ({editable_phrase!r}) is STILL "
+                f"refused; the exemption is narrow",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- PR13. negation exemption ALSO applies under the overlay-
+    # reservation gate: a local_region prompt that re-states the policy
+    # ("no calm space", "title overlay is forbidden") PASSES — the gate
+    # only fires on unnegated occurrences, mirroring the other rules. ----
+    for label, body in (
+        ("no calm space reserved",
+         "decorative diagram with no calm space reserved"),
+        ("title overlay is forbidden",
+         "decorative diagram; title overlay is forbidden here"),
+        ("without title overlay",
+         "decorative diagram without title overlay of any kind"),
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_pr_negation"
+            _seed_workspace(ws, images=[
+                {"id": "block", "local_path": "media/block.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "block",
+                        "prompt": body,
+                        "placement_role": "local_region",
+                    },
+                ],
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = rc == 0 and (ws / DEFAULT_PLAN_FILENAME).is_file()
+            results.append(_expect(
+                f"placement_role=local_region: overlay-reservation rule "
+                f"ACCEPTS negated reinforcement wording {label!r}",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- PR14. custom_descriptor under overlay-reservation gate.
+    # A vocab whose custom_descriptors[] allow-list approves a value
+    # that decodes (after separator normalization) to an overlay-
+    # reservation cue must be REFUSED for local_region / omitted role
+    # AND accepted for hero_page. Mirrors how the existing text_policy
+    # gate interacts with the custom_descriptor re-scan. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        # Build a vocab that has 'calm_space' in custom_descriptors[].
+        # After separator normalization the value becomes 'calm space',
+        # which is in the overlay-reservation literal list.
+        vocab_body = _canonical_vocab()
+        vocab_body["custom_descriptors"].append({
+            "kind": "composition_adjective",
+            "value": "calm_space",
+            "approved_in_review_ref": "synthetic_review.calm_space",
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, vocab_body)
+        # Case A: local_region → refused by overlay-reservation scan.
+        ws_a = td / "ws_pr_cd_local"
+        _seed_workspace(ws_a, images=[
+            {"id": "block", "local_path": "media/block.png", "source": "d_one_local"},
+        ])
+        spec_a = td / "spec_a.json"
+        _write_spec(spec_a, {
+            "requests": [
+                {
+                    "id": "block",
+                    "prompt": "abstract pattern, no text",
+                    "custom_descriptor": "calm_space",
+                    "placement_role": "local_region",
+                },
+            ],
+        })
+        rc_a, msg_a = done_image_adapter(
+            workspace=ws_a, spec=spec_a, descriptor_vocabulary=vocab,
+        )
+        ok_a = (
+            rc_a == 1
+            and "calm_space" in msg_a
+            and "overlay-reservation wording" in msg_a
+            and not (ws_a / DEFAULT_PLAN_FILENAME).exists()
+        )
+        # Case B: hero_page → accepted (overlay-reservation gate
+        # exempts hero_page and the separator-normalized scan no
+        # longer fires).
+        ws_b = td / "ws_pr_cd_hero"
+        _seed_workspace(ws_b, images=[
+            {"id": "cover", "local_path": "media/cover.png", "source": "d_one_local"},
+        ])
+        spec_b = td / "spec_b.json"
+        _write_spec(spec_b, {
+            "requests": [
+                {
+                    "id": "cover",
+                    "prompt": "abstract pattern, no text",
+                    "custom_descriptor": "calm_space",
+                    "placement_role": "hero_page",
+                },
+            ],
+        })
+        rc_b, msg_b = done_image_adapter(
+            workspace=ws_b, spec=spec_b, descriptor_vocabulary=vocab,
+        )
+        ok_b = rc_b == 0 and (ws_b / DEFAULT_PLAN_FILENAME).is_file()
+        ok = ok_a and ok_b
+        results.append(_expect(
+            "placement_role gates custom_descriptor safety re-scan: a "
+            "vocab-approved 'calm_space' value is refused for "
+            "local_region (separator-normalized overlay cue) but "
+            "accepted for hero_page",
+            ok,
+            f"local_region: rc={rc_a}, msg={msg_a!r}; "
+            f"hero_page: rc={rc_b}, msg={msg_b!r}",
+        ))
+
     return results
 
 
@@ -6219,7 +7338,15 @@ def main(argv: list[str]) -> int:
             "optional custom_descriptor escape-hatch field, validated "
             "against the vocab's custom_descriptors[].value allow-list "
             "with the full prompt safety scan re-applied on BOTH the "
-            "raw value AND a separator-normalized form. Does NOT "
+            "raw value AND a separator-normalized form, AND the "
+            "optional placement_role field (closed enumeration "
+            "hero_page / local_region), validated against the vocab's "
+            "image_taxonomy.placement_role.allowed_values and gating "
+            "the overlay-reservation safety scan (prompts and "
+            "custom_descriptor values that ask to reserve calm / "
+            "empty / right / lower-third / center space, SVG / PPT / "
+            "native / editable text overlay, or title overlay are "
+            "accepted only with placement_role='hero_page'). Does NOT "
             "call D-One / Qoder / any public network / any "
             "image-generation model / any external service. Does "
             "NOT generate any image bytes. Does NOT mutate "
@@ -6242,15 +7369,24 @@ def main(argv: list[str]) -> int:
              "any subset of the taxonomy fields 'rendering_style', "
              "'palette_family', 'image_role', 'layout_pattern', "
              "'modifier', 'text_policy', 'subject_domain', AND "
-             "optionally the 'custom_descriptor' escape-hatch field. "
-             "Each present taxonomy field requires "
-             "--descriptor-vocabulary AND must match a value declared "
-             "in image_taxonomy.<dim>.allowed_values. The "
-             "custom_descriptor field similarly requires "
+             "optionally the 'custom_descriptor' escape-hatch field "
+             "AND optionally the 'placement_role' field (closed "
+             "enumeration hero_page / local_region). Each present "
+             "taxonomy field requires --descriptor-vocabulary AND must "
+             "match a value declared in image_taxonomy.<dim>.allowed_values. "
+             "The custom_descriptor field similarly requires "
              "--descriptor-vocabulary AND must match an explicit "
              "approved entry in the vocab's custom_descriptors[] "
              "allow-list AND re-pass the full prompt safety scan on "
-             "BOTH the raw value AND a separator-normalized form.",
+             "BOTH the raw value AND a separator-normalized form. The "
+             "placement_role field similarly requires "
+             "--descriptor-vocabulary AND must be a member of the "
+             "vocab's image_taxonomy.placement_role.allowed_values; it "
+             "also gates the overlay-reservation safety scan (prompts "
+             "and custom_descriptor values that ask to reserve "
+             "calm/empty/right/lower-third/center space, SVG/PPT/"
+             "native/editable text overlay, or title overlay are "
+             "accepted only with placement_role='hero_page').",
     )
     parser.add_argument(
         "--plan-out", type=Path, default=None,
@@ -6268,15 +7404,21 @@ def main(argv: list[str]) -> int:
              "taxonomy fields (rendering_style / palette_family / "
              "image_role / layout_pattern / modifier / text_policy / "
              "subject_domain) OR the optional custom_descriptor "
-             "escape-hatch field. The file is re-validated every run, "
-             "every present taxonomy value must be a member of "
-             "the matching image_taxonomy.<dim>.allowed_values list, "
-             "and every present custom_descriptor value must be a "
-             "member of the vocab's custom_descriptors[].value "
-             "allow-list AND re-pass the full prompt safety scan on "
-             "BOTH the raw value AND a separator-normalized form. "
-             "Refused if URI-shaped, symlinked, missing, or "
-             "schema-invalid.",
+             "escape-hatch field OR the optional placement_role field "
+             "(closed enumeration hero_page / local_region). The file "
+             "is re-validated every run, every present taxonomy value "
+             "must be a member of the matching "
+             "image_taxonomy.<dim>.allowed_values list, every present "
+             "custom_descriptor value must be a member of the vocab's "
+             "custom_descriptors[].value allow-list AND re-pass the "
+             "full prompt safety scan on BOTH the raw value AND a "
+             "separator-normalized form, and every present "
+             "placement_role value must be a member of the vocab's "
+             "image_taxonomy.placement_role.allowed_values (the "
+             "placement_role block is OPTIONAL on the vocab — an "
+             "absent block means no allow-list and the adapter refuses "
+             "any placement_role-bearing request). Refused if URI-"
+             "shaped, symlinked, missing, or schema-invalid.",
     )
     parser.add_argument(
         "--validate-plan", action="store_true",
@@ -6284,21 +7426,25 @@ def main(argv: list[str]) -> int:
              "writing a new one. Requires --workspace and --plan; "
              "additionally requires --descriptor-vocabulary whenever "
              "the plan carries one or more taxonomy fields OR the "
-             "optional custom_descriptor escape-hatch field. The "
-             "validator is NON-MUTATING: it applies the schema "
+             "optional custom_descriptor escape-hatch field OR the "
+             "optional placement_role field. The validator is NON-"
+             "MUTATING: it applies the schema "
              "(d_one_adapter_plan.schema.json — covers list-rooted, "
              "unknown fields, missing required fields, mode != "
              "'dry_run', schema_version drift, manifest_source != "
              "'d_one_local', non-positive dimensions, and the "
              "lowercase-identifier + forbidden-token pattern lock on "
              "every taxonomy value AND on every custom_descriptor "
-             "value), the workspace + image_manifest "
+             "value AND the enum + pattern lock on every "
+             "placement_role value), the workspace + image_manifest "
              "preflight (manifest schema-valid; no duplicate ids; "
              "every local_path safe), the optional descriptor "
              "vocabulary preflight (vocab schema-valid; image_taxonomy "
              "projected to per-dimension allowed_values sets; the "
              "vocab's custom_descriptors[].value list projected to the "
-             "custom-descriptor allow-list set), and the "
+             "custom-descriptor allow-list set; the optional "
+             "image_taxonomy.placement_role.allowed_values projected "
+             "to the placement-role allow-list set), and the "
              "full set of cross-checks the schema cannot express "
              "(request_count == len(requests); no duplicate request "
              "ids; every id resolves in the manifest with "
@@ -6307,15 +7453,20 @@ def main(argv: list[str]) -> int:
              "byte-for-byte; every prompt re-passes the full URL / "
              "file-path / raw-source marker / 40-char source shingle "
              "/ credential / PII / full-slide wording / "
-             "public-distribution wording deny list; every "
-             "intended_use re-passes the full-slide wording subset of "
-             "that list; AND every taxonomy value is in the matching "
+             "public-distribution wording deny list AND — when "
+             "placement_role != 'hero_page' — the overlay-reservation "
+             "deny list; every intended_use re-passes the full-slide "
+             "wording subset of that list AND (for non-hero "
+             "placements) the overlay-reservation subset; AND every "
+             "taxonomy value is in the matching "
              "image_taxonomy.<dim>.allowed_values list, AND every "
              "custom_descriptor value is in the vocab's "
              "custom_descriptors[].value allow-list AND re-passes the "
              "full prompt safety scan on BOTH the raw value AND a "
-             "separator-normalized form — the same scope the write "
-             "path applies).",
+             "separator-normalized form, AND every placement_role "
+             "value is in the vocab's "
+             "image_taxonomy.placement_role.allowed_values — the same "
+             "scope the write path applies).",
     )
     parser.add_argument(
         "--plan", type=Path, default=None,
@@ -6355,10 +7506,29 @@ def main(argv: list[str]) -> int:
              "AND every compound (full_slide, image_search, "
              "web_generation, page_generation, slide_generation) is "
              "exercised against both new dimensions, with no "
-             "overclaim, and validate-plan drift). Exits non-zero if "
-             "any scenario does not behave as expected. Mutually "
-             "exclusive with --workspace / --spec / --plan-out / "
-             "--plan / --validate-plan / --descriptor-vocabulary.",
+             "overclaim, and validate-plan drift), AND the new "
+             "placement_role + overlay-reservation gate matrix "
+             "(hero_page + overlay-cue prompt round-trips through "
+             "write + validate-plan; local_region + overlay-cue is "
+             "refused; placement_role-omitted + overlay-cue is refused; "
+             "ordinary local_region prompt without overlay cues "
+             "PASSES; missing --descriptor-vocabulary refused for "
+             "placement_role-bearing requests; unknown placement_role "
+             "value refused with the "
+             "image_taxonomy.placement_role.allowed_values diagnostic; "
+             "vocab that omits the optional placement_role block "
+             "refuses any placement_role-bearing request; the universal "
+             "in-image-text rule's overlay subset is EXEMPTED for "
+             "hero_page; non-overlay editable-text wording (slide "
+             "title / body copy / data value) is STILL refused even "
+             "for hero_page; negation-exempt reinforcement wording is "
+             "accepted; AND a vocab-approved custom_descriptor whose "
+             "separator-normalized form decodes to an overlay-"
+             "reservation cue is refused for local_region and accepted "
+             "for hero_page). Exits non-zero if any scenario does not "
+             "behave as expected. Mutually exclusive with --workspace "
+             "/ --spec / --plan-out / --plan / --validate-plan / "
+             "--descriptor-vocabulary.",
     )
     args = parser.parse_args(argv)
 
