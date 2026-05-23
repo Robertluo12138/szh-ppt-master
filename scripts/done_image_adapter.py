@@ -409,6 +409,302 @@ _PROMPT_FULL_SLIDE_LITERALS: tuple[str, ...] = (
     "generate this page",
 )
 
+# Wording that asks the generated image to carry text the slide must
+# keep exact, editable, searchable, rewordable, or data-faithful.
+# Such copy belongs in the native SVG / PPT text layer, never baked
+# into the raster the image generator produces — once rasterised the
+# text is locked, untrustworthy under reflow, unreadable by screen
+# readers, and unsearchable. The check is universal: it fires
+# regardless of text_policy, because every policy that gates the
+# decorative artwork text layer (decorative_glyphs / caption_safe)
+# still forbids editable / data-faithful copy from living in the
+# image. The literals describe an intent the local pipeline cannot
+# fulfil at all, not a script or language preference — no
+# Latin-only / CJK-fails / length-based wording lives here.
+_PROMPT_EDITABLE_TEXT_LITERALS: tuple[str, ...] = (
+    # Page / slide / section chrome — must be native editable text.
+    "slide title",
+    "page title",
+    "section title",
+    "slide chrome",
+    "page chrome",
+    # Body / native text overlays / SVG overlays — must be native.
+    "body copy",
+    "body text",
+    "native text",
+    "native-text overlay",
+    "native text overlay",
+    "svg text overlay",
+    "svg-text overlay",
+    "svg overlay text",
+    "text overlay",
+    # Exact / editable / searchable / rewordable wording.
+    "exact text",
+    "exact copy",
+    "exact wording",
+    "editable text",
+    "editable copy",
+    "editable wording",
+    "searchable text",
+    "searchable copy",
+    "rewordable text",
+    "rewordable copy",
+    # Data-faithful labels and values.
+    "data value",
+    "data values",
+    "data label",
+    "data labels",
+    "axis label",
+    "axis labels",
+    "kpi number",
+    "kpi value",
+    "kpi figure",
+    "legend text",
+    # Editable typographic blocks — explicit "<thing> text" phrasing.
+    "headline text",
+    "subtitle text",
+    "callout text",
+    "annotation text",
+    "caption text",
+)
+
+# Wording that explicitly asks the generated image to carry visible
+# letters / numerals / words / captions / labels / titles / quotes /
+# slogans. Only fires when ``text_policy == 'no_text'`` — the policy
+# already says no in-image text, so a prompt that explicitly asks
+# for in-image text is self-contradictory. Under decorative_glyphs
+# / caption_safe the same wording may describe legitimate stylised
+# artwork (a wordmark accent, decorative calligraphy, a stylised
+# initial, etc.), so the rule deliberately does NOT fire there. The
+# rule is editability-based, not script-based; nothing here mentions
+# Latin / CJK / character length.
+#
+# Matching is boundary-aware (see ``_literal_present_unnegated``):
+# every literal must be flanked by word boundaries on each side, so
+# the literal ``image text`` matches ``"...image text..."`` but NOT
+# the prefix of ``"image texture"`` / ``"image textures"``, and
+# ``with text`` matches ``"...with text..."`` but NOT
+# ``"with textured paper"``. This closes the prefix / suffix
+# substring false positives the earlier plain ``str.find`` scan
+# produced on normal image-generation wording like ``image
+# texture`` / ``textured paper`` / ``context lighting`` / ``texture
+# pattern``.
+_PROMPT_NO_TEXT_REQUEST_LITERALS: tuple[str, ...] = (
+    # Direct text-request verbs.
+    "include text",
+    "add text",
+    "draw text",
+    "render text",
+    "show text",
+    "with text",
+    "visible text",
+    "any text",
+    "some text",
+    # Letter / character / word / numeral requests.
+    "include letters",
+    "add letters",
+    "draw letters",
+    "show letters",
+    "with letters",
+    "visible letters",
+    "include words",
+    "add words",
+    "draw words",
+    "show words",
+    "with words",
+    "include characters",
+    "add characters",
+    "show characters",
+    "include numerals",
+    "add numerals",
+    "show numerals",
+    # Specific kinds of in-image typography requested.
+    "include a caption",
+    "add a caption",
+    "with a caption",
+    "draw a caption",
+    "include a label",
+    "add a label",
+    "with a label",
+    "include a title",
+    "add a title",
+    "with a title",
+    "include a heading",
+    "add a heading",
+    "with a heading",
+    "include a slogan",
+    "with a slogan",
+    "add a slogan",
+    "include a quote",
+    "with a quote",
+    "add a quote",
+    "include a quotation",
+    "include a tagline",
+    "with a tagline",
+    "add a tagline",
+    # Typographic art that bakes text into the image.
+    "lettering",
+    "typography",
+    "typographic",
+    "wordmark",
+    "monogram",
+    "calligraphy",
+    "calligraphic",
+    # Generic in-image-text framings.
+    "in-image text",
+    "image text",
+    "baked text",
+    "text in the image",
+    "text on the image",
+    "text inside the image",
+    "letters in the image",
+    "letters on the image",
+    "words in the image",
+    "writing in the image",
+    "writing on the image",
+)
+
+# Negation-exemption pattern for the two policy-aware deny lists
+# above (``_PROMPT_EDITABLE_TEXT_LITERALS`` and
+# ``_PROMPT_NO_TEXT_REQUEST_LITERALS``). A prompt that re-states the
+# policy ("no visible text", "do not include text", "without
+# lettering", "caption text is forbidden") is NOT a request to bake
+# text into the image — it is policy reinforcement, and refusing it
+# would force callers to author awkward prompts to talk about what
+# the policy already forbids. Strict-adjacency matching mirrors the
+# pattern documented at scripts/validate_d_one_live_run_evidence.py:
+# BEFORE-side a single negation word immediately adjacent (no
+# punctuation between the negation word and the literal — a comma,
+# period, semicolon, or ellipsis IS a clause boundary and the
+# negation does NOT propagate across it); AFTER-side an optional
+# copula + refusal word, or a refusal bigram, with intermediate
+# tokens (the copula, the bigram-first half) exact (no punctuation)
+# and trailing sentence-end punctuation tolerated only on the FINAL
+# refusal token so reinforcement that ends a sentence still exempts.
+# Intervening words on the BEFORE side are NOT honored either, so
+# "must not have any text" stays refused because `have` sits between
+# `not` and the literal. The exemption applies ONLY to the two new
+# gates; the existing URL / file-path / credential / PII / full-
+# slide / public-distribution scans keep their existing strict-
+# substring behavior to avoid widening their blast radius.
+_PROMPT_NEGATION_BEFORE_WORDS: frozenset[str] = frozenset({
+    "no", "not", "never", "without",
+})
+_PROMPT_NEGATION_AFTER_COPULAS: frozenset[str] = frozenset({
+    "is", "are", "was", "were",
+})
+_PROMPT_NEGATION_AFTER_REFUSAL_WORDS: frozenset[str] = frozenset({
+    "forbidden", "prohibited", "denied", "disabled",
+    "blocked", "refused", "banned",
+})
+_PROMPT_NEGATION_AFTER_REFUSAL_BIGRAMS: frozenset[tuple[str, str]] = (
+    frozenset({
+        ("not", "used"),
+        ("not", "allowed"),
+        ("not", "permitted"),
+        ("not", "enabled"),
+    })
+)
+# Sentence-end punctuation tolerated ONLY on the FINAL refusal token
+# (so "lettering is forbidden." with a trailing period still exempts).
+# Comma and semicolon are intentionally absent — they indicate clause
+# / compound-sentence boundaries and the negation should not be
+# treated as propagating across them.
+_PROMPT_NEGATION_TAIL_PUNCT: str = ".!?\"')]"
+
+
+def _occurrence_is_negated(lower: str, start: int, end: int) -> bool:
+    """Return True if the substring at ``lower[start:end]`` sits next
+    to negation / refusal wording. See the comment block above for
+    the exact pattern. The BEFORE-side last word must be a bare
+    negation word with NO trailing punctuation — a comma, period, or
+    ellipsis between the negation and the literal is treated as a
+    clause boundary (so ``"no, include text"`` is NOT exempted even
+    though ``"no"`` precedes the literal — the comma breaks
+    adjacency). The AFTER-side allows trailing sentence-end
+    punctuation on the FINAL refusal token only; intermediate tokens
+    (the copula, the bigram-first half) must be exact, so
+    ``"is, forbidden"`` is NOT exempted because the comma after
+    ``is`` breaks adjacency."""
+    prefix = lower[:start].rstrip()
+    if prefix:
+        sep = max(
+            prefix.rfind(" "),
+            prefix.rfind("\t"),
+            prefix.rfind("\n"),
+        )
+        last_word = prefix[sep + 1:] if sep >= 0 else prefix
+        if last_word in _PROMPT_NEGATION_BEFORE_WORDS:
+            return True
+    suffix = lower[end:].lstrip()
+    if not suffix:
+        return False
+    tokens = suffix.split(maxsplit=3)
+    if not tokens:
+        return False
+    # Pattern 1: <refusal>  (e.g. "forbidden", "forbidden.")
+    if (
+        tokens[0].rstrip(_PROMPT_NEGATION_TAIL_PUNCT)
+        in _PROMPT_NEGATION_AFTER_REFUSAL_WORDS
+    ):
+        return True
+    if len(tokens) >= 2:
+        # Pattern 2: <copula> <refusal>   (e.g. "is forbidden")
+        if (
+            tokens[0] in _PROMPT_NEGATION_AFTER_COPULAS
+            and tokens[1].rstrip(_PROMPT_NEGATION_TAIL_PUNCT)
+                in _PROMPT_NEGATION_AFTER_REFUSAL_WORDS
+        ):
+            return True
+        # Pattern 3: <bigram[0]> <bigram[1]>  (e.g. "not used")
+        if (
+            tokens[0],
+            tokens[1].rstrip(_PROMPT_NEGATION_TAIL_PUNCT),
+        ) in _PROMPT_NEGATION_AFTER_REFUSAL_BIGRAMS:
+            return True
+    if len(tokens) >= 3:
+        # Pattern 4: <copula> <bigram[0]> <bigram[1]>
+        #   (e.g. "is not used")
+        if (
+            tokens[0] in _PROMPT_NEGATION_AFTER_COPULAS
+            and (
+                tokens[1],
+                tokens[2].rstrip(_PROMPT_NEGATION_TAIL_PUNCT),
+            ) in _PROMPT_NEGATION_AFTER_REFUSAL_BIGRAMS
+        ):
+            return True
+    return False
+
+
+def _literal_present_unnegated(lower: str, literal: str) -> bool:
+    """Return True if ``literal`` appears in ``lower`` at a word /
+    phrase boundary AND at least one occurrence is NOT next to a
+    documented negation / refusal pattern.
+
+    Boundary-aware matching: each match must have a word boundary
+    (``\\b``) on each side, so the literal only fires on whole-token /
+    whole-phrase matches and never on a substring of a longer word.
+    This closes the substring false positives the earlier plain
+    ``str.find`` scan produced — e.g. the literal ``"image text"``
+    matching the prefix of ``"image texture"`` under
+    ``text_policy='no_text'`` and the literal ``"with text"``
+    matching the prefix of ``"with textured paper"``. The full-slide
+    / public-distribution / source-marker / credential / personal-id
+    gates keep their plain-substring behavior; the boundary rule
+    applies only to the two policy-aware text-wording deny lists
+    (``_PROMPT_EDITABLE_TEXT_LITERALS`` and
+    ``_PROMPT_NO_TEXT_REQUEST_LITERALS``) consulted via this helper.
+
+    If every occurrence sits next to a documented negation pattern,
+    return False so the safety scan does not refuse a prompt that
+    merely re-states what the policy already forbids."""
+    pattern = re.compile(r"\b" + re.escape(literal) + r"\b")
+    for match in pattern.finditer(lower):
+        if not _occurrence_is_negated(lower, match.start(), match.end()):
+            return True
+    return False
+
+
 # Window size for the input/source.md shingle check. 40 chars is short
 # enough to catch a copy-pasted sentence ("The Q3 revenue grew by
 # fifteen percent over Q2") but long enough that common stop-phrases
@@ -547,11 +843,20 @@ def _scan_prompt_safety(
     prompt: str,
     *,
     source_text: str | None,
+    text_policy: str | None = None,
 ) -> list[str]:
     """Return a list of safety violations for ``prompt``. Empty list ->
     safe. Every pattern table is consulted; we collect ALL violations
     in one pass so the caller sees every problem at once rather than
-    a one-issue-at-a-time game of whack-a-mole."""
+    a one-issue-at-a-time game of whack-a-mole.
+
+    When ``text_policy`` is the request's ``text_policy`` taxonomy
+    value (``no_text`` / ``decorative_glyphs`` / ``caption_safe``)
+    the scan also applies the policy-aware in-image-text rule (only
+    fires when ``text_policy == 'no_text'``). ``text_policy=None`` is
+    the safe default — no policy-aware check is run, only the
+    universal rules.
+    """
     violations: list[str] = []
     lower = prompt.lower()
 
@@ -641,20 +946,77 @@ def _scan_prompt_safety(
                 f"published, shared, or hosted publicly"
             )
 
+    # Always-on editable-text rule. Any wording that asks the
+    # generated image to carry exact / editable / searchable /
+    # rewordable / data-faithful text is refused regardless of
+    # text_policy: such copy belongs in the native SVG / PPT text
+    # layer where it can be edited, reflowed, and indexed. The
+    # match is negation-exempt — see ``_occurrence_is_negated`` —
+    # so policy-reinforcement phrasings such as
+    # ``"no slide title in this image"`` or
+    # ``"body copy is forbidden"`` are NOT refused.
+    for literal in _PROMPT_EDITABLE_TEXT_LITERALS:
+        if _literal_present_unnegated(lower, literal):
+            violations.append(
+                f"contains the editable-text wording {literal!r}; "
+                f"text that must remain exact, editable, searchable, "
+                f"rewordable, or data-faithful belongs in the native "
+                f"SVG / PPT text layer, not in the generated image"
+            )
+
+    # Policy-aware in-image-text rule. When the request declares
+    # text_policy == 'no_text', the prompt may not ask for visible
+    # in-image letters / numerals / words / captions / labels /
+    # titles / quotes / slogans. The rule is editability-based, not
+    # script-based: decorative artwork text under decorative_glyphs
+    # / caption_safe is unaffected (including non-Latin / CJK
+    # glyphs). The match is negation-exempt — see
+    # ``_occurrence_is_negated`` — so policy-reinforcement phrasings
+    # such as ``"no visible text"`` / ``"do not include text"`` /
+    # ``"without lettering"`` / ``"calligraphy is not allowed"`` are
+    # NOT refused.
+    if text_policy == "no_text":
+        for literal in _PROMPT_NO_TEXT_REQUEST_LITERALS:
+            if _literal_present_unnegated(lower, literal):
+                violations.append(
+                    f"contains the in-image-text wording {literal!r} "
+                    f"under text_policy='no_text'; the policy forbids "
+                    f"any visible letters / numerals / words / "
+                    f"captions / labels / titles in the generated "
+                    f"image — move the copy to the native SVG / PPT "
+                    f"text layer or pick a text_policy that permits "
+                    f"decorative artwork text"
+                )
+
     return violations
 
 
 def _scan_intended_use(intended_use: str) -> list[str]:
     """Subset of the prompt safety scan applied to ``intended_use``.
-    Only the full-slide / screenshot wording matters here — the field
-    is short and the manifest schema's description already says
-    "never 'full-slide background'", so the helper enforces it."""
+    Only the full-slide / screenshot wording and the universal
+    editable-text rule matter here — the field is short and the
+    manifest schema's description already says "never 'full-slide
+    background'", so the helper enforces it. The editable-text rule
+    fires when ``intended_use`` claims the image will hold a slide
+    title, body copy, native-text overlay, or other copy that must
+    remain editable / data-faithful — wording the manifest could
+    never honour because such text must live in the native SVG /
+    PPT text layer, not in the generated raster."""
     violations: list[str] = []
     lower = intended_use.lower()
     for literal in _PROMPT_FULL_SLIDE_LITERALS:
         if literal in lower:
             violations.append(
                 f"intended_use contains forbidden wording {literal!r}"
+            )
+    for literal in _PROMPT_EDITABLE_TEXT_LITERALS:
+        if _literal_present_unnegated(lower, literal):
+            violations.append(
+                f"intended_use contains the editable-text wording "
+                f"{literal!r}; text that must remain exact, editable, "
+                f"searchable, rewordable, or data-faithful belongs in "
+                f"the native SVG / PPT text layer, not in the "
+                f"generated image"
             )
     return violations
 
@@ -755,8 +1117,17 @@ def _validate_spec_requests(
                 f"FAIL: requests[{i}].prompt (id {req_id!r}) must be a "
                 f"non-empty string (got {prompt!r})"
             )
+        # Peek at text_policy for the policy-aware prompt scan. The
+        # full taxonomy validation runs below (refuses unknown values,
+        # missing vocab, etc.); the peek only enables the no_text
+        # in-image-text gate when the value is a non-empty string,
+        # so a malformed text_policy stays caught by the taxonomy
+        # block — it just does not trigger the policy-aware scan.
+        text_policy_peek = req.get("text_policy")
+        if not isinstance(text_policy_peek, str) or not text_policy_peek.strip():
+            text_policy_peek = None
         prompt_violations = _scan_prompt_safety(
-            prompt, source_text=source_text,
+            prompt, source_text=source_text, text_policy=text_policy_peek,
         )
         if prompt_violations:
             return None, (
@@ -1500,8 +1871,17 @@ def validate_plan_file(
                 f"after resolution"
             )
 
+        # Peek at text_policy for the policy-aware prompt scan; the
+        # full taxonomy validation against the descriptor vocabulary
+        # runs below. Mirrors the live spec path so a plan whose
+        # text_policy says ``no_text`` is held to the same in-image-
+        # text refusal the spec writer applied.
+        plan_text_policy_peek = req.get("text_policy")
+        if not isinstance(plan_text_policy_peek, str) or not plan_text_policy_peek.strip():
+            plan_text_policy_peek = None
         prompt_violations = _scan_prompt_safety(
             req["prompt"], source_text=source_text,
+            text_policy=plan_text_policy_peek,
         )
         if prompt_violations:
             return 1, (
@@ -2153,6 +2533,72 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
                 ok, f"rc={rc}, msg={msg!r}",
             ))
 
+    # ---- 11c. editable-text wording in prompt refused (universal —
+    # fires regardless of text_policy because text that must remain
+    # exact / editable / searchable / rewordable / data-faithful
+    # belongs in the native SVG / PPT text layer, never in the
+    # generated raster). Each phrase lives in
+    # _PROMPT_EDITABLE_TEXT_LITERALS. NO descriptor-vocabulary is
+    # supplied here — proves the rule fires without taxonomy. ----
+    for phrase in (
+        # Page / slide / section chrome wording.
+        "slide title",
+        "page title",
+        "page chrome",
+        # Body / overlay wording.
+        "body copy",
+        "body text",
+        "native text",
+        "svg text overlay",
+        "text overlay",
+        # Exact / editable / searchable / rewordable wording.
+        "exact text",
+        "editable copy",
+        "searchable text",
+        "rewordable copy",
+        # Data-faithful wording.
+        "data value",
+        "data label",
+        "axis label",
+        "kpi number",
+        "legend text",
+        # Editable typographic blocks.
+        "headline text",
+        "subtitle text",
+        "callout text",
+        "annotation text",
+        "caption text",
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_editable_text"
+            _seed_workspace(ws, images=[
+                {"id": "x", "local_path": "a/x.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "x",
+                        "prompt": (
+                            f"abstract pattern that holds the {phrase}"
+                        ),
+                    },
+                ],
+            })
+            rc, msg = done_image_adapter(workspace=ws, spec=spec)
+            ok = (
+                rc == 1
+                and "editable-text wording" in msg
+                and "native SVG / PPT text layer" in msg
+                and not (ws / DEFAULT_PLAN_FILENAME).exists()
+            )
+            results.append(_expect(
+                f"editable-text wording {phrase!r} in prompt refused "
+                f"(universal — no text_policy)",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
     # ---- 12. intended_use containing forbidden wording refused. ----
     with tempfile.TemporaryDirectory() as raw_td:
         td = Path(raw_td)
@@ -2180,6 +2626,89 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
             "intended_use containing 'full-slide background' refused",
             ok, f"rc={rc}, msg={msg!r}",
         ))
+
+    # ---- 12b. intended_use containing editable-text wording refused
+    # (universal — proves the editable-text rule applies symmetrically
+    # to the intended_use field, not just the prompt). ----
+    for phrase in (
+        "slide title",
+        "body copy",
+        "native text",
+        "data value",
+        "headline text",
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_iu_editable"
+            _seed_workspace(ws, images=[
+                {"id": "x", "local_path": "a/x.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "x",
+                        "prompt": "an abstract pattern, no text",
+                        "intended_use": (
+                            f"raster that holds the {phrase} of the deck"
+                        ),
+                    },
+                ],
+            })
+            rc, msg = done_image_adapter(workspace=ws, spec=spec)
+            ok = (
+                rc == 1
+                and "intended_use" in msg
+                and "editable-text wording" in msg
+                and not (ws / DEFAULT_PLAN_FILENAME).exists()
+            )
+            results.append(_expect(
+                f"intended_use containing editable-text wording "
+                f"{phrase!r} refused",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- 12c. intended_use with NEGATED editable-text wording
+    # PASSES — proves the negation exemption also applies on the
+    # intended_use path, so a manifest description that re-states the
+    # policy ("no slide title in this image", "body copy is
+    # forbidden") is not refused. ----
+    for label, iu_body in (
+        ("no slide title in this image",
+         "decorative accent, no slide title in this image"),
+        ("body copy is forbidden",
+         "decorative accent, body copy is forbidden here"),
+        ("without body copy",
+         "decorative accent, without body copy of any kind"),
+        ("native text is prohibited",
+         "decorative accent, native text is prohibited in this asset"),
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_iu_negated"
+            _seed_workspace(ws, images=[
+                {"id": "x", "local_path": "a/x.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "x",
+                        "prompt": "an abstract pattern, no text",
+                        "intended_use": iu_body,
+                    },
+                ],
+            })
+            rc, msg = done_image_adapter(workspace=ws, spec=spec)
+            ok = (
+                rc == 0
+                and (ws / DEFAULT_PLAN_FILENAME).is_file()
+            )
+            results.append(_expect(
+                f"intended_use ACCEPTS negated editable-text wording "
+                f"{label!r} (BEFORE / AFTER negation exemption)",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
 
     # ---- 13. output path outside workspace refused (--plan-out). ----
     with tempfile.TemporaryDirectory() as raw_td:
@@ -4137,6 +4666,512 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
             results.append(_expect(
                 f"prompt-intent: validate-plan refuses a plan whose "
                 f"{field} value drifted from allowed_values",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- TPI7. text_policy='no_text' + a prompt asking for visible
+    # in-image text refused. Each phrase lives in
+    # _PROMPT_NO_TEXT_REQUEST_LITERALS. The vocab IS supplied so the
+    # taxonomy value is valid; the only thing refusing the request is
+    # the policy-aware in-image-text scan. ----
+    for phrase in (
+        "include text",
+        "with text",
+        "visible text",
+        "add letters",
+        "show numerals",
+        "include a caption",
+        "with a label",
+        "with a title",
+        "include a slogan",
+        "with a quote",
+        "lettering",
+        "typography",
+        "wordmark",
+        "calligraphy",
+        "monogram",
+        "text in the image",
+        "letters on the image",
+        "writing in the image",
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_tpi_no_text_request"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "a",
+                        "prompt": f"abstract pattern, please {phrase}",
+                        "text_policy": "no_text",
+                        "subject_domain": "abstract_geometry",
+                    },
+                ],
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = (
+                rc == 1
+                and "in-image-text wording" in msg
+                and "text_policy='no_text'" in msg
+                and not (ws / DEFAULT_PLAN_FILENAME).exists()
+            )
+            results.append(_expect(
+                f"prompt-intent: text_policy='no_text' refuses prompt "
+                f"asking for in-image text via {phrase!r}",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- TPI8. decorative artwork text wording in prompt PASSES
+    # under text_policy='decorative_glyphs' (the policy permits
+    # artwork-style letterforms). Same prompt that TPI7 would refuse
+    # under no_text is accepted here — proves the gate is policy-
+    # aware, not a blanket ban on letter-related wording. ----
+    for phrase in ("lettering", "calligraphy", "wordmark", "monogram"):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_tpi_decorative_glyphs"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "a",
+                        "prompt": (
+                            f"decorative {phrase} accent, "
+                            f"stylised artwork only"
+                        ),
+                        "text_policy": "decorative_glyphs",
+                        "subject_domain": "metric_emblem",
+                    },
+                ],
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            plan_doc = json.loads(
+                (ws / DEFAULT_PLAN_FILENAME).read_text()
+            ) if rc == 0 else {}
+            ok = (
+                rc == 0
+                and plan_doc.get("requests", [{}])[0].get(
+                    "text_policy",
+                ) == "decorative_glyphs"
+            )
+            results.append(_expect(
+                f"prompt-intent: text_policy='decorative_glyphs' "
+                f"accepts decorative artwork wording {phrase!r} "
+                f"(policy-aware, not a blanket ban)",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- TPI9. non-Latin / CJK decorative artwork text in the
+    # prompt PASSES under text_policy='decorative_glyphs'. Proves
+    # the validator is editability-based, not script-based: nothing
+    # in _scan_prompt_safety rejects a prompt SOLELY because it
+    # contains non-Latin characters. The fixture is synthetic — a
+    # generic decorative-pattern adjective followed by a short
+    # non-sensitive non-Latin string. ----
+    for label, non_latin_snippet in (
+        # Synthetic stand-in for a CJK calligraphy accent.
+        ("CJK calligraphy", "水火"),
+        # Synthetic stand-in for a Cyrillic decorative initial.
+        ("Cyrillic initial", "Я"),
+        # Synthetic stand-in for an Arabic decorative ornament.
+        ("Arabic ornament", "فج"),
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_tpi_non_latin_artwork"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "a",
+                        "prompt": (
+                            f"decorative geometric accent, "
+                            f"stylised motif {non_latin_snippet}"
+                        ),
+                        "text_policy": "decorative_glyphs",
+                        "subject_domain": "metric_emblem",
+                    },
+                ],
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = (
+                rc == 0
+                and (ws / DEFAULT_PLAN_FILENAME).is_file()
+            )
+            results.append(_expect(
+                f"prompt-intent: non-Latin decorative wording "
+                f"({label}) accepted under "
+                f"text_policy='decorative_glyphs' (editability-based "
+                f"gate, NOT a script-based ban)",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- TPI10. universal editable-text rule fires EVEN when
+    # text_policy permits decorative artwork text. A prompt asking
+    # for the slide title under text_policy='decorative_glyphs' is
+    # still refused: the artwork-text policy permits stylised
+    # letterforms, not editable chrome. Proves the universal rule
+    # and the policy-aware rule are independent. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_tpi_editable_vs_decorative"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": (
+                        "decorative letterform that holds the slide title"
+                    ),
+                    "text_policy": "decorative_glyphs",
+                    "subject_domain": "metric_emblem",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "editable-text wording" in msg
+            and "'slide title'" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "prompt-intent: universal editable-text rule still fires "
+            "under text_policy='decorative_glyphs' (slide-title chrome "
+            "refused even when artwork letterforms are permitted)",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- TPI11. text_policy='no_text' + a prompt that NEGATES the
+    # in-image-text wording PASSES. Proves the policy-aware scan is
+    # negation-exempt, so a prompt that simply re-states the policy
+    # ("no visible text", "do not include text", "without lettering",
+    # "calligraphy is not allowed") is accepted instead of refused.
+    # Mirrors the BEFORE / AFTER adjacency pattern documented at
+    # scripts/validate_d_one_live_run_evidence.py. ----
+    for label, prompt_body in (
+        ("BEFORE-side 'no'", "abstract pattern, no visible text"),
+        ("BEFORE-side 'not'",
+         "abstract pattern, do not include text in the asset"),
+        ("BEFORE-side 'never'",
+         "abstract pattern, never show numerals please"),
+        ("BEFORE-side 'without'",
+         "abstract pattern, without any text"),
+        ("BEFORE-side 'without' applied to typographic-art literal",
+         "abstract pattern, without lettering"),
+        ("AFTER-side 'is forbidden'",
+         "abstract pattern, lettering is forbidden in this image"),
+        ("AFTER-side 'is not allowed'",
+         "abstract pattern, calligraphy is not allowed here"),
+        ("AFTER-side bare refusal 'refused'",
+         "abstract pattern, typography refused for this asset"),
+        ("AFTER-side 'is prohibited'",
+         "abstract pattern, wordmark is prohibited here"),
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_tpi_negated_no_text"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "a",
+                        "prompt": prompt_body,
+                        "text_policy": "no_text",
+                        "subject_domain": "abstract_geometry",
+                    },
+                ],
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = (
+                rc == 0
+                and (ws / DEFAULT_PLAN_FILENAME).is_file()
+            )
+            results.append(_expect(
+                f"prompt-intent: text_policy='no_text' ACCEPTS "
+                f"negated reinforcement wording ({label}) — the "
+                f"in-image-text scan exempts policy-reinforcement "
+                f"phrasings",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- TPI12. universal editable-text rule + NEGATED prompt
+    # wording PASSES (no text_policy supplied; the universal rule is
+    # checked regardless). Proves the universal rule honors the same
+    # negation exemption — "no slide title", "without body copy",
+    # "caption text is forbidden" all describe what the image must
+    # NOT carry and should not trip the gate. ----
+    for label, prompt_body in (
+        ("BEFORE-side 'no'",
+         "abstract pattern, no slide title in the artwork"),
+        ("BEFORE-side 'without'",
+         "abstract pattern, without body copy of any kind"),
+        ("BEFORE-side 'never' (strict adjacency)",
+         "abstract pattern, never legend text baked in"),
+        ("AFTER-side 'is forbidden'",
+         "abstract pattern, caption text is forbidden here"),
+        ("AFTER-side 'is not used'",
+         "abstract pattern, native text is not used in this asset"),
+        ("AFTER-side bare 'prohibited'",
+         "abstract pattern, body copy prohibited in this raster"),
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_universal_negated"
+            _seed_workspace(ws, images=[
+                {"id": "x", "local_path": "a/x.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {"id": "x", "prompt": prompt_body},
+                ],
+            })
+            rc, msg = done_image_adapter(workspace=ws, spec=spec)
+            ok = (
+                rc == 0
+                and (ws / DEFAULT_PLAN_FILENAME).is_file()
+            )
+            results.append(_expect(
+                f"universal editable-text rule ACCEPTS negated "
+                f"wording ({label}) — policy-reinforcement is "
+                f"exempted regardless of text_policy",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- TPI13. mixed prompt — a negated reinforcement AND an
+    # unnegated request — STILL FAILS. Proves the negation exemption
+    # is per-occurrence, not per-prompt: if any unnegated request
+    # phrase appears, the gate fires. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_mixed_negation"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": (
+                        "abstract pattern, do not include text, "
+                        "but please add a caption"
+                    ),
+                    "text_policy": "no_text",
+                    "subject_domain": "abstract_geometry",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "in-image-text wording" in msg
+            and "'add a caption'" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "prompt-intent: mixed prompt with a NEGATED reinforcement "
+            "AND an UNNEGATED request — the unnegated request still "
+            "trips the in-image-text gate (negation exemption is "
+            "per-occurrence, not per-prompt)",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- TPI14. BEFORE-side false-green probe (regression for the
+    # Codex stop-time review): a comma / period / ellipsis between
+    # the negation word and the literal breaks strict adjacency, so
+    # the in-image-text request still fires. Comma is a clause
+    # boundary in English; if it were exempted, a caller could write
+    # ``"no, include text"`` and sneak an unnegated request past the
+    # gate. ----
+    for label, prompt_body in (
+        ("'no,' comma break",
+         "abstract pattern. no, include text in this image"),
+        ("'not.' period break",
+         "abstract pattern. not. include text everywhere"),
+        ("'without...' ellipsis break",
+         "abstract pattern. without... lettering required"),
+        ("'no;' semicolon break",
+         "abstract pattern. no; show text"),
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_tpi_before_punct_break"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "a",
+                        "prompt": prompt_body,
+                        "text_policy": "no_text",
+                        "subject_domain": "abstract_geometry",
+                    },
+                ],
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = (
+                rc == 1
+                and "in-image-text wording" in msg
+                and "text_policy='no_text'" in msg
+                and not (ws / DEFAULT_PLAN_FILENAME).exists()
+            )
+            results.append(_expect(
+                f"prompt-intent: BEFORE-side punctuation BREAKS "
+                f"adjacency ({label}) — the in-image-text request "
+                f"still fires (negation does NOT propagate across "
+                f"a clause boundary)",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- TPI15. AFTER-side false-green probe: a comma immediately
+    # after the literal OR after the copula breaks strict adjacency
+    # to the refusal phrase. Closes a parallel false-green where a
+    # caller could write ``"include text is, forbidden later"`` and
+    # have the ``"is, forbidden"`` sequence treated as a refusal
+    # phrase even though the comma between subject and verb means
+    # this is two unrelated clauses, not one reinforcement. ----
+    for label, prompt_body in (
+        ("comma between literal and refusal",
+         "abstract pattern, include text, forbidden everywhere"),
+        ("comma between copula and refusal",
+         "abstract pattern, include text is, forbidden later"),
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_tpi_after_punct_break"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "a",
+                        "prompt": prompt_body,
+                        "text_policy": "no_text",
+                        "subject_domain": "abstract_geometry",
+                    },
+                ],
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = (
+                rc == 1
+                and "in-image-text wording" in msg
+                and "text_policy='no_text'" in msg
+                and not (ws / DEFAULT_PLAN_FILENAME).exists()
+            )
+            results.append(_expect(
+                f"prompt-intent: AFTER-side punctuation BREAKS "
+                f"adjacency ({label}) — the in-image-text request "
+                f"still fires (refusal phrase belongs to a later "
+                f"clause)",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- TPI16. boundary-aware text-policy probe (regression for
+    # the Codex stop-time review): normal image-generation wording
+    # whose substring happens to overlap a deny-list literal must
+    # PASS under text_policy='no_text'. The reported false positive
+    # is ``"image text"`` matching the prefix of ``"image texture"``
+    # — and the same prefix-substring class catches ``"with text"``
+    # in ``"with textured paper"``. The boundary-aware match in
+    # ``_literal_present_unnegated`` only fires on whole-word /
+    # whole-phrase matches, so these prompts are accepted without
+    # weakening the gate for real text-bearing requests (covered by
+    # TPI7 / TPI13 / TPI14 / TPI15 / 11c / 12 / 12b above). ----
+    for label, prompt_body in (
+        ("'image texture' (was: 'image text' prefix false positive)",
+         "abstract image texture with soft grain"),
+        ("'with textured paper' (was: 'with text' prefix false positive)",
+         "clean abstract shapes with textured paper background"),
+        ("'context lighting' (normal scene-setup wording)",
+         "soft context lighting on neutral background"),
+        ("'texture pattern' (normal artwork wording)",
+         "abstract design featuring simple texture pattern, even tones"),
+    ):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_tpi_boundary_aware"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "a",
+                        "prompt": prompt_body,
+                        "text_policy": "no_text",
+                        "subject_domain": "abstract_geometry",
+                    },
+                ],
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = (
+                rc == 0
+                and (ws / DEFAULT_PLAN_FILENAME).is_file()
+            )
+            results.append(_expect(
+                f"prompt-intent: text_policy='no_text' ACCEPTS "
+                f"boundary-aware wording {label} — deny-list literal "
+                f"only fires on whole-word / whole-phrase matches, "
+                f"never on a prefix / suffix substring of a longer "
+                f"word",
                 ok, f"rc={rc}, msg={msg!r}",
             ))
 
