@@ -81,8 +81,9 @@ the assets-dir returns to its pre-call state):
       (existing regular non-symlink file; URI-shape refused).
 
   --descriptor-vocabulary (optional; required iff the plan carries any
-  of the five taxonomy fields: ``rendering_style`` / ``palette_family``
-  / ``image_role`` / ``layout_pattern`` / ``modifier``)
+  of the seven taxonomy fields: ``rendering_style`` / ``palette_family``
+  / ``image_role`` / ``layout_pattern`` / ``modifier`` / ``text_policy``
+  / ``subject_domain``)
     * when supplied, must be an existing regular non-symlink file whose
       bytes parse as JSON, decode to an object, and validate against
       ``schemas/d_one_descriptor_vocabulary.schema.json``; the runner
@@ -796,6 +797,17 @@ def _seed_descriptor_vocab(td: Path) -> Path:
                 "allowed_values": [
                     "low_contrast", "soft_edges", "grid_aligned",
                     "negative_space",
+                ],
+            },
+            "text_policy": {
+                "allowed_values": [
+                    "no_text", "decorative_glyphs", "caption_safe",
+                ],
+            },
+            "subject_domain": {
+                "allowed_values": [
+                    "abstract_geometry", "process_motif",
+                    "metric_emblem", "concept_diagram",
                 ],
             },
         },
@@ -1817,6 +1829,104 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
             ok, f"rc={rc}, msg={msg!r}",
         ))
 
+    # ---- TPI-RUN1. runner forwards --descriptor-vocabulary for a
+    # plan carrying text_policy + subject_domain (the prompt-intent
+    # contract extension). A taxonomy plan that ONLY carries the new
+    # fields (no rendering_style / palette_family / etc.) round-trips
+    # through the synthetic runner; the new fields are gated through
+    # the same forwarding the original five V6 fields use (the
+    # taxonomy is seven dimensions total now), so this proves the
+    # runner does not single-out any taxonomy field by name. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        vocab = _seed_descriptor_vocab(td)
+        ws, plan_path = _seed_workspace_with_plan(
+            td,
+            images=[
+                {"id": "spot", "local_path": "media/spot.png", "source": "d_one_local"},
+            ],
+            requests=[
+                {
+                    "id": "spot",
+                    "prompt": "abstract pattern, no text",
+                    "text_policy": "no_text",
+                    "subject_domain": "abstract_geometry",
+                },
+            ],
+            descriptor_vocabulary=vocab,
+        )
+        # Confirm the plan really does carry the two new fields (and
+        # NOT the original five) — the runner must forward the vocab
+        # regardless of which subset of TAXONOMY_FIELDS is present.
+        plan_body = json.loads(plan_path.read_text())
+        first_req = plan_body["requests"][0]
+        seed_ok = (
+            first_req.get("text_policy") == "no_text"
+            and first_req.get("subject_domain") == "abstract_geometry"
+            and "rendering_style" not in first_req
+        )
+        out = td / "out"
+        out.mkdir()
+        vocab_bytes_before = vocab.read_bytes()
+        rc, msg = run_d_one_generation(
+            workspace=ws, assets_dir=out, allow_synthetic_bytes=True,
+            descriptor_vocabulary=vocab,
+        )
+        png = out / "spot.png"
+        ok = (
+            seed_ok
+            and rc == 0
+            and png.is_file() and not png.is_symlink()
+            and vocab.read_bytes() == vocab_bytes_before
+        )
+        results.append(_expect(
+            "prompt-intent: runner forwards --descriptor-vocabulary "
+            "for a text_policy + subject_domain plan; vocab "
+            "byte-identical post-run",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- TPI-RUN2. runner refuses a text_policy + subject_domain plan
+    # when --descriptor-vocabulary is omitted (the validator the runner
+    # delegates to surfaces the missing-vocab diagnostic). ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        vocab = _seed_descriptor_vocab(td)
+        ws, plan_path = _seed_workspace_with_plan(
+            td,
+            images=[
+                {"id": "spot", "local_path": "media/spot.png", "source": "d_one_local"},
+            ],
+            requests=[
+                {
+                    "id": "spot",
+                    "prompt": "abstract pattern, no text",
+                    "text_policy": "caption_safe",
+                    "subject_domain": "concept_diagram",
+                },
+            ],
+            descriptor_vocabulary=vocab,
+        )
+        out = td / "out"
+        out.mkdir()
+        before = _list_dir_files(out)
+        rc, msg = run_d_one_generation(
+            workspace=ws, assets_dir=out, allow_synthetic_bytes=True,
+        )
+        after = _list_dir_files(out)
+        ok = (
+            rc == 1
+            and "--descriptor-vocabulary" in msg
+            and ("text_policy" in msg or "subject_domain" in msg)
+            and after == before
+        )
+        results.append(_expect(
+            "prompt-intent: runner refuses a text_policy + "
+            "subject_domain plan when --descriptor-vocabulary is "
+            "omitted; assets-dir untouched",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
     return results
 
 
@@ -1836,8 +1946,9 @@ def main(argv: list[str]) -> int:
             "--descriptor-vocabulary <path-to-d_one_descriptor_vocabulary.json>"
             " is forwarded verbatim to done_image_adapter.validate_plan_file"
             " and is REQUIRED iff the plan carries one or more of the "
-            "five taxonomy fields (rendering_style / palette_family / "
-            "image_role / layout_pattern / modifier); the runner refuses "
+            "seven taxonomy fields (rendering_style / palette_family / "
+            "image_role / layout_pattern / modifier / text_policy / "
+            "subject_domain); the runner refuses "
             "to certify a taxonomy-bearing plan whose values cannot be "
             "re-checked against image_taxonomy.<dim>.allowed_values, and "
             "the vocab bytes are byte-identical pre/post a successful "
@@ -1890,12 +2001,13 @@ def main(argv: list[str]) -> int:
         help="Optional. Path to a d_one_descriptor_vocabulary JSON "
              "file (see schemas/d_one_descriptor_vocabulary.schema.json). "
              "Forwarded verbatim to done_image_adapter.validate_plan_file, "
-             "which requires it iff the plan carries any of the five "
+             "which requires it iff the plan carries any of the seven "
              "taxonomy fields (rendering_style / palette_family / "
-             "image_role / layout_pattern / modifier) and refuses any "
-             "taxonomy value not in image_taxonomy.<dim>.allowed_values. "
-             "Refused if URI-shaped, symlinked, missing, or "
-             "schema-invalid; byte-identical pre/post a successful run.",
+             "image_role / layout_pattern / modifier / text_policy / "
+             "subject_domain) and refuses any taxonomy value not in "
+             "image_taxonomy.<dim>.allowed_values. Refused if "
+             "URI-shaped, symlinked, missing, or schema-invalid; "
+             "byte-identical pre/post a successful run.",
     )
     parser.add_argument(
         "--self-test", action="store_true",
@@ -1909,17 +2021,22 @@ def main(argv: list[str]) -> int:
              "extensions, plan-validator gate, manifest + plan "
              "byte-identical post-success, mid-write rollback, missing "
              "manifest, missing plan, no-extraneous-files guarantee, "
-             "AND the --descriptor-vocabulary taxonomy round-trip "
+             "the --descriptor-vocabulary taxonomy round-trip "
              "(taxonomy-bearing plan + matching vocab succeeds; "
              "taxonomy-bearing plan without vocab refused; plan drift "
              "against vocab refused at the runner boundary; vocab "
              "bytes byte-identical pre/post a successful run; "
              "taxonomy-free plan accepts an optional vocab without "
-             "complaint). Exits non-zero if any scenario does not "
-             "behave as expected. Mutually exclusive with the other "
-             "arguments (--workspace / --plan / --assets-dir / "
-             "--fixtures-dir / --allow-synthetic-bytes / "
-             "--descriptor-vocabulary).",
+             "complaint), AND the prompt-intent contract forwarding "
+             "scenarios for the two extension dimensions text_policy + "
+             "subject_domain (a plan that ONLY carries those two "
+             "fields round-trips through the runner with vocab "
+             "byte-identical post-run, and the runner refuses the same "
+             "plan when --descriptor-vocabulary is omitted). Exits "
+             "non-zero if any scenario does not behave as expected. "
+             "Mutually exclusive with the other arguments "
+             "(--workspace / --plan / --assets-dir / --fixtures-dir / "
+             "--allow-synthetic-bytes / --descriptor-vocabulary).",
     )
     args = parser.parse_args(argv)
 

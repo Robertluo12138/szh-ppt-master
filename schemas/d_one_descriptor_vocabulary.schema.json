@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "d_one_descriptor_vocabulary.schema.json",
   "title": "D-One Descriptor Vocabulary",
-  "description": "Contract sketch for the V1/V2 approved descriptor vocabulary named in references/d-one-live-run-readiness.md and references/d-one-live-prerequisites.md. NOT wired into runtime today: no script reads this file at prompt-assembly time, no prompt assembler exists, and there has never been a real D-One call. The schema ships only so references/d-one-live-prerequisites.md can point at concrete field names. V3 closed-enumeration: a runtime prompt assembler, when one is written, MUST refuse any descriptor not present in this file; the live runner MUST re-check this at its own boundary (defense in depth). V2 abstract-only: every entry is one of four kinds — a design-system color token referenced by name, a geometric noun, a mood adjective, or a composition adjective. Proper nouns, product names, customer names, quoted source text, source-derived sentences, dates, and numbers pulled from the source body are forbidden; the schema enforces lowercase-identifier shape via a positive-whitelist 'pattern' lock on every descriptor value (refusing uppercase letters, whitespace, URI schemes, paths, emails, and fragment / query / percent-encoded shapes) AND a negative-lookahead deny clause that refuses forbidden-token shapes at the schema layer — bounded tokens 'public', 'upload', 'raw', 'customer', 'confidential', 'screenshot', 'credential', 'password', 'secret' (matched as standalone identifier tokens with start-of-string / end-of-string / an identifier-boundary char '.' / '_' / '-' on each side, so legitimate words like 'drawing' that merely contain 'raw' mid-word still pass, AND so hyphen-separator forms like 'public-upload' / 'raw-source' / 'customer-acme' / 'confidential-report' and dotted forms like 'public.upload' fail too) and the compound phrases 'full slide', 'image search', 'web generation', 'page generation', 'slide generation' — each compound matched across ZERO OR MORE identifier-boundary chars so the underscore form ('full_slide'), the hyphen form ('full-slide'), the dotted form ('full.slide'), the concatenated form ('fullslide'), AND every separator-stacked obfuscation (multi-char runs like 'full__slide' / 'full--slide' / 'full..slide' / 'full___slide' / 'full----slide', and mixed-separator runs like 'full_-slide' / 'full.-slide' / 'full_.slide') all fail. The deny is a fail-closed schema-layer precaution; the V4 post-assembly re-scan (the adapter's full deny list re-running on every assembled prompt before the plan is written) remains the adapter runtime's responsibility and is still TODO.",
+  "description": "Contract sketch for the V1/V2 approved descriptor vocabulary named in references/d-one-live-run-readiness.md and references/d-one-live-prerequisites.md. Wiring status today is partial: the image_taxonomy block IS wired into the mock-mode runtime — scripts/done_image_adapter.py loads this file via --descriptor-vocabulary, schema-validates it against this schema, projects each image_taxonomy.<dim>.allowed_values into a per-dimension set, and refuses any spec/plan request whose taxonomy value is not in the matching set (both at write time and at --validate-plan time); scripts/run_d_one_generation.py forwards --descriptor-vocabulary verbatim so the mock runner re-runs the same check. The descriptors[*] list is NOT wired today (no prompt assembler exists; the V3 closed-enumeration runtime cross-check against descriptors[*] remains TODO). There has never been a real D-One call. V3 closed-enumeration: a runtime prompt assembler, when one is written, MUST refuse any descriptor not present in this file; the live runner MUST re-check this at its own boundary (defense in depth). V2 abstract-only: every entry is one of four kinds — a design-system color token referenced by name, a geometric noun, a mood adjective, or a composition adjective. Proper nouns, product names, customer names, quoted source text, source-derived sentences, dates, and numbers pulled from the source body are forbidden; the schema enforces lowercase-identifier shape via a positive-whitelist 'pattern' lock on every descriptor value (refusing uppercase letters, whitespace, URI schemes, paths, emails, and fragment / query / percent-encoded shapes) AND a negative-lookahead deny clause that refuses forbidden-token shapes at the schema layer — bounded tokens 'public', 'upload', 'raw', 'customer', 'confidential', 'screenshot', 'credential', 'password', 'secret' (matched as standalone identifier tokens with start-of-string / end-of-string / an identifier-boundary char '.' / '_' / '-' on each side, so legitimate words like 'drawing' that merely contain 'raw' mid-word still pass, AND so hyphen-separator forms like 'public-upload' / 'raw-source' / 'customer-acme' / 'confidential-report' and dotted forms like 'public.upload' fail too) and the compound phrases 'full slide', 'image search', 'web generation', 'page generation', 'slide generation' — each compound matched across ZERO OR MORE identifier-boundary chars so the underscore form ('full_slide'), the hyphen form ('full-slide'), the dotted form ('full.slide'), the concatenated form ('fullslide'), AND every separator-stacked obfuscation (multi-char runs like 'full__slide' / 'full--slide' / 'full..slide' / 'full___slide' / 'full----slide', and mixed-separator runs like 'full_-slide' / 'full.-slide' / 'full_.slide') all fail. The deny is a fail-closed schema-layer precaution; the V4 post-assembly re-scan (the adapter's full deny list re-running on every assembled prompt before the plan is written) remains the adapter runtime's responsibility and is still TODO.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -84,7 +84,9 @@
         "palette_family",
         "image_role",
         "layout_pattern",
-        "modifier"
+        "modifier",
+        "text_policy",
+        "subject_domain"
       ],
       "properties": {
         "rendering_style": {
@@ -225,9 +227,62 @@
             }
           },
           "description": "Dimension 5 — optional intensity / texture modifier. Applied on top of the four required dimensions; never carries product-specific or customer-specific tokens."
+        },
+        "text_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_values"],
+          "properties": {
+            "allowed_values": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "enum": [
+                  "no_text",
+                  "decorative_glyphs",
+                  "caption_safe"
+                ],
+                "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+              },
+              "description": "Closed enumeration of text-rendering policies. 'no_text' instructs the (future) generator to render NO readable language inside the image at all (the canonical safest default — the slide caption goes on the slide, not inside the asset). 'decorative_glyphs' permits abstract non-language marks (geometric notches, dots, ticks) that look like glyphs but do not spell anything. 'caption_safe' reserves margin around the subject so a downstream slide-side caption can sit above / beside the rendered art without colliding with the subject — the art itself still carries NO language. Clean-room engineering tokens; not a quote of any external text-rendering policy."
+            }
+          },
+          "description": "Dimension 6 — text-rendering policy. Narrows HOW the (future) generator handles language inside the produced asset; the local pipeline never embeds source-derived prose or customer-facing language into the rendered art (the slide caption is owned by the slide, not the asset). 'no_text' is the conservative default; 'decorative_glyphs' / 'caption_safe' are explicit opt-ins."
+        },
+        "subject_domain": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_values"],
+          "properties": {
+            "allowed_values": {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "enum": [
+                  "abstract_geometry",
+                  "process_motif",
+                  "metric_emblem",
+                  "concept_diagram"
+                ],
+                "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$"
+              },
+              "description": "Closed enumeration of subject-domain tokens. Each value narrows WHAT the rendered subject is at the most abstract level: 'abstract_geometry' (pure shape-language motifs); 'process_motif' (generic arrows / chevrons / flow segments — no business prose); 'metric_emblem' (small abstract gauge / dot / wedge — no real numbers); 'concept_diagram' (two- or three-node connector motifs — no business labels). Clean-room engineering tokens; deliberately NOT industry / customer / product names ('finance', 'healthcare', 'acme-banking' would all trip the forbidden-token deny pattern anyway)."
+            }
+          },
+          "description": "Dimension 7 — subject domain. Narrows the rendered subject at the most abstract level. Each value is a clean-room shape-language category; no industry / customer / product / brand tokens are admissible (the forbidden-token deny pattern refuses them at the schema layer in any case)."
         }
       },
-      "description": "Image-request taxonomy. A synthetic image request is composed from five clean-room dimensions: rendering_style, palette_family, image_role, layout_pattern, modifier. Each dimension declares a fixed-length 'allowed_values' array whose entries are simultaneously enum-locked AND pattern-locked at the schema layer — the same positive whitelist + forbidden-token deny clause that descriptors[*].value uses. Canonical-set-membership invariant: every 'allowed_values' array carries minItems == maxItems == N AND uniqueItems == true AND items.enum of length N, where N is the canonical count (5 for rendering_style / palette_family / image_role / layout_pattern, 4 for modifier). With N unique items drawn from an N-element enum, the only valid array is a permutation of the canonical set — a tampered file that ships `[\"flat_vector\"] * 5` would fail uniqueItems, and a file that omits a value would fail minItems; neither false-greens. Defense in depth: the runtime image-request gate (when wired) MUST cross-check every dimension value against the matching 'allowed_values' AND independently re-apply the deny pattern. This taxonomy is intentionally minimal — five dimensions × ≤5 values — and is not a mirror of any external image-style catalog. Adding, removing, or modifying a dimension or value is a paired schema / template / validator-probe change."
+      "description": "Image-request taxonomy. A synthetic image request is composed from seven clean-room dimensions: rendering_style, palette_family, image_role, layout_pattern, modifier, text_policy, subject_domain. Each dimension declares a fixed-length 'allowed_values' array whose entries are simultaneously enum-locked AND pattern-locked at the schema layer — the same positive whitelist + forbidden-token deny clause that descriptors[*].value uses. Canonical-set-membership invariant: every 'allowed_values' array carries minItems == maxItems == N AND uniqueItems == true AND items.enum of length N, where N is the canonical count (5 for rendering_style / palette_family / image_role / layout_pattern, 4 for modifier and subject_domain, 3 for text_policy). With N unique items drawn from an N-element enum, the only valid array is a permutation of the canonical set — a tampered file that ships `[\"flat_vector\"] * 5` would fail uniqueItems, and a file that omits a value would fail minItems; neither false-greens. Defense in depth: the runtime image-request gate IS wired today in mock mode — scripts/done_image_adapter.py cross-checks every dimension value supplied on a spec/plan request against the matching 'allowed_values' set (and refuses any value not present), and the schema's items.pattern + items.enum locks on every 'allowed_values' array are independently re-applied here as a post-write defense-in-depth gate. The live D-One image-request gate (real D-One / MCP / model-API) is NOT wired today and remains TODO. This taxonomy is intentionally minimal — seven dimensions × ≤5 values — and is not a mirror of any external image-style catalog. Adding, removing, or modifying a dimension or value is a paired schema / template / validator-probe change."
     },
     "synthetic_requests": {
       "type": "array",
@@ -315,10 +370,35 @@
             ],
             "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
             "description": "Optional. When omitted, the runtime gate (when wired) applies no modifier. When present, MUST be one of the closed enumeration values."
+          },
+          "text_policy": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "enum": [
+              "no_text",
+              "decorative_glyphs",
+              "caption_safe"
+            ],
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Optional. When omitted, the runtime gate (when wired) treats the request as 'no_text' (conservative default). When present, MUST be one of the closed enumeration values."
+          },
+          "subject_domain": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "enum": [
+              "abstract_geometry",
+              "process_motif",
+              "metric_emblem",
+              "concept_diagram"
+            ],
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Optional. When omitted, the runtime gate (when wired) applies no subject narrowing. When present, MUST be one of the closed enumeration values."
           }
         }
       },
-      "description": "Optional synthetic composed-request list. Each item demonstrates a fully composed image request whose four required dimensions (and optional modifier) all draw from image_taxonomy.<dim>.allowed_values. Length is bounded so a tampered file cannot smuggle a large free-form payload here. The schema's per-dimension enum lock means a tampered request cannot use a value outside the canonical taxonomy. Empty array is acceptable — this list is a documentation aid, not a contract requirement."
+      "description": "Optional synthetic composed-request list. Each item demonstrates a fully composed image request whose four required dimensions (and the optional modifier / text_policy / subject_domain) all draw from image_taxonomy.<dim>.allowed_values. Length is bounded so a tampered file cannot smuggle a large free-form payload here. The schema's per-dimension enum lock means a tampered request cannot use a value outside the canonical taxonomy. Empty array is acceptable — this list is a documentation aid, not a contract requirement."
     }
   }
 }

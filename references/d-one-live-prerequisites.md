@@ -164,8 +164,10 @@ user request and a paired security review.
   schema-layer deny clause above refuses the documented
   forbidden-token shapes today (verified by passing the synthetic
   placeholder and refusing each of `public_upload`, `raw_source`,
-  `full_slide`, `image_search`, `web_generation`, `customer_acme`,
-  `confidential_report`). The V3 closed-enumeration runtime check
+  `full_slide`, `image_search`, `web_generation`, `page_generation`,
+  `slide_generation`, `customer_acme`, `confidential_report` —
+  every compound the schema regex names is exercised by the
+  evidence validator's T2-T4 block). The V3 closed-enumeration runtime check
   (the prompt assembler refusing a descriptor not in the file; the
   live runner re-checking at its own boundary) is still part of
   the live-mode wiring TODO and is NOT wired today. V4
@@ -195,7 +197,11 @@ records only the lowercase-identifier shape, the runtime validator
   `examples/d_one_descriptor_vocabulary_template.json` ships both
   blocks with the canonical clean-room values below plus two
   composed example requests.
-- **Five clean-room dimensions** — each a closed enumeration:
+- **Seven clean-room dimensions** — each a closed enumeration. The
+  first five are the original V6 surface; the last two (`text_policy`,
+  `subject_domain`) extend the contract idea-level with the latest
+  local upstream ai-image prompt-intent work but copy NO upstream
+  code / text / assets / templates:
   - `rendering_style` (5 values): `flat_vector`, `line_diagram`,
     `isometric_lite`, `low_poly`, `solid_shape`;
   - `palette_family` (5 values): `neutral_grey`, `accent_only`,
@@ -206,6 +212,19 @@ records only the lowercase-identifier shape, the runtime validator
     `right_anchor`, `top_band`, `bottom_band`;
   - `modifier` (4 values, optional in a request): `low_contrast`,
     `soft_edges`, `grid_aligned`, `negative_space`.
+  - `text_policy` (3 values, optional in a request): `no_text`,
+    `decorative_glyphs`, `caption_safe`. The local pipeline never
+    embeds source-derived prose or customer-facing language into
+    rendered art — the slide caption is owned by the slide, not the
+    asset. `no_text` is the conservative default; the other two are
+    explicit opt-ins for abstract non-language marks or caption-area
+    reservation.
+  - `subject_domain` (4 values, optional in a request):
+    `abstract_geometry`, `process_motif`, `metric_emblem`,
+    `concept_diagram`. Clean-room shape-language categories;
+    deliberately NOT industry / customer / product / brand tokens
+    (the forbidden-token deny pattern refuses such values at the
+    schema layer in any case).
 - **Schema-layer locks (defense in depth):**
   - per-dimension `allowed_values` arrays are pinned to a fixed
     length (`minItems == maxItems`) so a tampered file cannot
@@ -219,8 +238,9 @@ records only the lowercase-identifier shape, the runtime validator
     future schema-edit that loosened the enum would still trip
     the deny pattern on any unsafe token (`public_upload`,
     `raw_source`, `full_slide`, `image_search`, `web_generation`,
-    `customer_acme`, `confidential_report`, URL-like shapes, and
-    free-form raw-source text are all refused at this layer);
+    `page_generation`, `slide_generation`, `customer_acme`,
+    `confidential_report`, URL-like shapes, and free-form
+    raw-source text are all refused at this layer);
   - `uniqueItems: true` is set on every `allowed_values` array,
     so a noncanonical array that ships the same canonical value N
     times (e.g. `["flat_vector"] * 5`) is refused at the schema
@@ -244,7 +264,8 @@ records only the lowercase-identifier shape, the runtime validator
   --self-test` as the T1-T10 block — T1 confirms the canonical
   synthetic vocabulary validates clean; T2-T4 confirm each
   documented forbidden value (`public_upload`, `raw_source`,
-  `full_slide`, `image_search`, `web_generation`, `customer_acme`,
+  `full_slide`, `image_search`, `web_generation`,
+  `page_generation`, `slide_generation`, `customer_acme`,
   `confidential_report`, `https://example.com`,
   `file:///etc/passwd`, a public asset URL shape
   `https://cdn.public.example.com/asset.png`, and a free-form
@@ -262,12 +283,25 @@ records only the lowercase-identifier shape, the runtime validator
   `allowed_values` array of length N that ships the same
   canonical value N times — e.g. `["flat_vector"] * 5`) is also
   refused by the same lock, closing the false-green Codex
-  stop-time review flagged. The V3 closed-enumeration runtime
-  cross-check (the prompt assembler refusing a request value not
-  in `image_taxonomy.<dim>.allowed_values`; the live runner
+  stop-time review flagged. The same T2-T10 probes iterate over
+  every dimension declared in the canonical vocabulary (the
+  in-script tuple `taxonomy_dims`), so adding the prompt-intent
+  contract dimensions `text_policy` + `subject_domain` to the
+  schema and the canonical fixture automatically extends the
+  probe surface — every dimension is re-checked against the
+  uniqueItems / maxItems / enum / pattern locks. The V3
+  closed-enumeration runtime cross-check (the prompt assembler
+  refusing a request value not in
+  `image_taxonomy.<dim>.allowed_values`; the live runner
   re-checking at its own boundary) is still part of the live-mode
   wiring TODO and is NOT wired today — real D-One remains
-  **UNVERIFIED**.
+  **UNVERIFIED**. The mock-mode runtime cross-check (the
+  `done_image_adapter --validate-plan` re-check against every
+  taxonomy field present in a plan, including the new
+  `text_policy` + `subject_domain` fields) IS wired today, and the
+  mock runner `run_d_one_generation.py` forwards
+  `--descriptor-vocabulary` verbatim so a taxonomy plan does not
+  dead-end at the runner boundary.
 
 ## 5. Live-run preflight contract (audit-out path placement + M1-M4 + R1 / V1 pins)
 

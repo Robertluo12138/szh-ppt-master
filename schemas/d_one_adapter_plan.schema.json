@@ -2,15 +2,15 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "d_one_adapter_plan.schema.json",
   "title": "D-One Adapter Dry-Run Plan",
-  "description": "Deterministic dry-run plan written by scripts/done_image_adapter.py. The plan records the validated D-One generation requests for a future generator to consume. The plan is NOT D-One integration — no D-One call is made and no image bytes are produced. The schema is strict on shape and on the dry-run sentinel fields (mode, note, manifest_source); deeper safety gates (no URLs / credentials / source-text leakage / full-slide wording in prompts; ids resolve in image_manifest.json; manifest_source matches manifest entry) are enforced by scripts/done_image_adapter.py at write time and re-runnable via `done_image_adapter.py --validate-plan`. Optional per-request taxonomy fields (rendering_style / palette_family / image_role / layout_pattern / modifier) may appear ONLY when the caller passed `--descriptor-vocabulary <path-to-d_one_descriptor_vocabulary.json>`; the runtime then refuses any taxonomy value not in the matching image_taxonomy.<dim>.allowed_values list, and `--validate-plan` re-runs the same vocabulary check whenever the plan carries taxonomy fields.",
+  "description": "Deterministic dry-run plan written by scripts/done_image_adapter.py. The plan records the validated D-One generation requests for a future generator to consume. The plan is NOT D-One integration — no D-One call is made and no image bytes are produced. The schema is strict on shape and on the dry-run sentinel fields (mode, note, manifest_source); deeper safety gates (no URLs / credentials / source-text leakage / full-slide wording in prompts; ids resolve in image_manifest.json; manifest_source matches manifest entry) are enforced by scripts/done_image_adapter.py at write time and re-runnable via `done_image_adapter.py --validate-plan`. Optional per-request taxonomy fields (rendering_style / palette_family / image_role / layout_pattern / modifier / text_policy / subject_domain — seven dimensions total) may appear ONLY when the caller passed `--descriptor-vocabulary <path-to-d_one_descriptor_vocabulary.json>`; the runtime then refuses any taxonomy value not in the matching image_taxonomy.<dim>.allowed_values list, and `--validate-plan` re-runs the same vocabulary check whenever the plan carries taxonomy fields.",
   "type": "object",
   "required": ["schema_version", "mode", "note", "request_count", "requests"],
   "additionalProperties": false,
   "properties": {
     "schema_version": {
       "type": "integer",
-      "enum": [1],
-      "description": "Plan-file schema version. Locked to integer 1 today. Bumped only with a paired script change so a future real-D-One generator can refuse a plan shape it does not recognize."
+      "enum": [2],
+      "description": "Plan-file schema version. Locked to integer 2 today. Bumped only with a paired script change so a future real-D-One generator can refuse a plan shape it does not recognize. The 1 -> 2 bump was the paired change for the optional per-request taxonomy fields (rendering_style / palette_family / image_role / layout_pattern / modifier / text_policy / subject_domain): an older reader with schema_version=1 would reject those properties under the per-request additionalProperties:false lock, so the shape change is not backward-compatible and gets a new version."
     },
     "mode": {
       "type": "string",
@@ -76,7 +76,7 @@
             "minLength": 1,
             "maxLength": 64,
             "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
-            "description": "Optional. Clean-room rendering-style taxonomy token (dimension 1 of image_taxonomy in d_one_descriptor_vocabulary.schema.json). May appear ONLY when the writer / validator passed `--descriptor-vocabulary <path>`; the runtime cross-check refuses any value not in image_taxonomy.rendering_style.allowed_values. The pattern lock here mirrors the descriptor-vocabulary's lowercase-identifier positive whitelist + forbidden-token deny clause (refuses 'public', 'upload', 'raw', 'customer', 'confidential', 'screenshot', 'credential', 'password', 'secret' as bounded tokens, and the compound phrases 'full slide' / 'image search' / 'web generation' / 'page generation' / 'slide generation' across any '.' / '_' / '-' separator stacking), so an unsafe value is refused at the schema layer before the runtime allowed_values check even runs."
+            "description": "Optional. Clean-room rendering-style taxonomy token (dimension 1 of image_taxonomy in d_one_descriptor_vocabulary.schema.json). May appear ONLY when the writer / validator passed `--descriptor-vocabulary <path>`. Two layers gate this field, in this order: (1) the runtime allowed_values cross-check in scripts/done_image_adapter.py runs FIRST against the in-memory spec (and at --validate-plan time against the parsed plan), refusing any value not in image_taxonomy.rendering_style.allowed_values BEFORE the plan file is written; (2) the pattern lock on this property — which mirrors the descriptor-vocabulary's lowercase-identifier positive whitelist + forbidden-token deny clause (refuses 'public', 'upload', 'raw', 'customer', 'confidential', 'screenshot', 'credential', 'password', 'secret' as bounded tokens, and the compound phrases 'full slide' / 'image search' / 'web generation' / 'page generation' / 'slide generation' across any '.' / '_' / '-' separator stacking) — is a post-write defense-in-depth gate: the writer runs _schema_validate on the just-written plan after the runtime check, so an unsafe value that somehow slipped past the runtime gate (e.g. a future refactor loosened the runtime check, or a hand-authored plan bypassed the writer entirely) is still caught by this pattern when --validate-plan is run."
           },
           "palette_family": {
             "type": "string",
@@ -105,6 +105,20 @@
             "maxLength": 64,
             "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
             "description": "Optional. Clean-room intensity / texture modifier (dimension 5 of image_taxonomy). Same gating, pattern lock, and runtime allowed_values check as rendering_style; intentionally optional, mirroring d_one_descriptor_vocabulary.image_taxonomy.modifier."
+          },
+          "text_policy": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Optional. Clean-room text-rendering policy (dimension 6 of image_taxonomy — e.g. 'no_text', 'decorative_glyphs', 'caption_safe'). Same gating, pattern lock, and runtime allowed_values check as rendering_style. The local pipeline never embeds source-derived prose or customer-facing language into rendered art; this field records the policy the request was made under."
+          },
+          "subject_domain": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Optional. Clean-room subject-domain token (dimension 7 of image_taxonomy — e.g. 'abstract_geometry', 'process_motif', 'metric_emblem', 'concept_diagram'). Same gating, pattern lock, and runtime allowed_values check as rendering_style. Deliberately NOT an industry / customer / product / brand token — the forbidden-token deny clause refuses such values at the schema layer in any case."
           }
         }
       }

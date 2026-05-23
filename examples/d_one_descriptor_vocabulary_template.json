@@ -89,6 +89,21 @@
         "grid_aligned",
         "negative_space"
       ]
+    },
+    "text_policy": {
+      "allowed_values": [
+        "no_text",
+        "decorative_glyphs",
+        "caption_safe"
+      ]
+    },
+    "subject_domain": {
+      "allowed_values": [
+        "abstract_geometry",
+        "process_motif",
+        "metric_emblem",
+        "concept_diagram"
+      ]
     }
   },
   "synthetic_requests": [
@@ -98,7 +113,9 @@
       "palette_family": "neutral_grey",
       "image_role": "cover_motif",
       "layout_pattern": "single_center",
-      "modifier": "negative_space"
+      "modifier": "negative_space",
+      "text_policy": "no_text",
+      "subject_domain": "abstract_geometry"
     },
     {
       "id": "kpi_emblem_accent",
@@ -106,7 +123,9 @@
       "palette_family": "accent_only",
       "image_role": "kpi_emblem",
       "layout_pattern": "top_band",
-      "modifier": "grid_aligned"
+      "modifier": "grid_aligned",
+      "text_policy": "decorative_glyphs",
+      "subject_domain": "metric_emblem"
     }
   ]
 }

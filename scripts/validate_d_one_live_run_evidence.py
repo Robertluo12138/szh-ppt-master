@@ -1023,6 +1023,21 @@ def _canonical_descriptor_vocab() -> dict:
                     "negative_space",
                 ],
             },
+            "text_policy": {
+                "allowed_values": [
+                    "no_text",
+                    "decorative_glyphs",
+                    "caption_safe",
+                ],
+            },
+            "subject_domain": {
+                "allowed_values": [
+                    "abstract_geometry",
+                    "process_motif",
+                    "metric_emblem",
+                    "concept_diagram",
+                ],
+            },
         },
         "synthetic_requests": [
             {
@@ -1032,6 +1047,8 @@ def _canonical_descriptor_vocab() -> dict:
                 "image_role": "cover_motif",
                 "layout_pattern": "single_center",
                 "modifier": "negative_space",
+                "text_policy": "no_text",
+                "subject_domain": "abstract_geometry",
             },
         ],
     }
@@ -2246,6 +2263,8 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
         "image_role",
         "layout_pattern",
         "modifier",
+        "text_policy",
+        "subject_domain",
     )
     forbidden_descriptor_values = (
         "public_upload",
@@ -2253,6 +2272,8 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
         "full_slide",
         "image_search",
         "web_generation",
+        "page_generation",
+        "slide_generation",
         "customer_acme",
         "confidential_report",
         "https://example.com",
