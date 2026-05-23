@@ -705,6 +705,33 @@ python3 scripts/run_explicit_pipeline.py \
 python3 scripts/run_explicit_pipeline.py --self-test
 ```
 
+### Mock D-One image-to-editable-PPT runner (NOT real D-One integration)
+
+`scripts/run_mock_image_pipeline.py` is a stdlib-only, deterministic wrapper that packages the local image chain (`done_image_adapter.py` → `run_d_one_generation.py --allow-synthetic-bytes` → `materialize_image_assets.py` → `run_explicit_pipeline.py --assets-dir <staging>`) behind one explicit-input command. It accepts the same caller-authored inputs as `run_explicit_pipeline.py` (`--workspace` / `--source` / `--title` / `--audience` / `--objective` / `--plan-spec` / `--design-system-spec` OR `--theme-from-template` / `--template-root` / `--slide-specs-dir` / `--image-manifest-spec` / `--output`, plus the optional `--source-id` / `--tone` / `--language` / `--approximate-slide-count` / `--report-dir`) AND adds two image-chain inputs: `--d-one-spec <path>` (the caller-authored D-One request spec forwarded to `done_image_adapter --spec`) and `--descriptor-vocabulary <path>` (optional; required iff `--d-one-spec` carries any of the seven taxonomy fields `rendering_style` / `palette_family` / `image_role` / `layout_pattern` / `modifier` / `text_policy` / `subject_domain`). The runner opens one `tempfile.TemporaryDirectory()` for staging, seeds the staging `image_manifest.json` from `--image-manifest-spec` (the direct-author workflow documented at `scripts/materialize_image_assets.py`), drives the d-one chain on the staging workspace, then invokes `scripts/run_explicit_pipeline.py --assets-dir <staging>` so the orchestrator's materialize_image_assets step copies the synthetic bytes into the production workspace between Stage 5 and Stage 6. **MOCK / STUB only — NOT real D-One integration**: nothing calls D-One, MCP, Qoder, a public network, telemetry, any model API, an image search, or any external service. `--allow-synthetic-bytes` is REQUIRED on the runner — omitting it fails closed at the runner boundary rather than implying a real-D-One / provider mode this repo does not support today. For taxonomy-bearing specs the runner re-parses the produced `<staging>/d_one_adapter_plan.json` BEFORE invoking the production pipeline and refuses to proceed unless `schema_version == 2` AND every taxonomy field/value supplied on the spec request appears byte-identical on the matching plan request — a downgrade or value drift aborts the run before any PPTX is written. The only files the runner writes outside the staging tempdir are the caller's `--workspace` (created by `init_workspace.py` inside `run_explicit_pipeline.py`), the `.pptx` at `--output`, and (when supplied) `pipeline_report.{json,txt}` + `inventory.json` under `--report-dir`; no committed example or repo directory is touched.
+
+```
+python3 scripts/run_mock_image_pipeline.py \
+  --workspace /tmp/szh-mock-image-ws \
+  --source /path/to/source.md \
+  --title "Synthetic Mock" \
+  --audience "Internal reviewers" \
+  --objective "Exercise the local mock D-One chain end-to-end" \
+  --plan-spec /path/to/plan_spec.json \
+  --design-system-spec /path/to/design_system_spec.json \
+  --template-root templates/layouts \
+  --slide-specs-dir /path/to/slide_specs/ \
+  --image-manifest-spec /path/to/image_manifest_spec.json \
+  --d-one-spec /path/to/d_one_spec.json \
+  --descriptor-vocabulary /path/to/descriptor_vocabulary.json \
+  --allow-synthetic-bytes \
+  --output /tmp/szh-mock-image-out/deck.pptx \
+  --report-dir /tmp/szh-mock-image-out/reports
+
+python3 scripts/run_mock_image_pipeline.py --self-test
+```
+
+`scripts/run_mock_image_pipeline.py --self-test` exercises 13 in-script tempfixture scenarios under `tempfile.TemporaryDirectory()`: the happy path (a 2-slide bundle with one `d_one_local` image carrying all 7 taxonomy dimensions produces a validated `.pptx` whose `ppt/media/` carries a native PNG/JPG/JPEG with no external/`file://`/`data:`/scheme-shaped relationships AND the `[PASS] taxonomy preservation check` marker fires); negative probes for missing `--allow-synthetic-bytes`, taxonomy-bearing `--d-one-spec` without `--descriptor-vocabulary`, regex-shape-valid-but-out-of-vocabulary `text_policy`, regex-shape-valid-but-out-of-vocabulary `subject_domain`, the `schema_version == 2` invariant on the produced plan (indirect — the runner always invokes `done_image_adapter`, which writes `schema_version=2`; the probe confirms the assertion line lands in stdout), `--d-one-spec` request id not declared in the image-manifest spec, image-manifest `local_path` carrying a URI scheme (`http://...`), symlinked `--output` / `--workspace` / `--report-dir` (each refused at the runner boundary before any subprocess fires); a `no-repo-write` snapshot probe that strips `PYTHONDONTWRITEBYTECODE` from the subprocess env and asserts a flat-bytes snapshot of `scripts/__pycache__/` is byte-identical before and after the run — proves the in-script `sys.dont_write_bytecode = True` flip (set BEFORE the first-party `validate_scaffold` import) closes the `.pyc`-leak hole even when the caller forgets the env-var prefix; and a downstream-failure cleanup probe asserting no `.pptx` lands at `--output` when the run aborts.
+
 Raw-source-to-PPTX automation — extracting `deck_brief` / `deck_plan` / `design_system` / `slide_plans` / `image_manifest` content from `input/source.md` directly, without explicit caller-supplied spec files — remains TODO. The implemented explicit-input runtime pipeline (the six per-stage helpers `init_workspace.py` / `init_deck_brief.py` / `init_deck_plan.py` / `init_design_system.py` / `init_slide_plans.py` / `init_image_manifest.py`, the Stage-1-to-6 orchestrator `scripts/prepare_workspace.py`, the Stage-7-to-10 runner `scripts/run_pipeline.py`, and the Stage-1-to-10 end-to-end orchestrator `scripts/run_explicit_pipeline.py`) does **not** implement it: every script in that pipeline is intentionally explicit-input. The work of reading `input/source.md` plus the user's request and **authoring** the five spec inputs the runtime pipeline consumes is the agent's responsibility; the authoring contract (per-stage fields, source-fidelity rules, image-safety rules, and the pre-pipeline quality loop) lives in [`references/authoring-workflow.md`](references/authoring-workflow.md), kept as a separate document so the authoring workflow is never read as runtime code. A passing `scripts/run_explicit_pipeline.py` (or per-stage chain) run is evidence that the authored specs round-trip to a validated editable PPTX, **not** evidence of automatic prompt-to-PPTX behavior, of D-One image generation, of Qoder runtime packaging, or of any model API call — none of those are implemented anywhere in this repo.
 
 ### Pre-pipeline authoring quality gate
