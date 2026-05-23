@@ -10,6 +10,16 @@ have to satisfy before it ships. The adapter today:
   - reads an EXPLICIT caller-supplied ``--spec`` JSON file listing the
     asset ids the caller wants generated plus a safety-scrubbed prompt
     for each;
+  - optionally reads an EXPLICIT caller-supplied
+    ``--descriptor-vocabulary`` JSON file (the clean-room V2/V3
+    contract sketch at ``schemas/d_one_descriptor_vocabulary.schema.json``)
+    — required iff any spec request carries one or more of the five
+    taxonomy fields ``rendering_style`` / ``palette_family`` /
+    ``image_role`` / ``layout_pattern`` / ``modifier``; the file must
+    parse, decode to an object, and validate against the vocabulary
+    schema; every taxonomy value supplied in a spec request must then
+    be a member of the matching ``image_taxonomy.<dim>.allowed_values``
+    list (the same closed enumeration the vocabulary schema locks);
   - validates every requested ``id`` matches an entry in
     ``image_manifest.images[]`` whose ``source == "d_one_local"`` (so
     a caller cannot smuggle a request for a ``local_asset`` /
@@ -96,7 +106,9 @@ when any gate fires):
       is an object with required keys ``id`` (non-empty string) and
       ``prompt`` (non-empty string), optional keys ``intended_use``
       (string), ``width_px`` (positive int), ``height_px`` (positive
-      int), and no other keys;
+      int), and optionally any of the five taxonomy fields
+      ``rendering_style`` / ``palette_family`` / ``image_role`` /
+      ``layout_pattern`` / ``modifier``; no other keys are accepted;
     * no two requests may share an ``id``;
     * every request ``id`` must appear in ``image_manifest.images[*]``
       with ``source == "d_one_local"``;
@@ -107,7 +119,31 @@ when any gate fires):
       full-slide / page / screenshot wording, AND public-distribution
       wording);
     * every request ``intended_use`` (if present) must not contain
-      full-slide / screenshot / page-generation wording.
+      full-slide / screenshot / page-generation wording;
+    * a request may carry zero or more of the five taxonomy fields,
+      but every present taxonomy field forces
+      ``--descriptor-vocabulary`` to have been supplied AND every
+      value must be a member of the matching
+      ``image_taxonomy.<dim>.allowed_values`` list.
+
+  --descriptor-vocabulary (optional)
+    * when omitted, a spec / plan may not carry any of the five
+      taxonomy fields (any request that does is refused);
+    * when supplied, must be an existing regular file; URI-shaped
+      values refused; symlinks (broken or resolvable) refused;
+    * must parse as JSON, decode to an object, and validate against
+      ``schemas/d_one_descriptor_vocabulary.schema.json`` — which
+      pattern-locks every descriptor / taxonomy value to a
+      lowercase-identifier shape with a forbidden-token deny clause
+      (``public`` / ``upload`` / ``raw`` / ``customer`` /
+      ``confidential`` / ``screenshot`` / ``credential`` /
+      ``password`` / ``secret`` as bounded tokens, plus the compound
+      ``full slide`` / ``image search`` / ``web generation`` /
+      ``page generation`` / ``slide generation`` phrases across any
+      ``.`` / ``_`` / ``-`` separator stacking);
+    * is re-validated every run (no in-memory caching across
+      invocations), so a tampered vocabulary that drifts from the
+      schema is refused immediately.
 
   --plan-out (defaults to ``<workspace>/d_one_adapter_plan.json``)
     * must pass ``local_path_is_safe`` when resolved as a workspace-
@@ -162,6 +198,23 @@ IMAGE_MANIFEST_SCHEMA = SCHEMAS_DIR / "image_manifest.schema.json"
 SOURCE_INPUT_RELPATH = "input/source.md"
 DEFAULT_PLAN_FILENAME = "d_one_adapter_plan.json"
 PLAN_SCHEMA = SCHEMAS_DIR / "d_one_adapter_plan.schema.json"
+DESCRIPTOR_VOCAB_SCHEMA = SCHEMAS_DIR / "d_one_descriptor_vocabulary.schema.json"
+
+# Optional per-request taxonomy fields. Mirror the five image_taxonomy
+# dimensions declared in schemas/d_one_descriptor_vocabulary.schema.json.
+# A spec / plan request may carry zero or more of these; ANY taxonomy
+# field present forces --descriptor-vocabulary to have been supplied,
+# and every value must be a member of the matching
+# image_taxonomy.<dim>.allowed_values list. The tuple order is the
+# spec/plan field order in the on-disk artifact (deterministic projection
+# matters because the plan file is reread byte-for-byte across runs).
+TAXONOMY_FIELDS: tuple[str, ...] = (
+    "rendering_style",
+    "palette_family",
+    "image_role",
+    "layout_pattern",
+    "modifier",
+)
 
 # Only manifest entries whose source == "d_one_local" are eligible for
 # D-One generation. local_asset / synthetic entries belong to a
@@ -404,6 +457,77 @@ def _parent_path_has_no_symlink(workspace: Path, target: Path) -> tuple[bool, st
     return True, ""
 
 
+def _load_descriptor_vocabulary(
+    vocab_path: Path,
+) -> tuple[dict[str, set[str]] | None, bytes | None, int, str]:
+    """Validate ``vocab_path`` and project its ``image_taxonomy`` into a
+    dimension -> allowed_values set mapping.
+
+    The helper runs the same string / filesystem / schema gates the rest
+    of the adapter applies: URI-shape refused, symlink refused, exists,
+    regular file, parses as JSON, decodes to an object, and validates
+    against ``schemas/d_one_descriptor_vocabulary.schema.json``. Returns
+    ``(allowed_per_dim, vocab_bytes, rc, msg)``; on success ``rc == 0``,
+    ``allowed_per_dim`` is keyed by every member of ``TAXONOMY_FIELDS``,
+    and ``vocab_bytes`` is the exact byte content the loader read (used
+    by callers as the canonical "before" snapshot for the byte-identical
+    post-condition — both the write path and the validate path require
+    the vocab file to be byte-identical pre/post a successful run, and
+    sharing the loader's bytes ensures the two paths cannot drift on
+    what counts as "before"); on failure ``rc != 0``, ``msg`` is
+    non-empty, and ``vocab_bytes`` is None.
+
+    No in-memory caching across calls: a tampered file is caught every
+    run, and the helper is small (a few-KB JSON parse) so the cost is
+    negligible.
+    """
+    if _has_uri_scheme(str(vocab_path)):
+        return None, None, 2, (
+            f"FAIL: --descriptor-vocabulary {vocab_path} looks like a URI; "
+            f"done_image_adapter only accepts local file paths"
+        )
+    is_symlink, msg = _refuse_symlink(vocab_path, "--descriptor-vocabulary")
+    if is_symlink:
+        return None, None, 2, msg
+    if not vocab_path.exists():
+        return None, None, 2, (
+            f"FAIL: --descriptor-vocabulary {vocab_path} does not exist"
+        )
+    if not vocab_path.is_file():
+        return None, None, 2, (
+            f"FAIL: --descriptor-vocabulary {vocab_path} is not a regular file"
+        )
+    try:
+        vocab_bytes = vocab_path.read_bytes()
+        vocab_doc = json.loads(vocab_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, None, 1, (
+            f"FAIL: cannot read --descriptor-vocabulary {vocab_path}: {exc}"
+        )
+    if not isinstance(vocab_doc, dict):
+        return None, None, 1, (
+            f"FAIL: --descriptor-vocabulary {vocab_path} did not decode to "
+            f"an object (got {type(vocab_doc).__name__})"
+        )
+    vocab_errors = _schema_validate(vocab_doc, DESCRIPTOR_VOCAB_SCHEMA)
+    if vocab_errors:
+        return None, None, 1, (
+            f"FAIL: --descriptor-vocabulary {vocab_path} does not validate "
+            f"against d_one_descriptor_vocabulary.schema.json: "
+            + "; ".join(vocab_errors)
+        )
+    # By this point the schema guarantees image_taxonomy is a dict with
+    # each of the five required dimensions, each carrying an
+    # allowed_values list pinned to the canonical count and enum-locked
+    # to canonical tokens. We project to a per-dimension set for cheap
+    # membership checks at the request layer.
+    allowed_per_dim: dict[str, set[str]] = {}
+    for dim in TAXONOMY_FIELDS:
+        dim_block = vocab_doc["image_taxonomy"][dim]
+        allowed_per_dim[dim] = set(dim_block["allowed_values"])
+    return allowed_per_dim, vocab_bytes, 0, ""
+
+
 def _scan_prompt_safety(
     prompt: str,
     *,
@@ -525,10 +649,20 @@ def _validate_spec_requests(
     *,
     manifest_by_id: dict[str, dict],
     source_text: str | None,
+    taxonomy_allowed: dict[str, set[str]] | None,
 ) -> tuple[list[dict] | None, str]:
-    """Validate ``spec['requests']`` against the manifest and the
-    safety scans. Returns (validated_requests, error_msg). On error,
-    validated_requests is None and error_msg is non-empty."""
+    """Validate ``spec['requests']`` against the manifest, the safety
+    scans, and (when supplied) the descriptor vocabulary taxonomy.
+    Returns (validated_requests, error_msg). On error, validated_requests
+    is None and error_msg is non-empty.
+
+    ``taxonomy_allowed`` is the per-dimension allowed_values set
+    projection produced by ``_load_descriptor_vocabulary``. When
+    ``taxonomy_allowed is None``, any spec request that carries one or
+    more of ``TAXONOMY_FIELDS`` is refused — the user must pass
+    ``--descriptor-vocabulary``. When ``taxonomy_allowed`` is supplied,
+    every present taxonomy field's value must be in the matching
+    ``taxonomy_allowed[<dim>]`` set."""
     requests = spec.get("requests")
     if not isinstance(requests, list):
         return None, (
@@ -541,7 +675,10 @@ def _validate_spec_requests(
             "required (this stub does not have a no-op mode)"
         )
 
-    allowed_keys = {"id", "prompt", "intended_use", "width_px", "height_px"}
+    allowed_keys = (
+        {"id", "prompt", "intended_use", "width_px", "height_px"}
+        | set(TAXONOMY_FIELDS)
+    )
     required_keys = {"id", "prompt"}
 
     seen_ids: dict[str, int] = {}
@@ -636,6 +773,46 @@ def _validate_spec_requests(
                         f"must be a positive integer (got {value!r})"
                     )
 
+        # Taxonomy fields. Each field is OPTIONAL; ANY present field
+        # forces --descriptor-vocabulary to have been supplied, and
+        # every value must be in the matching image_taxonomy
+        # allowed_values set. Defense in depth: the plan schema
+        # additionally pattern-locks every taxonomy field at the
+        # lowercase-identifier + forbidden-token shape, so the
+        # post-write _schema_validate gate catches any unsafe value
+        # the runtime check missed (it should not — allowed_values is
+        # a closed enumeration of canonical tokens — but the layered
+        # check matters if the runtime allowed_values set ever drifts).
+        present_taxonomy: dict[str, str] = {}
+        for dim in TAXONOMY_FIELDS:
+            if dim not in req:
+                continue
+            value = req[dim]
+            if not isinstance(value, str) or not value.strip():
+                return None, (
+                    f"FAIL: requests[{i}].{dim} (id {req_id!r}) must be "
+                    f"a non-empty string when present (got {value!r})"
+                )
+            present_taxonomy[dim] = value
+        if present_taxonomy and taxonomy_allowed is None:
+            return None, (
+                f"FAIL: requests[{i}] (id {req_id!r}) carries taxonomy "
+                f"field(s) {sorted(present_taxonomy.keys())} but no "
+                f"--descriptor-vocabulary was supplied; taxonomy fields "
+                f"are only accepted when --descriptor-vocabulary points "
+                f"at a schema-valid d_one_descriptor_vocabulary JSON."
+            )
+        if present_taxonomy:
+            assert taxonomy_allowed is not None  # for type-checkers
+            for dim, value in present_taxonomy.items():
+                if value not in taxonomy_allowed[dim]:
+                    return None, (
+                        f"FAIL: requests[{i}].{dim} (id {req_id!r}) "
+                        f"value {value!r} is not in "
+                        f"image_taxonomy.{dim}.allowed_values "
+                        f"({sorted(taxonomy_allowed[dim])})."
+                    )
+
         validated.append({
             "id": req_id,
             "prompt": prompt,
@@ -644,6 +821,7 @@ def _validate_spec_requests(
             "height_px": req.get("height_px"),
             "manifest_local_path": manifest_entry.get("local_path"),
             "manifest_source": manifest_source,
+            "taxonomy": present_taxonomy,
         })
 
     return validated, ""
@@ -653,7 +831,14 @@ def _build_plan(validated_requests: list[dict]) -> dict:
     """Project the validated request list into the deterministic plan
     file shape. Sorted by id so a re-ordered spec produces an
     identical plan file (the manifest itself is order-sensitive, but
-    the plan is an audit projection and benefits from a stable order)."""
+    the plan is an audit projection and benefits from a stable order).
+
+    Taxonomy fields (TAXONOMY_FIELDS) are projected in the canonical
+    order — the same tuple order TAXONOMY_FIELDS declares — only when
+    the validated request carries them. Absent fields stay absent (no
+    null projection), so a spec without taxonomy produces a plan file
+    byte-identical to the pre-taxonomy shape, preserving the schema's
+    `additionalProperties: false` and the existing fixture set."""
     return {
         "schema_version": PLAN_SCHEMA_VERSION,
         "mode": "dry_run",
@@ -668,6 +853,11 @@ def _build_plan(validated_requests: list[dict]) -> dict:
                 **({"height_px": r["height_px"]} if r["height_px"] is not None else {}),
                 "manifest_local_path": r["manifest_local_path"],
                 "manifest_source": r["manifest_source"],
+                **{
+                    dim: r["taxonomy"][dim]
+                    for dim in TAXONOMY_FIELDS
+                    if dim in r.get("taxonomy", {})
+                },
             }
             for r in sorted(validated_requests, key=lambda x: x["id"])
         ],
@@ -793,6 +983,7 @@ def done_image_adapter(
     workspace: Path,
     spec: Path,
     plan_out: Path | None = None,
+    descriptor_vocabulary: Path | None = None,
 ) -> tuple[int, str]:
     """Run the D-One adapter contract stub. Returns (exit_code, message).
 
@@ -800,10 +991,10 @@ def done_image_adapter(
     image bytes are generated. A successful run produces only the
     deterministic plan file at ``plan_out`` (default
     ``<workspace>/d_one_adapter_plan.json``)."""
-    # String-level shape gates run first for BOTH --workspace and
-    # --spec (no filesystem syscall). A URI-shaped argument otherwise
-    # would slip past the URI guard for whichever input was checked
-    # second if the first input happened to fail an earlier
+    # String-level shape gates run first for --workspace, --spec, AND
+    # --descriptor-vocabulary (no filesystem syscall). A URI-shaped
+    # argument otherwise would slip past the URI guard for whichever
+    # input was checked later if an earlier input happened to fail a
     # filesystem gate (missing / wrong-kind / etc.).
     if _has_uri_scheme(str(workspace)):
         return 2, (
@@ -814,6 +1005,14 @@ def done_image_adapter(
         return 2, (
             f"FAIL: --spec {spec} looks like a URI; "
             f"done_image_adapter only accepts local file paths"
+        )
+    if descriptor_vocabulary is not None and _has_uri_scheme(
+        str(descriptor_vocabulary)
+    ):
+        return 2, (
+            f"FAIL: --descriptor-vocabulary {descriptor_vocabulary} "
+            f"looks like a URI; done_image_adapter only accepts local "
+            f"file paths"
         )
 
     # Filesystem gates for --workspace.
@@ -846,6 +1045,26 @@ def done_image_adapter(
     assert manifest_by_id is not None
     assert manifest_bytes_before is not None
 
+    # Optional --descriptor-vocabulary preflight. Re-validated every run
+    # (no caching across invocations) so a tampered file is caught even
+    # if a prior process wrote a different version to the same path. The
+    # loader returns the exact bytes it read, which we keep as the
+    # canonical "before" snapshot for the byte-identical post-condition
+    # below — the write path must NOT mutate the supplied vocabulary
+    # file (the README states this explicitly), so the post-condition
+    # re-reads and compares against this snapshot, rolling back the
+    # just-written plan on a mismatch.
+    taxonomy_allowed: dict[str, set[str]] | None = None
+    vocab_bytes_before: bytes | None = None
+    if descriptor_vocabulary is not None:
+        taxonomy_allowed, vocab_bytes_before, rc, msg = (
+            _load_descriptor_vocabulary(descriptor_vocabulary)
+        )
+        if rc != 0:
+            return rc, msg
+        assert taxonomy_allowed is not None
+        assert vocab_bytes_before is not None
+
     # Parse --spec.
     try:
         spec_bytes = spec.read_bytes()
@@ -869,6 +1088,7 @@ def done_image_adapter(
         spec_doc,
         manifest_by_id=manifest_by_id,
         source_text=source_text,
+        taxonomy_allowed=taxonomy_allowed,
     )
     if err:
         return 1, err
@@ -1000,12 +1220,46 @@ def done_image_adapter(
             f"FAIL: {manifest_path} bytes changed during apply "
             f"(expected byte-identical). Rolled back plan."
         )
+    # Vocabulary byte-identical post-condition. Mirrors the manifest
+    # byte-identical check above and the same check on the validate
+    # path. The write path is documented as non-mutating with respect
+    # to the supplied vocabulary file (the README states the vocab is
+    # byte-identical pre/post a successful run); the post-condition
+    # closes that contract by re-reading the file and rolling the
+    # just-written plan back on any mismatch.
+    if descriptor_vocabulary is not None and vocab_bytes_before is not None:
+        try:
+            vocab_bytes_after = descriptor_vocabulary.read_bytes()
+        except OSError as exc:
+            try:
+                plan_out.unlink()
+            except OSError:
+                pass
+            return 1, (
+                f"FAIL: cannot re-read --descriptor-vocabulary "
+                f"{descriptor_vocabulary} after apply: {exc}; rolled "
+                f"back plan."
+            )
+        if vocab_bytes_after != vocab_bytes_before:
+            try:
+                plan_out.unlink()
+            except OSError:
+                pass
+            return 1, (
+                f"FAIL: {descriptor_vocabulary} bytes changed during "
+                f"apply (expected byte-identical). Rolled back plan."
+            )
 
+    vocab_line = (
+        f"\n  vocab: {descriptor_vocabulary} (byte-identical)"
+        if descriptor_vocabulary is not None
+        else ""
+    )
     return 0, (
         f"OK: D-One adapter contract stub validated "
         f"{len(validated)} request(s) for {workspace}\n"
         f"  spec: {spec}\n"
-        f"  plan: {plan_out}\n"
+        f"  plan: {plan_out}{vocab_line}\n"
         f"  mode: dry_run (no D-One call; no image bytes generated)"
     )
 
@@ -1014,6 +1268,7 @@ def validate_plan_file(
     *,
     workspace: Path,
     plan: Path,
+    descriptor_vocabulary: Path | None = None,
 ) -> tuple[int, str]:
     """Validate an existing ``d_one_adapter_plan.json``. Returns
     ``(exit_code, message)``.
@@ -1023,20 +1278,26 @@ def validate_plan_file(
     gates against the candidate plan:
 
       1. String- and filesystem-layer gates on ``--workspace`` /
-         ``--plan`` (URI shape refused, symlink refused, exists,
-         regular file / directory).
+         ``--plan`` / (optional) ``--descriptor-vocabulary`` (URI
+         shape refused, symlink refused, exists, regular file /
+         directory).
       2. The same ``image_manifest.json`` + ``input/source.md``
          preflight the write path applies, via
          ``_load_workspace_manifest_and_source`` — so a workspace
          without a schema-valid manifest is refused before the plan
-         is even parsed.
+         is even parsed. When ``--descriptor-vocabulary`` is supplied,
+         the file is additionally schema-validated against
+         ``schemas/d_one_descriptor_vocabulary.schema.json`` and its
+         ``image_taxonomy`` projected into a per-dimension
+         allowed_values set.
       3. ``schemas/d_one_adapter_plan.schema.json`` against the plan
          JSON — catches malformed plans, list-rooted plans, unknown
          top-level / per-request fields, missing required fields,
          ``mode != "dry_run"``, ``schema_version != 1``, ``note``
          missing the dry-run sentinel, ``manifest_source !=
          "d_one_local"``, non-positive ``width_px`` / ``height_px``,
-         non-integer ``request_count``, etc.
+         taxonomy values that fail the lowercase-identifier +
+         forbidden-token pattern lock, etc.
       4. Cross-checks the schema cannot express: ``request_count ==
          len(requests)``; no duplicate request ``id`` across the
          array; every ``id`` resolves to an ``images[].id`` in the
@@ -1055,7 +1316,14 @@ def validate_plan_file(
          ``public hosting`` / ``publish to web`` / ``public url`` /
          ``public link`` / ``public cdn`` / ``host publicly`` and
          the documented variants); every ``intended_use`` (when
-         present) passes the full-slide-wording subset.
+         present) passes the full-slide-wording subset; and when ANY
+         plan request carries one or more of ``TAXONOMY_FIELDS``,
+         ``--descriptor-vocabulary`` MUST have been supplied AND every
+         present taxonomy value MUST be a member of the matching
+         ``image_taxonomy.<dim>.allowed_values`` projected at gate (2)
+         — drift detection: a plan whose taxonomy value is regex-shape
+         valid but no longer in the vocabulary's allowed_values is
+         refused here.
 
     Post-condition: the manifest bytes and the plan bytes are
     byte-identical pre/post the call. A successful run returns
@@ -1071,6 +1339,14 @@ def validate_plan_file(
         return 2, (
             f"FAIL: --plan {plan} looks like a URI; "
             f"done_image_adapter only accepts local file paths"
+        )
+    if descriptor_vocabulary is not None and _has_uri_scheme(
+        str(descriptor_vocabulary)
+    ):
+        return 2, (
+            f"FAIL: --descriptor-vocabulary {descriptor_vocabulary} "
+            f"looks like a URI; done_image_adapter only accepts local "
+            f"file paths"
         )
 
     if workspace.is_symlink():
@@ -1099,6 +1375,26 @@ def validate_plan_file(
         return rc, msg
     assert manifest_by_id is not None
     assert manifest_bytes_before is not None
+
+    # Optional descriptor vocabulary preflight. Loaded eagerly (before
+    # the plan is parsed) so a malformed vocabulary fails BEFORE the
+    # validator inspects the plan — that matches the write path's order
+    # so the two paths surface the same diagnostic for the same input.
+    # The loader returns the vocab bytes it actually read; we keep
+    # those as the canonical "before" snapshot for the byte-identical
+    # post-condition below (no separate read here — sharing the loader's
+    # bytes guarantees the two paths cannot drift on what counts as
+    # "before").
+    taxonomy_allowed: dict[str, set[str]] | None = None
+    vocab_bytes_before: bytes | None = None
+    if descriptor_vocabulary is not None:
+        taxonomy_allowed, vocab_bytes_before, rc, msg = (
+            _load_descriptor_vocabulary(descriptor_vocabulary)
+        )
+        if rc != 0:
+            return rc, msg
+        assert taxonomy_allowed is not None
+        assert vocab_bytes_before is not None
 
     try:
         plan_bytes_before = plan.read_bytes()
@@ -1208,6 +1504,40 @@ def validate_plan_file(
                     + "; ".join(iu_violations)
                 )
 
+        # Taxonomy cross-check. The schema already pattern-locked the
+        # shape of every taxonomy value; the runtime additionally
+        # requires --descriptor-vocabulary AND that every present value
+        # is in image_taxonomy.<dim>.allowed_values. A plan whose
+        # taxonomy value drifted away from the vocabulary's
+        # allowed_values is refused here (the schema regex would still
+        # pass on a regex-shape valid token like 'blueprint_style' that
+        # is not in the canonical five rendering_style values).
+        plan_taxonomy: dict[str, str] = {
+            dim: req[dim] for dim in TAXONOMY_FIELDS if dim in req
+        }
+        if plan_taxonomy and taxonomy_allowed is None:
+            return 1, (
+                f"FAIL: {plan} requests[{i}] (id {req_id!r}) carries "
+                f"taxonomy field(s) {sorted(plan_taxonomy.keys())} but "
+                f"--descriptor-vocabulary was not supplied; "
+                f"--validate-plan refuses to certify a plan whose "
+                f"taxonomy values cannot be re-checked against "
+                f"image_taxonomy.<dim>.allowed_values. Re-run with "
+                f"--descriptor-vocabulary <path>."
+            )
+        if plan_taxonomy:
+            assert taxonomy_allowed is not None
+            for dim, value in plan_taxonomy.items():
+                if value not in taxonomy_allowed[dim]:
+                    return 1, (
+                        f"FAIL: {plan} requests[{i}].{dim} "
+                        f"(id {req_id!r}) value {value!r} is not in "
+                        f"image_taxonomy.{dim}.allowed_values "
+                        f"({sorted(taxonomy_allowed[dim])}); the plan "
+                        f"taxonomy drifted from the supplied "
+                        f"--descriptor-vocabulary."
+                    )
+
     # Post-condition: nothing was written. A mismatch here would mean
     # another process is touching either file while we validated,
     # which is a stronger signal than the validator itself producing
@@ -1229,15 +1559,46 @@ def validate_plan_file(
             f"FAIL: {plan} bytes changed during --validate-plan "
             f"(expected byte-identical)"
         )
+    # Vocabulary byte-identical post-condition (when supplied). The
+    # validator is non-mutating; a vocab-bytes change during the run
+    # would mean another process is touching the file while we
+    # validated, which is the same stronger signal we emit for the
+    # manifest / plan.
+    if descriptor_vocabulary is not None and vocab_bytes_before is not None:
+        try:
+            vocab_bytes_after = descriptor_vocabulary.read_bytes()
+        except OSError as exc:
+            return 1, (
+                f"FAIL: cannot re-read --descriptor-vocabulary "
+                f"{descriptor_vocabulary} after validate: {exc}"
+            )
+        if vocab_bytes_after != vocab_bytes_before:
+            return 1, (
+                f"FAIL: {descriptor_vocabulary} bytes changed during "
+                f"--validate-plan (expected byte-identical)"
+            )
 
+    vocab_suffix = (
+        f"\n  vocab:     {descriptor_vocabulary} "
+        f"(image_taxonomy re-checked)"
+        if descriptor_vocabulary is not None
+        else ""
+    )
     return 0, (
         f"OK: {plan} validates against "
         f"d_one_adapter_plan.schema.json AND the workspace's "
-        f"image_manifest.json AND the full prompt safety scan.\n"
-        f"  workspace: {workspace}\n"
+        f"image_manifest.json AND the full prompt safety scan"
+        + (
+            f" AND --descriptor-vocabulary "
+            f"image_taxonomy.allowed_values."
+            if descriptor_vocabulary is not None
+            else "."
+        )
+        + f"\n  workspace: {workspace}\n"
         f"  requests:  {len(requests)}\n"
         f"  mode:      {plan_doc['mode']} "
         f"(NON-MUTATING — no file was written)"
+        + vocab_suffix
     )
 
 
@@ -2788,6 +3149,668 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
             ok, f"rc={rc}, msg={msg!r}",
         ))
 
+    # =========================================================================
+    # --descriptor-vocabulary taxonomy scenarios.
+    #
+    # Every scenario uses a small in-memory canonical descriptor
+    # vocabulary written to a tempfile inside the temp directory. This
+    # mirrors the on-disk template at
+    # examples/d_one_descriptor_vocabulary_template.json but is
+    # in-script-only so the probes do not depend on on-disk template
+    # bytes (and so a future schema/template drift is still surfaced
+    # by `python3 scripts/validate_artifacts.py --schema ... <template>`
+    # independently).
+    # =========================================================================
+
+    def _canonical_vocab() -> dict:
+        return {
+            "schema_version": 1,
+            "note": (
+                "Synthetic in-script D-One descriptor vocabulary for "
+                "adapter taxonomy probes."
+            ),
+            "kind_enum": [
+                "color_token",
+                "geometric_noun",
+                "mood_adjective",
+                "composition_adjective",
+            ],
+            "descriptors": [
+                {"kind": "color_token", "value": "palette.accent"},
+                {"kind": "geometric_noun", "value": "circle"},
+                {"kind": "mood_adjective", "value": "calm"},
+                {"kind": "composition_adjective", "value": "centered"},
+            ],
+            "image_taxonomy": {
+                "rendering_style": {
+                    "allowed_values": [
+                        "flat_vector",
+                        "line_diagram",
+                        "isometric_lite",
+                        "low_poly",
+                        "solid_shape",
+                    ],
+                },
+                "palette_family": {
+                    "allowed_values": [
+                        "neutral_grey",
+                        "accent_only",
+                        "dual_tone",
+                        "mono_brand",
+                        "palette_default",
+                    ],
+                },
+                "image_role": {
+                    "allowed_values": [
+                        "decorative_accent",
+                        "metaphor_icon",
+                        "divider_motif",
+                        "kpi_emblem",
+                        "cover_motif",
+                    ],
+                },
+                "layout_pattern": {
+                    "allowed_values": [
+                        "single_center",
+                        "left_anchor",
+                        "right_anchor",
+                        "top_band",
+                        "bottom_band",
+                    ],
+                },
+                "modifier": {
+                    "allowed_values": [
+                        "low_contrast",
+                        "soft_edges",
+                        "grid_aligned",
+                        "negative_space",
+                    ],
+                },
+            },
+        }
+
+    def _write_vocab(path: Path, body: dict) -> None:
+        path.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n")
+
+    # ---- T1. valid taxonomy (write path): a spec carrying all five
+    # taxonomy fields with canonical values + a vocab pointer writes a
+    # plan whose requests carry the same taxonomy fields. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_tax_valid"
+        _seed_workspace(ws, images=[
+            {"id": "cover", "local_path": "media/cover.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "cover",
+                    "prompt": "an abstract geometric pattern, no text",
+                    "rendering_style": "flat_vector",
+                    "palette_family": "neutral_grey",
+                    "image_role": "cover_motif",
+                    "layout_pattern": "single_center",
+                    "modifier": "negative_space",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        plan_doc = json.loads((ws / DEFAULT_PLAN_FILENAME).read_text()) if rc == 0 else {}
+        req = plan_doc.get("requests", [{}])[0]
+        ok = (
+            rc == 0
+            and req.get("rendering_style") == "flat_vector"
+            and req.get("palette_family") == "neutral_grey"
+            and req.get("image_role") == "cover_motif"
+            and req.get("layout_pattern") == "single_center"
+            and req.get("modifier") == "negative_space"
+        )
+        results.append(_expect(
+            "taxonomy: spec with valid taxonomy + --descriptor-vocabulary "
+            "succeeds; plan requests carry the same taxonomy fields",
+            ok, f"rc={rc}, msg={msg!r}, req={req!r}",
+        ))
+
+    # ---- T2. omitted taxonomy (write path): a spec with no taxonomy
+    # field is accepted with OR without --descriptor-vocabulary; the
+    # plan does not gain any taxonomy field. ----
+    for use_vocab in (False, True):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / f"ws_tax_omitted_{int(use_vocab)}"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [{"id": "a", "prompt": "abstract pattern"}],
+            })
+            vocab = td / "vocab.json"
+            if use_vocab:
+                _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec,
+                descriptor_vocabulary=vocab if use_vocab else None,
+            )
+            plan_doc = json.loads(
+                (ws / DEFAULT_PLAN_FILENAME).read_text()
+            ) if rc == 0 else {}
+            req = plan_doc.get("requests", [{}])[0]
+            no_taxonomy = all(dim not in req for dim in TAXONOMY_FIELDS)
+            ok = rc == 0 and no_taxonomy
+            results.append(_expect(
+                f"taxonomy: spec without taxonomy fields succeeds "
+                f"(--descriptor-vocabulary {'supplied' if use_vocab else 'omitted'}); "
+                f"plan stays taxonomy-free",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- T3. unknown taxonomy value (write path): a spec with a
+    # rendering_style not in image_taxonomy.rendering_style.allowed_values
+    # is refused with a clear allowed_values diagnostic. The value
+    # 'blueprint_style' is regex-shape valid (lowercase identifier, no
+    # forbidden tokens) so the schema regex would NOT trip; the
+    # runtime allowed_values check must close that gap. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_tax_unknown"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern",
+                    "rendering_style": "blueprint_style",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "rendering_style" in msg
+            and "blueprint_style" in msg
+            and "image_taxonomy.rendering_style.allowed_values" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "taxonomy: unknown rendering_style refused with "
+            "allowed_values diagnostic; no plan file written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- T4. unsafe taxonomy value (write path): values whose shape
+    # carries a forbidden token (public / upload / raw / customer /
+    # confidential / screenshot / credential / password / secret) OR a
+    # forbidden compound (full slide / image search / web generation /
+    # page generation / slide generation) cannot land in the plan. The
+    # runtime allowed_values check already refuses them (none of the
+    # canonical five values matches an unsafe shape), so they fail
+    # FIRST at the allowed_values gate; the post-write schema regex
+    # remains a belt-and-braces defense. We parametrize across the
+    # five dimensions to prove the gate is consistent. ----
+    unsafe_cases: tuple[tuple[str, str], ...] = (
+        ("rendering_style", "public_render"),
+        ("palette_family", "upload_palette"),
+        ("image_role", "raw_motif"),
+        ("layout_pattern", "customer_anchor"),
+        ("modifier", "confidential_modifier"),
+        ("rendering_style", "screenshot_diagram"),
+        ("rendering_style", "credential_motif"),
+        ("rendering_style", "password_motif"),
+        ("rendering_style", "secret_render"),
+        ("rendering_style", "full_slide"),
+        ("rendering_style", "image_search"),
+        ("rendering_style", "web_generation"),
+    )
+    for dim, unsafe_value in unsafe_cases:
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / f"ws_tax_unsafe_{dim}"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "a",
+                        "prompt": "abstract pattern",
+                        dim: unsafe_value,
+                    },
+                ],
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = (
+                rc == 1
+                and dim in msg
+                and unsafe_value in msg
+                and not (ws / DEFAULT_PLAN_FILENAME).exists()
+            )
+            results.append(_expect(
+                f"taxonomy: unsafe {dim}={unsafe_value!r} refused; no "
+                f"plan file written",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- T5. missing --descriptor-vocabulary (write path): a spec
+    # request carrying a taxonomy field is refused when no
+    # --descriptor-vocabulary was supplied. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_tax_no_vocab"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+        })
+        rc, msg = done_image_adapter(workspace=ws, spec=spec)
+        ok = (
+            rc == 1
+            and "--descriptor-vocabulary" in msg
+            and "rendering_style" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "taxonomy: spec with taxonomy field but no "
+            "--descriptor-vocabulary refused; no plan file written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- T6. plan drift (validate-plan path): a plan was written
+    # with a valid taxonomy value, then the plan file was rewritten
+    # by hand to carry a regex-shape-valid value that is NOT in the
+    # vocabulary's allowed_values. --validate-plan refuses it. This
+    # is the realistic drift mode the runtime gate exists to catch
+    # (schema pattern alone passes a value like 'blueprint_style').
+    # ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_drift"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg_seed = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        assert rc == 0, f"T6 seed failed: rc={rc} msg={msg_seed!r}"
+        plan_path = ws / DEFAULT_PLAN_FILENAME
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["rendering_style"] = "blueprint_style"
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(
+            workspace=ws, plan=plan_path, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "rendering_style" in msg
+            and "blueprint_style" in msg
+            and "drifted" in msg
+        )
+        results.append(_expect(
+            "taxonomy: validate-plan refuses a plan whose taxonomy value "
+            "drifted from --descriptor-vocabulary "
+            "image_taxonomy.allowed_values",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- T7. validate-plan path: missing --descriptor-vocabulary
+    # when the plan carries taxonomy fields is refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_validate_no_vocab"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, _ = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        assert rc == 0
+        plan_path = ws / DEFAULT_PLAN_FILENAME
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and "--descriptor-vocabulary" in msg
+            and "rendering_style" in msg
+        )
+        results.append(_expect(
+            "taxonomy: validate-plan refuses a taxonomy-carrying plan "
+            "when --descriptor-vocabulary was not supplied",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- T8. validate-plan path: a plan written WITHOUT taxonomy
+    # fields validates clean with OR without --descriptor-vocabulary
+    # (the optional vocab is still schema-checked when supplied). ----
+    for use_vocab in (False, True):
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / f"ws_validate_no_tax_{int(use_vocab)}"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [{"id": "a", "prompt": "abstract pattern"}],
+            })
+            rc, _ = done_image_adapter(workspace=ws, spec=spec)
+            assert rc == 0
+            plan_path = ws / DEFAULT_PLAN_FILENAME
+            vocab = td / "vocab.json"
+            if use_vocab:
+                _write_vocab(vocab, _canonical_vocab())
+            rc, msg = validate_plan_file(
+                workspace=ws, plan=plan_path,
+                descriptor_vocabulary=vocab if use_vocab else None,
+            )
+            ok = rc == 0 and "validates against" in msg
+            results.append(_expect(
+                f"taxonomy: validate-plan accepts a taxonomy-free plan "
+                f"(--descriptor-vocabulary "
+                f"{'supplied' if use_vocab else 'omitted'})",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- T9. malformed / schema-invalid --descriptor-vocabulary
+    # refused (write path). ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_bad_vocab"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+        })
+        # Missing kind_enum -> schema-invalid.
+        bad_vocab = td / "vocab.json"
+        bad_vocab.write_text(json.dumps({
+            "schema_version": 1,
+            "note": "D-One descriptor vocabulary, broken on purpose",
+            "descriptors": [],
+            "image_taxonomy": _canonical_vocab()["image_taxonomy"],
+        }))
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=bad_vocab,
+        )
+        ok = (
+            rc == 1
+            and "d_one_descriptor_vocabulary.schema.json" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "taxonomy: schema-invalid --descriptor-vocabulary refused; "
+            "no plan file written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- T10. symlinked / URI-shaped / missing --descriptor-vocabulary
+    # refused at the string + filesystem layers (write path). ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_vocab_link"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+        })
+        real_vocab = td / "vocab.json"
+        _write_vocab(real_vocab, _canonical_vocab())
+        link_vocab = td / "vocab_link.json"
+        link_vocab.symlink_to(real_vocab)
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=link_vocab,
+        )
+        ok = (
+            rc == 2
+            and "symlink" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "taxonomy: symlink at --descriptor-vocabulary refused; no "
+            "plan file written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    rc, msg = done_image_adapter(
+        workspace=Path("/tmp/ws"),
+        spec=Path("/tmp/spec.json"),
+        descriptor_vocabulary=Path("https://attacker.example/v.json"),
+    )
+    ok = rc == 2 and "URI" in msg
+    results.append(_expect(
+        "taxonomy: URI-shaped --descriptor-vocabulary refused at the "
+        "string layer",
+        ok, f"rc={rc}, msg={msg!r}",
+    ))
+
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_vocab_missing"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+        })
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec,
+            descriptor_vocabulary=td / "does_not_exist.json",
+        )
+        ok = (
+            rc == 2
+            and "does not exist" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "taxonomy: missing --descriptor-vocabulary file refused",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- T11. determinism: with taxonomy fields, two independent runs
+    # from identical inputs produce byte-identical plan-file bytes. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bodies: list[bytes] = []
+        for ws_name in ("ws_a", "ws_b"):
+            ws = td / ws_name
+            _seed_workspace(ws, images=[
+                {"id": "x", "local_path": "media/x.png", "source": "d_one_local"},
+                {"id": "y", "local_path": "media/y.png", "source": "d_one_local"},
+            ])
+            spec = td / f"spec_{ws_name}.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "y",
+                        "prompt": "second abstract pattern",
+                        "rendering_style": "low_poly",
+                        "image_role": "kpi_emblem",
+                    },
+                    {
+                        "id": "x",
+                        "prompt": "first abstract pattern",
+                        "rendering_style": "flat_vector",
+                        "modifier": "soft_edges",
+                    },
+                ],
+            })
+            vocab = td / f"vocab_{ws_name}.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            assert rc == 0, f"determinism seed failed: rc={rc} msg={msg!r}"
+            bodies.append((ws / DEFAULT_PLAN_FILENAME).read_bytes())
+        ok = bodies[0] == bodies[1]
+        results.append(_expect(
+            "taxonomy: two independent runs with identical taxonomy "
+            "inputs produce byte-identical plan-file bytes",
+            ok, f"len_a={len(bodies[0])}, len_b={len(bodies[1])}",
+        ))
+
+    # ---- T12. write-path vocab byte-identical post-condition: a
+    # successful write leaves the supplied --descriptor-vocabulary file
+    # byte-identical pre/post. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_vocab_post"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        vocab_bytes_before = vocab.read_bytes()
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 0
+            and vocab.read_bytes() == vocab_bytes_before
+            and (ws / DEFAULT_PLAN_FILENAME).is_file()
+        )
+        results.append(_expect(
+            "taxonomy: write-path leaves --descriptor-vocabulary bytes "
+            "byte-identical pre/post a successful run",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- T13. write-path vocab post-condition rolls back: a mutation
+    # of the vocab file between the loader's read and the post-condition
+    # re-read trips the gate and unlinks the just-written plan file.
+    # Monkey-patches the loader to return a "before" snapshot that
+    # disagrees with the disk bytes at post-condition time. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_vocab_rollback"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        import sys as _sys2
+        _mod2 = _sys2.modules[__name__]
+        original_loader = _mod2._load_descriptor_vocabulary
+
+        def fake_loader(vocab_path: Path):
+            allowed, real_bytes, rc, msg = original_loader(vocab_path)
+            if rc != 0:
+                return allowed, real_bytes, rc, msg
+            # Return a doctored "before" snapshot that disagrees with
+            # the bytes currently on disk. The post-condition re-reads
+            # the real bytes and compares to this — they cannot match,
+            # so the gate must fire and the plan must be rolled back.
+            return allowed, real_bytes + b"X", rc, msg
+
+        _mod2._load_descriptor_vocabulary = fake_loader  # type: ignore[attr-defined]
+        try:
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+        finally:
+            _mod2._load_descriptor_vocabulary = original_loader  # type: ignore[attr-defined]
+        ok = (
+            rc == 1
+            and "bytes changed during apply" in msg
+            and "Rolled back plan" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "taxonomy: write-path post-condition rolls the plan back "
+            "when the vocab bytes disagree at re-read (regression for "
+            "the new vocab byte-identical post-condition)",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
     return results
 
 
@@ -2806,12 +3829,18 @@ def main(argv: list[str]) -> int:
             "'public hosting', 'publish to web', 'public url', "
             "'public link', 'public cdn', 'host publicly' and the "
             "documented variants), and writes a deterministic "
-            "dry-run plan file. Does NOT call D-One / Qoder / any "
-            "public network / any image-generation model / any "
-            "external service. Does NOT generate any image bytes. "
-            "Does NOT mutate image_manifest.json. Does NOT produce "
-            "render_models, svg_previews, or any .pptx. Does NOT "
-            "change PPTX export behavior."
+            "dry-run plan file. Optional --descriptor-vocabulary "
+            "unlocks the five clean-room taxonomy fields "
+            "(rendering_style / palette_family / image_role / "
+            "layout_pattern / modifier) per request, validated "
+            "against image_taxonomy.<dim>.allowed_values in the "
+            "supplied d_one_descriptor_vocabulary JSON. Does NOT "
+            "call D-One / Qoder / any public network / any "
+            "image-generation model / any external service. Does "
+            "NOT generate any image bytes. Does NOT mutate "
+            "image_manifest.json. Does NOT produce render_models, "
+            "svg_previews, or any .pptx. Does NOT change PPTX export "
+            "behavior."
         ),
     )
     parser.add_argument(
@@ -2824,7 +3853,12 @@ def main(argv: list[str]) -> int:
              "object with a non-empty 'requests' list whose every "
              "entry has 'id' (matching an images[].id with "
              "source='d_one_local'), 'prompt' (non-empty, safe), and "
-             "optionally 'intended_use', 'width_px', 'height_px'.",
+             "optionally 'intended_use', 'width_px', 'height_px', plus "
+             "any subset of the taxonomy fields 'rendering_style', "
+             "'palette_family', 'image_role', 'layout_pattern', "
+             "'modifier' — but each present taxonomy field requires "
+             "--descriptor-vocabulary AND must match a value declared "
+             "in image_taxonomy.<dim>.allowed_values.",
     )
     parser.add_argument(
         "--plan-out", type=Path, default=None,
@@ -2833,26 +3867,48 @@ def main(argv: list[str]) -> int:
              "inside --workspace and must not pre-exist.",
     )
     parser.add_argument(
+        "--descriptor-vocabulary", type=Path, default=None,
+        dest="descriptor_vocabulary",
+        help="Optional. Path to a d_one_descriptor_vocabulary JSON file "
+             "(see schemas/d_one_descriptor_vocabulary.schema.json). "
+             "Required iff a --spec request (write path) or plan "
+             "request (--validate-plan path) carries any of the five "
+             "taxonomy fields. The file is re-validated every run, and "
+             "every present taxonomy value must be a member of the "
+             "matching image_taxonomy.<dim>.allowed_values list. "
+             "Refused if URI-shaped, symlinked, missing, or "
+             "schema-invalid.",
+    )
+    parser.add_argument(
         "--validate-plan", action="store_true",
         help="Validate an EXISTING d_one_adapter_plan.json instead of "
-             "writing a new one. Requires --workspace and --plan. The "
+             "writing a new one. Requires --workspace and --plan; "
+             "additionally requires --descriptor-vocabulary whenever "
+             "the plan carries one or more taxonomy fields. The "
              "validator is NON-MUTATING: it applies the schema "
              "(d_one_adapter_plan.schema.json — covers list-rooted, "
              "unknown fields, missing required fields, mode != "
              "'dry_run', schema_version drift, manifest_source != "
-             "'d_one_local', non-positive dimensions), the workspace + "
-             "image_manifest preflight (manifest schema-valid; no "
-             "duplicate ids; every local_path safe), and the full set "
-             "of cross-checks the schema cannot express (request_count "
-             "== len(requests); no duplicate request ids; every id "
-             "resolves in the manifest with source='d_one_local'; "
-             "manifest_local_path / manifest_source agree with the "
-             "manifest entry byte-for-byte; every prompt re-passes the "
-             "full URL / file-path / raw-source marker / 40-char source "
-             "shingle / credential / PII / full-slide wording / "
-             "public-distribution wording deny list, and every "
+             "'d_one_local', non-positive dimensions, and the "
+             "lowercase-identifier + forbidden-token pattern lock on "
+             "every taxonomy value), the workspace + image_manifest "
+             "preflight (manifest schema-valid; no duplicate ids; "
+             "every local_path safe), the optional descriptor "
+             "vocabulary preflight (vocab schema-valid; image_taxonomy "
+             "projected to per-dimension allowed_values sets), and the "
+             "full set of cross-checks the schema cannot express "
+             "(request_count == len(requests); no duplicate request "
+             "ids; every id resolves in the manifest with "
+             "source='d_one_local'; manifest_local_path / "
+             "manifest_source agree with the manifest entry "
+             "byte-for-byte; every prompt re-passes the full URL / "
+             "file-path / raw-source marker / 40-char source shingle "
+             "/ credential / PII / full-slide wording / "
+             "public-distribution wording deny list; every "
              "intended_use re-passes the full-slide wording subset of "
-             "that list — the same scope the write path applies).",
+             "that list; AND every taxonomy value is in the matching "
+             "image_taxonomy.<dim>.allowed_values list — the same "
+             "scope the write path applies).",
     )
     parser.add_argument(
         "--plan", type=Path, default=None,
@@ -2872,11 +3928,15 @@ def main(argv: list[str]) -> int:
              "/schema-invalid manifest, malformed spec, duplicate "
              "request ids, empty prompts, no-image-bytes guarantee, "
              "mid-write rollback, no-source-leak, plan determinism, "
-             "plus the standalone --validate-plan path covering "
-             "schema gates, cross-checks, and the non-mutating "
-             "post-condition. Exits non-zero if any scenario does not "
-             "behave as expected. Mutually exclusive with --workspace "
-             "/ --spec / --plan-out / --plan / --validate-plan.",
+             "the optional --descriptor-vocabulary taxonomy gates "
+             "(valid taxonomy, omitted taxonomy, unknown taxonomy "
+             "value, unsafe-token taxonomy value, missing vocabulary, "
+             "plan drift), plus the standalone --validate-plan path "
+             "covering schema gates, cross-checks, and the "
+             "non-mutating post-condition. Exits non-zero if any "
+             "scenario does not behave as expected. Mutually "
+             "exclusive with --workspace / --spec / --plan-out / "
+             "--plan / --validate-plan / --descriptor-vocabulary.",
     )
     args = parser.parse_args(argv)
 
@@ -2884,6 +3944,7 @@ def main(argv: list[str]) -> int:
         if any(
             v is not None for v in (
                 args.workspace, args.spec, args.plan_out, args.plan,
+                args.descriptor_vocabulary,
             )
         ) or args.validate_plan:
             print(
@@ -2924,7 +3985,8 @@ def main(argv: list[str]) -> int:
         if rejected:
             print(
                 f"FAIL: --validate-plan does not accept "
-                f"{', '.join(rejected)}; use --workspace and --plan only",
+                f"{', '.join(rejected)}; use --workspace, --plan, and "
+                f"optionally --descriptor-vocabulary only",
                 file=sys.stderr,
             )
             return 2
@@ -2944,6 +4006,7 @@ def main(argv: list[str]) -> int:
         rc, msg = validate_plan_file(
             workspace=args.workspace,
             plan=args.plan,
+            descriptor_vocabulary=args.descriptor_vocabulary,
         )
         if rc == 0:
             print(msg)
@@ -2978,6 +4041,7 @@ def main(argv: list[str]) -> int:
         workspace=args.workspace,
         spec=args.spec,
         plan_out=args.plan_out,
+        descriptor_vocabulary=args.descriptor_vocabulary,
     )
     if rc == 0:
         print(msg)

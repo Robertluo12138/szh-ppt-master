@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "d_one_adapter_plan.schema.json",
   "title": "D-One Adapter Dry-Run Plan",
-  "description": "Deterministic dry-run plan written by scripts/done_image_adapter.py. The plan records the validated D-One generation requests for a future generator to consume. The plan is NOT D-One integration — no D-One call is made and no image bytes are produced. The schema is strict on shape and on the dry-run sentinel fields (mode, note, manifest_source); deeper safety gates (no URLs / credentials / source-text leakage / full-slide wording in prompts; ids resolve in image_manifest.json; manifest_source matches manifest entry) are enforced by scripts/done_image_adapter.py at write time and re-runnable via `done_image_adapter.py --validate-plan`.",
+  "description": "Deterministic dry-run plan written by scripts/done_image_adapter.py. The plan records the validated D-One generation requests for a future generator to consume. The plan is NOT D-One integration — no D-One call is made and no image bytes are produced. The schema is strict on shape and on the dry-run sentinel fields (mode, note, manifest_source); deeper safety gates (no URLs / credentials / source-text leakage / full-slide wording in prompts; ids resolve in image_manifest.json; manifest_source matches manifest entry) are enforced by scripts/done_image_adapter.py at write time and re-runnable via `done_image_adapter.py --validate-plan`. Optional per-request taxonomy fields (rendering_style / palette_family / image_role / layout_pattern / modifier) may appear ONLY when the caller passed `--descriptor-vocabulary <path-to-d_one_descriptor_vocabulary.json>`; the runtime then refuses any taxonomy value not in the matching image_taxonomy.<dim>.allowed_values list, and `--validate-plan` re-runs the same vocabulary check whenever the plan carries taxonomy fields.",
   "type": "object",
   "required": ["schema_version", "mode", "note", "request_count", "requests"],
   "additionalProperties": false,
@@ -70,6 +70,41 @@
             "type": "integer",
             "exclusiveMinimum": 0,
             "description": "Optional. Target asset height in pixels. Positive integer."
+          },
+          "rendering_style": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Optional. Clean-room rendering-style taxonomy token (dimension 1 of image_taxonomy in d_one_descriptor_vocabulary.schema.json). May appear ONLY when the writer / validator passed `--descriptor-vocabulary <path>`; the runtime cross-check refuses any value not in image_taxonomy.rendering_style.allowed_values. The pattern lock here mirrors the descriptor-vocabulary's lowercase-identifier positive whitelist + forbidden-token deny clause (refuses 'public', 'upload', 'raw', 'customer', 'confidential', 'screenshot', 'credential', 'password', 'secret' as bounded tokens, and the compound phrases 'full slide' / 'image search' / 'web generation' / 'page generation' / 'slide generation' across any '.' / '_' / '-' separator stacking), so an unsafe value is refused at the schema layer before the runtime allowed_values check even runs."
+          },
+          "palette_family": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Optional. Clean-room palette-family taxonomy token (dimension 2 of image_taxonomy). Same gating, pattern lock, and runtime allowed_values check as rendering_style."
+          },
+          "image_role": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Optional. Clean-room image-role taxonomy token (dimension 3 of image_taxonomy). Same gating, pattern lock, and runtime allowed_values check as rendering_style."
+          },
+          "layout_pattern": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Optional. Clean-room layout-pattern taxonomy token (dimension 4 of image_taxonomy). Same gating, pattern lock, and runtime allowed_values check as rendering_style."
+          },
+          "modifier": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Optional. Clean-room intensity / texture modifier (dimension 5 of image_taxonomy). Same gating, pattern lock, and runtime allowed_values check as rendering_style; intentionally optional, mirroring d_one_descriptor_vocabulary.image_taxonomy.modifier."
           }
         }
       }

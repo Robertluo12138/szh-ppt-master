@@ -43,7 +43,9 @@ today and is documented as TODO. The script deliberately does NOT:
     output.);
   - mutate ``<workspace>/image_manifest.json`` or
     ``<workspace>/d_one_adapter_plan.json`` (both byte-identical
-    pre/post a successful run);
+    pre/post a successful run) or the optional
+    ``--descriptor-vocabulary`` file (also byte-identical pre/post a
+    successful run);
   - generate ``render_models/*``, ``svg_previews/*``, or any ``.pptx``;
   - change PPTX export behavior in any way;
   - emit SVG / GIF / WebP / TIFF bytes — the embed surface
@@ -77,6 +79,20 @@ the assets-dir returns to its pre-call state):
   --plan (optional; defaults to ``<workspace>/d_one_adapter_plan.json``)
     * must pass the same gate the validator applies internally
       (existing regular non-symlink file; URI-shape refused).
+
+  --descriptor-vocabulary (optional; required iff the plan carries any
+  of the five taxonomy fields: ``rendering_style`` / ``palette_family``
+  / ``image_role`` / ``layout_pattern`` / ``modifier``)
+    * when supplied, must be an existing regular non-symlink file whose
+      bytes parse as JSON, decode to an object, and validate against
+      ``schemas/d_one_descriptor_vocabulary.schema.json``; the runner
+      hands the path through to ``done_image_adapter.validate_plan_file``
+      so the same image_taxonomy.allowed_values check the writer ran is
+      re-run at the runner boundary;
+    * when omitted, a plan that carries taxonomy fields is refused by
+      the validator (the runner cannot certify a taxonomy plan whose
+      values it cannot re-check). A taxonomy-free plan accepts the
+      omitted flag without complaint.
 
   --assets-dir
     * must be an existing directory; URI-shaped values refused; the
@@ -206,6 +222,7 @@ def run_d_one_generation(
     plan: Path | None = None,
     fixtures_dir: Path | None = None,
     allow_synthetic_bytes: bool = False,
+    descriptor_vocabulary: Path | None = None,
 ) -> tuple[int, str]:
     """Run the mockable local D-One generator. Returns (exit_code, message).
 
@@ -250,6 +267,14 @@ def run_d_one_generation(
         return 2, (
             f"FAIL: --fixtures-dir {fixtures_dir} looks like a URI; "
             f"run_d_one_generation only accepts local directory paths"
+        )
+    if descriptor_vocabulary is not None and _has_uri_scheme(
+        str(descriptor_vocabulary)
+    ):
+        return 2, (
+            f"FAIL: --descriptor-vocabulary {descriptor_vocabulary} "
+            f"looks like a URI; run_d_one_generation only accepts "
+            f"local file paths"
         )
 
     # --workspace filesystem gates.
@@ -308,9 +333,18 @@ def run_d_one_generation(
     # cross-check the schema cannot express, AND the full per-request
     # safety re-scan (URIs, file paths, raw-source markers, 40-char
     # input/source.md shingles, credentials, PII, full-slide wording).
-    # Re-using the validator keeps the runner from drifting away from
-    # the same gates done_image_adapter applied at write time.
-    rc, msg = _adapter.validate_plan_file(workspace=workspace, plan=plan)
+    # When the caller passed --descriptor-vocabulary, the validator
+    # additionally schema-checks the vocab and re-runs the
+    # image_taxonomy.allowed_values membership check against every
+    # taxonomy-bearing plan request — closing the dead-end where a
+    # taxonomy plan could not pass through the mock runner. Re-using
+    # the validator keeps the runner from drifting away from the same
+    # gates done_image_adapter applied at write time.
+    rc, msg = _adapter.validate_plan_file(
+        workspace=workspace,
+        plan=plan,
+        descriptor_vocabulary=descriptor_vocabulary,
+    )
     if rc != 0:
         return rc, msg
 
@@ -330,6 +364,19 @@ def run_d_one_generation(
         manifest_bytes_before = manifest_path.read_bytes()
     except OSError as exc:
         return 1, f"FAIL: cannot re-read {manifest_path}: {exc}"
+    # When --descriptor-vocabulary was supplied, capture its bytes so the
+    # post-condition can confirm the runner did not mutate it. The
+    # validator already schema-validated the file and rejected symlinks
+    # / URIs, so a successful read here is expected.
+    vocab_bytes_before: bytes | None = None
+    if descriptor_vocabulary is not None:
+        try:
+            vocab_bytes_before = descriptor_vocabulary.read_bytes()
+        except OSError as exc:
+            return 1, (
+                f"FAIL: cannot re-read --descriptor-vocabulary "
+                f"{descriptor_vocabulary}: {exc}"
+            )
 
     # Build the per-request schedule. Each scheduled entry resolves to
     # a target inside --assets-dir; the schedule is built fully before
@@ -577,6 +624,32 @@ def run_d_one_generation(
             f"FAIL: {plan} bytes changed during apply "
             f"(expected byte-identical). Rolled back outputs."
         )
+    if descriptor_vocabulary is not None and vocab_bytes_before is not None:
+        try:
+            vocab_bytes_after = descriptor_vocabulary.read_bytes()
+        except OSError as exc:
+            for t in rollback:
+                try:
+                    if t.exists() or t.is_symlink():
+                        t.unlink()
+                except OSError:
+                    pass
+            return 1, (
+                f"FAIL: cannot re-read --descriptor-vocabulary "
+                f"{descriptor_vocabulary} after apply: {exc}. Rolled "
+                f"back outputs."
+            )
+        if vocab_bytes_after != vocab_bytes_before:
+            for t in rollback:
+                try:
+                    if t.exists() or t.is_symlink():
+                        t.unlink()
+                except OSError:
+                    pass
+            return 1, (
+                f"FAIL: {descriptor_vocabulary} bytes changed during "
+                f"apply (expected byte-identical). Rolled back outputs."
+            )
     post_errors: list[str] = []
     for req_id, ext, target, _payload in schedule:
         if target.is_symlink():
@@ -640,6 +713,7 @@ def _seed_workspace_with_plan(
     *,
     images: list[dict],
     requests: list[dict],
+    descriptor_vocabulary: Path | None = None,
 ) -> tuple[Path, Path]:
     """Seed a workspace with an image_manifest.json AND a valid
     d_one_adapter_plan.json by running done_image_adapter against a
@@ -647,18 +721,87 @@ def _seed_workspace_with_plan(
 
     Building the plan through the writer (rather than handcrafting it)
     keeps the self-test honest: the runner consumes plans the same way
-    a downstream caller would receive them — straight off the writer."""
+    a downstream caller would receive them — straight off the writer.
+
+    When ``descriptor_vocabulary`` is supplied, it is forwarded to the
+    writer so a taxonomy-bearing spec lands in the produced plan."""
     ws = td / "ws"
     _adapter._seed_workspace(ws, images=images)
     spec_path = td / "spec.json"
     _adapter._write_spec(spec_path, {"requests": requests})
-    rc, msg = _adapter.done_image_adapter(workspace=ws, spec=spec_path)
+    rc, msg = _adapter.done_image_adapter(
+        workspace=ws, spec=spec_path,
+        descriptor_vocabulary=descriptor_vocabulary,
+    )
     if rc != 0:
         raise AssertionError(
             f"self-test fixture: done_image_adapter failed unexpectedly: "
             f"rc={rc} msg={msg!r}"
         )
     return ws, ws / DEFAULT_PLAN_FILENAME
+
+
+def _seed_descriptor_vocab(td: Path) -> Path:
+    """Write a synthetic, schema-valid descriptor vocabulary to the
+    given tempdir and return the path. Mirrors the canonical taxonomy
+    in examples/d_one_descriptor_vocabulary_template.json but kept
+    in-script so the runner's self-tests do not depend on on-disk
+    template bytes (the schema/template pair is re-validated separately
+    via `python3 scripts/validate_artifacts.py ...`)."""
+    vocab_path = td / "vocab.json"
+    body = {
+        "schema_version": 1,
+        "note": (
+            "Synthetic D-One descriptor vocabulary for runner taxonomy "
+            "probes."
+        ),
+        "kind_enum": [
+            "color_token",
+            "geometric_noun",
+            "mood_adjective",
+            "composition_adjective",
+        ],
+        "descriptors": [
+            {"kind": "color_token", "value": "palette.accent"},
+            {"kind": "geometric_noun", "value": "circle"},
+            {"kind": "mood_adjective", "value": "calm"},
+            {"kind": "composition_adjective", "value": "centered"},
+        ],
+        "image_taxonomy": {
+            "rendering_style": {
+                "allowed_values": [
+                    "flat_vector", "line_diagram", "isometric_lite",
+                    "low_poly", "solid_shape",
+                ],
+            },
+            "palette_family": {
+                "allowed_values": [
+                    "neutral_grey", "accent_only", "dual_tone",
+                    "mono_brand", "palette_default",
+                ],
+            },
+            "image_role": {
+                "allowed_values": [
+                    "decorative_accent", "metaphor_icon", "divider_motif",
+                    "kpi_emblem", "cover_motif",
+                ],
+            },
+            "layout_pattern": {
+                "allowed_values": [
+                    "single_center", "left_anchor", "right_anchor",
+                    "top_band", "bottom_band",
+                ],
+            },
+            "modifier": {
+                "allowed_values": [
+                    "low_contrast", "soft_edges", "grid_aligned",
+                    "negative_space",
+                ],
+            },
+        },
+    }
+    vocab_path.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n")
+    return vocab_path
 
 
 def _expect(name: str, ok: bool, detail: str = "") -> tuple[str, bool, str]:
@@ -1437,6 +1580,243 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
             ok, f"rc={rc}, msg={msg!r}, only_new={after-before}",
         ))
 
+    # =========================================================================
+    # --descriptor-vocabulary taxonomy scenarios.
+    #
+    # The mock runner must accept taxonomy-bearing plans so the writer
+    # → mock chain is not a dead end. The validator (delegated via
+    # done_image_adapter.validate_plan_file) requires the same vocab the
+    # writer used; the runner forwards --descriptor-vocabulary verbatim.
+    # Byte-identical post-condition on the vocab file is also asserted.
+    # =========================================================================
+
+    # ---- TAX1. taxonomy-bearing plan + matching --descriptor-vocabulary
+    # round-trips through the mock runner end-to-end. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        vocab = _seed_descriptor_vocab(td)
+        ws, plan_path = _seed_workspace_with_plan(
+            td,
+            images=[
+                {"id": "spot", "local_path": "media/spot.png", "source": "d_one_local"},
+            ],
+            requests=[
+                {
+                    "id": "spot",
+                    "prompt": "an abstract calm geometric pattern, no text",
+                    "rendering_style": "flat_vector",
+                    "palette_family": "neutral_grey",
+                    "image_role": "decorative_accent",
+                    "layout_pattern": "single_center",
+                    "modifier": "negative_space",
+                },
+            ],
+            descriptor_vocabulary=vocab,
+        )
+        out = td / "out"
+        out.mkdir()
+        vocab_bytes_before = vocab.read_bytes()
+        rc, msg = run_d_one_generation(
+            workspace=ws, assets_dir=out, allow_synthetic_bytes=True,
+            descriptor_vocabulary=vocab,
+        )
+        png = out / "spot.png"
+        ok = (
+            rc == 0
+            and png.is_file() and not png.is_symlink()
+            and png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+            and vocab.read_bytes() == vocab_bytes_before
+        )
+        results.append(_expect(
+            "taxonomy: a taxonomy-bearing plan + matching "
+            "--descriptor-vocabulary round-trips through the synthetic "
+            "runner; vocab bytes byte-identical post-run",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- TAX2. taxonomy-bearing plan WITHOUT --descriptor-vocabulary
+    # is refused by the runner (the delegated validator surfaces the
+    # 'plan carries taxonomy field(s) but --descriptor-vocabulary was
+    # not supplied' diagnostic; no output bytes land). ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        vocab = _seed_descriptor_vocab(td)
+        ws, plan_path = _seed_workspace_with_plan(
+            td,
+            images=[
+                {"id": "spot", "local_path": "media/spot.png", "source": "d_one_local"},
+            ],
+            requests=[
+                {
+                    "id": "spot",
+                    "prompt": "an abstract pattern, no text",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+            descriptor_vocabulary=vocab,
+        )
+        out = td / "out"
+        out.mkdir()
+        before = _list_dir_files(out)
+        rc, msg = run_d_one_generation(
+            workspace=ws, assets_dir=out, allow_synthetic_bytes=True,
+        )
+        after = _list_dir_files(out)
+        ok = (
+            rc == 1
+            and "--descriptor-vocabulary" in msg
+            and "rendering_style" in msg
+            and after == before
+        )
+        results.append(_expect(
+            "taxonomy: a taxonomy-bearing plan WITHOUT "
+            "--descriptor-vocabulary is refused; assets-dir untouched",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- TAX3. plan drift on the runner boundary: a plan whose
+    # taxonomy value is regex-shape valid but not in the vocab's
+    # allowed_values is refused by the runner. Mirrors the
+    # validate-plan-side drift scenario but verifies the dead-end is
+    # closed at the runner side too. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        vocab = _seed_descriptor_vocab(td)
+        ws, plan_path = _seed_workspace_with_plan(
+            td,
+            images=[
+                {"id": "spot", "local_path": "media/spot.png", "source": "d_one_local"},
+            ],
+            requests=[
+                {
+                    "id": "spot",
+                    "prompt": "an abstract pattern, no text",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+            descriptor_vocabulary=vocab,
+        )
+        # Drift: rewrite the plan to use a regex-shape valid value that
+        # is not in image_taxonomy.rendering_style.allowed_values.
+        body = json.loads(plan_path.read_text())
+        body["requests"][0]["rendering_style"] = "blueprint_style"
+        plan_path.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n")
+        out = td / "out"
+        out.mkdir()
+        before = _list_dir_files(out)
+        rc, msg = run_d_one_generation(
+            workspace=ws, assets_dir=out, allow_synthetic_bytes=True,
+            descriptor_vocabulary=vocab,
+        )
+        after = _list_dir_files(out)
+        ok = (
+            rc == 1
+            and "blueprint_style" in msg
+            and "drifted" in msg
+            and after == before
+        )
+        results.append(_expect(
+            "taxonomy: plan drift refused at the runner boundary; "
+            "assets-dir untouched",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- TAX4. URI-shaped --descriptor-vocabulary refused at the
+    # string layer before any filesystem syscall on the runner side. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        vocab = _seed_descriptor_vocab(td)
+        ws, plan_path = _seed_workspace_with_plan(
+            td,
+            images=[
+                {"id": "spot", "local_path": "media/spot.png", "source": "d_one_local"},
+            ],
+            requests=[
+                {
+                    "id": "spot",
+                    "prompt": "an abstract pattern, no text",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+            descriptor_vocabulary=vocab,
+        )
+        out = td / "out"
+        out.mkdir()
+        rc, msg = run_d_one_generation(
+            workspace=ws, assets_dir=out, allow_synthetic_bytes=True,
+            descriptor_vocabulary=Path("https://attacker.example/v.json"),
+        )
+        ok = rc == 2 and "URI" in msg
+        results.append(_expect(
+            "taxonomy: URI-shaped --descriptor-vocabulary refused at "
+            "the runner string layer",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- TAX5. symlinked --descriptor-vocabulary refused. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        real_vocab = _seed_descriptor_vocab(td)
+        link_vocab = td / "vocab_link.json"
+        link_vocab.symlink_to(real_vocab)
+        ws, plan_path = _seed_workspace_with_plan(
+            td,
+            images=[
+                {"id": "spot", "local_path": "media/spot.png", "source": "d_one_local"},
+            ],
+            requests=[
+                {
+                    "id": "spot",
+                    "prompt": "an abstract pattern, no text",
+                    "rendering_style": "flat_vector",
+                },
+            ],
+            descriptor_vocabulary=real_vocab,
+        )
+        out = td / "out"
+        out.mkdir()
+        before = _list_dir_files(out)
+        rc, msg = run_d_one_generation(
+            workspace=ws, assets_dir=out, allow_synthetic_bytes=True,
+            descriptor_vocabulary=link_vocab,
+        )
+        after = _list_dir_files(out)
+        ok = rc != 0 and "symlink" in msg and after == before
+        results.append(_expect(
+            "taxonomy: symlinked --descriptor-vocabulary refused; "
+            "assets-dir untouched",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- TAX6. taxonomy-free plan with --descriptor-vocabulary
+    # supplied still runs (the optional vocab is benign for a plan
+    # that does not reference taxonomy). ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        vocab = _seed_descriptor_vocab(td)
+        ws, plan_path = _seed_workspace_with_plan(
+            td,
+            images=[
+                {"id": "spot", "local_path": "media/spot.png", "source": "d_one_local"},
+            ],
+            requests=[
+                {"id": "spot", "prompt": "abstract pattern, no text"},
+            ],
+        )
+        out = td / "out"
+        out.mkdir()
+        rc, msg = run_d_one_generation(
+            workspace=ws, assets_dir=out, allow_synthetic_bytes=True,
+            descriptor_vocabulary=vocab,
+        )
+        png = out / "spot.png"
+        ok = rc == 0 and png.is_file() and not png.is_symlink()
+        results.append(_expect(
+            "taxonomy: taxonomy-free plan accepts an optional "
+            "--descriptor-vocabulary without complaint",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
     return results
 
 
@@ -1452,13 +1832,22 @@ def main(argv: list[str]) -> int:
             "providers (mutually exclusive, both purely local): "
             "--fixtures-dir copies caller-supplied PNG/JPG/JPEG bytes "
             "verbatim; --allow-synthetic-bytes emits a fixed "
-            "magic-byte-valid payload per extension. Real D-One / MCP / "
-            "model-API integration is intentionally TODO; this runner "
-            "does NOT call D-One / Qoder / any public network / any "
-            "image-generation model / any external service. Does NOT "
-            "mutate image_manifest.json or the plan file. Does NOT "
-            "generate render_models / svg_previews / any .pptx. Does "
-            "NOT change PPTX export behavior."
+            "magic-byte-valid payload per extension. Optional "
+            "--descriptor-vocabulary <path-to-d_one_descriptor_vocabulary.json>"
+            " is forwarded verbatim to done_image_adapter.validate_plan_file"
+            " and is REQUIRED iff the plan carries one or more of the "
+            "five taxonomy fields (rendering_style / palette_family / "
+            "image_role / layout_pattern / modifier); the runner refuses "
+            "to certify a taxonomy-bearing plan whose values cannot be "
+            "re-checked against image_taxonomy.<dim>.allowed_values, and "
+            "the vocab bytes are byte-identical pre/post a successful "
+            "run. Real D-One / MCP / model-API integration is "
+            "intentionally TODO; this runner does NOT call D-One / "
+            "Qoder / any public network / any image-generation model / "
+            "any external service. Does NOT mutate image_manifest.json "
+            "or the plan file. Does NOT generate render_models / "
+            "svg_previews / any .pptx. Does NOT change PPTX export "
+            "behavior."
         ),
     )
     parser.add_argument(
@@ -1471,7 +1860,9 @@ def main(argv: list[str]) -> int:
         help="Path to the d_one_adapter_plan.json to consume. Defaults "
              "to <workspace>/" + DEFAULT_PLAN_FILENAME + ". Must resolve "
              "to a regular non-symlink JSON file and pass "
-             "done_image_adapter --validate-plan.",
+             "done_image_adapter --validate-plan — which additionally "
+             "requires --descriptor-vocabulary when the plan carries "
+             "taxonomy fields.",
     )
     parser.add_argument(
         "--assets-dir", type=Path, default=None,
@@ -1494,17 +1885,41 @@ def main(argv: list[str]) -> int:
              "one is required.",
     )
     parser.add_argument(
+        "--descriptor-vocabulary", type=Path, default=None,
+        dest="descriptor_vocabulary",
+        help="Optional. Path to a d_one_descriptor_vocabulary JSON "
+             "file (see schemas/d_one_descriptor_vocabulary.schema.json). "
+             "Forwarded verbatim to done_image_adapter.validate_plan_file, "
+             "which requires it iff the plan carries any of the five "
+             "taxonomy fields (rendering_style / palette_family / "
+             "image_role / layout_pattern / modifier) and refuses any "
+             "taxonomy value not in image_taxonomy.<dim>.allowed_values. "
+             "Refused if URI-shaped, symlinked, missing, or "
+             "schema-invalid; byte-identical pre/post a successful run.",
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help="Run in-script tempfixture scenarios covering the synthetic "
              "and fixture happy paths, end-to-end materialize hand-off, "
              "determinism, provider-mode invariants, missing / wrong-magic "
              "/ symlinked fixtures, pre-existing output, symlinks at "
-             "workspace / assets-dir / fixtures-dir, URI-shaped arguments, "
-             "unsupported extensions, plan-validator gate, manifest + "
-             "plan byte-identical post-success, mid-write rollback, "
-             "missing manifest, missing plan, and no-extraneous-files "
-             "guarantee. Exits non-zero if any scenario does not behave "
-             "as expected. Mutually exclusive with the other arguments.",
+             "workspace / assets-dir / fixtures-dir / "
+             "descriptor-vocabulary, URI-shaped arguments (including "
+             "URI-shaped --descriptor-vocabulary), unsupported "
+             "extensions, plan-validator gate, manifest + plan "
+             "byte-identical post-success, mid-write rollback, missing "
+             "manifest, missing plan, no-extraneous-files guarantee, "
+             "AND the --descriptor-vocabulary taxonomy round-trip "
+             "(taxonomy-bearing plan + matching vocab succeeds; "
+             "taxonomy-bearing plan without vocab refused; plan drift "
+             "against vocab refused at the runner boundary; vocab "
+             "bytes byte-identical pre/post a successful run; "
+             "taxonomy-free plan accepts an optional vocab without "
+             "complaint). Exits non-zero if any scenario does not "
+             "behave as expected. Mutually exclusive with the other "
+             "arguments (--workspace / --plan / --assets-dir / "
+             "--fixtures-dir / --allow-synthetic-bytes / "
+             "--descriptor-vocabulary).",
     )
     args = parser.parse_args(argv)
 
@@ -1512,7 +1927,7 @@ def main(argv: list[str]) -> int:
         if any(
             v is not None for v in (
                 args.workspace, args.plan, args.assets_dir,
-                args.fixtures_dir,
+                args.fixtures_dir, args.descriptor_vocabulary,
             )
         ) or args.allow_synthetic_bytes:
             print(
@@ -1564,6 +1979,7 @@ def main(argv: list[str]) -> int:
         plan=args.plan,
         fixtures_dir=args.fixtures_dir,
         allow_synthetic_bytes=args.allow_synthetic_bytes,
+        descriptor_vocabulary=args.descriptor_vocabulary,
     )
     if rc == 0:
         print(msg)
