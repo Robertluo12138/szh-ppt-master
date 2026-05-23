@@ -284,6 +284,44 @@
       },
       "description": "Image-request taxonomy. A synthetic image request is composed from seven clean-room dimensions: rendering_style, palette_family, image_role, layout_pattern, modifier, text_policy, subject_domain. Each dimension declares a fixed-length 'allowed_values' array whose entries are simultaneously enum-locked AND pattern-locked at the schema layer — the same positive whitelist + forbidden-token deny clause that descriptors[*].value uses. Canonical-set-membership invariant: every 'allowed_values' array carries minItems == maxItems == N AND uniqueItems == true AND items.enum of length N, where N is the canonical count (5 for rendering_style / palette_family / image_role / layout_pattern, 4 for modifier and subject_domain, 3 for text_policy). With N unique items drawn from an N-element enum, the only valid array is a permutation of the canonical set — a tampered file that ships `[\"flat_vector\"] * 5` would fail uniqueItems, and a file that omits a value would fail minItems; neither false-greens. Defense in depth: the runtime image-request gate IS wired today in mock mode — scripts/done_image_adapter.py cross-checks every dimension value supplied on a spec/plan request against the matching 'allowed_values' set (and refuses any value not present), and the schema's items.pattern + items.enum locks on every 'allowed_values' array are independently re-applied here as a post-write defense-in-depth gate. The live D-One image-request gate (real D-One / MCP / model-API) is NOT wired today and remains TODO. This taxonomy is intentionally minimal — seven dimensions × ≤5 values — and is not a mirror of any external image-style catalog. Adding, removing, or modifying a dimension or value is a paired schema / template / validator-probe change."
     },
+    "custom_descriptors": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "value"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "color_token",
+              "geometric_noun",
+              "mood_adjective",
+              "composition_adjective"
+            ],
+            "description": "One of the four V2 kinds, same closed enumeration descriptors[*].kind uses."
+          },
+          "value": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+            "description": "Approved custom-descriptor value. Same lowercase-identifier positive whitelist + forbidden-token deny clause as descriptors[*].value (refuses 'public', 'upload', 'raw', 'customer', 'confidential', 'screenshot', 'credential', 'password', 'secret' as bounded tokens, and the compound phrases 'full slide' / 'image search' / 'web generation' / 'page generation' / 'slide generation' across any '.' / '_' / '-' separator stacking). The done_image_adapter runtime additionally refuses any spec/plan request whose 'custom_descriptor' value is not present in this list — the allow-list approval is the *only* path by which a request may carry the escape-hatch field."
+          },
+          "approved_in_review_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.+\\-]*$",
+            "description": "Optional. Opaque reference to the recorded V1 vocabulary approval review under which the custom descriptor was added. NEVER a real reviewer name, NEVER an email, NEVER any PII shape."
+          }
+        }
+      },
+      "description": "OPTIONAL. Approved custom-descriptor allow-list — the conservative escape hatch a spec/plan request may use via a 'custom_descriptor' field. The list is bounded so a tampered file cannot smuggle a large free-form payload here. ABSENT or EMPTY means no request may carry a 'custom_descriptor' field today (the adapter refuses any value when this allow-list is missing or empty). Backward compatibility: this property is OPTIONAL; an older vocabulary file that omits it continues to validate cleanly, and adding the property does NOT bump the descriptor-vocabulary schema_version (the file-shape version remains 1) — the allow-list is additive, not a breaking change. A request that ATTEMPTS to use 'custom_descriptor' against an older vocabulary fails closed at the adapter's allow-list check, not at this schema. Adding, removing, or modifying an entry is a paired vocabulary / approval-review change AND requires re-running the smoke probes that exercise the adapter's allow-list gate."
+    },
     "synthetic_requests": {
       "type": "array",
       "minItems": 0,

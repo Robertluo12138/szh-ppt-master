@@ -12,7 +12,7 @@ end-to-end, without adding any real D-One behavior:
     ``scripts/materialize_image_assets.py``)
       -> scripts/done_image_adapter.py --descriptor-vocabulary <vocab>
            (writes ``d_one_adapter_plan.json`` whose schema_version is
-            locked to 2 and which preserves every taxonomy field /
+            locked to 3 and which preserves every taxonomy field /
             value supplied on the request)
       -> scripts/run_d_one_generation.py --descriptor-vocabulary <vocab>
            --allow-synthetic-bytes
@@ -31,7 +31,7 @@ end-to-end, without adding any real D-One behavior:
 
 The smoke then asserts:
 
-  * ``d_one_adapter_plan.json`` carries ``schema_version == 2``;
+  * ``d_one_adapter_plan.json`` carries ``schema_version == 3``;
   * every taxonomy field / value supplied on the spec request appears
     byte-identical on the corresponding plan request (no value drift,
     no silent re-ordering, no field dropped);
@@ -64,7 +64,7 @@ Negative probes (in-process via ``done_image_adapter``):
       ``--validate-plan`` (stale taxonomy drift after the vocab moved);
 
   N5  a plan whose ``schema_version`` is anything other than the
-      locked value 2 (we probe with 1, the pre-taxonomy shape, AND 3,
+      locked value 3 (we probe with 1, the pre-taxonomy shape, AND 4,
       a future shape) is refused by the plan schema's enum;
 
   N6  a descriptor vocabulary whose ``descriptors[*].value`` carries
@@ -127,9 +127,11 @@ _EMBEDDABLE_MEDIA_EXTS: tuple[str, ...] = (".png", ".jpg", ".jpeg")
 _URI_SCHEME_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
 
 # Locked plan-file schema version. The 1 -> 2 bump was the paired
-# change for the optional per-request taxonomy fields; an older reader
-# with schema_version=1 would reject the new properties.
-_LOCKED_PLAN_SCHEMA_VERSION = 2
+# change for the optional per-request taxonomy fields. The 2 -> 3 bump
+# is the paired change for the optional per-request custom_descriptor
+# escape-hatch field; an older reader with schema_version=2 would
+# reject the new property under additionalProperties:false.
+_LOCKED_PLAN_SCHEMA_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +593,7 @@ def _check_plan_taxonomy(
     plan_path: Path, *, expected_taxonomy: dict[str, str],
 ) -> list[PostCondition]:
     """Re-parse the produced ``d_one_adapter_plan.json`` and assert:
-      * schema_version == 2 (locked by schema enum);
+      * schema_version == 3 (locked by schema enum);
       * exactly one request;
       * every taxonomy field/value supplied on the spec appears
         byte-identical on the plan request (no value drift, no field
@@ -849,10 +851,10 @@ def _negative_probes(td: Path) -> list[PostCondition]:
                 ok, f"rc={rc}, msg={msg!r}",
             ))
 
-    # ---- N5. schema_version != 2 refused. Probe with 1 (the
-    # pre-taxonomy shape an older reader would have produced) AND 3
+    # ---- N5. schema_version != 3 refused. Probe with 1 (the
+    # pre-taxonomy shape an older reader would have produced) AND 4
     # (a future unknown shape). Both must trip the schema enum. ----
-    for bad_version in (1, 3):
+    for bad_version in (1, 4):
         with tempfile.TemporaryDirectory(dir=str(td)) as raw_td:
             ws = _seed_negative_workspace(Path(raw_td))
             spec = Path(raw_td) / "spec.json"

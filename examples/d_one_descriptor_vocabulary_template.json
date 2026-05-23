@@ -106,6 +106,13 @@
       ]
     }
   },
+  "custom_descriptors": [
+    {
+      "kind": "composition_adjective",
+      "value": "hero_centered_motif",
+      "approved_in_review_ref": "synthetic_review.001"
+    }
+  ],
   "synthetic_requests": [
     {
       "id": "cover_motif_neutral",

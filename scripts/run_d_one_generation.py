@@ -83,17 +83,22 @@ the assets-dir returns to its pre-call state):
   --descriptor-vocabulary (optional; required iff the plan carries any
   of the seven taxonomy fields: ``rendering_style`` / ``palette_family``
   / ``image_role`` / ``layout_pattern`` / ``modifier`` / ``text_policy``
-  / ``subject_domain``)
+  / ``subject_domain`` OR the optional ``custom_descriptor`` escape-
+  hatch field)
     * when supplied, must be an existing regular non-symlink file whose
       bytes parse as JSON, decode to an object, and validate against
       ``schemas/d_one_descriptor_vocabulary.schema.json``; the runner
       hands the path through to ``done_image_adapter.validate_plan_file``
-      so the same image_taxonomy.allowed_values check the writer ran is
-      re-run at the runner boundary;
-    * when omitted, a plan that carries taxonomy fields is refused by
-      the validator (the runner cannot certify a taxonomy plan whose
-      values it cannot re-check). A taxonomy-free plan accepts the
-      omitted flag without complaint.
+      so the same ``image_taxonomy.<dim>.allowed_values`` check the
+      writer ran is re-run at the runner boundary AND the same
+      ``custom_descriptors[].value`` allow-list re-check + the same
+      separator-normalized safety re-scan against every
+      ``custom_descriptor``-bearing plan request is also re-run;
+    * when omitted, a plan that carries taxonomy fields OR the
+      ``custom_descriptor`` escape-hatch field is refused by the
+      validator (the runner cannot certify a taxonomy / custom-
+      descriptor plan whose values it cannot re-check). A plan that
+      carries neither accepts the omitted flag without complaint.
 
   --assets-dir
     * must be an existing directory; URI-shaped values refused; the
@@ -1948,11 +1953,13 @@ def main(argv: list[str]) -> int:
             " and is REQUIRED iff the plan carries one or more of the "
             "seven taxonomy fields (rendering_style / palette_family / "
             "image_role / layout_pattern / modifier / text_policy / "
-            "subject_domain); the runner refuses "
-            "to certify a taxonomy-bearing plan whose values cannot be "
-            "re-checked against image_taxonomy.<dim>.allowed_values, and "
-            "the vocab bytes are byte-identical pre/post a successful "
-            "run. Real D-One / MCP / model-API integration is "
+            "subject_domain) OR the optional custom_descriptor escape-"
+            "hatch field; the runner refuses "
+            "to certify a taxonomy- or custom-descriptor-bearing plan "
+            "whose values cannot be re-checked against "
+            "image_taxonomy.<dim>.allowed_values or against the vocab's "
+            "custom_descriptors[].value allow-list, and the vocab bytes "
+            "are byte-identical pre/post a successful run. Real D-One / MCP / model-API integration is "
             "intentionally TODO; this runner does NOT call D-One / "
             "Qoder / any public network / any image-generation model / "
             "any external service. Does NOT mutate image_manifest.json "

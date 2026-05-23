@@ -38,18 +38,22 @@ real-D-One / provider mode that does not exist in this repo today.
 Taxonomy contract preservation: when the ``--d-one-spec`` carries any
 of the seven taxonomy fields (``rendering_style`` / ``palette_family``
 / ``image_role`` / ``layout_pattern`` / ``modifier`` / ``text_policy``
-/ ``subject_domain``), the runner requires ``--descriptor-vocabulary``,
-forwards it to BOTH ``done_image_adapter`` and ``run_d_one_generation``,
-and — before invoking ``run_explicit_pipeline.py`` — re-parses the
-produced ``<staging>/d_one_adapter_plan.json`` and asserts:
+/ ``subject_domain``) OR the optional ``custom_descriptor`` escape-hatch
+field, the runner requires ``--descriptor-vocabulary``, forwards it to
+BOTH ``done_image_adapter`` and ``run_d_one_generation``, and — before
+invoking ``run_explicit_pipeline.py`` — re-parses the produced
+``<staging>/d_one_adapter_plan.json`` and asserts:
 
-  * ``schema_version == 2`` (the value the plan schema's enum locks);
+  * ``schema_version == 3`` (the value the plan schema's enum locks);
   * every taxonomy field / value supplied on the spec request appears
     byte-identical on the corresponding plan request (no value drift,
-    no silent re-ordering, no field dropped).
+    no silent re-ordering, no field dropped);
+  * the ``custom_descriptor`` value, when supplied on the spec request,
+    appears byte-identical on the corresponding plan request.
 
-A taxonomy-bearing spec without ``--descriptor-vocabulary`` is refused
-at the runner boundary BEFORE any subprocess fires.
+A taxonomy- OR custom_descriptor-bearing spec without
+``--descriptor-vocabulary`` is refused at the runner boundary BEFORE
+any subprocess fires.
 
 Output behavior:
 
@@ -149,14 +153,31 @@ TAXONOMY_FIELDS: tuple[str, ...] = (
     "subject_domain",
 )
 
+# Optional custom-descriptor escape-hatch field. Same vocab-required
+# semantic as the taxonomy fields — present => --descriptor-vocabulary
+# is required AND the adapter refuses any value not in the vocab's
+# custom_descriptors[] allow-list.
+CUSTOM_DESCRIPTOR_FIELD = "custom_descriptor"
+
+# Vocab-gated request fields: TAXONOMY_FIELDS + CUSTOM_DESCRIPTOR_FIELD.
+# Used by the runner-boundary check that refuses a vocab-bearing spec
+# without --descriptor-vocabulary BEFORE any subprocess fires.
+VOCAB_GATED_FIELDS: tuple[str, ...] = (
+    *TAXONOMY_FIELDS,
+    CUSTOM_DESCRIPTOR_FIELD,
+)
+
 # Locked plan-file schema version. The 1 -> 2 bump was the paired
-# change for the optional per-request taxonomy fields; an older reader
-# with schema_version=1 would reject the new properties under the
-# additionalProperties:false lock. The runner re-asserts this value
-# AFTER done_image_adapter writes the plan AND BEFORE run_explicit_
-# pipeline is invoked, so a regression that downgrades the plan shape
-# is caught even if the plan validator itself drifts.
-LOCKED_PLAN_SCHEMA_VERSION = 2
+# change for the optional per-request taxonomy fields. The 2 -> 3 bump
+# is the paired change for the optional per-request custom_descriptor
+# escape-hatch field. An older reader with schema_version=2 would
+# reject the new property under the per-request additionalProperties:
+# false lock, so the shape change is not backward-compatible and gets
+# a new version. The runner re-asserts this value AFTER
+# done_image_adapter writes the plan AND BEFORE run_explicit_pipeline
+# is invoked, so a regression that downgrades the plan shape is caught
+# even if the plan validator itself drifts.
+LOCKED_PLAN_SCHEMA_VERSION = 3
 
 # Embed surface scripts/export_pptx.py supports today. The self-test
 # walks `ppt/media/` looking for any of these extensions; finding none
@@ -228,13 +249,14 @@ def _load_json_object(path: Path, label: str) -> tuple[dict | None, str]:
 
 
 def _spec_taxonomy_fields_used(spec_doc: dict) -> set[str]:
-    """Return the set of taxonomy field names appearing on any request
-    in ``spec_doc``. Empty set means none used — vocabulary is not
+    """Return the set of vocab-gated field names (taxonomy fields plus
+    the ``custom_descriptor`` escape hatch) appearing on any request in
+    ``spec_doc``. Empty set means none used — vocabulary is not
     required. The runner uses this BEFORE shelling out to gate
     --descriptor-vocabulary at the runner boundary so the failure
     diagnostic is the runner's own (clear context: "your spec uses
-    taxonomy, pass --descriptor-vocabulary") rather than the chained
-    diagnostic emitted by done_image_adapter."""
+    taxonomy / custom_descriptor, pass --descriptor-vocabulary")
+    rather than the chained diagnostic emitted by done_image_adapter."""
     requests = spec_doc.get("requests")
     if not isinstance(requests, list):
         return set()
@@ -242,7 +264,7 @@ def _spec_taxonomy_fields_used(spec_doc: dict) -> set[str]:
     for req in requests:
         if not isinstance(req, dict):
             continue
-        for f in TAXONOMY_FIELDS:
+        for f in VOCAB_GATED_FIELDS:
             if f in req:
                 seen.add(f)
     return seen
@@ -288,8 +310,9 @@ def _check_plan_taxonomy_preserved(
 ) -> tuple[bool, str]:
     """Re-parse ``<staging>/d_one_adapter_plan.json`` and verify:
       * the file exists as a regular non-symlink JSON file;
-      * ``schema_version == 2``;
-      * every taxonomy field / value supplied on the spec request
+      * ``schema_version == LOCKED_PLAN_SCHEMA_VERSION``;
+      * every taxonomy field / value AND the optional
+        ``custom_descriptor`` value supplied on the spec request
         appears byte-identical on the matching plan request (matched by
         ``id``).
     Returns (ok, msg). msg names the first violation when ok=False."""
@@ -331,7 +354,7 @@ def _check_plan_taxonomy_preserved(
                 f"FAIL: produced plan is missing request id {rid!r}."
             )
         plan_req = by_id[rid]
-        for f in TAXONOMY_FIELDS:
+        for f in VOCAB_GATED_FIELDS:
             if f not in expected:
                 continue
             if plan_req.get(f) != expected[f]:
@@ -503,7 +526,10 @@ def run_mock_image_pipeline(
             return result
 
     # Compute the per-request expected-taxonomy snapshot now so we can
-    # cross-check the plan AFTER done_image_adapter writes it.
+    # cross-check the plan AFTER done_image_adapter writes it. Snapshot
+    # covers TAXONOMY_FIELDS plus the optional custom_descriptor
+    # escape-hatch field — every vocab-gated field is held to the same
+    # byte-identical-from-spec contract.
     expected_per_request: list[dict[str, str]] = []
     for req in spec_doc.get("requests", []):
         if not isinstance(req, dict):
@@ -512,7 +538,7 @@ def run_mock_image_pipeline(
         rid = req.get("id")
         if isinstance(rid, str):
             snap["id"] = rid
-        for f in TAXONOMY_FIELDS:
+        for f in VOCAB_GATED_FIELDS:
             if f in req and isinstance(req[f], str):
                 snap[f] = req[f]
         if snap:
@@ -672,7 +698,8 @@ def _format_result(result: MockImagePipelineResult) -> str:
     elif result.plan_check_ok:
         lines.append(
             "  [PASS] taxonomy preservation check "
-            "(plan.schema_version==2; taxonomy fields byte-identical)"
+            f"(plan.schema_version=={LOCKED_PLAN_SCHEMA_VERSION}; "
+            "taxonomy + custom_descriptor fields byte-identical)"
         )
     if result.aborted_reason and result.stages:
         lines.append(f"  ABORT: {result.aborted_reason}")
@@ -801,7 +828,7 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--self-test", action="store_true",
-        help="Run 16 in-script tempfixture scenarios covering: the "
+        help="Run 18 in-script tempfixture scenarios covering: the "
              "happy-path mock chain (2-slide bundle with one "
              "d_one_local image carrying all 7 taxonomy dimensions; "
              "proves PPTX embeds an internal ppt/media PNG/JPG/JPEG "
@@ -819,8 +846,14 @@ def main(argv: list[str]) -> int:
              "lighting' / 'texture pattern') under "
              "text_policy='no_text' still pass the chain end-to-end "
              "and produce a PPTX with internal PNG/JPG/JPEG media, "
-             "schema_version=2 invariant on the produced plan "
+             "schema_version=3 invariant on the produced plan "
              "(downgrade refused indirectly via plan re-parse), "
+             "an APPROVED custom_descriptor escape-hatch value matching "
+             "the supplied vocab's custom_descriptors[] allow-list "
+             "passes the chain end-to-end and the value lands on the "
+             "produced plan byte-identical to the spec, an UNAPPROVED "
+             "custom_descriptor value is refused by done_image_adapter "
+             "before any production workspace or PPTX is created, "
              "missing fixture/request image id mismatch, unsafe "
              "local_path/URL in the image-manifest spec, symlinked "
              "--output / --workspace / --report-dir targets; a "
@@ -1189,6 +1222,22 @@ def _descriptor_vocabulary_body() -> dict:
                 "metric_emblem", "concept_diagram",
             ]},
         },
+        # Approved custom-descriptor allow-list (escape-hatch). Same
+        # shape as descriptors[]; the adapter projects the value
+        # strings into a set and refuses any request whose
+        # custom_descriptor field is not a member.
+        "custom_descriptors": [
+            {
+                "kind": "composition_adjective",
+                "value": "hero_centered_motif",
+                "approved_in_review_ref": "synthetic_review.001",
+            },
+            {
+                "kind": "color_token",
+                "value": "palette.accent_pair",
+                "approved_in_review_ref": "synthetic_review.002",
+            },
+        ],
     }
 
 
@@ -1649,9 +1698,10 @@ def _scenario_boundary_safe_text_phrases_pass(td: Path) -> _Scenario:
 def _scenario_plan_schema_version_locked(td: Path) -> _Scenario:
     """The schema_version invariant is NOT directly probeable from the
     runner CLI — the runner always invokes done_image_adapter, which
-    writes schema_version=2. We probe indirectly: a happy-path run must
-    leave a [PASS] taxonomy preservation marker AND its stdout must
-    name `plan.schema_version==2` (the assertion line in the formatted
+    writes schema_version=3 (the value LOCKED_PLAN_SCHEMA_VERSION
+    holds). We probe indirectly: a happy-path run must leave a
+    [PASS] taxonomy preservation marker AND its stdout must name
+    `plan.schema_version==3` (the assertion line in the formatted
     output)."""
     bundle = _materialize_bundle(
         td / "schema_lock",
@@ -1662,17 +1712,19 @@ def _scenario_plan_schema_version_locked(td: Path) -> _Scenario:
     outcome = _invoke_runner(_baseline_runner_args(
         bundle=bundle, workspace=ws, output=out,
     ))
+    sv_marker = f"plan.schema_version=={LOCKED_PLAN_SCHEMA_VERSION}"
     ok = (
         outcome.exit_code == 0
-        and "plan.schema_version==2" in outcome.stdout
+        and sv_marker in outcome.stdout
         and "[PASS] taxonomy preservation check" in outcome.stdout
     )
     return _Scenario(
-        "negative (indirect): produced d_one_adapter_plan.json carries "
-        "schema_version==2; the runner refuses to forward a downgrade",
+        f"negative (indirect): produced d_one_adapter_plan.json carries "
+        f"schema_version=={LOCKED_PLAN_SCHEMA_VERSION}; the runner "
+        f"refuses to forward a downgrade",
         ok,
         (f"rc={outcome.exit_code}, "
-         f"sv_marker={'plan.schema_version==2' in outcome.stdout}, "
+         f"sv_marker={sv_marker in outcome.stdout}, "
          f"pass_marker="
          f"{'[PASS] taxonomy preservation check' in outcome.stdout}, "
          f"tail={outcome.stdout.splitlines()[-10:]!r}")
@@ -1913,6 +1965,100 @@ def _scenario_no_repo_bytecode_write(td: Path) -> _Scenario:
     )
 
 
+def _scenario_approved_custom_descriptor(td: Path) -> _Scenario:
+    """An APPROVED custom_descriptor — a value present in the supplied
+    vocab's ``custom_descriptors[]`` allow-list — passes the chain
+    end-to-end. The produced PPTX must embed an internal PNG/JPG/JPEG
+    media part with no external relationships, AND the produced plan
+    must carry the spec's custom_descriptor value byte-identical."""
+    spec_body = _d_one_spec_body_with_taxonomy()
+    spec_body["requests"][0]["custom_descriptor"] = "hero_centered_motif"
+    bundle = _materialize_bundle(
+        td / "cd_approved", d_one_spec_body=spec_body,
+    )
+    ws = td / "cd_approved_ws"
+    out = td / "cd_approved.pptx"
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    if outcome.exit_code != 0:
+        return _Scenario(
+            "custom_descriptor (mock chain): APPROVED value matching "
+            "vocab.custom_descriptors[] passes end-to-end",
+            False,
+            f"rc={outcome.exit_code}; "
+            f"stderr tail: {outcome.stderr.splitlines()[-10:]!r}; "
+            f"stdout tail: {outcome.stdout.splitlines()[-10:]!r}",
+        )
+    if not out.is_file() or out.is_symlink():
+        return _Scenario(
+            "custom_descriptor: approved-value PPTX exists as regular "
+            "non-symlink file",
+            False, f"out={out}, is_file={out.is_file()}",
+        )
+    ok, msg = _pptx_embeds_internal_media_only(out)
+    if not ok:
+        return _Scenario(
+            "custom_descriptor: approved-value PPTX embeds at least "
+            "one internal ppt/media/<name>.<png|jpg|jpeg> part with "
+            "no external/file/data/scheme relationships",
+            False, msg,
+        )
+    if "[PASS] taxonomy preservation check" not in outcome.stdout:
+        return _Scenario(
+            "custom_descriptor: approved-value run leaves the [PASS] "
+            "taxonomy preservation marker on stdout",
+            False,
+            f"stdout tail: {outcome.stdout.splitlines()[-10:]!r}",
+        )
+    return _Scenario(
+        "custom_descriptor (mock chain): APPROVED value matching "
+        "vocab.custom_descriptors[] passes end-to-end; PPTX embeds "
+        "internal media, no external relationships, taxonomy + "
+        "custom_descriptor preservation gate fires",
+        True,
+    )
+
+
+def _scenario_unapproved_custom_descriptor(td: Path) -> _Scenario:
+    """An UNAPPROVED custom_descriptor — a value NOT in the supplied
+    vocab's ``custom_descriptors[]`` allow-list — must be refused by
+    ``done_image_adapter`` BEFORE any production workspace or PPTX is
+    created. The value is regex-shape valid (lowercase identifier, no
+    forbidden tokens) so the schema regex would NOT trip; the runtime
+    allow-list check is the only gate that closes it. The chosen value
+    ``rogue_motif`` is deliberately not added to the vocab body."""
+    spec_body = _d_one_spec_body_with_taxonomy()
+    spec_body["requests"][0]["custom_descriptor"] = "rogue_motif"
+    bundle = _materialize_bundle(
+        td / "cd_unapproved", d_one_spec_body=spec_body,
+    )
+    ws = td / "cd_unapproved_ws"
+    out = td / "cd_unapproved.pptx"
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "custom_descriptor" in combined
+        and "rogue_motif" in combined
+        and "custom_descriptors[].value allow-list" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "custom_descriptor (mock chain): UNAPPROVED value is refused "
+        "by done_image_adapter before any production workspace or "
+        "PPTX is created",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-10:]!r}")
+        if not ok else "",
+    )
+
+
 def _scenario_failure_no_residue(td: Path) -> _Scenario:
     """After a downstream failure, no .pptx must exist at --output AND
     no staging tempdir must remain under the caller's tempdir."""
@@ -1965,6 +2111,8 @@ def _run_self_test() -> int:
             _scenario_no_text_policy_visible_text_refused(td),
             _scenario_boundary_safe_text_phrases_pass(td),
             _scenario_plan_schema_version_locked(td),
+            _scenario_approved_custom_descriptor(td),
+            _scenario_unapproved_custom_descriptor(td),
             _scenario_request_id_mismatch(td),
             _scenario_unsafe_local_path(td),
             _scenario_symlinked_output(td),

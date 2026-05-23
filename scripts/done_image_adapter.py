@@ -16,12 +16,20 @@ have to satisfy before it ships. The adapter today:
     — required iff any spec request carries one or more of the seven
     taxonomy fields ``rendering_style`` / ``palette_family`` /
     ``image_role`` / ``layout_pattern`` / ``modifier`` /
-    ``text_policy`` / ``subject_domain``; the file must parse,
+    ``text_policy`` / ``subject_domain`` OR the optional
+    ``custom_descriptor`` escape-hatch field; the file must parse,
     decode to an object, and validate against the vocabulary
     schema; every taxonomy value supplied in a spec request must
     then be a member of the matching
     ``image_taxonomy.<dim>.allowed_values`` list (the same closed
-    enumeration the vocabulary schema locks);
+    enumeration the vocabulary schema locks), AND every
+    ``custom_descriptor`` value must be a member of the vocab's
+    ``custom_descriptors[*].value`` allow-list AND re-pass the full
+    prompt safety scan on BOTH the raw value AND a separator-
+    normalized form (so compound deny literals like ``slide title``
+    / ``body copy`` / ``render the slide`` / ``include text`` fire
+    on ``slide_title`` / ``body-copy`` / ``render.the.slide`` /
+    ``include_text`` and every separator stacking);
   - validates every requested ``id`` matches an entry in
     ``image_manifest.images[]`` whose ``source == "d_one_local"`` (so
     a caller cannot smuggle a request for a ``local_asset`` /
@@ -108,10 +116,12 @@ when any gate fires):
       is an object with required keys ``id`` (non-empty string) and
       ``prompt`` (non-empty string), optional keys ``intended_use``
       (string), ``width_px`` (positive int), ``height_px`` (positive
-      int), and optionally any of the seven taxonomy fields
+      int), optionally any of the seven taxonomy fields
       ``rendering_style`` / ``palette_family`` / ``image_role`` /
       ``layout_pattern`` / ``modifier`` / ``text_policy`` /
-      ``subject_domain``; no other keys are accepted;
+      ``subject_domain``, AND optionally the
+      ``custom_descriptor`` escape-hatch field; no other keys are
+      accepted;
     * no two requests may share an ``id``;
     * every request ``id`` must appear in ``image_manifest.images[*]``
       with ``source == "d_one_local"``;
@@ -127,11 +137,21 @@ when any gate fires):
       but every present taxonomy field forces
       ``--descriptor-vocabulary`` to have been supplied AND every
       value must be a member of the matching
-      ``image_taxonomy.<dim>.allowed_values`` list.
+      ``image_taxonomy.<dim>.allowed_values`` list;
+    * a request may optionally carry one ``custom_descriptor``
+      escape-hatch field — present only when
+      ``--descriptor-vocabulary`` is supplied AND the vocab's
+      ``custom_descriptors[*].value`` allow-list contains an
+      explicit approved entry for that exact value AND the value
+      re-passes the full prompt safety scan on BOTH the raw value
+      AND a separator-normalized form. Missing vocab,
+      omitted-or-empty allow-list, unknown value, malformed type,
+      or unsafe shape each fail closed before any plan is written.
 
   --descriptor-vocabulary (optional)
     * when omitted, a spec / plan may not carry any of the seven
-      taxonomy fields (any request that does is refused);
+      taxonomy fields NOR the ``custom_descriptor`` escape-hatch
+      field (any request that does is refused);
     * when supplied, must be an existing regular file; URI-shaped
       values refused; symlinks (broken or resolvable) refused;
     * must parse as JSON, decode to an object, and validate against
@@ -224,6 +244,26 @@ TAXONOMY_FIELDS: tuple[str, ...] = (
     "subject_domain",
 )
 
+# Optional per-request *custom-descriptor escape hatch*. Aligned only
+# with upstream ppt-master's ai-image custom rendering / palette / hero-
+# composition direction; no upstream code / prompts / examples / assets
+# / wording were copied. A request may carry AT MOST this one field, and
+# only when --descriptor-vocabulary supplies a non-empty
+# custom_descriptors[] allow-list AND the request's value is a member of
+# that allow-list. Like the taxonomy fields, the field is OPTIONAL and
+# absent fields produce no key in the plan (no null projection).
+CUSTOM_DESCRIPTOR_FIELD = "custom_descriptor"
+
+# Vocab-gated request fields — every member forces
+# --descriptor-vocabulary to have been supplied and forces the adapter
+# to re-check the value against its matching allow-list. Today this is
+# TAXONOMY_FIELDS (checked against image_taxonomy.<dim>.allowed_values)
+# plus CUSTOM_DESCRIPTOR_FIELD (checked against custom_descriptors[].value).
+VOCAB_GATED_FIELDS: tuple[str, ...] = (
+    *TAXONOMY_FIELDS,
+    CUSTOM_DESCRIPTOR_FIELD,
+)
+
 # Only manifest entries whose source == "d_one_local" are eligible for
 # D-One generation. local_asset / synthetic entries belong to a
 # different lifecycle (local-authored or fixture-only) and the adapter
@@ -237,11 +277,16 @@ ELIGIBLE_MANIFEST_SOURCE = "d_one_local"
 # Plan-file schema version. 1 was the pre-taxonomy shape; the 1 -> 2
 # bump is the paired change for the optional per-request taxonomy
 # fields (rendering_style / palette_family / image_role /
-# layout_pattern / modifier / text_policy / subject_domain). An older
-# reader with PLAN_SCHEMA_VERSION = 1 would reject those properties
-# under the schema's additionalProperties:false lock, so the shape
-# change is not backward-compatible and gets a new version.
-PLAN_SCHEMA_VERSION = 2
+# layout_pattern / modifier / text_policy / subject_domain). The 2 -> 3
+# bump is the paired change for the new optional per-request
+# `custom_descriptor` escape-hatch field. An older reader with
+# PLAN_SCHEMA_VERSION = 2 would reject the new property under the
+# schema's additionalProperties:false lock, so the shape change is not
+# backward-compatible and gets a new version. Plan files without
+# `custom_descriptor` written by a current writer still ship with
+# schema_version=3 — the version reflects the schema shape, not the
+# per-request payload.
+PLAN_SCHEMA_VERSION = 3
 
 # The note we stamp into every plan so an audit of the file is
 # self-describing — "this came from a stub, no D-One call happened."
@@ -770,59 +815,68 @@ def _parent_path_has_no_symlink(workspace: Path, target: Path) -> tuple[bool, st
 
 def _load_descriptor_vocabulary(
     vocab_path: Path,
-) -> tuple[dict[str, set[str]] | None, bytes | None, int, str]:
-    """Validate ``vocab_path`` and project its ``image_taxonomy`` into a
-    dimension -> allowed_values set mapping.
+) -> tuple[
+    dict[str, set[str]] | None,
+    set[str] | None,
+    bytes | None,
+    int,
+    str,
+]:
+    """Validate ``vocab_path`` and project its ``image_taxonomy`` plus
+    its optional ``custom_descriptors`` allow-list into membership sets.
 
     The helper runs the same string / filesystem / schema gates the rest
     of the adapter applies: URI-shape refused, symlink refused, exists,
     regular file, parses as JSON, decodes to an object, and validates
     against ``schemas/d_one_descriptor_vocabulary.schema.json``. Returns
-    ``(allowed_per_dim, vocab_bytes, rc, msg)``; on success ``rc == 0``,
-    ``allowed_per_dim`` is keyed by every member of ``TAXONOMY_FIELDS``,
-    and ``vocab_bytes`` is the exact byte content the loader read (used
-    by callers as the canonical "before" snapshot for the byte-identical
-    post-condition — both the write path and the validate path require
-    the vocab file to be byte-identical pre/post a successful run, and
-    sharing the loader's bytes ensures the two paths cannot drift on
-    what counts as "before"); on failure ``rc != 0``, ``msg`` is
-    non-empty, and ``vocab_bytes`` is None.
+    ``(allowed_per_dim, allowed_custom, vocab_bytes, rc, msg)``; on
+    success ``rc == 0``, ``allowed_per_dim`` is keyed by every member of
+    ``TAXONOMY_FIELDS``, ``allowed_custom`` is the set of approved
+    ``custom_descriptors[*].value`` strings (EMPTY set when the
+    vocabulary omits / declares an empty ``custom_descriptors`` list —
+    in that case the adapter refuses any request that carries
+    ``custom_descriptor``, mirroring the same "no allow-list, no
+    permission" gate the taxonomy fields use), and ``vocab_bytes`` is
+    the exact byte content the loader read (used by callers as the
+    canonical "before" snapshot for the byte-identical post-condition);
+    on failure ``rc != 0``, ``msg`` is non-empty, and every other return
+    value is None.
 
     No in-memory caching across calls: a tampered file is caught every
     run, and the helper is small (a few-KB JSON parse) so the cost is
     negligible.
     """
     if _has_uri_scheme(str(vocab_path)):
-        return None, None, 2, (
+        return None, None, None, 2, (
             f"FAIL: --descriptor-vocabulary {vocab_path} looks like a URI; "
             f"done_image_adapter only accepts local file paths"
         )
     is_symlink, msg = _refuse_symlink(vocab_path, "--descriptor-vocabulary")
     if is_symlink:
-        return None, None, 2, msg
+        return None, None, None, 2, msg
     if not vocab_path.exists():
-        return None, None, 2, (
+        return None, None, None, 2, (
             f"FAIL: --descriptor-vocabulary {vocab_path} does not exist"
         )
     if not vocab_path.is_file():
-        return None, None, 2, (
+        return None, None, None, 2, (
             f"FAIL: --descriptor-vocabulary {vocab_path} is not a regular file"
         )
     try:
         vocab_bytes = vocab_path.read_bytes()
         vocab_doc = json.loads(vocab_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return None, None, 1, (
+        return None, None, None, 1, (
             f"FAIL: cannot read --descriptor-vocabulary {vocab_path}: {exc}"
         )
     if not isinstance(vocab_doc, dict):
-        return None, None, 1, (
+        return None, None, None, 1, (
             f"FAIL: --descriptor-vocabulary {vocab_path} did not decode to "
             f"an object (got {type(vocab_doc).__name__})"
         )
     vocab_errors = _schema_validate(vocab_doc, DESCRIPTOR_VOCAB_SCHEMA)
     if vocab_errors:
-        return None, None, 1, (
+        return None, None, None, 1, (
             f"FAIL: --descriptor-vocabulary {vocab_path} does not validate "
             f"against d_one_descriptor_vocabulary.schema.json: "
             + "; ".join(vocab_errors)
@@ -836,7 +890,17 @@ def _load_descriptor_vocabulary(
     for dim in TAXONOMY_FIELDS:
         dim_block = vocab_doc["image_taxonomy"][dim]
         allowed_per_dim[dim] = set(dim_block["allowed_values"])
-    return allowed_per_dim, vocab_bytes, 0, ""
+    # custom_descriptors is OPTIONAL on the vocab file (schema allows it
+    # to be absent for backward compatibility). When absent or empty,
+    # the resulting allow-list is the empty set; the adapter then
+    # refuses any request that carries the custom_descriptor field.
+    allowed_custom: set[str] = set()
+    for entry in vocab_doc.get("custom_descriptors", []) or []:
+        if isinstance(entry, dict):
+            value = entry.get("value")
+            if isinstance(value, str) and value:
+                allowed_custom.add(value)
+    return allowed_per_dim, allowed_custom, vocab_bytes, 0, ""
 
 
 def _scan_prompt_safety(
@@ -991,6 +1055,63 @@ def _scan_prompt_safety(
     return violations
 
 
+def _scan_custom_descriptor_safety(
+    value: str,
+    *,
+    source_text: str | None,
+    text_policy: str | None,
+) -> list[str]:
+    """Defense-in-depth safety scan for the ``custom_descriptor``
+    escape-hatch value.
+
+    The schema regex pattern-locks ``custom_descriptor`` to a
+    lowercase identifier with `.` / `_` / `-` separators, and refuses
+    the 9 bounded forbidden tokens (``public`` / ``upload`` / ... /
+    ``secret``) plus the 5 compound deny phrases (``full_slide`` /
+    ``image_search`` / ``web_generation`` / ``page_generation`` /
+    ``slide_generation``) across every separator stacking. That
+    closes the obvious-shape gap.
+
+    But ``_scan_prompt_safety``'s remaining compound literals are
+    SPACE-separated (`slide title` / `body copy` / `render the slide`
+    / `include text` / ...), so a schema-shape-valid value that
+    encodes the same compound with a separator stacking — e.g.
+    ``slide_title`` / ``body-copy`` / ``render.the.slide`` — slips
+    past the substring scan. The schema does not cover those
+    phrases (they are not in its closed 5-compound deny list), and
+    a reviewer who adds such a value to ``custom_descriptors[]`` by
+    mistake would have it pass every other gate.
+
+    We close that gap here by scanning BOTH the raw lowercased value
+    AND a separator-normalized form (every run of `.` / `_` / `-`
+    collapsed to a single space), then unioning the violations. The
+    raw scan catches single-word literals (``screenshot`` /
+    ``lettering`` / ``calligraphy`` / ``typography`` / ``wordmark``
+    / ``monogram`` / ``calligraphic``); the normalized scan catches
+    compound literals (``slide title`` / ``body copy`` / ``render
+    the slide`` / ``include text`` / ...) regardless of whether the
+    caller wrote them with `_`, `-`, `.`, or a mix.
+    """
+    raw_violations = _scan_prompt_safety(
+        value, source_text=source_text, text_policy=text_policy,
+    )
+    normalized = re.sub(r"[._\-]+", " ", value).strip()
+    if not normalized or normalized == value:
+        return raw_violations
+    normalized_violations = _scan_prompt_safety(
+        normalized, source_text=source_text, text_policy=text_policy,
+    )
+    if not normalized_violations:
+        return raw_violations
+    seen = set(raw_violations)
+    out = list(raw_violations)
+    for v in normalized_violations:
+        if v not in seen:
+            out.append(v)
+            seen.add(v)
+    return out
+
+
 def _scan_intended_use(intended_use: str) -> list[str]:
     """Subset of the prompt safety scan applied to ``intended_use``.
     Only the full-slide / screenshot wording and the universal
@@ -1027,9 +1148,11 @@ def _validate_spec_requests(
     manifest_by_id: dict[str, dict],
     source_text: str | None,
     taxonomy_allowed: dict[str, set[str]] | None,
+    custom_descriptor_allowed: set[str] | None,
 ) -> tuple[list[dict] | None, str]:
     """Validate ``spec['requests']`` against the manifest, the safety
-    scans, and (when supplied) the descriptor vocabulary taxonomy.
+    scans, and (when supplied) the descriptor vocabulary taxonomy +
+    custom-descriptor allow-list.
     Returns (validated_requests, error_msg). On error, validated_requests
     is None and error_msg is non-empty.
 
@@ -1039,7 +1162,14 @@ def _validate_spec_requests(
     more of ``TAXONOMY_FIELDS`` is refused — the user must pass
     ``--descriptor-vocabulary``. When ``taxonomy_allowed`` is supplied,
     every present taxonomy field's value must be in the matching
-    ``taxonomy_allowed[<dim>]`` set."""
+    ``taxonomy_allowed[<dim>]`` set.
+
+    ``custom_descriptor_allowed`` is the allow-list set produced by
+    ``_load_descriptor_vocabulary`` from the vocab's
+    ``custom_descriptors[*].value`` list. When ``None`` (no vocab
+    supplied) OR ``set()`` (vocab supplied but no allow-list entries),
+    any spec request that carries ``custom_descriptor`` is refused — the
+    escape hatch is only usable when an explicit approved entry exists."""
     requests = spec.get("requests")
     if not isinstance(requests, list):
         return None, (
@@ -1055,6 +1185,7 @@ def _validate_spec_requests(
     allowed_keys = (
         {"id", "prompt", "intended_use", "width_px", "height_px"}
         | set(TAXONOMY_FIELDS)
+        | {CUSTOM_DESCRIPTOR_FIELD}
     )
     required_keys = {"id", "prompt"}
 
@@ -1199,6 +1330,91 @@ def _validate_spec_requests(
                         f"({sorted(taxonomy_allowed[dim])})."
                     )
 
+        # custom_descriptor escape hatch. Optional; when present, the
+        # request must satisfy four gates in this order:
+        #   (1) the value is a non-empty string;
+        #   (2) --descriptor-vocabulary must have been supplied — without
+        #       it the runtime has no allow-list to certify the value;
+        #   (3) the supplied vocab's custom_descriptors[] allow-list
+        #       must be non-empty AND the value must be a member;
+        #   (4) the value re-passes the full prompt safety scan (URI /
+        #       file-path / source-marker / source-shingle / credential /
+        #       PII / full-slide / public-distribution / editable-text
+        #       and — under text_policy='no_text' — visible-text wording).
+        # The plan schema additionally pattern-locks the field shape at
+        # the lowercase-identifier + forbidden-token layer, so an
+        # unsafe shape that somehow slipped past the runtime scan is
+        # still caught by the post-write _schema_validate gate.
+        custom_descriptor: str | None = None
+        if CUSTOM_DESCRIPTOR_FIELD in req:
+            raw_cd = req[CUSTOM_DESCRIPTOR_FIELD]
+            if not isinstance(raw_cd, str) or not raw_cd.strip():
+                return None, (
+                    f"FAIL: requests[{i}].{CUSTOM_DESCRIPTOR_FIELD} "
+                    f"(id {req_id!r}) must be a non-empty string when "
+                    f"present (got {raw_cd!r})"
+                )
+            if custom_descriptor_allowed is None:
+                return None, (
+                    f"FAIL: requests[{i}] (id {req_id!r}) carries "
+                    f"{CUSTOM_DESCRIPTOR_FIELD} but no "
+                    f"--descriptor-vocabulary was supplied; the "
+                    f"custom-descriptor escape hatch is only accepted "
+                    f"when --descriptor-vocabulary points at a "
+                    f"schema-valid d_one_descriptor_vocabulary JSON "
+                    f"whose custom_descriptors[] allow-list contains "
+                    f"an explicit approved entry for that exact value."
+                )
+            if not custom_descriptor_allowed:
+                return None, (
+                    f"FAIL: requests[{i}].{CUSTOM_DESCRIPTOR_FIELD} "
+                    f"(id {req_id!r}) value {raw_cd!r}: the supplied "
+                    f"--descriptor-vocabulary declares no "
+                    f"custom_descriptors[] entries, so no value is "
+                    f"approved. Add an explicit allow-list entry under "
+                    f"the documented vocabulary approval review and "
+                    f"re-run."
+                )
+            if raw_cd not in custom_descriptor_allowed:
+                return None, (
+                    f"FAIL: requests[{i}].{CUSTOM_DESCRIPTOR_FIELD} "
+                    f"(id {req_id!r}) value {raw_cd!r} is not in the "
+                    f"supplied --descriptor-vocabulary "
+                    f"custom_descriptors[].value allow-list "
+                    f"({sorted(custom_descriptor_allowed)}). The "
+                    f"escape hatch requires an explicit approved entry "
+                    f"for that exact descriptor."
+                )
+            # Defense in depth: re-run the FULL prompt safety scan
+            # against the custom_descriptor value, on BOTH the raw
+            # lowercased form AND a separator-normalized form (`_` /
+            # `-` / `.` collapsed to spaces) so compound deny-list
+            # literals like `slide title` / `render the slide` /
+            # `body copy` / `include text` (under
+            # text_policy='no_text') fire on `slide_title` /
+            # `render_the_slide` / `body-copy` / `include.text` etc.
+            # The schema regex already refuses URI / file-path /
+            # credential / full-slide-compound / public-distribution
+            # shapes at the identifier level, and the allow-list
+            # certification means a reviewer approved this value — but
+            # without the separator-normalized pass, a compound that
+            # is NOT in the schema's 5-compound deny list (e.g.
+            # `slide title` / `body copy`) would slip past the
+            # substring scan because the raw value uses `_` / `-` /
+            # `.` while the deny literal uses spaces.
+            cd_violations = _scan_custom_descriptor_safety(
+                raw_cd,
+                source_text=source_text,
+                text_policy=text_policy_peek,
+            )
+            if cd_violations:
+                return None, (
+                    f"FAIL: requests[{i}].{CUSTOM_DESCRIPTOR_FIELD} "
+                    f"(id {req_id!r}) value {raw_cd!r} failed the "
+                    f"safety re-scan: " + "; ".join(cd_violations)
+                )
+            custom_descriptor = raw_cd
+
         validated.append({
             "id": req_id,
             "prompt": prompt,
@@ -1208,6 +1424,7 @@ def _validate_spec_requests(
             "manifest_local_path": manifest_entry.get("local_path"),
             "manifest_source": manifest_source,
             "taxonomy": present_taxonomy,
+            "custom_descriptor": custom_descriptor,
         })
 
     return validated, ""
@@ -1221,10 +1438,14 @@ def _build_plan(validated_requests: list[dict]) -> dict:
 
     Taxonomy fields (TAXONOMY_FIELDS) are projected in the canonical
     order — the same tuple order TAXONOMY_FIELDS declares — only when
-    the validated request carries them. Absent fields stay absent (no
-    null projection), so a spec without taxonomy produces a plan file
-    byte-identical to the pre-taxonomy shape, preserving the schema's
-    `additionalProperties: false` and the existing fixture set."""
+    the validated request carries them. The optional
+    ``custom_descriptor`` escape-hatch field is projected only when the
+    validated request carries a non-None value. Absent fields stay
+    absent (no null projection), so a spec without taxonomy / without
+    custom_descriptor produces a plan-file body byte-identical to the
+    pre-extension shape (modulo the schema_version field), preserving
+    the schema's `additionalProperties: false` and the existing
+    fixture set."""
     return {
         "schema_version": PLAN_SCHEMA_VERSION,
         "mode": "dry_run",
@@ -1244,6 +1465,11 @@ def _build_plan(validated_requests: list[dict]) -> dict:
                     for dim in TAXONOMY_FIELDS
                     if dim in r.get("taxonomy", {})
                 },
+                **(
+                    {CUSTOM_DESCRIPTOR_FIELD: r["custom_descriptor"]}
+                    if r.get("custom_descriptor") is not None
+                    else {}
+                ),
             }
             for r in sorted(validated_requests, key=lambda x: x["id"])
         ],
@@ -1441,14 +1667,20 @@ def done_image_adapter(
     # re-reads and compares against this snapshot, rolling back the
     # just-written plan on a mismatch.
     taxonomy_allowed: dict[str, set[str]] | None = None
+    custom_descriptor_allowed: set[str] | None = None
     vocab_bytes_before: bytes | None = None
     if descriptor_vocabulary is not None:
-        taxonomy_allowed, vocab_bytes_before, rc, msg = (
-            _load_descriptor_vocabulary(descriptor_vocabulary)
-        )
+        (
+            taxonomy_allowed,
+            custom_descriptor_allowed,
+            vocab_bytes_before,
+            rc,
+            msg,
+        ) = _load_descriptor_vocabulary(descriptor_vocabulary)
         if rc != 0:
             return rc, msg
         assert taxonomy_allowed is not None
+        assert custom_descriptor_allowed is not None
         assert vocab_bytes_before is not None
 
     # Parse --spec.
@@ -1475,6 +1707,7 @@ def done_image_adapter(
         manifest_by_id=manifest_by_id,
         source_text=source_text,
         taxonomy_allowed=taxonomy_allowed,
+        custom_descriptor_allowed=custom_descriptor_allowed,
     )
     if err:
         return 1, err
@@ -1673,17 +1906,19 @@ def validate_plan_file(
          without a schema-valid manifest is refused before the plan
          is even parsed. When ``--descriptor-vocabulary`` is supplied,
          the file is additionally schema-validated against
-         ``schemas/d_one_descriptor_vocabulary.schema.json`` and its
+         ``schemas/d_one_descriptor_vocabulary.schema.json``, its
          ``image_taxonomy`` projected into a per-dimension
-         allowed_values set.
+         allowed_values set, AND its ``custom_descriptors[].value``
+         list projected into the custom-descriptor allow-list set.
       3. ``schemas/d_one_adapter_plan.schema.json`` against the plan
          JSON — catches malformed plans, list-rooted plans, unknown
          top-level / per-request fields, missing required fields,
-         ``mode != "dry_run"``, ``schema_version != 2``, ``note``
+         ``mode != "dry_run"``, ``schema_version != 3``, ``note``
          missing the dry-run sentinel, ``manifest_source !=
          "d_one_local"``, non-positive ``width_px`` / ``height_px``,
          taxonomy values that fail the lowercase-identifier +
-         forbidden-token pattern lock, etc.
+         forbidden-token pattern lock, AND ``custom_descriptor``
+         values that fail the same pattern lock.
       4. Cross-checks the schema cannot express: ``request_count ==
          len(requests)``; no duplicate request ``id`` across the
          array; every ``id`` resolves to an ``images[].id`` in the
@@ -1702,14 +1937,22 @@ def validate_plan_file(
          ``public hosting`` / ``publish to web`` / ``public url`` /
          ``public link`` / ``public cdn`` / ``host publicly`` and
          the documented variants); every ``intended_use`` (when
-         present) passes the full-slide-wording subset; and when ANY
+         present) passes the full-slide-wording subset; when ANY
          plan request carries one or more of ``TAXONOMY_FIELDS``,
          ``--descriptor-vocabulary`` MUST have been supplied AND every
          present taxonomy value MUST be a member of the matching
          ``image_taxonomy.<dim>.allowed_values`` projected at gate (2)
          — drift detection: a plan whose taxonomy value is regex-shape
          valid but no longer in the vocabulary's allowed_values is
-         refused here.
+         refused here; AND when ANY plan request carries the
+         ``custom_descriptor`` escape-hatch field,
+         ``--descriptor-vocabulary`` MUST have been supplied AND the
+         value MUST be a member of the vocab's
+         ``custom_descriptors[].value`` allow-list AND re-pass the
+         full ``_scan_prompt_safety`` deny list on BOTH the raw
+         lowercased form AND a separator-normalized form (every run
+         of ``.`` / ``_`` / ``-`` collapsed to a single space) — the
+         same dual-form safety scan the write path applies.
 
     Post-condition: the manifest bytes and the plan bytes are
     byte-identical pre/post the call. A successful run returns
@@ -1772,14 +2015,20 @@ def validate_plan_file(
     # bytes guarantees the two paths cannot drift on what counts as
     # "before").
     taxonomy_allowed: dict[str, set[str]] | None = None
+    custom_descriptor_allowed: set[str] | None = None
     vocab_bytes_before: bytes | None = None
     if descriptor_vocabulary is not None:
-        taxonomy_allowed, vocab_bytes_before, rc, msg = (
-            _load_descriptor_vocabulary(descriptor_vocabulary)
-        )
+        (
+            taxonomy_allowed,
+            custom_descriptor_allowed,
+            vocab_bytes_before,
+            rc,
+            msg,
+        ) = _load_descriptor_vocabulary(descriptor_vocabulary)
         if rc != 0:
             return rc, msg
         assert taxonomy_allowed is not None
+        assert custom_descriptor_allowed is not None
         assert vocab_bytes_before is not None
 
     try:
@@ -1932,6 +2181,62 @@ def validate_plan_file(
                         f"taxonomy drifted from the supplied "
                         f"--descriptor-vocabulary."
                     )
+
+        # custom_descriptor cross-check. The schema already pattern-
+        # locked the field shape (lowercase-identifier + forbidden-token
+        # deny clause); the runtime additionally requires
+        # --descriptor-vocabulary AND that the value is present in the
+        # vocab's custom_descriptors[] allow-list AND that the value
+        # passes the full safety scan. A plan whose custom_descriptor
+        # value drifted away from the vocab's allow-list (e.g. the
+        # reviewer removed an entry and the plan was not re-authored)
+        # is refused here. The plan-prompt safety scan above already
+        # ran with the peeked text_policy; the same peeked value
+        # applies to the custom_descriptor re-scan so an in-image-text
+        # literal like 'calligraphy' under text_policy='no_text' is
+        # caught symmetrically with the write path.
+        plan_custom = req.get(CUSTOM_DESCRIPTOR_FIELD)
+        if isinstance(plan_custom, str) and plan_custom:
+            if custom_descriptor_allowed is None:
+                return 1, (
+                    f"FAIL: {plan} requests[{i}] (id {req_id!r}) "
+                    f"carries {CUSTOM_DESCRIPTOR_FIELD} but "
+                    f"--descriptor-vocabulary was not supplied; "
+                    f"--validate-plan refuses to certify a plan whose "
+                    f"custom-descriptor value cannot be re-checked "
+                    f"against the vocab's custom_descriptors[] allow-"
+                    f"list. Re-run with --descriptor-vocabulary <path>."
+                )
+            if not custom_descriptor_allowed:
+                return 1, (
+                    f"FAIL: {plan} requests[{i}].{CUSTOM_DESCRIPTOR_FIELD} "
+                    f"(id {req_id!r}) value {plan_custom!r}: the "
+                    f"supplied --descriptor-vocabulary declares no "
+                    f"custom_descriptors[] entries, so no value can "
+                    f"be approved. The plan custom_descriptor drifted "
+                    f"from the supplied --descriptor-vocabulary."
+                )
+            if plan_custom not in custom_descriptor_allowed:
+                return 1, (
+                    f"FAIL: {plan} requests[{i}].{CUSTOM_DESCRIPTOR_FIELD} "
+                    f"(id {req_id!r}) value {plan_custom!r} is not in "
+                    f"the supplied --descriptor-vocabulary "
+                    f"custom_descriptors[].value allow-list "
+                    f"({sorted(custom_descriptor_allowed)}); the plan "
+                    f"custom_descriptor drifted from the supplied "
+                    f"--descriptor-vocabulary."
+                )
+            cd_violations = _scan_custom_descriptor_safety(
+                plan_custom,
+                source_text=source_text,
+                text_policy=plan_text_policy_peek,
+            )
+            if cd_violations:
+                return 1, (
+                    f"FAIL: {plan} requests[{i}].{CUSTOM_DESCRIPTOR_FIELD} "
+                    f"(id {req_id!r}) value {plan_custom!r} failed the "
+                    f"safety re-scan: " + "; ".join(cd_violations)
+                )
 
     # Post-condition: nothing was written. A mismatch here would mean
     # another process is touching either file while we validated,
@@ -3296,19 +3601,20 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
         ))
 
     # ---- 36. schema gate: wrong schema_version refused. Probe with
-    # 3 — the locked enum is currently [2] (the 1 -> 2 bump landed
-    # alongside the optional per-request taxonomy fields), so 3 is a
-    # future unrecognized shape that the schema must refuse. ----
+    # 4 — the locked enum is currently [3] (the 2 -> 3 bump landed
+    # alongside the optional per-request custom_descriptor escape-hatch
+    # field), so 4 is a future unrecognized shape that the schema must
+    # refuse. ----
     with tempfile.TemporaryDirectory() as raw_td:
         td = Path(raw_td)
         ws, plan_path = _seed_validate_workspace(td)
         plan_body = json.loads(plan_path.read_text())
-        plan_body["schema_version"] = 3
+        plan_body["schema_version"] = 4
         _overwrite_plan(plan_path, plan_body)
         rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
         ok = rc == 1 and "schema_version" in msg and "not in enum" in msg
         results.append(_expect(
-            "validate-plan: schema_version != 2 refused by schema enum "
+            "validate-plan: schema_version != 3 refused by schema enum "
             "(version drift must be a paired script change)",
             ok, f"rc={rc}, msg={msg!r}",
         ))
@@ -3789,6 +4095,23 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
                     ],
                 },
             },
+            # Approved custom-descriptor allow-list for the escape-hatch
+            # probes. Same shape as descriptors[] (kind + value +
+            # optional approved_in_review_ref); the adapter projects the
+            # value strings into a set and refuses any request whose
+            # custom_descriptor field is not a member.
+            "custom_descriptors": [
+                {
+                    "kind": "composition_adjective",
+                    "value": "hero_centered_motif",
+                    "approved_in_review_ref": "synthetic_review.001",
+                },
+                {
+                    "kind": "color_token",
+                    "value": "palette.accent_pair",
+                    "approved_in_review_ref": "synthetic_review.002",
+                },
+            ],
         }
 
     def _write_vocab(path: Path, body: dict) -> None:
@@ -4349,14 +4672,16 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
         original_loader = _mod2._load_descriptor_vocabulary
 
         def fake_loader(vocab_path: Path):
-            allowed, real_bytes, rc, msg = original_loader(vocab_path)
+            allowed, allowed_custom, real_bytes, rc, msg = (
+                original_loader(vocab_path)
+            )
             if rc != 0:
-                return allowed, real_bytes, rc, msg
+                return allowed, allowed_custom, real_bytes, rc, msg
             # Return a doctored "before" snapshot that disagrees with
             # the bytes currently on disk. The post-condition re-reads
             # the real bytes and compares to this — they cannot match,
             # so the gate must fire and the plan must be rolled back.
-            return allowed, real_bytes + b"X", rc, msg
+            return allowed, allowed_custom, real_bytes + b"X", rc, msg
 
         _mod2._load_descriptor_vocabulary = fake_loader  # type: ignore[attr-defined]
         try:
@@ -5119,6 +5444,697 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
                 ok, f"rc={rc}, msg={msg!r}",
             ))
 
+    # =========================================================================
+    # custom_descriptor escape-hatch scenarios.
+    #
+    # The custom_descriptor field is a conservative escape hatch aligned
+    # only with the upstream ai-image custom rendering/palette/hero-
+    # composition direction — no upstream code/prompts/examples/assets
+    # were copied. The field is OPTIONAL on every spec / plan request
+    # and may appear only when --descriptor-vocabulary is supplied AND
+    # the vocab's custom_descriptors[] allow-list carries an explicit
+    # approved entry for the exact value. Missing vocab, missing
+    # allow-list, unknown value, unsafe shape, malformed type, or plan
+    # drift each fail closed before any plan / asset / workspace / PPTX
+    # is produced.
+    # =========================================================================
+
+    # ---- CD1. approved custom_descriptor (write path): a spec carrying
+    # a custom_descriptor that matches the vocab allow-list lands on the
+    # plan request byte-identical to the spec. The plan re-parses to a
+    # schema-valid body whose schema_version is the locked 3. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_cd_valid"
+        _seed_workspace(ws, images=[
+            {"id": "cover", "local_path": "media/cover.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "cover",
+                    "prompt": "an abstract geometric pattern, no text",
+                    "custom_descriptor": "hero_centered_motif",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        plan_doc = (
+            json.loads((ws / DEFAULT_PLAN_FILENAME).read_text())
+            if rc == 0 else {}
+        )
+        req = plan_doc.get("requests", [{}])[0] if plan_doc else {}
+        ok = (
+            rc == 0
+            and plan_doc.get("schema_version") == PLAN_SCHEMA_VERSION
+            and req.get("custom_descriptor") == "hero_centered_motif"
+        )
+        results.append(_expect(
+            "custom_descriptor: approved value + vocab allow-list "
+            "succeeds; plan carries the value byte-identically and "
+            f"schema_version == {PLAN_SCHEMA_VERSION}",
+            ok, f"rc={rc}, msg={msg!r}, req={req!r}",
+        ))
+
+    # ---- CD2. missing --descriptor-vocabulary (write path): a spec
+    # carrying custom_descriptor with no vocab supplied is refused with
+    # a clear "--descriptor-vocabulary" diagnostic; no plan written. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_cd_no_vocab"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern, no text",
+                    "custom_descriptor": "hero_centered_motif",
+                },
+            ],
+        })
+        rc, msg = done_image_adapter(workspace=ws, spec=spec)
+        ok = (
+            rc == 1
+            and "--descriptor-vocabulary" in msg
+            and CUSTOM_DESCRIPTOR_FIELD in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "custom_descriptor: missing --descriptor-vocabulary refused; "
+            "no plan file written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- CD3. empty allow-list refused (write path): a vocab whose
+    # custom_descriptors[] is empty cannot certify any value. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_cd_empty_list"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern, no text",
+                    "custom_descriptor": "hero_centered_motif",
+                },
+            ],
+        })
+        empty_vocab = _canonical_vocab()
+        empty_vocab["custom_descriptors"] = []
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, empty_vocab)
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "no custom_descriptors[] entries" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "custom_descriptor: empty custom_descriptors[] allow-list "
+            "refuses any value; no plan file written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- CD4. omitted allow-list refused (write path): a vocab that
+    # does NOT declare custom_descriptors[] (backward-compatible older
+    # vocabulary) cannot certify any value. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_cd_omitted_list"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern, no text",
+                    "custom_descriptor": "hero_centered_motif",
+                },
+            ],
+        })
+        omitted_vocab = _canonical_vocab()
+        del omitted_vocab["custom_descriptors"]
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, omitted_vocab)
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "no custom_descriptors[] entries" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "custom_descriptor: vocab WITHOUT a custom_descriptors[] "
+            "list refuses any value (backward-compat older vocab); no "
+            "plan file written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- CD5. unknown value refused (write path): the value is
+    # regex-shape valid (lowercase identifier, no forbidden tokens) but
+    # not in the supplied vocab's custom_descriptors[] allow-list. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_cd_unknown"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern, no text",
+                    "custom_descriptor": "unapproved_motif",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "unapproved_motif" in msg
+            and "custom_descriptors[].value allow-list" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "custom_descriptor: unknown value (regex-shape valid but not "
+            "in the vocab allow-list) refused with a clear allow-list "
+            "diagnostic; no plan file written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- CD6. malformed type refused (write path): a non-string
+    # custom_descriptor (number, list, dict, empty / whitespace-only
+    # string) is refused with a non-empty-string diagnostic. ----
+    malformed_cases: tuple[object, ...] = (
+        42, [], {}, "", "   ",
+    )
+    for bad_value in malformed_cases:
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_cd_malformed"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "a",
+                        "prompt": "abstract pattern, no text",
+                        "custom_descriptor": bad_value,
+                    },
+                ],
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = (
+                rc == 1
+                and "non-empty string" in msg
+                and CUSTOM_DESCRIPTOR_FIELD in msg
+                and not (ws / DEFAULT_PLAN_FILENAME).exists()
+            )
+            results.append(_expect(
+                f"custom_descriptor: malformed type {bad_value!r} refused "
+                f"with non-empty-string diagnostic",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- CD7. unsafe-token allow-list value refused at the schema
+    # layer (write path). Every value here matches the forbidden-token
+    # deny clause in the descriptor-vocabulary schema's pattern lock; a
+    # vocab that ships such a value as a custom_descriptors[].value
+    # fails closed at the schema layer when the adapter loads it. We
+    # exercise the same 9-token + 5-compound deny list used elsewhere
+    # so a regression in either family is caught. ----
+    unsafe_cd_cases: tuple[str, ...] = (
+        "public_motif",
+        "upload_motif",
+        "raw_motif",
+        "customer_motif",
+        "confidential_motif",
+        "screenshot_motif",
+        "credential_motif",
+        "password_motif",
+        "secret_motif",
+        "full_slide",
+        "image_search",
+        "web_generation",
+        "page_generation",
+        "slide_generation",
+    )
+    for unsafe_value in unsafe_cd_cases:
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_cd_unsafe_vocab"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "a",
+                        "prompt": "abstract pattern, no text",
+                        "custom_descriptor": unsafe_value,
+                    },
+                ],
+            })
+            unsafe_vocab = _canonical_vocab()
+            unsafe_vocab["custom_descriptors"].append({
+                "kind": "geometric_noun", "value": unsafe_value,
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, unsafe_vocab)
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = (
+                rc == 1
+                and "d_one_descriptor_vocabulary.schema.json" in msg
+                and not (ws / DEFAULT_PLAN_FILENAME).exists()
+            )
+            results.append(_expect(
+                f"custom_descriptor: unsafe vocab allow-list value "
+                f"{unsafe_value!r} refused at the vocabulary schema "
+                f"layer; no plan file written",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- CD8. policy-aware in-image-text scan: the allow-list entry
+    # "calligraphic_glyph" passes the schema regex (no forbidden token)
+    # but the safety re-scan refuses it as in-image-text wording when
+    # the request also declares text_policy='no_text'. Proves the
+    # custom_descriptor value is held to the SAME safety scan the
+    # prompt is held to, so an approved value that drifts into an
+    # in-image-text shape under a no_text request still fails closed.
+    # ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_cd_policy_aware"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern, no text",
+                    "custom_descriptor": "calligraphy",
+                    "text_policy": "no_text",
+                    "subject_domain": "abstract_geometry",
+                },
+            ],
+        })
+        policy_aware_vocab = _canonical_vocab()
+        policy_aware_vocab["custom_descriptors"].append({
+            "kind": "composition_adjective", "value": "calligraphy",
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, policy_aware_vocab)
+        rc, msg = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and CUSTOM_DESCRIPTOR_FIELD in msg
+            and "in-image-text wording" in msg
+            and "text_policy='no_text'" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "custom_descriptor: an allow-list value that hits the "
+            "in-image-text safety scan under text_policy='no_text' is "
+            "refused by the value re-scan; no plan file written",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- CD9. determinism: two independent runs with identical inputs
+    # (including the custom_descriptor field) produce byte-identical
+    # plan-file bytes. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        bodies: list[bytes] = []
+        for ws_name in ("ws_a", "ws_b"):
+            ws = td / ws_name
+            _seed_workspace(ws, images=[
+                {"id": "x", "local_path": "media/x.png", "source": "d_one_local"},
+            ])
+            spec = td / f"spec_{ws_name}.json"
+            _write_spec(spec, {
+                "requests": [
+                    {
+                        "id": "x",
+                        "prompt": "abstract pattern, no text",
+                        "rendering_style": "flat_vector",
+                        "custom_descriptor": "hero_centered_motif",
+                    },
+                ],
+            })
+            vocab = td / f"vocab_{ws_name}.json"
+            _write_vocab(vocab, _canonical_vocab())
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            assert rc == 0, (
+                f"CD9 seed failed: rc={rc} msg={msg!r}"
+            )
+            bodies.append((ws / DEFAULT_PLAN_FILENAME).read_bytes())
+        ok = bodies[0] == bodies[1]
+        results.append(_expect(
+            "custom_descriptor: two independent runs with identical "
+            "custom_descriptor inputs produce byte-identical plan-file "
+            "bytes",
+            ok, f"len_a={len(bodies[0])}, len_b={len(bodies[1])}",
+        ))
+
+    # ---- CD10. validate-plan drift: a plan written with an approved
+    # custom_descriptor is hand-mutated to a regex-shape-valid but
+    # not-in-allow-list value; --validate-plan refuses it. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_cd_drift"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern, no text",
+                    "custom_descriptor": "hero_centered_motif",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, _ = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        assert rc == 0
+        plan_path = ws / DEFAULT_PLAN_FILENAME
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["custom_descriptor"] = "drifted_value"
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(
+            workspace=ws, plan=plan_path, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and "drifted_value" in msg
+            and "drifted from the supplied" in msg
+        )
+        results.append(_expect(
+            "custom_descriptor: validate-plan refuses a plan whose "
+            "custom_descriptor value drifted from the supplied vocab's "
+            "custom_descriptors[] allow-list",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- CD11. validate-plan: missing --descriptor-vocabulary refuses
+    # a plan carrying custom_descriptor. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_cd_validate_no_vocab"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern, no text",
+                    "custom_descriptor": "hero_centered_motif",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        rc, _ = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        assert rc == 0
+        plan_path = ws / DEFAULT_PLAN_FILENAME
+        rc, msg = validate_plan_file(workspace=ws, plan=plan_path)
+        ok = (
+            rc == 1
+            and CUSTOM_DESCRIPTOR_FIELD in msg
+            and "--descriptor-vocabulary" in msg
+        )
+        results.append(_expect(
+            "custom_descriptor: validate-plan refuses a "
+            "custom_descriptor-carrying plan when "
+            "--descriptor-vocabulary was not supplied",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- CD12. plan-schema regex defense (post-write): a plan that
+    # carries an unsafe-shape custom_descriptor (forbidden token at the
+    # identifier boundary) is refused by the post-write _schema_validate
+    # gate even when the in-memory allow-list would have certified the
+    # value AND the safety re-scan does not catch the specific token
+    # shape. ``public_motif`` is chosen because it (a) trips the
+    # schema's bounded-``public`` deny clause and (b) does NOT match any
+    # single-word or multi-word literal in the runtime safety scan
+    # (every safety-scan ``public`` literal is multi-word — ``public
+    # upload`` / ``public hosting`` / ``public url`` etc.). We
+    # monkey-patch the loader to claim the unsafe value is approved, so
+    # the only remaining defense is the post-write schema pattern lock.
+    # Mirrors the existing post-write _schema_validate regression
+    # (scenario 54). ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_cd_schema_post"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "media/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern, no text",
+                    "custom_descriptor": "public_motif",
+                },
+            ],
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, _canonical_vocab())
+        import sys as _sys_cd
+        _mod_cd = _sys_cd.modules[__name__]
+        original_loader_cd = _mod_cd._load_descriptor_vocabulary
+
+        def fake_loader_cd(vocab_path: Path):
+            allowed, allowed_custom, real_bytes, rc, msg = (
+                original_loader_cd(vocab_path)
+            )
+            if rc != 0:
+                return allowed, allowed_custom, real_bytes, rc, msg
+            assert allowed_custom is not None
+            # Pretend the unsafe-shape value is on the allow-list so the
+            # runtime gate accepts the request. The post-write schema
+            # pattern-lock must still refuse it.
+            return (
+                allowed,
+                allowed_custom | {"public_motif"},
+                real_bytes,
+                rc,
+                msg,
+            )
+
+        _mod_cd._load_descriptor_vocabulary = fake_loader_cd  # type: ignore[attr-defined]
+        try:
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+        finally:
+            _mod_cd._load_descriptor_vocabulary = original_loader_cd  # type: ignore[attr-defined]
+        ok = (
+            rc == 1
+            and "d_one_adapter_plan.schema.json" in msg
+            and "rolled back" in msg
+            and not (ws / DEFAULT_PLAN_FILENAME).exists()
+        )
+        results.append(_expect(
+            "custom_descriptor: an unsafe-shape value that bypasses the "
+            "runtime allow-list (loader monkey-patched) is still "
+            "refused by the post-write schema pattern lock; plan rolls "
+            "back",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
+    # ---- CD13. separator-token safety gap (regression for the Codex
+    # stop-time review): a vocab whose custom_descriptors[] approves
+    # ``slide_title`` / ``body_copy`` / ``render_the_slide`` (each
+    # regex-shape valid — neither the 9 bounded forbidden tokens nor
+    # the 5 compound deny phrases in the schema match these — and a
+    # naive substring safety scan would also miss them, because its
+    # compound literals (``slide title`` / ``body copy`` / ``render
+    # the slide``) are space-separated while the value uses `_`).
+    # The separator-normalized safety re-scan in
+    # _scan_custom_descriptor_safety must catch them BEFORE any plan
+    # file is written. We probe every separator variant (`_`, `-`,
+    # `.`, and a mixed run) to prove the normalization fires across
+    # all stacking shapes, AND we probe both editable-text and
+    # full-slide compounds so the regression covers more than one
+    # deny family. The text_policy='no_text' variant additionally
+    # probes the policy-aware in-image-text scan via the normalized
+    # form (`include_text` → ``include text``). ----
+    cd_separator_cases: tuple[tuple[str, str | None, str], ...] = (
+        # Editable-text wording, universal — fires regardless of
+        # text_policy. Every separator stacking maps to the same
+        # space-separated literal.
+        ("slide_title", None, "editable-text wording"),
+        ("slide-title", None, "editable-text wording"),
+        ("slide.title", None, "editable-text wording"),
+        ("slide_-title", None, "editable-text wording"),
+        ("body_copy", None, "editable-text wording"),
+        ("body-copy", None, "editable-text wording"),
+        ("body.copy", None, "editable-text wording"),
+        # Full-slide / page / screenshot wording — fires regardless
+        # of text_policy. The schema's 5-compound deny list does NOT
+        # include "render the slide" (only `full[._\-]*slide` etc.),
+        # so without the separator-normalized re-scan this would
+        # slip past both the schema regex AND the substring scan.
+        ("render_the_slide", None, "full-slide/page/screenshot wording"),
+        ("render-the-slide", None, "full-slide/page/screenshot wording"),
+        ("render.the.slide", None, "full-slide/page/screenshot wording"),
+        # Policy-aware in-image-text wording. Only fires under
+        # text_policy='no_text'. `include_text` → "include text".
+        ("include_text", "no_text", "in-image-text wording"),
+        ("include-text", "no_text", "in-image-text wording"),
+        ("include.text", "no_text", "in-image-text wording"),
+    )
+    for unsafe_cd, policy, diagnostic_fragment in cd_separator_cases:
+        with tempfile.TemporaryDirectory() as raw_td:
+            td = Path(raw_td)
+            ws = td / "ws_cd_sep_token"
+            _seed_workspace(ws, images=[
+                {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+            ])
+            spec = td / "spec.json"
+            request_body: dict = {
+                "id": "a",
+                "prompt": "abstract pattern, no text",
+                "custom_descriptor": unsafe_cd,
+            }
+            if policy is not None:
+                request_body["text_policy"] = policy
+                request_body["subject_domain"] = "abstract_geometry"
+            _write_spec(spec, {"requests": [request_body]})
+            # Add the unsafe-shape value to the vocab's allow-list so
+            # the runtime allow-list check accepts it; the safety
+            # re-scan is the ONLY remaining gate.
+            sep_vocab = _canonical_vocab()
+            sep_vocab["custom_descriptors"].append({
+                "kind": "composition_adjective",
+                "value": unsafe_cd,
+            })
+            vocab = td / "vocab.json"
+            _write_vocab(vocab, sep_vocab)
+            rc, msg = done_image_adapter(
+                workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+            )
+            ok = (
+                rc == 1
+                and CUSTOM_DESCRIPTOR_FIELD in msg
+                and unsafe_cd in msg
+                and diagnostic_fragment in msg
+                and not (ws / DEFAULT_PLAN_FILENAME).exists()
+            )
+            results.append(_expect(
+                f"custom_descriptor: separator-token value {unsafe_cd!r} "
+                f"(policy={policy!r}) is refused by the separator-"
+                f"normalized safety re-scan with the "
+                f"{diagnostic_fragment!r} diagnostic; no plan file "
+                f"written",
+                ok, f"rc={rc}, msg={msg!r}",
+            ))
+
+    # ---- CD14. validate-plan path: separator-token drift on
+    # ``custom_descriptor`` is refused. A plan written with an
+    # approved-and-safe value is hand-mutated to a separator-token
+    # value that the vocab also approves (so the allow-list check
+    # passes), and the safety re-scan on the validate path must
+    # close the gap symmetrically with the write path. ----
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        ws = td / "ws_cd_sep_validate"
+        _seed_workspace(ws, images=[
+            {"id": "a", "local_path": "a/a.png", "source": "d_one_local"},
+        ])
+        spec = td / "spec.json"
+        _write_spec(spec, {
+            "requests": [
+                {
+                    "id": "a",
+                    "prompt": "abstract pattern, no text",
+                    "custom_descriptor": "hero_centered_motif",
+                },
+            ],
+        })
+        sep_vocab = _canonical_vocab()
+        # The vocab also approves ``slide_title`` so the validate-
+        # path allow-list check passes and the separator-normalized
+        # safety re-scan is the only gate left.
+        sep_vocab["custom_descriptors"].append({
+            "kind": "composition_adjective",
+            "value": "slide_title",
+        })
+        vocab = td / "vocab.json"
+        _write_vocab(vocab, sep_vocab)
+        rc, _ = done_image_adapter(
+            workspace=ws, spec=spec, descriptor_vocabulary=vocab,
+        )
+        assert rc == 0, "CD14 seed failed"
+        plan_path = ws / DEFAULT_PLAN_FILENAME
+        plan_body = json.loads(plan_path.read_text())
+        plan_body["requests"][0]["custom_descriptor"] = "slide_title"
+        _overwrite_plan(plan_path, plan_body)
+        rc, msg = validate_plan_file(
+            workspace=ws, plan=plan_path, descriptor_vocabulary=vocab,
+        )
+        ok = (
+            rc == 1
+            and CUSTOM_DESCRIPTOR_FIELD in msg
+            and "slide_title" in msg
+            and "editable-text wording" in msg
+        )
+        results.append(_expect(
+            "custom_descriptor: validate-plan refuses a "
+            "separator-token value (``slide_title``) on the plan path "
+            "via the separator-normalized safety re-scan, even when "
+            "the vocab's custom_descriptors[] allow-list approves it",
+            ok, f"rc={rc}, msg={msg!r}",
+        ))
+
     # ---- TPI16. boundary-aware text-policy probe (regression for
     # the Codex stop-time review): normal image-generation wording
     # whose substring happens to overlap a deny-list literal must
@@ -5199,7 +6215,11 @@ def main(argv: list[str]) -> int:
             "layout_pattern / modifier / text_policy / "
             "subject_domain) per request, validated "
             "against image_taxonomy.<dim>.allowed_values in the "
-            "supplied d_one_descriptor_vocabulary JSON. Does NOT "
+            "supplied d_one_descriptor_vocabulary JSON, AND the "
+            "optional custom_descriptor escape-hatch field, validated "
+            "against the vocab's custom_descriptors[].value allow-list "
+            "with the full prompt safety scan re-applied on BOTH the "
+            "raw value AND a separator-normalized form. Does NOT "
             "call D-One / Qoder / any public network / any "
             "image-generation model / any external service. Does "
             "NOT generate any image bytes. Does NOT mutate "
@@ -5221,10 +6241,16 @@ def main(argv: list[str]) -> int:
              "optionally 'intended_use', 'width_px', 'height_px', plus "
              "any subset of the taxonomy fields 'rendering_style', "
              "'palette_family', 'image_role', 'layout_pattern', "
-             "'modifier', 'text_policy', 'subject_domain' — but each "
-             "present taxonomy field requires --descriptor-vocabulary "
-             "AND must match a value declared in "
-             "image_taxonomy.<dim>.allowed_values.",
+             "'modifier', 'text_policy', 'subject_domain', AND "
+             "optionally the 'custom_descriptor' escape-hatch field. "
+             "Each present taxonomy field requires "
+             "--descriptor-vocabulary AND must match a value declared "
+             "in image_taxonomy.<dim>.allowed_values. The "
+             "custom_descriptor field similarly requires "
+             "--descriptor-vocabulary AND must match an explicit "
+             "approved entry in the vocab's custom_descriptors[] "
+             "allow-list AND re-pass the full prompt safety scan on "
+             "BOTH the raw value AND a separator-normalized form.",
     )
     parser.add_argument(
         "--plan-out", type=Path, default=None,
@@ -5241,9 +6267,14 @@ def main(argv: list[str]) -> int:
              "request (--validate-plan path) carries any of the seven "
              "taxonomy fields (rendering_style / palette_family / "
              "image_role / layout_pattern / modifier / text_policy / "
-             "subject_domain). The file is re-validated every run, "
-             "and every present taxonomy value must be a member of "
-             "the matching image_taxonomy.<dim>.allowed_values list. "
+             "subject_domain) OR the optional custom_descriptor "
+             "escape-hatch field. The file is re-validated every run, "
+             "every present taxonomy value must be a member of "
+             "the matching image_taxonomy.<dim>.allowed_values list, "
+             "and every present custom_descriptor value must be a "
+             "member of the vocab's custom_descriptors[].value "
+             "allow-list AND re-pass the full prompt safety scan on "
+             "BOTH the raw value AND a separator-normalized form. "
              "Refused if URI-shaped, symlinked, missing, or "
              "schema-invalid.",
     )
@@ -5252,18 +6283,22 @@ def main(argv: list[str]) -> int:
         help="Validate an EXISTING d_one_adapter_plan.json instead of "
              "writing a new one. Requires --workspace and --plan; "
              "additionally requires --descriptor-vocabulary whenever "
-             "the plan carries one or more taxonomy fields. The "
+             "the plan carries one or more taxonomy fields OR the "
+             "optional custom_descriptor escape-hatch field. The "
              "validator is NON-MUTATING: it applies the schema "
              "(d_one_adapter_plan.schema.json — covers list-rooted, "
              "unknown fields, missing required fields, mode != "
              "'dry_run', schema_version drift, manifest_source != "
              "'d_one_local', non-positive dimensions, and the "
              "lowercase-identifier + forbidden-token pattern lock on "
-             "every taxonomy value), the workspace + image_manifest "
+             "every taxonomy value AND on every custom_descriptor "
+             "value), the workspace + image_manifest "
              "preflight (manifest schema-valid; no duplicate ids; "
              "every local_path safe), the optional descriptor "
              "vocabulary preflight (vocab schema-valid; image_taxonomy "
-             "projected to per-dimension allowed_values sets), and the "
+             "projected to per-dimension allowed_values sets; the "
+             "vocab's custom_descriptors[].value list projected to the "
+             "custom-descriptor allow-list set), and the "
              "full set of cross-checks the schema cannot express "
              "(request_count == len(requests); no duplicate request "
              "ids; every id resolves in the manifest with "
@@ -5275,8 +6310,12 @@ def main(argv: list[str]) -> int:
              "public-distribution wording deny list; every "
              "intended_use re-passes the full-slide wording subset of "
              "that list; AND every taxonomy value is in the matching "
-             "image_taxonomy.<dim>.allowed_values list — the same "
-             "scope the write path applies).",
+             "image_taxonomy.<dim>.allowed_values list, AND every "
+             "custom_descriptor value is in the vocab's "
+             "custom_descriptors[].value allow-list AND re-passes the "
+             "full prompt safety scan on BOTH the raw value AND a "
+             "separator-normalized form — the same scope the write "
+             "path applies).",
     )
     parser.add_argument(
         "--plan", type=Path, default=None,
