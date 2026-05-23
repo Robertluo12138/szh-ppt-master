@@ -801,7 +801,7 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--self-test", action="store_true",
-        help="Run 13 in-script tempfixture scenarios covering: the "
+        help="Run 16 in-script tempfixture scenarios covering: the "
              "happy-path mock chain (2-slide bundle with one "
              "d_one_local image carrying all 7 taxonomy dimensions; "
              "proves PPTX embeds an internal ppt/media PNG/JPG/JPEG "
@@ -810,6 +810,15 @@ def main(argv: list[str]) -> int:
              "negative probes for missing --allow-synthetic-bytes, "
              "missing --descriptor-vocabulary with taxonomy fields, "
              "invalid text_policy / subject_domain values, "
+             "editable-text wording in the prompt ('slide title') "
+             "refused before any production workspace or PPTX is "
+             "created, in-image-text wording in the prompt under "
+             "text_policy='no_text' refused before any production "
+             "workspace or PPTX is created, boundary-safe phrases "
+             "('image texture' / 'textured paper' / 'context "
+             "lighting' / 'texture pattern') under "
+             "text_policy='no_text' still pass the chain end-to-end "
+             "and produce a PPTX with internal PNG/JPG/JPEG media, "
              "schema_version=2 invariant on the produced plan "
              "(downgrade refused indirectly via plan re-parse), "
              "missing fixture/request image id mismatch, unsafe "
@@ -1502,6 +1511,141 @@ def _scenario_invalid_subject_domain(td: Path) -> _Scenario:
     )
 
 
+def _scenario_editable_text_in_prompt_refused(td: Path) -> _Scenario:
+    """Editable-text wording (`slide title` / `body copy` / `exact
+    text`) embedded in a prompt is refused by ``done_image_adapter``
+    regardless of ``text_policy`` — such copy must live in the native
+    SVG / PPT text layer, never baked into the raster. The runner
+    must abort before any production workspace or PPTX is created.
+    Uses a no-taxonomy spec so the rule fires on its universal path,
+    not via the policy-aware gate."""
+    spec_body = _d_one_spec_body_without_taxonomy()
+    spec_body["requests"][0]["prompt"] = (
+        "abstract geometric pattern that embeds the slide title text"
+    )
+    bundle = _materialize_bundle(
+        td / "editable_text", d_one_spec_body=spec_body,
+    )
+    ws = td / "editable_text_ws"
+    out = td / "editable_text.pptx"
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out, with_vocab=False,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "editable-text wording" in combined
+        and "'slide title'" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "negative: prompt with editable-text wording ('slide title') "
+        "is refused by done_image_adapter before any production "
+        "workspace or PPTX is created",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-10:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_no_text_policy_visible_text_refused(td: Path) -> _Scenario:
+    """Under ``text_policy='no_text'`` an in-image-text request like
+    ``include text`` is self-contradictory; ``done_image_adapter``
+    refuses and the runner must abort before any production workspace
+    or PPTX is created."""
+    spec_body = _d_one_spec_body_with_taxonomy()
+    spec_body["requests"][0]["prompt"] = (
+        "abstract geometric pattern, please include text inside it"
+    )
+    bundle = _materialize_bundle(
+        td / "no_text_visible", d_one_spec_body=spec_body,
+    )
+    ws = td / "no_text_visible_ws"
+    out = td / "no_text_visible.pptx"
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "in-image-text wording" in combined
+        and "text_policy='no_text'" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "negative: prompt with `include text` under "
+        "text_policy='no_text' is refused by done_image_adapter "
+        "before any production workspace or PPTX is created",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-10:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_boundary_safe_text_phrases_pass(td: Path) -> _Scenario:
+    """Boundary-safe phrases — ``image texture``, ``textured paper``,
+    ``context lighting``, ``texture pattern`` — embedded in a prompt
+    under ``text_policy='no_text'`` must NOT trip the policy-aware
+    in-image-text gate. The deny list's ``image text`` / ``with text``
+    literals use word boundaries, so legitimate image-generation
+    wording that merely contains the same character prefix slides
+    past. The chain must complete and the PPTX must embed an
+    internal PNG / JPG / JPEG with no external relationships."""
+    spec_body = _d_one_spec_body_with_taxonomy()
+    spec_body["requests"][0]["prompt"] = (
+        "abstract geometric pattern with image texture, "
+        "textured paper backdrop, soft context lighting, "
+        "and a subtle texture pattern, no logo"
+    )
+    bundle = _materialize_bundle(
+        td / "boundary_safe", d_one_spec_body=spec_body,
+    )
+    ws = td / "boundary_safe_ws"
+    out = td / "boundary_safe.pptx"
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    if outcome.exit_code != 0:
+        return _Scenario(
+            "positive: prompt with boundary-safe phrases ('image "
+            "texture' / 'textured paper' / 'context lighting' / "
+            "'texture pattern') under text_policy='no_text' passes "
+            "the chain and produces a PPTX with internal media",
+            False,
+            f"rc={outcome.exit_code}; "
+            f"stderr tail: {outcome.stderr.splitlines()[-10:]!r}; "
+            f"stdout tail: {outcome.stdout.splitlines()[-10:]!r}",
+        )
+    if not out.is_file() or out.is_symlink():
+        return _Scenario(
+            "positive: boundary-safe PPTX exists as regular non-"
+            "symlink file",
+            False, f"out={out}, is_file={out.is_file()}",
+        )
+    ok, msg = _pptx_embeds_internal_media_only(out)
+    if not ok:
+        return _Scenario(
+            "positive: boundary-safe PPTX embeds at least one "
+            "internal ppt/media/<name>.<png|jpg|jpeg> part with no "
+            "external/file/data/scheme relationships",
+            False, msg,
+        )
+    return _Scenario(
+        "positive: prompt with boundary-safe phrases ('image "
+        "texture' / 'textured paper' / 'context lighting' / "
+        "'texture pattern') under text_policy='no_text' passes the "
+        "chain and produces a PPTX whose ppt/media/ carries a "
+        "native PNG/JPG/JPEG with no external relationships",
+        True,
+    )
+
+
 def _scenario_plan_schema_version_locked(td: Path) -> _Scenario:
     """The schema_version invariant is NOT directly probeable from the
     runner CLI — the runner always invokes done_image_adapter, which
@@ -1817,6 +1961,9 @@ def _run_self_test() -> int:
             _scenario_taxonomy_without_vocab(td),
             _scenario_invalid_text_policy(td),
             _scenario_invalid_subject_domain(td),
+            _scenario_editable_text_in_prompt_refused(td),
+            _scenario_no_text_policy_visible_text_refused(td),
+            _scenario_boundary_safe_text_phrases_pass(td),
             _scenario_plan_schema_version_locked(td),
             _scenario_request_id_mismatch(td),
             _scenario_unsafe_local_path(td),
