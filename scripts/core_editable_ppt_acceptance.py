@@ -58,6 +58,26 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     bytecode hole without ``PYTHONDONTWRITEBYTECODE=1`` in env,
     failure cleanup leaves no residue). MOCK / STUB ONLY — no real
     D-One.
+  - ``scripts/mock_image_bundle_acceptance_smoke.py`` — top-level
+    acceptance gate that drives the COMMITTED
+    ``examples/synthetic_mock_image_trial/`` bundle through
+    ``run_mock_image_pipeline.py --bundle`` into a tempfile-owned
+    workspace/output/report directory OUTSIDE the repo tree, then
+    asserts the documented invariants (rc=0; PPTX exists as regular
+    non-symlink non-empty file; ``validate_pptx_contract.py
+    --expected-slide-count 2`` passes; ``<report-dir>/inventory.json``
+    reports ``ok=true`` / ``findings=[]`` / ``slide_count=2`` / no
+    external relationships / at least one ppt/media PNG/JPG/JPEG part;
+    ``[PASS] taxonomy preservation check`` stdout marker fires;
+    ``scripts/__pycache__/`` byte-identical before/after even with
+    ``PYTHONDONTWRITEBYTECODE`` stripped from the subprocess env;
+    no committed repo path mutated) plus four tempfixture fail-closed
+    probes (missing bundle, symlinked bundle parent, parent-traversal
+    ``..`` bundle path, bad ``image_manifest_spec.local_path``).
+    Complements the in-script tempfixture coverage of
+    ``run_mock_image_pipeline --self-test`` by exercising the
+    committed bundle path directly. MOCK / STUB ONLY — no real
+    D-One.
   - ``scripts/render_model_roundtrip_smoke.py`` — synthetic
     render_model -> editable .pptx round-trip exercising every
     primitive kind the exporter supports today (text, line, shape,
@@ -123,6 +143,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "image_asset_negative_probes_smoke.py",
     SCRIPTS_DIR / "image_taxonomy_acceptance_smoke.py",
     SCRIPTS_DIR / "run_mock_image_pipeline.py",
+    SCRIPTS_DIR / "mock_image_bundle_acceptance_smoke.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
     SCRIPTS_DIR / "trace_acceptance_smoke.py",
 )
@@ -351,7 +372,8 @@ def main(argv: list[str]) -> int:
             "image_asset_acceptance_smoke + image_asset_trial_evidence "
             "+ image_asset_negative_probes_smoke + "
             "image_taxonomy_acceptance_smoke + run_mock_image_pipeline "
-            "+ render_model_roundtrip_smoke + trace_acceptance_smoke). "
+            "+ mock_image_bundle_acceptance_smoke + "
+            "render_model_roundtrip_smoke + trace_acceptance_smoke). "
             "Runs each delegated smoke as a subprocess from REPO_ROOT; "
             "writes no .pptx / render_model / report / SVG / JSON "
             "artifacts of its own. Stdlib-only. NETWORK-FREE. "
