@@ -62,13 +62,23 @@ committed repo tree):
     ``--require-both-placement-roles`` was active (so the G9 +
     G13 gates actually fired against the runner-written sidecar).
   - ``sidecar.{path,exists,schema_version,request_count,
-    placement_role_coverage,requests}`` — fields lifted from the
-    runner-written ``mock_d_one_adapter_plan.json``. Each
-    ``requests[]`` entry carries ``id`` / ``placement_role`` /
-    ``text_policy`` / ``subject_domain`` / ``manifest_local_path``
-    plus the optional ``custom_descriptor`` (preserved verbatim
-    when the request carries the escape-hatch field, omitted
-    otherwise so the JSON does not invent a value).
+    placement_role_coverage,text_policy_coverage,
+    covers_multiple_text_policies,requests}`` — fields lifted
+    from the runner-written ``mock_d_one_adapter_plan.json``.
+    Each ``requests[]`` entry carries ``id`` / ``placement_role``
+    / ``text_policy`` / ``subject_domain`` /
+    ``manifest_local_path`` plus the optional ``custom_descriptor``
+    (preserved verbatim when the request carries the escape-hatch
+    field, omitted otherwise so the JSON does not invent a value).
+    ``text_policy_coverage`` is the sorted unique set of per-
+    request text_policy values and ``covers_multiple_text_policies``
+    is True iff at least ``EXPECTED_MIN_DISTINCT_TEXT_POLICIES``
+    (today: 2) distinct text_policy values were observed; the
+    emitter's ``summary.ok`` gate refuses a record where every
+    per-request text_policy collapsed to the same value (typically
+    all ``no_text``) so the committed bundle path exercises mixed
+    per-request text_policy end-to-end, not only the adapter-only
+    smoke.
   - ``notes.scope`` / ``notes.embed_surface`` — fixed framing so
     the evidence reader knows what this emitter does NOT prove.
 
@@ -160,6 +170,13 @@ EXPECTED_SLIDE_COUNT = 2
 EXPECTED_PLACEMENT_ROLES: frozenset[str] = frozenset({
     "hero_page", "local_region",
 })
+# Goal-pinned minimum number of distinct text_policy values across
+# the sidecar's requests[]. The committed bundle must exercise mixed
+# per-request text_policy end-to-end — a sidecar in which every
+# request's text_policy collapsed to the same value (typically all
+# 'no_text') is refused by both the emitter's summary.ok gate and the
+# downstream validator's G10 diversity gate.
+EXPECTED_MIN_DISTINCT_TEXT_POLICIES = 2
 EVIDENCE_SIDECAR_FILENAME = "mock_d_one_adapter_plan.json"
 EXPECTED_EVIDENCE_BASIS = (
     "OOXML structure only; not proof of full PowerPoint editability"
@@ -540,6 +557,8 @@ def _collect_sidecar_evidence(sidecar_path: Path) -> dict:
         "all_requests_well_formed": False,
         "placement_role_coverage": [],
         "covers_both_placement_roles": False,
+        "text_policy_coverage": [],
+        "covers_multiple_text_policies": False,
     }
     if not (sidecar_path.is_file() and not sidecar_path.is_symlink()):
         return out
@@ -561,6 +580,7 @@ def _collect_sidecar_evidence(sidecar_path: Path) -> dict:
         )
         records: list[dict] = []
         roles: set[str] = set()
+        text_policies: set[str] = set()
         malformed: list[int] = []
         for i, req in enumerate(requests):
             if not isinstance(req, dict):
@@ -593,6 +613,9 @@ def _collect_sidecar_evidence(sidecar_path: Path) -> dict:
             role = req.get("placement_role")
             if isinstance(role, str):
                 roles.add(role)
+            tp = req.get("text_policy")
+            if isinstance(tp, str) and tp:
+                text_policies.add(tp)
         out["requests"] = records
         out["malformed_request_indices"] = malformed
         # The full set of conditions a well-formed requests list
@@ -608,6 +631,16 @@ def _collect_sidecar_evidence(sidecar_path: Path) -> dict:
         out["placement_role_coverage"] = sorted(roles)
         out["covers_both_placement_roles"] = (
             roles == EXPECTED_PLACEMENT_ROLES
+        )
+        # Mixed-text_policy coverage. The committed bundle must
+        # exercise per-request text_policy judgement end-to-end;
+        # the smoke / runner / sidecar validator already do per-id
+        # parity (so a drift would surface there), and this derived
+        # pair surfaces the diversity gate at the evidence layer so
+        # a reviewer can read it from the JSON bytes alone.
+        out["text_policy_coverage"] = sorted(text_policies)
+        out["covers_multiple_text_policies"] = (
+            len(text_policies) >= EXPECTED_MIN_DISTINCT_TEXT_POLICIES
         )
     return out
 
@@ -856,6 +889,14 @@ def _summary_ok(evidence: dict) -> bool:
     if not sc["request_count_matches_requests"]:
         return False
     if not sc["covers_both_placement_roles"]:
+        return False
+    # Goal-pinned mixed per-request text_policy coverage. A sidecar in
+    # which every request's text_policy collapsed to the same value is
+    # refused — the committed bundle must exercise per-request
+    # text_policy judgement end-to-end, not only through the adapter-
+    # only smoke. The downstream validator's G10 gate re-asserts this
+    # from a clean process boundary against the emitted JSON.
+    if not sc["covers_multiple_text_policies"]:
         return False
     # Goal-required per-request coverage. The sidecar schema treats
     # taxonomy fields as optional, so a schema-valid sidecar can
@@ -1539,7 +1580,7 @@ def _probe_summary_refuses_malformed_request_evidence(
             {
                 "id": "system_schematic",
                 "placement_role": "local_region",
-                "text_policy": "no_text",
+                "text_policy": "caption_safe",
                 "subject_domain": "process_motif",
                 "manifest_local_path": "media/system_schematic.png",
             },
@@ -1558,6 +1599,11 @@ def _probe_summary_refuses_malformed_request_evidence(
             "well-formed sidecar should set "
             "all_requests_well_formed=True"
         )
+    if not ev["sidecar"]["covers_multiple_text_policies"]:
+        failures.append(
+            "well-formed sidecar with 2 distinct text_policy values "
+            "should set covers_multiple_text_policies=True"
+        )
 
     def _mutate(mutator, tag) -> dict:
         # Deep-copy via JSON so each probe variant gets its own
@@ -1565,6 +1611,31 @@ def _probe_summary_refuses_malformed_request_evidence(
         copy = json.loads(json.dumps(good_sidecar))
         mutator(copy)
         return _build_evidence(copy, tag)
+
+    # Collapsed text_policy: every request carries the same value.
+    # summary.ok MUST flip False, covers_multiple_text_policies MUST
+    # be False, and text_policy_coverage MUST contain exactly one
+    # entry. This is the diversity gate at the evidence layer.
+    def _collapse_text_policy(doc):
+        for req in doc["requests"]:
+            req["text_policy"] = "no_text"
+    ev = _mutate(_collapse_text_policy, "collapsed_text_policy")
+    if _summary_ok(ev):
+        failures.append(
+            "sidecar with text_policy collapsed to a single value "
+            "should NOT produce summary.ok=True (diversity gate)"
+        )
+    if ev["sidecar"]["covers_multiple_text_policies"] is not False:
+        failures.append(
+            "sidecar with text_policy collapsed should set "
+            "covers_multiple_text_policies=False"
+        )
+    if ev["sidecar"]["text_policy_coverage"] != ["no_text"]:
+        failures.append(
+            f"sidecar with text_policy collapsed should set "
+            f"text_policy_coverage=['no_text'] (got "
+            f"{ev['sidecar']['text_policy_coverage']!r})"
+        )
 
     # Missing required field on one request — every variant must
     # flip summary.ok to False.
@@ -1636,9 +1707,12 @@ def _probe_summary_refuses_malformed_request_evidence(
     return _NegativeOutcome(
         "static helpers: summary.ok flips False for any sidecar with "
         "a malformed request (missing/non-string/empty goal-required "
-        "field, non-dict request entry, or empty requests list); the "
-        "well-formed baseline still produces summary.ok=True so the "
-        "gate is not a blanket fail",
+        "field, non-dict request entry, or empty requests list) OR "
+        "per-request text_policy collapsed to a single value across "
+        "every request (covers_multiple_text_policies=False, "
+        "text_policy_coverage=['no_text']); the well-formed baseline "
+        "with two distinct text_policy values still produces "
+        "summary.ok=True so the gate is not a blanket fail",
         not failures,
         "; ".join(failures) if failures else "",
     )
@@ -1827,12 +1901,17 @@ def _run_self_test() -> int:
         "sidecar field including one record per generated request "
         "with id / placement_role / text_policy / subject_domain / "
         "manifest_local_path (plus optional custom_descriptor when "
-        "the request carries it), and BOTH hero_page AND local_region "
-        "placement_role coverage. The five fail-closed probes "
-        "(missing bundle, forced downstream failure, bad descriptor "
-        "vocabulary, malformed-request summary refusal, and static "
-        "helper refusing real-D-One / MCP / network / model / "
-        "image-search / Qoder success claims) all fire. "
+        "the request carries it), BOTH hero_page AND local_region "
+        "placement_role coverage, AND at least two distinct "
+        "text_policy values observed across requests[] "
+        "(covers_multiple_text_policies=True, text_policy_coverage "
+        "size >= EXPECTED_MIN_DISTINCT_TEXT_POLICIES). The five fail-"
+        "closed probes (missing bundle, forced downstream failure, "
+        "bad descriptor vocabulary, malformed-request summary refusal "
+        "with the diversity-gate-triggered text_policy collapse "
+        "variant, and static helper refusing real-D-One / MCP / "
+        "network / model / image-search / Qoder success claims) all "
+        "fire. "
         "REPO_ROOT/examples and REPO_ROOT/scripts are byte-snapshot "
         "unchanged. MOCK / local only — NOT real D-One."
     )

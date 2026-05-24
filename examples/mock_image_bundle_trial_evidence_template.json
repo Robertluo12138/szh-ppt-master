@@ -31,6 +31,7 @@
   "sidecar": {
     "all_requests_well_formed": true,
     "covers_both_placement_roles": true,
+    "covers_multiple_text_policies": true,
     "exists": true,
     "malformed_request_indices": [],
     "parses_as_json": true,
@@ -51,11 +52,12 @@
         "manifest_local_path": "media/template_local.png",
         "placement_role": "local_region",
         "subject_domain": "process_motif",
-        "text_policy": "no_text"
+        "text_policy": "caption_safe"
       }
     ],
     "schema_version": 4,
-    "schema_version_locked": true
+    "schema_version_locked": true,
+    "text_policy_coverage": ["caption_safe", "no_text"]
   },
   "summary": {
     "ok": true

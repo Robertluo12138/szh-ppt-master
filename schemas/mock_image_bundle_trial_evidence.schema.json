@@ -177,7 +177,9 @@
         "malformed_request_indices",
         "all_requests_well_formed",
         "placement_role_coverage",
-        "covers_both_placement_roles"
+        "covers_both_placement_roles",
+        "text_policy_coverage",
+        "covers_multiple_text_policies"
       ],
       "properties": {
         "path": {
@@ -255,7 +257,16 @@
           "items": {"type": "string"},
           "description": "Sorted unique placement_role values observed across requests[]. The semantic gate refuses summary.ok=true unless this equals exactly ['hero_page', 'local_region']."
         },
-        "covers_both_placement_roles": {"type": "boolean"}
+        "covers_both_placement_roles": {"type": "boolean"},
+        "text_policy_coverage": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Sorted unique text_policy values observed across requests[]. The semantic gate refuses summary.ok=true unless this carries at least two distinct values (so a sidecar in which every per-request text_policy collapsed to the same value — typically all 'no_text' — is refused; the goal pins per-request text_policy judgement to flow end-to-end through the committed bundle path, not only through the adapter-only smoke)."
+        },
+        "covers_multiple_text_policies": {
+          "type": "boolean",
+          "description": "True iff len(text_policy_coverage) >= 2. Derived from requests[*].text_policy; the validator cross-checks the boolean against the array for agreement."
+        }
       }
     },
     "bundle_path": {

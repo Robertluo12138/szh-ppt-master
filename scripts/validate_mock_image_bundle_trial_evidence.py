@@ -93,6 +93,26 @@ on any failure):
       truth here; the derived ``sidecar.placement_role_coverage``
       field is cross-checked for agreement.
 
+  G10 ``text_policy_diversity``
+    - the set of ``sidecar.requests[*].text_policy`` values MUST
+      carry at least ``EXPECTED_MIN_DISTINCT_TEXT_POLICIES`` (today:
+      2) distinct entries. A sidecar in which every per-request
+      text_policy collapsed to the same value — typically all
+      ``no_text`` — is refused. The committed mock bundle path
+      must exercise mixed per-request text_policy end-to-end, not
+      only the adapter-only smoke. Records[] alone is the source
+      of truth; the derived ``sidecar.text_policy_coverage`` array
+      AND ``sidecar.covers_multiple_text_policies`` boolean are
+      cross-checked against the raw requests[] values for
+      agreement, so a tampered record that hand-edits the derived
+      fields without updating the per-request values is refused.
+    - when ``bundle_path`` points at a local bundle that contains a
+      regular ``d_one_spec.json``, the sidecar request id ->
+      text_policy mapping MUST byte-match that spec. This keeps the
+      standalone evidence validator from accepting a record whose
+      derived coverage is internally consistent but drifted away from
+      the committed bundle's source of truth.
+
   G7 ``string_safety_scan``
     - every free-form string scalar (path / note / status / report
       / bundle / request id / manifest_local_path / custom_descriptor)
@@ -216,6 +236,12 @@ EXPECTED_EVIDENCE_BASIS = (
 EXPECTED_PLACEMENT_ROLES: frozenset[str] = frozenset(
     {"hero_page", "local_region"}
 )
+# Goal-pinned minimum number of distinct text_policy values that must
+# appear across the sidecar's requests[]. The committed bundle path
+# must exercise mixed per-request text_policy end-to-end (not only the
+# adapter-only smoke); a sidecar in which every request collapsed to
+# the same value — typically all 'no_text' — is refused.
+EXPECTED_MIN_DISTINCT_TEXT_POLICIES = 2
 _REQUIRED_REQUEST_FIELDS: tuple[str, ...] = (
     "id",
     "placement_role",
@@ -787,6 +813,19 @@ def _summary_ok_sub_conditions(evidence: dict) -> list[str]:
                 f"{coverage!r}, covers_both="
                 f"{sc.get('covers_both_placement_roles')!r})"
             )
+        tp_coverage = sc.get("text_policy_coverage")
+        if (
+            not isinstance(tp_coverage, list)
+            or len(set(tp_coverage)) < EXPECTED_MIN_DISTINCT_TEXT_POLICIES
+            or sc.get("covers_multiple_text_policies") is not True
+        ):
+            fails.append(
+                f"sidecar.text_policy_coverage must carry at least "
+                f"{EXPECTED_MIN_DISTINCT_TEXT_POLICIES} distinct values "
+                f"AND covers_multiple_text_policies must be True "
+                f"(got coverage={tp_coverage!r}, covers_multiple="
+                f"{sc.get('covers_multiple_text_policies')!r})"
+            )
 
     return fails
 
@@ -874,6 +913,145 @@ def _check_placement_role_coverage(evidence: dict) -> list[str]:
                 f"disagrees with requests[*].placement_role "
                 f"({sorted(roles)!r})"
             )
+    return errors
+
+
+def _check_text_policy_diversity(evidence: dict) -> list[str]:
+    """G10 — the set of ``sidecar.requests[*].text_policy`` values MUST
+    carry at least ``EXPECTED_MIN_DISTINCT_TEXT_POLICIES`` distinct
+    entries. This gate refuses a sidecar where every per-request
+    text_policy collapsed to the same value (typically all ``no_text``)
+    — the goal pins per-request text_policy judgement to flow end-to-
+    end through the committed mock bundle path, not only through the
+    adapter-only smoke. The derived ``sidecar.text_policy_coverage``
+    and ``sidecar.covers_multiple_text_policies`` fields are cross-
+    checked against the raw requests[] values for agreement so a
+    tampered sidecar that hand-edits the derived fields without
+    updating the per-request values is refused too."""
+    errors: list[str] = []
+    sc = evidence.get("sidecar", {})
+    requests = sc.get("requests") if isinstance(sc, dict) else None
+    if not isinstance(requests, list):
+        return errors
+    raw_values: set[str] = set()
+    for req in requests:
+        if isinstance(req, dict):
+            v = req.get("text_policy")
+            if isinstance(v, str):
+                raw_values.add(v)
+    if len(raw_values) < EXPECTED_MIN_DISTINCT_TEXT_POLICIES:
+        errors.append(
+            f"sidecar.requests[*].text_policy must carry at least "
+            f"{EXPECTED_MIN_DISTINCT_TEXT_POLICIES} distinct values "
+            f"(got {sorted(raw_values)!r}); per-request text_policy "
+            f"collapsed — the committed mock bundle path must exercise "
+            f"mixed text_policy end-to-end"
+        )
+    coverage = sc.get("text_policy_coverage")
+    if isinstance(coverage, list):
+        if sorted(set(coverage)) != sorted(raw_values):
+            errors.append(
+                f"sidecar.text_policy_coverage ({coverage!r}) "
+                f"disagrees with requests[*].text_policy "
+                f"({sorted(raw_values)!r})"
+            )
+    covers_multi = sc.get("covers_multiple_text_policies")
+    if isinstance(covers_multi, bool):
+        expected_covers = (
+            len(raw_values) >= EXPECTED_MIN_DISTINCT_TEXT_POLICIES
+        )
+        if covers_multi != expected_covers:
+            errors.append(
+                f"sidecar.covers_multiple_text_policies={covers_multi!r} "
+                f"disagrees with the derived value "
+                f"(len(distinct text_policy)="
+                f"{len(raw_values)} >= "
+                f"{EXPECTED_MIN_DISTINCT_TEXT_POLICIES} -> "
+                f"{expected_covers!r})"
+            )
+    return errors
+
+
+def _check_bundle_text_policy_parity(evidence: dict) -> list[str]:
+    """G10 parity extension — if ``bundle_path`` names a local bundle
+    with a regular ``d_one_spec.json``, compare the sidecar's per-id
+    text_policy mapping to the spec's per-id mapping.
+
+    The committed mock-image evidence emitter records the real
+    ``examples/synthetic_mock_image_trial`` path, so this gate catches
+    evidence records that remain internally consistent but no longer
+    describe the committed bundle bytes. Synthetic templates may use a
+    non-existent placeholder bundle path; those records still rely on
+    schema + semantic consistency and are not forced through this
+    filesystem parity check."""
+    errors: list[str] = []
+    bundle_raw = evidence.get("bundle_path")
+    if not isinstance(bundle_raw, str) or not bundle_raw:
+        return errors
+    # URI/traversal-shaped bundle paths are handled by the recursive
+    # string-safety scan. Avoid turning that into noisy filesystem
+    # errors here.
+    if _has_uri_scheme(bundle_raw) or ".." in Path(bundle_raw).parts:
+        return errors
+    bundle = Path(bundle_raw)
+    if not bundle.exists():
+        return errors
+    spec_path = bundle / "d_one_spec.json"
+    if spec_path.is_symlink() or not spec_path.is_file():
+        errors.append(
+            f"bundle_path points at existing local bundle {bundle}, "
+            "but d_one_spec.json is missing, symlinked, or not a "
+            "regular file; cannot prove evidence text_policy parity"
+        )
+        return errors
+    try:
+        spec_doc = json.loads(spec_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(
+            f"cannot parse bundle d_one_spec.json at {spec_path}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return errors
+    spec_requests = (
+        spec_doc.get("requests") if isinstance(spec_doc, dict) else None
+    )
+    if not isinstance(spec_requests, list):
+        errors.append(
+            f"bundle d_one_spec.json at {spec_path} does not carry a "
+            "requests[] array"
+        )
+        return errors
+
+    def _mapping(rows: object) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if not isinstance(rows, list):
+            return out
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            rid = row.get("id")
+            tp = row.get("text_policy")
+            if isinstance(rid, str) and rid and isinstance(tp, str) and tp:
+                out[rid] = tp
+        return out
+
+    spec_by_id = _mapping(spec_requests)
+    sc = evidence.get("sidecar", {})
+    sidecar_by_id = _mapping(
+        sc.get("requests") if isinstance(sc, dict) else None
+    )
+    if not spec_by_id:
+        errors.append(
+            f"bundle d_one_spec.json at {spec_path} has no request id "
+            "-> text_policy mapping"
+        )
+        return errors
+    if sidecar_by_id != spec_by_id:
+        errors.append(
+            "sidecar.requests[*].text_policy disagrees with "
+            f"bundle d_one_spec.json at {spec_path}: "
+            f"spec={spec_by_id!r}, evidence={sidecar_by_id!r}"
+        )
     return errors
 
 
@@ -1248,6 +1426,8 @@ def validate_evidence(
     errors.extend(_check_summary_ok_consistency(evidence))
     errors.extend(_check_per_request_well_formed(evidence))
     errors.extend(_check_placement_role_coverage(evidence))
+    errors.extend(_check_text_policy_diversity(evidence))
+    errors.extend(_check_bundle_text_policy_parity(evidence))
     errors.extend(_check_string_safety(evidence))
     errors.extend(_check_real_d_one_claim_refusal(evidence))
     if require_files:
@@ -1342,7 +1522,7 @@ def _baseline_record(
                 {
                     "id": "synthetic_local",
                     "placement_role": "local_region",
-                    "text_policy": "no_text",
+                    "text_policy": "caption_safe",
                     "subject_domain": "process_motif",
                     "manifest_local_path": "media/synthetic_local.png",
                 },
@@ -1351,6 +1531,8 @@ def _baseline_record(
             "all_requests_well_formed": True,
             "placement_role_coverage": ["hero_page", "local_region"],
             "covers_both_placement_roles": True,
+            "text_policy_coverage": ["caption_safe", "no_text"],
+            "covers_multiple_text_policies": True,
         },
         "bundle_path": "synthetic-tempdir/bundle",
         "report_dir": "synthetic-tempdir/trial_report",
@@ -1618,6 +1800,158 @@ def _run_self_tests() -> list[tuple[str, bool, str]]:  # noqa: C901
             "(G6 + G4)",
             rc == 1 and any(
                 "placement_role" in e and "local_region" in e
+                for e in errs
+            ),
+            f"rc={rc}, errs={errs!r}",
+        ))
+
+    # ---- 14a. text_policy collapsed to one value refused (G10). ----
+    # All requests carry the same text_policy → the sidecar collapsed
+    # per-request text_policy judgement, which the goal pins to flow
+    # end-to-end through the committed bundle path (not only the
+    # adapter-only smoke).
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        rec = _baseline_record()
+        for req in rec["sidecar"]["requests"]:
+            req["text_policy"] = "no_text"
+        rec["sidecar"]["text_policy_coverage"] = ["no_text"]
+        rec["sidecar"]["covers_multiple_text_policies"] = False
+        p = _write(td, "rec.json", rec)
+        rc, errs = _validate_path(p, schema)
+        results.append(_expect(
+            "text_policy collapsed to a single value across requests "
+            "refused (G10)",
+            rc == 1 and any(
+                "text_policy" in e
+                and "distinct" in e
+                for e in errs
+            ),
+            f"rc={rc}, errs={errs!r}",
+        ))
+
+    # ---- 14b. tampered text_policy_coverage refused (G10 cross-check)
+    # The derived coverage array claims 2 distinct values but the
+    # per-request values are all ``no_text``. The cross-check must
+    # surface the disagreement so a tampered evidence record cannot
+    # hand-edit the derived field to false-green the diversity gate.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        rec = _baseline_record()
+        for req in rec["sidecar"]["requests"]:
+            req["text_policy"] = "no_text"
+        # Leave text_policy_coverage / covers_multiple_text_policies at
+        # the baseline values (which still claim 2 distinct values) so
+        # the cross-check fires.
+        p = _write(td, "rec.json", rec)
+        rc, errs = _validate_path(p, schema)
+        results.append(_expect(
+            "tampered text_policy_coverage disagreeing with requests[*]"
+            ".text_policy refused (G10 cross-check)",
+            rc == 1 and any(
+                "text_policy_coverage" in e
+                and "disagrees" in e
+                for e in errs
+            ),
+            f"rc={rc}, errs={errs!r}",
+        ))
+
+    # ---- 14c. tampered covers_multiple_text_policies refused (G10). --
+    # The derived boolean claims True but the per-request values are
+    # all the same value. Mirrors 14b but for the boolean half of the
+    # derivation; either tampering shape should be caught.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        rec = _baseline_record()
+        for req in rec["sidecar"]["requests"]:
+            req["text_policy"] = "no_text"
+        rec["sidecar"]["text_policy_coverage"] = ["no_text"]
+        # Leave covers_multiple_text_policies=True; the cross-check
+        # must fire because len({no_text}) < 2.
+        p = _write(td, "rec.json", rec)
+        rc, errs = _validate_path(p, schema)
+        results.append(_expect(
+            "tampered covers_multiple_text_policies=True with single-"
+            "value coverage refused (G10 cross-check)",
+            rc == 1 and any(
+                "covers_multiple_text_policies" in e for e in errs
+            ),
+            f"rc={rc}, errs={errs!r}",
+        ))
+
+    def _committed_bundle_evidence_record() -> dict:
+        rec = json.loads(
+            (REPO_ROOT / "examples/mock_image_bundle_trial_evidence_"
+             "template.json").read_text()
+        )
+        rec["bundle_path"] = str(
+            (REPO_ROOT / "examples/synthetic_mock_image_trial").resolve()
+        )
+        rec["sidecar"]["requests"][0].update({
+            "id": "cover_accent",
+            "manifest_local_path": "media/cover_accent.png",
+            "placement_role": "hero_page",
+            "subject_domain": "abstract_geometry",
+            "text_policy": "no_text",
+        })
+        rec["sidecar"]["requests"][1].update({
+            "id": "system_schematic",
+            "manifest_local_path": "media/system_schematic.png",
+            "placement_role": "local_region",
+            "subject_domain": "process_motif",
+            "text_policy": "caption_safe",
+        })
+        rec["sidecar"]["text_policy_coverage"] = [
+            "caption_safe", "no_text",
+        ]
+        rec["sidecar"]["covers_multiple_text_policies"] = True
+        rec["sidecar"]["placement_role_coverage"] = [
+            "hero_page", "local_region",
+        ]
+        rec["sidecar"]["covers_both_placement_roles"] = True
+        return rec
+
+    # ---- 14d. local bundle d_one_spec parity happy path (G10). ----
+    # The committed evidence template mirrors the committed bundle's
+    # request ids / text_policy values. Point bundle_path at the real
+    # committed bundle so the filesystem parity extension actually
+    # opens d_one_spec.json and confirms it agrees.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        rec = _committed_bundle_evidence_record()
+        p = _write(td, "rec.json", rec)
+        rc, errs = _validate_path(p, schema)
+        results.append(_expect(
+            "local bundle d_one_spec text_policy parity passes when "
+            "evidence mirrors the committed bundle (G10 parity)",
+            rc == 0,
+            f"rc={rc}, errs={errs!r}",
+        ))
+
+    # ---- 14e. local bundle d_one_spec parity drift refused (G10). ----
+    # Keep the evidence internally consistent (two distinct values +
+    # derived fields updated), but drift one per-id value away from
+    # the committed bundle's d_one_spec.json. Without the bundle
+    # parity extension this shape false-greened.
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = Path(raw_td)
+        rec = _committed_bundle_evidence_record()
+        rec["sidecar"]["requests"][0]["text_policy"] = (
+            "decorative_glyphs"
+        )
+        rec["sidecar"]["text_policy_coverage"] = [
+            "caption_safe", "decorative_glyphs",
+        ]
+        rec["sidecar"]["covers_multiple_text_policies"] = True
+        p = _write(td, "rec.json", rec)
+        rc, errs = _validate_path(p, schema)
+        results.append(_expect(
+            "evidence text_policy drift from local bundle d_one_spec "
+            "refused even when coverage is internally consistent "
+            "(G10 parity)",
+            rc == 1 and any(
+                "d_one_spec.json" in e
+                and "disagrees" in e
                 for e in errs
             ),
             f"rc={rc}, errs={errs!r}",
@@ -2276,14 +2610,18 @@ def main(argv: list[str]) -> int:
             f"template.json validates against the schema and every "
             f"semantic gate; the synthetic baseline + every negative "
             f"probe (missing required field, count mismatch, missing "
-            f"local_region, vocab flag false, role flag false, "
-            f"failed validator with summary.ok=True, real-D-One "
-            f"verified claim, sk-/api_key:/token: tokens, external "
-            f"URL, public hosting/upload/share, confidential / "
-            f"customer_id / raw-source markers, --require-files repo "
-            f"path / URI / traversal / missing / directory / "
-            f"symlinked evidence-PPTX-inventory-sidecar) flips a "
-            f"non-zero exit. Read-only / stdlib-only / tempdir-only."
+            f"local_region, text_policy collapsed to a single value "
+            f"+ tampered text_policy_coverage / "
+            f"covers_multiple_text_policies cross-check + local "
+            f"bundle d_one_spec parity drift (G10), vocab flag "
+            f"false, role flag false, failed validator with "
+            f"summary.ok=True, real-D-One verified claim, "
+            f"sk-/api_key:/token: tokens, external URL, public "
+            f"hosting/upload/share, confidential / customer_id / "
+            f"raw-source markers, --require-files repo path / URI / "
+            f"traversal / missing / directory / symlinked evidence-"
+            f"PPTX-inventory-sidecar) flips a non-zero exit. "
+            f"Read-only / stdlib-only / tempdir-only."
         )
         return 0
 

@@ -31,6 +31,13 @@ documented invariants on the produced artifacts:
     taxonomy preservation marker (asserted independently), this
     certifies BOTH placement_roles flowed from the spec into the
     produced ``d_one_adapter_plan.json`` byte-identical;
+  * the committed ``d_one_spec.json`` declares at least
+    ``EXPECTED_MIN_DISTINCT_TEXT_POLICIES`` distinct ``text_policy``
+    values across its requests (mixed per-request text_policy
+    end-to-end, not only the adapter-only smoke) AND the runner-
+    written sidecar's per-id ``text_policy`` values byte-match the
+    committed spec's per-id values (belt-and-braces for the runner's
+    taxonomy preservation marker);
   * stdout contains the ``[PASS] taxonomy preservation check``
     marker (proves the runner's plan re-parse gate fired against the
     bundle's taxonomy-bearing ``d_one_spec.json``);
@@ -97,6 +104,13 @@ flags the regression) AND the output PPTX is never created:
      request from a bundle copy makes ``_bundle_placement_roles``
      return only ``{'hero_page'}``, which is what the happy-path
      gate would detect as a regression on the committed bundle.
+  8. collapsed text_policy evidence (direct probe on the smoke's
+     static text_policy helper): flipping every spec request's
+     ``text_policy`` to ``no_text`` in a bundle copy makes
+     ``_bundle_text_policies_by_id`` report a single distinct value
+     (< ``EXPECTED_MIN_DISTINCT_TEXT_POLICIES``), which is what the
+     happy-path gate would detect as a regression that silently
+     de-scopes the committed bundle to a single text_policy.
 
 MOCK / STUB acceptance ONLY — NOT real D-One integration. Nothing in
 this smoke calls D-One, MCP, Qoder, a public network, telemetry, any
@@ -159,6 +173,18 @@ EXPECTED_SLIDE_COUNT = 2
 EXPECTED_PLACEMENT_ROLES: frozenset[str] = frozenset({
     "hero_page", "local_region",
 })
+
+# Goal-pinned minimum number of distinct text_policy values that
+# must appear across the committed d_one_spec.json's requests. The
+# committed bundle path must exercise mixed per-request text_policy
+# end-to-end (not only the adapter-only smoke); a regression where
+# the committed spec collapses to a single text_policy value
+# (typically all 'no_text') is refused by the static helper below.
+# The runner's taxonomy preservation marker already certifies that
+# whichever text_policy values the spec declares flow byte-identical
+# into the sidecar — so committed-spec diversity + the marker firing
+# together certify mixed text_policy end-to-end.
+EXPECTED_MIN_DISTINCT_TEXT_POLICIES = 2
 
 # The committed bundle declares two d_one_local images, each with a
 # distinct local_path; the exporter writes them as
@@ -466,6 +492,108 @@ def _check_inventory_invariants(
     return results
 
 
+def _bundle_text_policies_by_id(
+    bundle: Path,
+) -> tuple[dict[str, str], str]:
+    """Return (by_id, msg). ``by_id`` is the per-id text_policy mapping
+    declared on the bundle's ``d_one_spec.json`` requests (only entries
+    with a non-empty string ``text_policy`` field are included);
+    ``msg`` is non-empty on any read / decode error so the caller can
+    surface it as a PostCondition detail rather than crashing the
+    smoke.
+
+    Static evidence helper. The smoke's contract is that the committed
+    bundle exercises mixed per-request text_policy end-to-end; a
+    regression where the committed spec collapses to a single
+    text_policy value (typically all 'no_text') is refused here. The
+    runner's taxonomy preservation marker independently certifies the
+    sidecar's per-id text_policy values byte-match the spec, so
+    committed-spec diversity + the marker firing together certify
+    mixed text_policy end-to-end."""
+    spec_path = bundle / "d_one_spec.json"
+    if spec_path.is_symlink() or not spec_path.is_file():
+        return {}, (
+            f"d_one_spec.json missing or non-regular at {spec_path}"
+        )
+    try:
+        doc = json.loads(spec_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, (
+            f"cannot parse {spec_path}: {type(exc).__name__}: {exc}"
+        )
+    if not isinstance(doc, dict):
+        return {}, (
+            f"d_one_spec.json top-level value is not an object "
+            f"(got {type(doc).__name__})"
+        )
+    requests = doc.get("requests")
+    if not isinstance(requests, list):
+        return {}, (
+            f"d_one_spec.json 'requests' is not a list "
+            f"(got {type(requests).__name__})"
+        )
+    by_id: dict[str, str] = {}
+    for entry in requests:
+        if not isinstance(entry, dict):
+            continue
+        rid = entry.get("id")
+        tp = entry.get("text_policy")
+        if (
+            isinstance(rid, str) and rid
+            and isinstance(tp, str) and tp
+        ):
+            by_id[rid] = tp
+    return by_id, ""
+
+
+def _sidecar_text_policies_by_id(
+    sidecar_path: Path,
+) -> tuple[dict[str, str], str]:
+    """Mirror of ``_bundle_text_policies_by_id`` for the runner-written
+    audit sidecar (``mock_d_one_adapter_plan.json``). Returns the per-id
+    text_policy mapping observed on the sidecar's ``requests[]``.
+
+    Static evidence helper used by the happy-path parity assertion: the
+    sidecar's per-id text_policy MUST byte-match the committed spec's
+    per-id text_policy (the runner's taxonomy preservation marker is
+    the primary gate; this is belt-and-braces so a regression that
+    silently drops the marker still surfaces here)."""
+    if sidecar_path.is_symlink() or not sidecar_path.is_file():
+        return {}, (
+            f"sidecar missing or non-regular at {sidecar_path}"
+        )
+    try:
+        doc = json.loads(sidecar_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, (
+            f"cannot parse {sidecar_path}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if not isinstance(doc, dict):
+        return {}, (
+            f"sidecar top-level value is not an object "
+            f"(got {type(doc).__name__})"
+        )
+    requests = doc.get("requests")
+    if not isinstance(requests, list):
+        return {}, (
+            f"sidecar 'requests' is not a list "
+            f"(got {type(requests).__name__})"
+        )
+    by_id: dict[str, str] = {}
+    for entry in requests:
+        if not isinstance(entry, dict):
+            continue
+        rid = entry.get("id")
+        tp = entry.get("text_policy")
+        if (
+            isinstance(rid, str) and rid
+            and isinstance(tp, str) and tp
+        ):
+            by_id[rid] = tp
+    return by_id, ""
+
+
 def _bundle_placement_roles(bundle: Path) -> tuple[set[str], str]:
     """Return (roles, msg). ``roles`` is the set of ``placement_role``
     values declared on the bundle's ``d_one_spec.json`` requests; ``msg``
@@ -716,6 +844,74 @@ def _run_happy_path(td: Path) -> tuple[int, list[PostCondition]]:
          + (f"; read error: {roles_msg}" if roles_msg else ""))
         if roles != EXPECTED_PLACEMENT_ROLES else "",
     ))
+
+    # Static text_policy diversity on the committed bundle. The
+    # committed bundle path must exercise mixed per-request
+    # text_policy end-to-end (not only the adapter-only smoke). A
+    # regression where the committed spec collapses to a single
+    # text_policy value (typically all 'no_text') is refused here
+    # BEFORE the more expensive runtime / PPTX checks would otherwise
+    # green. Combined with the taxonomy preservation marker (asserted
+    # above) AND the sidecar-parity assertion (below), this certifies
+    # at least EXPECTED_MIN_DISTINCT_TEXT_POLICIES distinct text_policy
+    # values flowed from the committed d_one_spec.json into the
+    # produced d_one_adapter_plan.json per id byte-identical.
+    spec_tp_by_id, spec_tp_msg = _bundle_text_policies_by_id(
+        COMMITTED_BUNDLE,
+    )
+    spec_tp_distinct = set(spec_tp_by_id.values())
+    results.append(PostCondition(
+        f"committed d_one_spec.json declares at least "
+        f"{EXPECTED_MIN_DISTINCT_TEXT_POLICIES} distinct text_policy "
+        f"values across its requests (mixed per-request text_policy "
+        f"end-to-end, not only the adapter-only smoke)",
+        len(spec_tp_distinct) >= EXPECTED_MIN_DISTINCT_TEXT_POLICIES,
+        (f"got {sorted(spec_tp_distinct)!r}; "
+         f"per-id mapping: {spec_tp_by_id!r}"
+         + (f"; read error: {spec_tp_msg}" if spec_tp_msg else ""))
+        if len(spec_tp_distinct) < EXPECTED_MIN_DISTINCT_TEXT_POLICIES
+        else "",
+    ))
+
+    # Per-id text_policy parity between the committed d_one_spec.json
+    # and the runner-written sidecar. The runner's taxonomy
+    # preservation marker is the primary gate (the marker fires AFTER
+    # the runner re-parses the produced plan and confirms every spec
+    # taxonomy value lands byte-identical on the matching plan
+    # request, including text_policy); this is belt-and-braces so a
+    # regression that silently drops the marker still surfaces here.
+    if spec_tp_by_id:
+        sidecar_tp_by_id, sidecar_tp_msg = (
+            _sidecar_text_policies_by_id(sidecar_path)
+        )
+        if not sidecar_tp_msg:
+            mismatches = [
+                (rid, spec_tp_by_id[rid], sidecar_tp_by_id.get(rid))
+                for rid in sorted(spec_tp_by_id)
+                if sidecar_tp_by_id.get(rid) != spec_tp_by_id[rid]
+            ]
+            results.append(PostCondition(
+                "runner-written sidecar's per-id text_policy values "
+                "byte-match the committed d_one_spec.json (belt-and-"
+                "braces for the runner's taxonomy preservation "
+                "marker)",
+                not mismatches,
+                ("mismatches (id, spec, sidecar): "
+                 + "; ".join(
+                     f"({a!r}, {b!r}, {c!r})"
+                     for a, b, c in mismatches
+                 )
+                 ) if mismatches else "",
+            ))
+        else:
+            results.append(PostCondition(
+                "runner-written sidecar's per-id text_policy values "
+                "byte-match the committed d_one_spec.json (belt-and-"
+                "braces for the runner's taxonomy preservation "
+                "marker)",
+                False,
+                f"sidecar read failed: {sidecar_tp_msg}",
+            ))
 
     pycache_diff = _diff_snapshot(pycache_before, pycache_after)
     results.append(PostCondition(
@@ -1167,6 +1363,69 @@ def _probe_missing_local_region_evidence(td: Path) -> _NegativeOutcome:
     )
 
 
+def _probe_collapsed_text_policy_evidence(td: Path) -> _NegativeOutcome:
+    """Direct probe on the smoke's static text_policy diversity check.
+    Build a bundle copy whose d_one_spec.json carries every
+    ``text_policy`` value collapsed to ``no_text`` (the bundle still
+    type-checks: two d_one_local images, two cover slides), then call
+    ``_bundle_text_policies_by_id`` and assert the helper reports a
+    single distinct value.
+
+    Rationale: the runner happily produces a 2-slide PPTX against a
+    single-text_policy spec — text_policy=no_text is a legitimate
+    upstream shape on its own and not a failure mode the runner can
+    detect by itself. The smoke is the gate that certifies the
+    COMMITTED bundle exercises mixed per-request text_policy end-to-
+    end; a regression where the committed spec silently de-scopes to
+    a single text_policy value should fail the smoke, not pass it.
+    This probe exercises that gate directly: it builds the exact
+    regression shape and confirms ``_bundle_text_policies_by_id``
+    would surface it.
+
+    A direct probe (no subprocess) is deliberate — the surface under
+    test is the smoke's own static-evidence helper, not a runner
+    runtime gate (done_image_adapter happily accepts collapsed
+    text_policy; the validate_mock_d_one_adapter_plan validator's G13
+    happily accepts collapsed text_policy as long as every value is in
+    the vocabulary)."""
+    bundle = td / "probe_collapsed_text_policy_bundle"
+    _copy_committed_bundle(bundle)
+    spec_path = bundle / "d_one_spec.json"
+    spec_body = json.loads(spec_path.read_text())
+    for req in spec_body.get("requests", []):
+        if isinstance(req, dict):
+            req["text_policy"] = "no_text"
+    spec_path.write_text(
+        json.dumps(spec_body, indent=2, sort_keys=True) + "\n"
+    )
+
+    by_id, err_msg = _bundle_text_policies_by_id(bundle)
+    distinct = set(by_id.values())
+    helper_ok = (
+        not err_msg
+        and len(by_id) >= 1
+        and len(distinct) < EXPECTED_MIN_DISTINCT_TEXT_POLICIES
+        and distinct == {"no_text"}
+    )
+    detail = ""
+    if not helper_ok:
+        detail = (
+            f"got by_id={by_id!r}, distinct={sorted(distinct)!r}; "
+            f"expected single-value 'no_text' coverage after "
+            f"collapsing every spec text_policy"
+            + (f"; helper error: {err_msg}" if err_msg else "")
+        )
+    return _NegativeOutcome(
+        "negative (direct): collapsing every spec text_policy to "
+        "'no_text' makes _bundle_text_policies_by_id report a single "
+        f"distinct value (< {EXPECTED_MIN_DISTINCT_TEXT_POLICIES}) — "
+        "the static evidence gate would catch a regression that "
+        "silently de-scopes the committed bundle to a single text_"
+        "policy",
+        helper_ok, detail,
+    )
+
+
 _NEGATIVE_PROBES = (
     _probe_missing_bundle,
     _probe_symlinked_bundle_parent,
@@ -1175,6 +1434,7 @@ _NEGATIVE_PROBES = (
     _probe_traversal_local_path,
     _probe_wrong_placement_role_on_hero,
     _probe_missing_local_region_evidence,
+    _probe_collapsed_text_policy_evidence,
 )
 
 
@@ -1304,15 +1564,21 @@ def _run_self_test() -> int:
         ".json (so both generated-image roles are auditable from the "
         "sidecar bytes alone); and "
         "scripts/__pycache__/ is byte-identical even without "
-        "PYTHONDONTWRITEBYTECODE in the subprocess env. All "
-        "negative probes (missing bundle, symlinked bundle parent, "
-        "parent-traversal `..`, URI-shaped image_manifest_spec "
-        "local_path, traversal `../` image_manifest_spec local_path, "
-        "wrong placement_role on the hero_page request, missing "
-        "local_region evidence under the static helper) aborted the "
-        "runner with no PPTX written (or — for the direct helper "
-        "probe — surfaced the regression at the static-evidence "
-        "layer). MOCK / STUB only — NOT real D-One integration."
+        "PYTHONDONTWRITEBYTECODE in the subprocess env; the committed "
+        "d_one_spec.json carries at least EXPECTED_MIN_DISTINCT_TEXT_"
+        "POLICIES distinct text_policy values across its requests "
+        "and the runner-written sidecar's per-id text_policy values "
+        "byte-match the spec (mixed per-request text_policy end-to-"
+        "end, not only the adapter-only smoke). All negative probes "
+        "(missing bundle, symlinked bundle parent, parent-traversal "
+        "`..`, URI-shaped image_manifest_spec local_path, traversal "
+        "`../` image_manifest_spec local_path, wrong placement_role "
+        "on the hero_page request, missing local_region evidence "
+        "under the static helper, collapsed text_policy evidence "
+        "under the static helper) aborted the runner with no PPTX "
+        "written (or — for the direct helper probes — surfaced the "
+        "regression at the static-evidence layer). MOCK / STUB only "
+        "— NOT real D-One integration."
     )
     return 0
 
