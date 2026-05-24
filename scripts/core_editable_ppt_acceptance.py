@@ -89,6 +89,39 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     tempfixture coverage of ``run_mock_image_pipeline --self-test``
     by exercising the committed bundle path directly. MOCK / STUB
     ONLY — no real D-One.
+  - ``scripts/mock_image_bundle_trial_evidence.py`` — tempdir-only
+    evidence emitter sibling to
+    ``mock_image_bundle_acceptance_smoke``. Drives the same
+    committed bundle through ``run_mock_image_pipeline.py --bundle``
+    into a tempfile-owned workspace/output/report directory,
+    re-runs ``validate_pptx_contract.py`` /
+    ``inspect_pptx_inventory.py`` against the produced PPTX AND
+    ``validate_mock_d_one_adapter_plan.py`` (with
+    ``--require-both-placement-roles`` AND
+    ``--descriptor-vocabulary <bundle/descriptor_vocabulary.json>``)
+    against the runner-written
+    ``<report-dir>/mock_d_one_adapter_plan.json`` sidecar, and
+    emits a compact JSON evidence object (``summary.ok``, fixed
+    ``real_d_one_status: UNVERIFIED``, pptx exists/size, inventory
+    ok/findings/slide_count/media_parts_count/evidence_basis/no-
+    external-relationships, validator rc fields, sidecar
+    schema_version/request_count, and one record per generated
+    request with id / placement_role / text_policy /
+    subject_domain / optional custom_descriptor /
+    manifest_local_path). Asserts BOTH ``hero_page`` AND
+    ``local_region`` placement_role coverage and that the
+    committed vocabulary gate was actually used. Adds five fail-
+    closed probes (missing bundle, missing sidecar after a forced
+    downstream failure, bad descriptor vocabulary, malformed-
+    request summary refusal — synthetic sidecars that drop or
+    corrupt a goal-required per-request field, or carry a non-
+    dict request entry, or carry an empty requests list, must
+    flip ``summary.ok=False`` via
+    ``sidecar.all_requests_well_formed=False`` even when every
+    other gate would be green; the well-formed baseline still
+    passes — and a static helper refusing any evidence JSON that
+    claims real D-One / MCP / public network / model API / image
+    search / Qoder success). MOCK / STUB ONLY — no real D-One.
   - ``scripts/render_model_roundtrip_smoke.py`` — synthetic
     render_model -> editable .pptx round-trip exercising every
     primitive kind the exporter supports today (text, line, shape,
@@ -155,6 +188,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "image_taxonomy_acceptance_smoke.py",
     SCRIPTS_DIR / "run_mock_image_pipeline.py",
     SCRIPTS_DIR / "mock_image_bundle_acceptance_smoke.py",
+    SCRIPTS_DIR / "mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
     SCRIPTS_DIR / "trace_acceptance_smoke.py",
 )
@@ -384,6 +418,7 @@ def main(argv: list[str]) -> int:
             "+ image_asset_negative_probes_smoke + "
             "image_taxonomy_acceptance_smoke + run_mock_image_pipeline "
             "+ mock_image_bundle_acceptance_smoke + "
+            "mock_image_bundle_trial_evidence + "
             "render_model_roundtrip_smoke + trace_acceptance_smoke). "
             "Runs each delegated smoke as a subprocess from REPO_ROOT; "
             "writes no .pptx / render_model / report / SVG / JSON "
