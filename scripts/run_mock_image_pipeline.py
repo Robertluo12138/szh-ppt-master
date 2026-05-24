@@ -66,6 +66,14 @@ Output behavior:
   * writes the ``.pptx`` at ``--output``;
   * writes ``pipeline_report.{json,txt}`` and ``inventory.json`` under
     ``--report-dir`` when supplied;
+  * writes ``mock_d_one_adapter_plan.json`` (a byte-identical copy of
+    the staging ``d_one_adapter_plan.json`` after ``done_image_adapter``
+    succeeds and the taxonomy preservation check passes) under
+    ``--report-dir`` when supplied — local / mock / synthetic audit
+    evidence only, never a real D-One artifact. The copy happens
+    AFTER ``run_explicit_pipeline`` succeeds AND BEFORE the staging
+    ``tempfile.TemporaryDirectory()`` is cleaned, so the bytes
+    reflect exactly the plan the chain consumed;
   * uses ``tempfile.TemporaryDirectory()`` for the staging workspace +
     staging assets directory — both are removed when the runner returns;
   * writes nothing under the repo, nothing under ``examples/`` /
@@ -192,6 +200,15 @@ VOCAB_GATED_FIELDS: tuple[str, ...] = (
 # run_explicit_pipeline is invoked, so a regression that downgrades
 # the plan shape is caught even if the plan validator itself drifts.
 LOCKED_PLAN_SCHEMA_VERSION = 4
+
+# Filename for the audit sidecar the runner writes under --report-dir
+# when the chain succeeds. Byte-identical copy of the staging
+# d_one_adapter_plan.json that done_image_adapter produced. The
+# `mock_` prefix disambiguates the audit copy from the canonical
+# workspace plan a future real-D-One generator might also call
+# `d_one_adapter_plan.json`, and signals the bytes are local / mock /
+# synthetic evidence — never a real D-One artifact.
+EVIDENCE_SIDECAR_FILENAME = "mock_d_one_adapter_plan.json"
 
 # Embed surface scripts/export_pptx.py supports today. The self-test
 # walks `ppt/media/` looking for any of these extensions; finding none
@@ -831,6 +848,7 @@ class MockImagePipelineResult:
     stages: list[StageOutcome] = field(default_factory=list)
     plan_check_ok: bool = False
     plan_check_msg: str = ""
+    sidecar_path: Path | None = None
     aborted_reason: str = ""
 
     @property
@@ -1084,6 +1102,88 @@ def run_mock_image_pipeline(
             rxp_cmd += ["--report-dir", str(report_dir)]
         outcome = _run_stage("run_explicit_pipeline", rxp_cmd)
         result.stages.append(outcome)
+
+        # Audit sidecar. After the chain succeeds (every prior stage
+        # exit-0 and the plan re-parse gate passed), copy the staging
+        # d_one_adapter_plan.json byte-identical to
+        # ``<report_dir>/mock_d_one_adapter_plan.json`` so a reviewer
+        # can audit the exact validated mock plan without rerunning
+        # the runner. The copy MUST happen inside the
+        # tempfile.TemporaryDirectory() block (staging bytes are still
+        # on disk) and AFTER run_explicit_pipeline succeeded (the
+        # report_dir is created by the downstream orchestrator). Skip
+        # silently when --report-dir was not supplied. On copy failure
+        # set aborted_reason so the runner exit code reflects the
+        # missing evidence — the sidecar is part of the success
+        # contract, not a best-effort extra.
+        if outcome.ok and report_dir is not None:
+            sidecar_path = report_dir / EVIDENCE_SIDECAR_FILENAME
+            # Defense-in-depth: refuse a pre-existing symlink at the
+            # sidecar destination so the byte-write cannot redirect
+            # local mock evidence off-disk through an attacker-planted
+            # link inside the report_dir. The runner already refuses a
+            # symlinked --report-dir at the boundary; this is the
+            # belt-and-braces gate for the case where the dir itself
+            # is a real directory but a symlink was planted at the
+            # sidecar filename between when run_explicit_pipeline
+            # created the dir and when we write the sidecar.
+            if sidecar_path.is_symlink():
+                try:
+                    target = str(sidecar_path.readlink())
+                except OSError:
+                    target = "<unreadable>"
+                result.aborted_reason = (
+                    f"FAIL: evidence sidecar destination "
+                    f"{sidecar_path} is a symlink (-> {target}); "
+                    f"refusing to write through it — the sidecar must "
+                    f"remain local / mock / synthetic evidence and "
+                    f"writing through a symlink could redirect bytes "
+                    f"off-disk."
+                )
+                return result
+            try:
+                plan_bytes = plan_path.read_bytes()
+            except OSError as exc:
+                result.aborted_reason = (
+                    f"FAIL: cannot read staging plan {plan_path} for "
+                    f"the evidence sidecar: {type(exc).__name__}: {exc}"
+                )
+                return result
+            try:
+                sidecar_path.write_bytes(plan_bytes)
+                # Round-trip verify: a partial write (disk full, short
+                # write, filesystem corruption) would leave a truncated
+                # file behind. Re-read and byte-compare to the validated
+                # staging plan; on any drift, delete the bad file so a
+                # later reader cannot mistake a partial sidecar for
+                # audit evidence. On success the bytes on disk are
+                # byte-identical to the staging plan that
+                # done_image_adapter wrote.
+                if sidecar_path.read_bytes() != plan_bytes:
+                    try:
+                        sidecar_path.unlink()
+                    except OSError:
+                        pass
+                    result.aborted_reason = (
+                        f"FAIL: evidence sidecar at {sidecar_path} did "
+                        f"not round-trip byte-identical to the "
+                        f"validated staging plan; the partial / drifted "
+                        f"file has been removed."
+                    )
+                    return result
+            except OSError as exc:
+                # Best-effort cleanup of any partial write the OSError
+                # may have left behind.
+                try:
+                    sidecar_path.unlink()
+                except OSError:
+                    pass
+                result.aborted_reason = (
+                    f"FAIL: cannot write evidence sidecar "
+                    f"{sidecar_path}: {type(exc).__name__}: {exc}"
+                )
+                return result
+            result.sidecar_path = sidecar_path
     return result
 
 
@@ -1107,6 +1207,12 @@ def _format_result(result: MockImagePipelineResult) -> str:
             "  [PASS] taxonomy preservation check "
             f"(plan.schema_version=={LOCKED_PLAN_SCHEMA_VERSION}; "
             "taxonomy + custom_descriptor fields byte-identical)"
+        )
+    if result.sidecar_path is not None:
+        lines.append(
+            f"  [PASS] evidence sidecar written to {result.sidecar_path} "
+            f"(byte-identical copy of the staging "
+            f"d_one_adapter_plan.json)"
         )
     if result.aborted_reason and result.stages:
         lines.append(f"  ABORT: {result.aborted_reason}")
@@ -1241,8 +1347,14 @@ def main(argv: list[str]) -> int:
         "--report-dir", type=Path, default=None,
         help="Optional directory under which run_explicit_pipeline "
              "(via run_pipeline) writes pipeline_report.{json,txt} + "
-             "inventory.json. Must live outside --workspace; symlinks "
-             "refused.",
+             "inventory.json. On a successful chain, "
+             "run_mock_image_pipeline ALSO writes "
+             "mock_d_one_adapter_plan.json (a byte-identical copy of "
+             "the staging d_one_adapter_plan.json after "
+             "done_image_adapter succeeds and the taxonomy "
+             "preservation check passes) into this directory as local "
+             "/ mock / synthetic audit evidence. Must live outside "
+             "--workspace; symlinks refused.",
     )
     parser.add_argument(
         "--bundle", type=Path, default=None,
@@ -1267,7 +1379,7 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--self-test", action="store_true",
-        help="Run 37 in-script tempfixture scenarios covering: the "
+        help="Run 42 in-script tempfixture scenarios covering: the "
              "happy-path mock chain (2-slide bundle with one "
              "d_one_local image carrying all 7 taxonomy dimensions; "
              "proves PPTX embeds an internal ppt/media PNG/JPG/JPEG "
@@ -1344,8 +1456,27 @@ def main(argv: list[str]) -> int:
              "mirroring the explicit-flag one; and "
              "a failure-cleanup probe asserting no .pptx lands at "
              "--output when the run aborts (the staging tempdir is "
-             "auto-cleaned by tempfile.TemporaryDirectory). Mutually "
-             "exclusive with the orchestration flags.",
+             "auto-cleaned by tempfile.TemporaryDirectory); and five "
+             "sidecar-contract probes asserting the audit sidecar "
+             "(<report_dir>/mock_d_one_adapter_plan.json) IS written "
+             "on a happy run + --report-dir (with the locked "
+             "schema_version on the bytes, the [PASS] evidence-"
+             "sidecar marker on stdout, and the round-trip verify "
+             "confirming the bytes on disk are byte-identical to the "
+             "validated staging plan), is NOT written when "
+             "--report-dir is omitted (and the marker does not fire), "
+             "is NOT written when the chain fails AFTER the runner "
+             "boundary (no stray sidecar anywhere in the per-scenario "
+             "tempdir tree), a pre-existing DIRECTORY at the sidecar "
+             "destination forces write_bytes to fail with "
+             "IsADirectoryError and the runner surfaces the failure "
+             "cleanly (the cleanup unlink() is silently no-op'd "
+             "against a directory, preserving any pre-existing "
+             "sentinel inside it), AND a pre-existing symlink at "
+             "<report_dir>/mock_d_one_adapter_plan.json is refused "
+             "before any byte-write, leaving the planted target "
+             "byte-unchanged. Mutually exclusive with the "
+             "orchestration flags.",
     )
 
     args = parser.parse_args(argv)
@@ -1517,10 +1648,18 @@ def main(argv: list[str]) -> int:
     )
     print(_format_result(result))
     if result.ok:
-        print(
+        msg = (
             f"OK: mock D-One image-to-editable-PPT run succeeded; PPTX "
             f"written to {args.output}."
         )
+        if result.sidecar_path is not None:
+            msg += (
+                f" Evidence sidecar written to {result.sidecar_path} "
+                f"(byte-identical copy of the staging "
+                f"d_one_adapter_plan.json; local / mock / synthetic "
+                f"audit evidence only)."
+            )
+        print(msg)
         return 0
     if result.aborted_reason and not result.stages:
         print(f"FAIL: aborted before any subprocess fired.", file=sys.stderr)
@@ -3522,6 +3661,280 @@ def _scenario_failure_no_residue(td: Path) -> _Scenario:
     )
 
 
+def _scenario_sidecar_written_on_happy_path(td: Path) -> _Scenario:
+    """A successful run with --report-dir MUST write
+    ``mock_d_one_adapter_plan.json`` into --report-dir as a regular
+    non-symlink file whose JSON body carries the locked
+    schema_version. Also asserts the `[PASS] evidence sidecar
+    written to ...` marker fires on stdout so the formatted output
+    contract stays visible."""
+    bundle = _materialize_bundle(
+        td / "sidecar_happy",
+        d_one_spec_body=_d_one_spec_body_with_taxonomy(),
+    )
+    ws = td / "sidecar_happy_ws"
+    out = td / "sidecar_happy.pptx"
+    report = td / "sidecar_happy_report"
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out, report_dir=report,
+    ))
+    sidecar_path = report / EVIDENCE_SIDECAR_FILENAME
+    if outcome.exit_code != 0:
+        return _Scenario(
+            "sidecar happy path: --report-dir + successful run writes "
+            "mock_d_one_adapter_plan.json with locked schema_version",
+            False,
+            f"rc={outcome.exit_code}; "
+            f"stderr tail: {outcome.stderr.splitlines()[-10:]!r}",
+        )
+    if not sidecar_path.is_file() or sidecar_path.is_symlink():
+        return _Scenario(
+            "sidecar happy path: mock_d_one_adapter_plan.json exists "
+            "as a regular non-symlink file under --report-dir",
+            False,
+            (f"path={sidecar_path}, is_file={sidecar_path.is_file()}, "
+             f"is_symlink={sidecar_path.is_symlink()}"),
+        )
+    try:
+        body = json.loads(sidecar_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return _Scenario(
+            "sidecar happy path: sidecar parses as JSON",
+            False, f"{type(exc).__name__}: {exc}",
+        )
+    if body.get("schema_version") != LOCKED_PLAN_SCHEMA_VERSION:
+        return _Scenario(
+            "sidecar happy path: sidecar.schema_version == "
+            f"{LOCKED_PLAN_SCHEMA_VERSION}",
+            False, f"got: {body.get('schema_version')!r}",
+        )
+    marker = "[PASS] evidence sidecar written to"
+    if marker not in outcome.stdout:
+        return _Scenario(
+            "sidecar happy path: stdout carries the "
+            f"{marker!r} marker",
+            False,
+            f"stdout tail: {outcome.stdout.splitlines()[-10:]!r}",
+        )
+    return _Scenario(
+        "sidecar happy path: --report-dir + successful run writes "
+        "mock_d_one_adapter_plan.json with schema_version="
+        f"{LOCKED_PLAN_SCHEMA_VERSION} and stdout fires the "
+        "evidence-sidecar marker",
+        True,
+    )
+
+
+def _scenario_no_sidecar_when_report_dir_omitted(td: Path) -> _Scenario:
+    """A successful run WITHOUT --report-dir succeeds AND no sidecar
+    is written anywhere. The runner has no place to put the sidecar
+    if --report-dir is omitted, so the feature must silently no-op
+    rather than fail or write the sidecar to an arbitrary path. Each
+    scenario gets its own scope subdirectory so the stray-sidecar
+    rglob does not collide with sidecars legitimately written by
+    other happy-path scenarios in the same self-test run."""
+    scope = td / "sidecar_no_report_scope"
+    scope.mkdir()
+    bundle = _materialize_bundle(
+        scope / "bundle",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+    )
+    ws = scope / "ws"
+    out = scope / "out.pptx"
+    # Build args WITHOUT --report-dir.
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out, with_vocab=False,
+    ))
+    # The chain must succeed AND no sidecar file must materialize
+    # anywhere under the per-scenario scope subtree (catches a
+    # regression where the runner wrote the sidecar to a fallback
+    # path like cwd or workspace).
+    stray_sidecars = sorted(
+        p for p in scope.rglob(EVIDENCE_SIDECAR_FILENAME)
+        if p.is_file() and not p.is_symlink()
+    )
+    marker = "[PASS] evidence sidecar written to"
+    ok = (
+        outcome.exit_code == 0
+        and out.is_file()
+        and not stray_sidecars
+        and marker not in outcome.stdout
+    )
+    return _Scenario(
+        "sidecar gated on --report-dir: omitting --report-dir on a "
+        "successful run does NOT write the sidecar anywhere under "
+        "the per-scenario scope AND does NOT fire the sidecar marker "
+        "on stdout",
+        ok,
+        (f"rc={outcome.exit_code}, "
+         f"stray_sidecars={[str(p) for p in stray_sidecars]!r}, "
+         f"marker_on_stdout={marker in outcome.stdout}, "
+         f"stderr_tail={outcome.stderr.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_no_sidecar_on_failure(td: Path) -> _Scenario:
+    """A failure DURING the chain (e.g. unsafe local_path in the
+    image manifest spec) with --report-dir passed MUST NOT leave a
+    sidecar file behind. The sidecar is only written after every
+    stage succeeded; a partial chain that aborted before the copy
+    must leave the report_dir without the sidecar. Scoped to its
+    own subdirectory so the stray-sidecar rglob does not pick up
+    sidecars from other happy-path scenarios in the same self-test
+    run."""
+    scope = td / "sidecar_fail_scope"
+    scope.mkdir()
+    bundle = _materialize_bundle(
+        scope / "bundle",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+    )
+    # Tamper the image manifest to force a downstream refusal
+    # AFTER the runner boundary gates but BEFORE the sidecar write
+    # would otherwise fire. The unsafe local_path is the simplest
+    # such trigger.
+    bad_manifest = bundle["image_manifest_spec"]
+    body = json.loads(bad_manifest.read_text())
+    body["images"][0]["local_path"] = "http://attacker/x.png"
+    _write_json(bad_manifest, body)
+
+    ws = scope / "ws"
+    out = scope / "out.pptx"
+    report = scope / "report"
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+        report_dir=report, with_vocab=False,
+    ))
+    sidecar_path = report / EVIDENCE_SIDECAR_FILENAME
+    # No sidecar must exist; no stray copy anywhere under the
+    # per-scenario scope either.
+    stray_sidecars = sorted(
+        p for p in scope.rglob(EVIDENCE_SIDECAR_FILENAME)
+        if p.is_file() and not p.is_symlink()
+    )
+    ok = (
+        outcome.exit_code != 0
+        and not out.exists()
+        and not sidecar_path.exists()
+        and not stray_sidecars
+    )
+    return _Scenario(
+        "sidecar failure-isolation: a downstream rejection with "
+        "--report-dir passed leaves NO mock_d_one_adapter_plan.json "
+        "under report_dir AND no stray sidecar anywhere in the "
+        "per-scenario scope",
+        ok,
+        (f"rc={outcome.exit_code}, "
+         f"sidecar_exists={sidecar_path.exists()}, "
+         f"stray_sidecars={[str(p) for p in stray_sidecars]!r}, "
+         f"out_exists={out.exists()}, "
+         f"stderr_tail={outcome.stderr.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_sidecar_write_failure_cleans_up(td: Path) -> _Scenario:
+    """A pre-existing DIRECTORY at the sidecar destination forces the
+    runner's ``write_bytes`` call to raise ``IsADirectoryError`` (a
+    subclass of ``OSError``). The runner must surface the failure
+    cleanly, exit non-zero, AND the cleanup ``unlink()`` attempt
+    must NOT remove the pre-existing directory or its contents
+    (``unlink()`` on a directory is silently no-op'd by the except-
+    OSError fallback). Exercises the failure path the round-trip
+    write contract is designed to handle so a partial-write
+    regression cannot silently green."""
+    bundle = _materialize_bundle(
+        td / "sidecar_write_fail",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+    )
+    ws = td / "sidecar_write_fail_ws"
+    out = td / "sidecar_write_fail.pptx"
+    report = td / "sidecar_write_fail_report"
+    report.mkdir()
+    sidecar_as_dir = report / EVIDENCE_SIDECAR_FILENAME
+    sidecar_as_dir.mkdir()
+    sentinel = sidecar_as_dir / "sentinel.txt"
+    sentinel.write_text("preserved-pre-run")
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+        report_dir=report, with_vocab=False,
+    ))
+    combined = outcome.combined
+    sentinel_intact = (
+        sidecar_as_dir.is_dir()
+        and sentinel.is_file()
+        and sentinel.read_text() == "preserved-pre-run"
+    )
+    ok = (
+        outcome.exit_code != 0
+        and "cannot write evidence sidecar" in combined
+        and sentinel_intact
+    )
+    return _Scenario(
+        "sidecar write-failure cleanup: a pre-existing DIRECTORY at "
+        "<report_dir>/mock_d_one_adapter_plan.json forces write_bytes "
+        "to fail; the runner reports the failure cleanly, and the "
+        "pre-existing directory + sentinel are preserved (the "
+        "cleanup unlink() is silently no-op'd against a directory)",
+        ok,
+        (f"rc={outcome.exit_code}, "
+         f"sentinel_intact={sentinel_intact}, "
+         f"tail={combined.splitlines()[-10:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_symlinked_sidecar_destination(td: Path) -> _Scenario:
+    """A pre-existing symlink AT the sidecar destination
+    ``<report_dir>/mock_d_one_adapter_plan.json`` is refused even on
+    a chain that would otherwise succeed; the planted target must be
+    byte-unchanged and the runner must report failure before writing
+    the sidecar. Defense-in-depth gate for the case where report_dir
+    is a real directory but an attacker planted a link at the
+    sidecar filename between when run_explicit_pipeline created the
+    dir and when the runner writes the sidecar."""
+    bundle = _materialize_bundle(
+        td / "sidecar_symlink",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+    )
+    ws = td / "sidecar_symlink_ws"
+    out = td / "sidecar_symlink.pptx"
+    report = td / "sidecar_symlink_report"
+    report.mkdir()
+    real_target = td / "sidecar_symlink_evil_target.json"
+    real_target.write_text("evil-baseline-bytes\n")
+    sidecar_path = report / EVIDENCE_SIDECAR_FILENAME
+    sidecar_path.symlink_to(real_target)
+
+    outcome = _invoke_runner(_baseline_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+        report_dir=report, with_vocab=False,
+    ))
+    combined = outcome.combined
+    # The sidecar destination must still BE a symlink (unchanged) and
+    # the planted target's bytes must be unchanged. The runner must
+    # exit non-zero.
+    target_unchanged = real_target.read_text() == "evil-baseline-bytes\n"
+    ok = (
+        outcome.exit_code != 0
+        and "evidence sidecar destination" in combined
+        and "symlink" in combined
+        and sidecar_path.is_symlink()
+        and target_unchanged
+    )
+    return _Scenario(
+        "sidecar destination symlink refusal: a pre-existing symlink "
+        "at <report_dir>/mock_d_one_adapter_plan.json is refused; the "
+        "planted target's bytes are unchanged",
+        ok,
+        (f"rc={outcome.exit_code}, "
+         f"sidecar_still_symlink={sidecar_path.is_symlink()}, "
+         f"target_unchanged={target_unchanged}, "
+         f"tail={combined.splitlines()[-10:]!r}")
+        if not ok else "",
+    )
+
+
 def _run_self_test() -> int:
     print("=== run_mock_image_pipeline self-test ===")
     if not TEMPLATE_ROOT.is_dir():
@@ -3572,6 +3985,11 @@ def _run_self_test() -> int:
             _scenario_bundle_id_mismatch(td),
             _scenario_bundle_no_repo_writes(td),
             _scenario_failure_no_residue(td),
+            _scenario_sidecar_written_on_happy_path(td),
+            _scenario_no_sidecar_when_report_dir_omitted(td),
+            _scenario_no_sidecar_on_failure(td),
+            _scenario_sidecar_write_failure_cleans_up(td),
+            _scenario_symlinked_sidecar_destination(td),
         ]
         fails = 0
         for r in results:
