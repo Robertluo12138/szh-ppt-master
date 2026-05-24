@@ -2,19 +2,19 @@
   "template": "business_review",
   "planning": {
     "planned_slide_count": 2,
-    "rationale": "Two-slide synthetic trial: a cover that carries a taxonomy-tagged d_one_local accent image with a placement_role and a closing conclusion."
+    "rationale": "Two-slide synthetic trial: a cover that carries a taxonomy-tagged d_one_local hero_page accent image, then a second cover-layout slide that carries a taxonomy-tagged d_one_local local_region schematic accent image."
   },
   "sections": [
     {
       "id": "open",
       "title": "Open",
-      "summary": "Cover with the synthetic accent image.",
+      "summary": "Cover with the synthetic hero_page accent image.",
       "slide_indices": [1]
     },
     {
-      "id": "close",
-      "title": "Close",
-      "summary": "Synthetic conclusion.",
+      "id": "regional",
+      "title": "Regional",
+      "summary": "Cover-layout slide with the synthetic local_region schematic accent image.",
       "slide_indices": [2]
     }
   ],
@@ -24,16 +24,16 @@
       "layout": "cover",
       "title": "Synthetic Mock Image Trial",
       "section_id": "open",
-      "summary": "Cover with a taxonomy-tagged d_one_local accent image.",
+      "summary": "Cover with a taxonomy-tagged d_one_local hero_page accent image.",
       "density": "low",
       "source_refs": ["synthetic_mock_image_trial_source"]
     },
     {
       "index": 2,
-      "layout": "conclusion",
-      "title": "Trial Outcome",
-      "section_id": "close",
-      "summary": "Synthetic outcome of the mock image-to-editable-PPT trial.",
+      "layout": "cover",
+      "title": "Regional Process Schematic",
+      "section_id": "regional",
+      "summary": "Cover-layout slide carrying a taxonomy-tagged d_one_local local_region schematic accent image.",
       "density": "low",
       "source_refs": ["synthetic_mock_image_trial_source"]
     }

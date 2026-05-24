@@ -3,7 +3,7 @@
     {
       "id": "cover_accent",
       "prompt": "abstract geometric pattern in a calm neutral gradient, soft edges, leaves calm space on the right for the title overlay, no text, no logo",
-      "intended_use": "spot illustration",
+      "intended_use": "hero-page accent",
       "width_px": 320,
       "height_px": 320,
       "rendering_style": "flat_vector",
@@ -14,6 +14,21 @@
       "text_policy": "no_text",
       "subject_domain": "abstract_geometry",
       "placement_role": "hero_page"
+    },
+    {
+      "id": "system_schematic",
+      "prompt": "schematic line diagram of a regional process flow with simple round nodes and arrows, grid-aligned, no logo",
+      "intended_use": "local-region schematic",
+      "width_px": 320,
+      "height_px": 320,
+      "rendering_style": "line_diagram",
+      "palette_family": "dual_tone",
+      "image_role": "metaphor_icon",
+      "layout_pattern": "single_center",
+      "modifier": "grid_aligned",
+      "text_policy": "no_text",
+      "subject_domain": "process_motif",
+      "placement_role": "local_region"
     }
   ]
 }

@@ -4,8 +4,15 @@
       "id": "cover_accent",
       "local_path": "media/cover_accent.png",
       "source": "d_one_local",
-      "alt_text": "Synthetic abstract pattern (mock D-One output).",
-      "intended_use": "spot illustration"
+      "alt_text": "Synthetic abstract pattern (mock D-One output) reserving overlay space for the slide title.",
+      "intended_use": "hero-page accent"
+    },
+    {
+      "id": "system_schematic",
+      "local_path": "media/system_schematic.png",
+      "source": "d_one_local",
+      "alt_text": "Synthetic regional schematic line diagram (mock D-One output).",
+      "intended_use": "local-region schematic"
     }
   ]
 }

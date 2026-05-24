@@ -1,0 +1,15 @@
+{
+  "index": 2,
+  "layout": "cover",
+  "title": "Regional Process Schematic",
+  "subtitle": "Synthetic local_region schematic accent",
+  "blocks": [
+    { "id": "title",     "kind": "text",      "content": "Regional Process Schematic" },
+    { "id": "subtitle",  "kind": "text",      "content": "Synthetic local_region schematic accent" },
+    { "id": "presenter", "kind": "text",      "content": "Synthetic Pipeline Reviewer" },
+    { "id": "date",      "kind": "text",      "content": "Synthetic review window" },
+    { "id": "accent",    "kind": "image_ref", "content": "system_schematic" }
+  ],
+  "image_refs": ["system_schematic"],
+  "notes": "All values are synthetic placeholders."
+}

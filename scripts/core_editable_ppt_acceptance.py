@@ -67,17 +67,28 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     non-symlink non-empty file; ``validate_pptx_contract.py
     --expected-slide-count 2`` passes; ``<report-dir>/inventory.json``
     reports ``ok=true`` / ``findings=[]`` / ``slide_count=2`` / no
-    external relationships / at least one ppt/media PNG/JPG/JPEG part;
-    ``[PASS] taxonomy preservation check`` stdout marker fires;
-    ``scripts/__pycache__/`` byte-identical before/after even with
-    ``PYTHONDONTWRITEBYTECODE`` stripped from the subprocess env;
-    no committed repo path mutated) plus four tempfixture fail-closed
-    probes (missing bundle, symlinked bundle parent, parent-traversal
-    ``..`` bundle path, bad ``image_manifest_spec.local_path``).
-    Complements the in-script tempfixture coverage of
-    ``run_mock_image_pipeline --self-test`` by exercising the
-    committed bundle path directly. MOCK / STUB ONLY — no real
-    D-One.
+    external relationships / AT LEAST TWO ``ppt/media`` PNG/JPG/JPEG
+    parts (one per ``placement_role`` declared on the committed
+    ``d_one_spec.json``) referencing at least two distinct slide
+    indices; the committed bundle's ``d_one_spec.json`` declares BOTH
+    ``placement_role`` values (``hero_page`` AND ``local_region``);
+    ``[PASS] taxonomy preservation check`` stdout marker fires
+    (proves both placement_role values landed on the produced plan
+    byte-identical to the spec); ``scripts/__pycache__/`` byte-
+    identical before/after even with ``PYTHONDONTWRITEBYTECODE``
+    stripped from the subprocess env; no committed repo path
+    mutated) plus seven tempfixture fail-closed probes (missing
+    bundle, symlinked bundle parent, parent-traversal ``..`` bundle
+    path, URI-shaped ``image_manifest_spec.local_path``, traversal
+    ``../`` ``image_manifest_spec.local_path``, wrong
+    ``placement_role`` flipping the hero_page request to
+    ``local_region`` while the prompt still carries overlay-
+    reservation cues, and a direct probe on the smoke's static
+    ``_bundle_placement_roles`` helper against a bundle copy missing
+    the ``local_region`` request). Complements the in-script
+    tempfixture coverage of ``run_mock_image_pipeline --self-test``
+    by exercising the committed bundle path directly. MOCK / STUB
+    ONLY — no real D-One.
   - ``scripts/render_model_roundtrip_smoke.py`` — synthetic
     render_model -> editable .pptx round-trip exercising every
     primitive kind the exporter supports today (text, line, shape,
