@@ -19,6 +19,19 @@ Sibling to ``scripts/image_asset_trial_evidence.py`` but scoped to
 the BUNDLE path (not the synthetic-fixture path). Both ship under the
 core editable-PPT acceptance aggregate as separate evidence emitters.
 
+After the evidence JSON is written, the emitter shells out to
+``scripts/validate_mock_image_bundle_trial_evidence.py --evidence
+<happy>/evidence.json --require-files`` from a clean process boundary
+to re-check the just-written bytes against the committed schema
+``schemas/mock_image_bundle_trial_evidence.schema.json`` plus the
+documented semantic + string-safety + real-D-One claim-refusal gates
+(and the in-tempdir filesystem contract). The standalone validator
+never imports this emitter, so a bug where the in-script summary gate
+is green but the emitted JSON carries an internally-inconsistent or
+forbidden shape is caught from a clean process boundary. No circular
+fields are added to the evidence (the validator outcome is recorded
+in the emitter's stdout, not in the evidence JSON itself).
+
 What the JSON evidence records (every value observed under
 ``tempfile.TemporaryDirectory()`` — never read from or written to the
 committed repo tree):
@@ -1708,6 +1721,39 @@ def _run_self_test() -> int:
                 "JSON dump above for the failing fields.",
                 file=sys.stderr,
             )
+            total_fails += 1
+
+        # 1b. Re-validate the just-written evidence file from a clean
+        # process boundary using the standalone schema + semantic +
+        # string-safety + real-D-One claim-refusal validator. The
+        # validator does NOT import this emitter (no circular fields
+        # added to the evidence JSON) so this catches a bug where the
+        # in-script summary gate is green but the emitted bytes are
+        # internally inconsistent or carry a forbidden shape. The
+        # --require-files flag additionally re-checks that the
+        # evidence / PPTX / inventory / sidecar paths are regular
+        # non-symlink files sharing a common ancestor strictly under
+        # the system tempdir (so a future emitter regression that
+        # leaks an artifact out of the per-run tempdir is also caught
+        # here). The validator runs entirely under the per-run
+        # tempdir; the tempdir cleanup at the end of this `with` block
+        # removes both the evidence file and the validator's
+        # subprocess working state.
+        validator_outcome = _run_tool(
+            "validate_mock_image_bundle_trial_evidence "
+            "(--evidence <happy>/evidence.json --require-files)",
+            [
+                sys.executable,
+                str(
+                    SCRIPTS_DIR
+                    / "validate_mock_image_bundle_trial_evidence.py"
+                ),
+                "--evidence", str(evidence_path),
+                "--require-files",
+            ],
+        )
+        _print_outcome(validator_outcome)
+        if not validator_outcome.ok:
             total_fails += 1
 
         # 2. Negative probes (subprocess-based).

@@ -1,0 +1,79 @@
+{
+  "bundle_path": "synthetic-tempdir/committed_bundle_copy",
+  "evidence_id": "mock_image_bundle_trial_evidence",
+  "inventory": {
+    "evidence_basis": "OOXML structure only; not proof of full PowerPoint editability",
+    "evidence_basis_matches": true,
+    "exists": true,
+    "findings": [],
+    "findings_empty": true,
+    "media_parts_count": 2,
+    "media_parts_count_min_met": true,
+    "no_external_relationships": true,
+    "ok": true,
+    "parses_as_json": true,
+    "path": "synthetic-tempdir/trial_report/inventory.json",
+    "slide_count": 2,
+    "slide_count_matches_plan": true
+  },
+  "notes": {
+    "embed_surface": "PNG, JPG, and JPEG inside ppt media slot, the subset scripts export_pptx supports today. Anything outside that subset is fail-closed by the exporter.",
+    "scope": "Synthetic placeholder mock-image bundle trial evidence template. Mock chain only. NOT real D-One, NOT MCP, NOT Qoder, NOT a public-network run, NOT telemetry, NOT a prompt or report to PPTX automation. Replace every placeholder value with what an actual run produced."
+  },
+  "pptx": {
+    "exists": true,
+    "path": "synthetic-tempdir/trial.pptx",
+    "size_bytes": 1
+  },
+  "real_d_one_status": "UNVERIFIED. Real D-One is NOT called by this evidence emitter. The PNG bytes embedded in the produced PPTX come from the in-script mock provider, not from any external service. No MCP, no public network, no model API, no image search, no Qoder, no telemetry.",
+  "report_dir": "synthetic-tempdir/trial_report",
+  "schema_version": "1",
+  "sidecar": {
+    "all_requests_well_formed": true,
+    "covers_both_placement_roles": true,
+    "exists": true,
+    "malformed_request_indices": [],
+    "parses_as_json": true,
+    "path": "synthetic-tempdir/trial_report/mock_d_one_adapter_plan.json",
+    "placement_role_coverage": ["hero_page", "local_region"],
+    "request_count": 2,
+    "request_count_matches_requests": true,
+    "requests": [
+      {
+        "id": "template_hero_request",
+        "manifest_local_path": "media/template_hero.png",
+        "placement_role": "hero_page",
+        "subject_domain": "abstract_geometry",
+        "text_policy": "no_text"
+      },
+      {
+        "id": "template_local_request",
+        "manifest_local_path": "media/template_local.png",
+        "placement_role": "local_region",
+        "subject_domain": "process_motif",
+        "text_policy": "no_text"
+      }
+    ],
+    "schema_version": 4,
+    "schema_version_locked": true
+  },
+  "summary": {
+    "ok": true
+  },
+  "validators": {
+    "inspect_pptx_inventory": {
+      "ok": true,
+      "rc": 0
+    },
+    "validate_mock_d_one_adapter_plan": {
+      "ok": true,
+      "rc": 0,
+      "require_both_placement_roles_used": true,
+      "vocabulary_gate_used": true
+    },
+    "validate_pptx_contract": {
+      "ok": true,
+      "rc": 0
+    }
+  }
+}

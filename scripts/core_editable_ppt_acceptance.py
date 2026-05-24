@@ -122,6 +122,37 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     passes — and a static helper refusing any evidence JSON that
     claims real D-One / MCP / public network / model API / image
     search / Qoder success). MOCK / STUB ONLY — no real D-One.
+  - ``scripts/validate_mock_image_bundle_trial_evidence.py`` —
+    stdlib-only, read-only, tempdir-only validator for the JSON
+    evidence record emitted by
+    ``mock_image_bundle_trial_evidence``. Schema-validates against
+    ``schemas/mock_image_bundle_trial_evidence.schema.json``,
+    enforces the documented semantic gates (schema_version "1"
+    locked, evidence_id locked, real_d_one_status carries
+    UNVERIFIED + negated forbidden-service wording, summary.ok
+    consistency with every sub-condition the goal pins, per-request
+    well-formedness, placement_role coverage = {hero_page,
+    local_region}), runs a string-safety scan (URL/URI, traversal,
+    credential / token / API-key / sk- shapes, public-upload /
+    public-sharing / public-hosting wording, confidential / customer
+    / raw-source markers), refuses any positive real-D-One / MCP /
+    public-network / model-API / image-search / Qoder success claim
+    via the same word-boundary + 15-char-negation-window walker the
+    emitter uses, and (when ``--require-files`` is requested)
+    re-checks that evidence / PPTX / inventory / sidecar paths are
+    regular non-symlink files sharing a common ancestor strictly
+    under the system tempdir. The aggregator invokes
+    ``--self-test`` only; the matrix covers the committed template
+    PASS plus 47+ negative probes (missing required field, wrong
+    schema_version / evidence_id, count mismatch, missing
+    local_region, vocab flag false, role flag false, failed
+    validator with summary.ok=True, real-D-One verified claim,
+    sk-/api_key:/token: tokens, external URL, public hosting /
+    upload / share, confidential / customer_id / raw-source
+    markers, --require-files repo path / URI / traversal /
+    missing / directory / symlinked evidence-PPTX-inventory-
+    sidecar). Read-only / stdlib-only / tempdir-only — qualifies
+    for inclusion in the aggregate.
   - ``scripts/render_model_roundtrip_smoke.py`` — synthetic
     render_model -> editable .pptx round-trip exercising every
     primitive kind the exporter supports today (text, line, shape,
@@ -189,6 +220,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "run_mock_image_pipeline.py",
     SCRIPTS_DIR / "mock_image_bundle_acceptance_smoke.py",
     SCRIPTS_DIR / "mock_image_bundle_trial_evidence.py",
+    SCRIPTS_DIR / "validate_mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
     SCRIPTS_DIR / "trace_acceptance_smoke.py",
 )
@@ -419,6 +451,7 @@ def main(argv: list[str]) -> int:
             "image_taxonomy_acceptance_smoke + run_mock_image_pipeline "
             "+ mock_image_bundle_acceptance_smoke + "
             "mock_image_bundle_trial_evidence + "
+            "validate_mock_image_bundle_trial_evidence + "
             "render_model_roundtrip_smoke + trace_acceptance_smoke). "
             "Runs each delegated smoke as a subprocess from REPO_ROOT; "
             "writes no .pptx / render_model / report / SVG / JSON "
