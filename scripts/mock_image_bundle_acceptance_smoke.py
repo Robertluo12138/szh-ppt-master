@@ -50,18 +50,22 @@ audit-evidence copy of the staging ``d_one_adapter_plan.json`` after
 passes. The sidecar is then re-validated via the standalone
 ``scripts/validate_mock_d_one_adapter_plan.py --plan <sidecar>
 --d-one-spec <bundle/d_one_spec.json> --image-manifest-spec
-<bundle/image_manifest_spec.json> --require-both-placement-roles``
+<bundle/image_manifest_spec.json> --require-both-placement-roles
+--descriptor-vocabulary <bundle/descriptor_vocabulary.json>``
 subprocess; the validator's gates assert the bytes carry
 ``schema_version == 4``, ``request_count`` consistency, per-id
 ``placement_role`` parity, both committed request ids byte-identical
 to ``d_one_spec.json``, both ``hero_page`` AND ``local_region``
 coverage, manifest_local_path byte-identity with
-``image_manifest_spec.json``, and no URI / path-traversal /
-credential / public-upload / public-hosting / confidential /
-raw-source substring anywhere in the file — so the two generated-
-image roles are auditable from the sidecar bytes ALONE, no
-dependency on the runner's stdout marker. Per-gate refusal coverage
-lives in ``validate_mock_d_one_adapter_plan.py --self-test``.
+``image_manifest_spec.json``, no URI / path-traversal / credential /
+public-upload / public-hosting / confidential / raw-source substring
+anywhere in the file, AND every per-request taxonomy /
+``custom_descriptor`` / ``placement_role`` value lands in the
+matching allow-list projected from the committed
+``descriptor_vocabulary.json`` — so the two generated-image roles
+are auditable from the sidecar bytes ALONE, no dependency on the
+runner's stdout marker. Per-gate refusal coverage lives in
+``validate_mock_d_one_adapter_plan.py --self-test``.
 
 ``--self-test`` also runs tempfixture fail-closed probes; each
 asserts the runner exits non-zero (or the static evidence helper
@@ -531,16 +535,20 @@ def _run_sidecar_validator(
 ) -> StageOutcome:
     """Re-run scripts/validate_mock_d_one_adapter_plan.py against the
     runner-written sidecar with --require-both-placement-roles active
-    (the committed examples/synthetic_mock_image_trial invariant).
-    The validator schema-validates the sidecar and asserts parity with
-    the committed d_one_spec.json + image_manifest_spec.json plus the
-    forbidden-substring scan; per-gate refusal coverage lives in the
-    validator's own --self-test so the smoke only owns the integration
-    PostCondition (rc == 0 for the runner-written sidecar against the
-    committed bundle)."""
+    (the committed examples/synthetic_mock_image_trial invariant) AND
+    --descriptor-vocabulary pointed at the committed bundle's
+    descriptor_vocabulary.json (so the validator's G13 vocabulary gate
+    fires against every per-request taxonomy / custom_descriptor /
+    placement_role value the runner-written sidecar carries). The
+    validator schema-validates the sidecar and asserts parity with the
+    committed d_one_spec.json + image_manifest_spec.json plus the
+    forbidden-substring scan plus the vocabulary-membership scan;
+    per-gate refusal coverage lives in the validator's own --self-test
+    so the smoke only owns the integration PostCondition (rc == 0 for
+    the runner-written sidecar against the committed bundle)."""
     return _run_stage(
-        "validate_mock_d_one_adapter_plan "
-        "(belt-and-braces, --require-both-placement-roles)",
+        "validate_mock_d_one_adapter_plan (belt-and-braces, "
+        "--require-both-placement-roles, --descriptor-vocabulary)",
         [
             sys.executable,
             str(SCRIPTS_DIR / "validate_mock_d_one_adapter_plan.py"),
@@ -549,6 +557,8 @@ def _run_sidecar_validator(
             "--image-manifest-spec",
             str(bundle / "image_manifest_spec.json"),
             "--require-both-placement-roles",
+            "--descriptor-vocabulary",
+            str(bundle / "descriptor_vocabulary.json"),
         ],
     )
 
@@ -680,7 +690,8 @@ def _run_happy_path(td: Path) -> tuple[int, list[PostCondition]]:
         f"validate_mock_d_one_adapter_plan --plan <{EVIDENCE_SIDECAR_FILENAME}> "
         "--d-one-spec <bundle/d_one_spec.json> --image-manifest-spec "
         "<bundle/image_manifest_spec.json> --require-both-placement-roles "
-        "exits 0 against the runner-written sidecar",
+        "--descriptor-vocabulary <bundle/descriptor_vocabulary.json> exits "
+        "0 against the runner-written sidecar",
         sidecar_validator.ok,
         (f"rc={sidecar_validator.exit_code}; tail: "
          f"{(sidecar_validator.stdout + sidecar_validator.stderr).splitlines()[-10:]!r}")
@@ -1280,14 +1291,18 @@ def _run_self_test() -> int:
         "byte-identical on the produced plan); the runner writes "
         "<report-dir>/mock_d_one_adapter_plan.json and the standalone "
         "validate_mock_d_one_adapter_plan.py subprocess "
-        "(--require-both-placement-roles) exits 0 against it, "
-        "asserting schema_version=4, request_count consistency, both "
-        "committed request ids byte-identical to d_one_spec.json, "
-        "both hero_page AND local_region placement_role coverage, "
-        "manifest_local_path byte-identity with image_manifest_spec"
-        ".json, and no URI/path-traversal/credential/public-upload/"
-        "confidential/raw-source substring (so both generated-image "
-        "roles are auditable from the sidecar bytes alone); and "
+        "(--require-both-placement-roles --descriptor-vocabulary <bundle/"
+        "descriptor_vocabulary.json>) exits 0 against it, asserting "
+        "schema_version=4, request_count consistency, both committed "
+        "request ids byte-identical to d_one_spec.json, both hero_page "
+        "AND local_region placement_role coverage, manifest_local_path "
+        "byte-identity with image_manifest_spec.json, no URI/path-"
+        "traversal/credential/public-upload/confidential/raw-source "
+        "substring, AND every per-request taxonomy / custom_descriptor "
+        "/ placement_role value present on the sidecar lands in the "
+        "matching allow-list from the committed descriptor_vocabulary"
+        ".json (so both generated-image roles are auditable from the "
+        "sidecar bytes alone); and "
         "scripts/__pycache__/ is byte-identical even without "
         "PYTHONDONTWRITEBYTECODE in the subprocess env. All "
         "negative probes (missing bundle, symlinked bundle parent, "
@@ -1324,16 +1339,21 @@ def main(argv: list[str]) -> int:
             "marker; the runner writes <report-dir>/"
             "mock_d_one_adapter_plan.json AND the standalone "
             "validate_mock_d_one_adapter_plan.py subprocess "
-            "(--require-both-placement-roles) exits 0 against it, "
+            "(--require-both-placement-roles --descriptor-vocabulary "
+            "<bundle/descriptor_vocabulary.json>) exits 0 against it, "
             "asserting schema_version=4, request_count consistency, "
             "both committed request ids byte-identical to "
             "d_one_spec.json, both hero_page AND local_region "
             "placement_role coverage, manifest_local_path byte-"
-            "identity with image_manifest_spec.json, and no URI/path-"
+            "identity with image_manifest_spec.json, no URI/path-"
             "traversal/credential/public-upload/confidential/raw-"
-            "source substring (so both generated-image roles are "
-            "auditable from the sidecar bytes ALONE — no stdout "
-            "dependency); scripts/__pycache__/ is byte-identical "
+            "source substring, AND every per-request taxonomy / "
+            "custom_descriptor / placement_role value present on the "
+            "sidecar lands in the matching allow-list from the "
+            "committed descriptor_vocabulary.json (so both generated-"
+            "image roles are auditable from the sidecar bytes ALONE "
+            "— no stdout dependency); scripts/__pycache__/ is byte-"
+            "identical "
             "before and after the runner subprocess EVEN when "
             "PYTHONDONTWRITEBYTECODE is stripped from the subprocess "
             "env; and no committed repo path (examples/ or scripts/) "
