@@ -46,6 +46,21 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     out-of-vocabulary values, stale plan drift, schema_version lock,
     and the descriptor-vocabulary forbidden-token / forbidden-phrase
     schema patterns. MOCK / STUB ONLY — no real D-One.
+  - ``scripts/text_policy_decision_smoke.py`` — proves the
+    per-request ``text_policy`` decision invariant for the mockable
+    D-One stub chain: a spec with three ``d_one_local`` requests
+    carrying distinct ``text_policy`` values (``no_text`` /
+    ``decorative_glyphs`` / ``caption_safe``) produces a
+    ``d_one_adapter_plan.json`` whose per-request policy values
+    survive byte-identical (round-tripped via
+    ``done_image_adapter.validate_plan_file``), plus six fail-closed
+    probes that catch a global-default regression (flatten-to-no_text
+    detection, unknown-policy refusal, in-image-text wording under
+    ``no_text`` refused, decorative-glyph wording under
+    ``decorative_glyphs`` accepted, ``slide title`` under
+    ``caption_safe`` refused by the universal editable-text rule,
+    benign artwork under ``caption_safe`` accepted with the per-
+    request policy preserved). MOCK / STUB ONLY — no real D-One.
   - ``scripts/run_mock_image_pipeline.py`` — end-to-end runner that
     seeds a staging workspace and drives the mockable D-One stub
     chain through ``run_explicit_pipeline`` into a validated
@@ -217,6 +232,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "image_asset_trial_evidence.py",
     SCRIPTS_DIR / "image_asset_negative_probes_smoke.py",
     SCRIPTS_DIR / "image_taxonomy_acceptance_smoke.py",
+    SCRIPTS_DIR / "text_policy_decision_smoke.py",
     SCRIPTS_DIR / "run_mock_image_pipeline.py",
     SCRIPTS_DIR / "mock_image_bundle_acceptance_smoke.py",
     SCRIPTS_DIR / "mock_image_bundle_trial_evidence.py",
@@ -448,7 +464,8 @@ def main(argv: list[str]) -> int:
             "smokes (source_image_asset_acceptance_smoke + "
             "image_asset_acceptance_smoke + image_asset_trial_evidence "
             "+ image_asset_negative_probes_smoke + "
-            "image_taxonomy_acceptance_smoke + run_mock_image_pipeline "
+            "image_taxonomy_acceptance_smoke + "
+            "text_policy_decision_smoke + run_mock_image_pipeline "
             "+ mock_image_bundle_acceptance_smoke + "
             "mock_image_bundle_trial_evidence + "
             "validate_mock_image_bundle_trial_evidence + "
