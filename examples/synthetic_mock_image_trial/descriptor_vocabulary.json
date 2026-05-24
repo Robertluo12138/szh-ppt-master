@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "note": "Synthetic D-One descriptor vocabulary for the mock image trial bundle. Mirrors the canonical enums the schema locks plus the optional placement role allow list. No real artifact implied.",
+  "kind_enum": [
+    "color_token",
+    "geometric_noun",
+    "mood_adjective",
+    "composition_adjective"
+  ],
+  "descriptors": [
+    { "kind": "color_token",           "value": "palette.accent" },
+    { "kind": "geometric_noun",        "value": "circle" },
+    { "kind": "mood_adjective",        "value": "calm" },
+    { "kind": "composition_adjective", "value": "centered" }
+  ],
+  "image_taxonomy": {
+    "rendering_style":  { "allowed_values": ["flat_vector", "line_diagram", "isometric_lite", "low_poly", "solid_shape"] },
+    "palette_family":   { "allowed_values": ["neutral_grey", "accent_only", "dual_tone", "mono_brand", "palette_default"] },
+    "image_role":       { "allowed_values": ["decorative_accent", "metaphor_icon", "divider_motif", "kpi_emblem", "cover_motif"] },
+    "layout_pattern":   { "allowed_values": ["single_center", "left_anchor", "right_anchor", "top_band", "bottom_band"] },
+    "modifier":         { "allowed_values": ["low_contrast", "soft_edges", "grid_aligned", "negative_space"] },
+    "text_policy":      { "allowed_values": ["no_text", "decorative_glyphs", "caption_safe"] },
+    "subject_domain":   { "allowed_values": ["abstract_geometry", "process_motif", "metric_emblem", "concept_diagram"] },
+    "placement_role":   { "allowed_values": ["hero_page", "local_region"] }
+  },
+  "custom_descriptors": [
+    {
+      "kind": "composition_adjective",
+      "value": "hero_centered_motif",
+      "approved_in_review_ref": "synthetic_review.001"
+    }
+  ]
+}

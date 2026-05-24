@@ -1,0 +1,9 @@
+{
+  "approximate_slide_count": 2,
+  "audience": "Internal pipeline reviewers",
+  "language": "en",
+  "objective": "Exercise the local mock D-One image-to-editable-PPT chain end-to-end on a synthetic two-slide deck.",
+  "source_id": "synthetic_mock_image_trial_source",
+  "title": "Synthetic Mock Image Trial",
+  "tone": "neutral-professional"
+}

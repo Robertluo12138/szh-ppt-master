@@ -1,0 +1,18 @@
+{
+  "palette": {
+    "primary":    "#264653",
+    "secondary":  "#2A9D8F",
+    "accent":     "#E9C46A",
+    "background": "#FFFFFF",
+    "text":       "#1A1A1A"
+  },
+  "typography": {
+    "heading": { "font_family": "Calibri, Helvetica Neue, Arial, sans-serif", "size_pt": 28 },
+    "body":    { "font_family": "Calibri, Helvetica Neue, Arial, sans-serif", "size_pt": 14 }
+  },
+  "grid": {
+    "width_px": 1920,
+    "height_px": 1080,
+    "margin_px": 64
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "index": 2,
+  "layout": "conclusion",
+  "title": "Trial Outcome",
+  "blocks": [
+    { "id": "title",   "kind": "text", "content": "Trial Outcome" },
+    { "id": "summary", "kind": "text", "content": "Synthetic mock D-One chain succeeded; mock bytes are embedded under ppt/media/." }
+  ],
+  "notes": "All values are synthetic placeholders."
+}

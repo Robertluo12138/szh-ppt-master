@@ -319,6 +319,398 @@ def _write_json(path: Path, body: dict) -> None:
     path.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n")
 
 
+# ---------------------------------------------------------------------------
+# --bundle resolver. Canonical layout mirrors
+# scripts/validate_authoring_bundle.py so the same trial directory shape
+# is portable between the two tools, plus two mock-image-only entries
+# (d_one_spec.json, optional descriptor_vocabulary.json).
+# ---------------------------------------------------------------------------
+
+
+_BUNDLE_SOURCE_CANDIDATES = ("source.md", "source.txt")
+_BUNDLE_BRIEF_NAME = "brief.json"
+_BUNDLE_PLAN_SPEC_NAME = "plan_spec.json"
+_BUNDLE_DESIGN_SYSTEM_SPEC_NAME = "design_system_spec.json"
+_BUNDLE_SLIDE_SPECS_NAME = "slide_specs"
+_BUNDLE_IMAGE_MANIFEST_SPEC_NAME = "image_manifest_spec.json"
+_BUNDLE_D_ONE_SPEC_NAME = "d_one_spec.json"
+_BUNDLE_DESCRIPTOR_VOCABULARY_NAME = "descriptor_vocabulary.json"
+_BUNDLE_BRIEF_ALLOWED_FIELDS = frozenset((
+    "title", "audience", "objective",
+    "tone", "language", "approximate_slide_count", "source_id",
+))
+_BUNDLE_BRIEF_REQUIRED_FIELDS = ("title", "audience", "objective")
+
+
+def _refuse_path_with_parent_traversal(
+    bundle_dir: Path,
+) -> tuple[bool, str]:
+    """Refuse any ``--bundle`` path that contains a ``..`` segment.
+
+    ``os.path.abspath`` (used by ``_refuse_symlinked_bundle_ancestor``)
+    collapses ``..`` LEXICALLY without following symlinks, but
+    ``Path.exists()`` / ``is_dir()`` / ``is_symlink()`` resolve ``..``
+    POSIX-ly (after each preceding symlink is followed). A path like
+    ``/safe/link/../bundle`` where ``link`` is a symlink to an
+    attacker-controlled directory therefore:
+
+      * LEXICALLY collapses to ``/safe/bundle`` — no symlink anywhere
+        in the lexical ancestor chain, so the symlinked-ancestor walk
+        passes;
+      * POSIX-resolves to ``<attacker-parent>/bundle`` because ``..``
+        after the symlink steps up to the SYMLINK TARGET's parent, not
+        to ``/safe/``.
+
+    The runner reads from the POSIX-resolved location, so without this
+    gate the symlinked-ancestor walk silently passes while every
+    subsequent ``Path`` operation reads attacker-controlled bytes.
+    Refusing every ``..`` segment outright closes the bypass — bundle
+    paths are meant to be direct, unambiguous references to a
+    canonical bundle directory, and a legitimate caller can always
+    pass a pre-resolved path. Single-dot ``.`` segments are normalized
+    away by ``pathlib`` itself and are not a concern; ``..`` is the
+    only segment that diverges between lexical and POSIX resolution.
+    """
+    for part in bundle_dir.parts:
+        if part == "..":
+            return True, (
+                f"--bundle path {bundle_dir} contains a `..` segment; "
+                f"refusing — bundle paths must not include parent-"
+                f"traversal segments because `..` after a symlink "
+                f"follows the symlink target's parent on POSIX while "
+                f"lexical absolute-path normalization collapses it "
+                f"in place, bypassing the symlinked-ancestor gate."
+            )
+    return False, ""
+
+
+def _refuse_symlinked_bundle_ancestor(
+    bundle_dir: Path,
+) -> tuple[bool, str]:
+    """Walk every lexical-absolute parent of ``bundle_dir`` and refuse
+    if any is a symlink.
+
+    Closes the Codex-review gap where a real bundle copy placed under a
+    real parent directory, then reached through a symlink to that
+    parent (``/tmp/<probe>/link_parent/synthetic_mock_image_trial``
+    where ``link_parent -> real_parent``), passed every per-entry
+    ``is_symlink()`` check (the bundle dir itself and every named entry
+    inside it were each non-symlink files / directories — only the
+    PARENT segment was the symlink). Without this gate an attacker who
+    controls a directory the user is asked to point ``--bundle`` at can
+    redirect reads to a different bundle copy, silently swapping every
+    stage-input spec the runner reads.
+
+    Allowance: the macOS ``/tmp -> private/tmp`` (and ``/tmp ->
+    /private/tmp``) convention is the one symlink we accept, because
+    refusing it would break every ``TMPDIR=/tmp`` invocation on macOS
+    (including the goal's own verification commands and the runner's
+    self-test). Any other symlinked ancestor — at any depth between the
+    leaf and root — is refused. The root and the immediate bundle dir
+    itself are not inspected here; the bundle leaf gets its own
+    ``is_symlink()`` check in ``_resolve_bundle`` immediately after."""
+    abs_lexical = Path(os.path.abspath(str(bundle_dir)))
+    # ``parents`` yields the immediate parent first and the root last.
+    for ancestor in abs_lexical.parents:
+        if ancestor == ancestor.parent:
+            # Reached the filesystem root; nothing meaningful to check.
+            break
+        if not ancestor.is_symlink():
+            continue
+        try:
+            target = str(ancestor.readlink())
+        except OSError:
+            target = "<unreadable>"
+        # macOS aliases /tmp to /private/tmp; allow that specific pair.
+        if (str(ancestor) == "/tmp"
+                and target in ("private/tmp", "/private/tmp")):
+            continue
+        return True, (
+            f"--bundle parent {ancestor} is a symlink (-> {target}); "
+            f"run_mock_image_pipeline refuses to follow symlinked "
+            f"bundle ancestors."
+        )
+    return False, ""
+
+
+def _resolve_bundle(
+    bundle_dir: Path, *, theme_from_template: bool,
+) -> tuple[dict | None, str | None]:
+    """Resolve the canonical bundle layout into a kwargs dict that
+    matches ``run_mock_image_pipeline``'s keyword arguments.
+
+    Returns ``(kwargs, None)`` on success, ``(None, message)`` on any
+    failure — symlinked bundle, symlinked bundle ancestor, missing
+    required entry, brief.json malformed or missing required fields,
+    design-system mode conflict.
+
+    The helper is read-only; it never writes to the bundle. Brief
+    metadata is read from ``<dir>/brief.json``; every other input maps
+    1:1 to the explicit ``--*-spec`` flags. The optional
+    ``descriptor_vocabulary.json`` resolves to
+    ``--descriptor-vocabulary``; the caller can still pass that flag
+    explicitly when the bundle omits the file.
+
+    Path safety: the bundle directory itself must be a real directory
+    (URI-shaped paths, symlinks, symlinked lexical-absolute ancestors,
+    and non-directories are refused), every required entry must be a
+    non-symlink regular file / directory, and the slide_specs/ entries
+    are each individually refused for being symlinks BEFORE any
+    subprocess fires. Symlinks anywhere in the canonical layout — at
+    the bundle path, in any ancestor of the bundle path, or on any
+    canonical entry — would let an attacker who controls the bundle
+    redirect reads outside it; downstream init_* helpers refuse
+    symlinks for the same reason, so the bundle-resolver gate is
+    belt-and-braces."""
+    if _has_uri_scheme(str(bundle_dir)):
+        return None, (
+            f"--bundle looks like a URI: {bundle_dir} — only local "
+            f"directory paths are accepted"
+        )
+    # The `..` refusal MUST run before the symlinked-ancestor walk:
+    # the walk uses `os.path.abspath`, which collapses `..` lexically
+    # without following symlinks. A `..` segment paired with an
+    # earlier symlink lets the lexical-absolute path "look safe"
+    # while POSIX resolution reads attacker-controlled bytes through
+    # the symlink target's parent.
+    bad, msg = _refuse_path_with_parent_traversal(bundle_dir)
+    if bad:
+        return None, msg
+    bad, msg = _refuse_symlinked_bundle_ancestor(bundle_dir)
+    if bad:
+        return None, msg
+    if bundle_dir.is_symlink():
+        return None, f"--bundle is a symlink (refused): {bundle_dir}"
+    if not bundle_dir.exists():
+        return None, f"--bundle does not exist: {bundle_dir}"
+    if not bundle_dir.is_dir():
+        return None, f"--bundle is not a directory: {bundle_dir}"
+
+    def _check_regular_file(name: str) -> tuple[Path | None, str | None]:
+        path = bundle_dir / name
+        if path.is_symlink():
+            return None, (
+                f"--bundle entry {name} is a symlink (refused): {path}"
+            )
+        if not path.exists():
+            return None, f"--bundle is missing required entry {name}: {path}"
+        if not path.is_file():
+            return None, (
+                f"--bundle entry {name} is not a regular file: {path}"
+            )
+        return path, None
+
+    def _check_directory(name: str) -> tuple[Path | None, str | None]:
+        path = bundle_dir / name
+        if path.is_symlink():
+            return None, (
+                f"--bundle entry {name}/ is a symlink (refused): {path}"
+            )
+        if not path.exists():
+            return None, (
+                f"--bundle is missing required entry {name}/: {path}"
+            )
+        if not path.is_dir():
+            return None, (
+                f"--bundle entry {name}/ is not a directory: {path}"
+            )
+        return path, None
+
+    # Source: exactly one of source.md / source.txt; symlinks refused.
+    present_sources: list[Path] = []
+    for cand in _BUNDLE_SOURCE_CANDIDATES:
+        cand_path = bundle_dir / cand
+        if cand_path.is_symlink():
+            return None, (
+                f"--bundle entry {cand} is a symlink (refused): {cand_path}"
+            )
+        if cand_path.exists():
+            if not cand_path.is_file():
+                return None, (
+                    f"--bundle entry {cand} is not a regular file: "
+                    f"{cand_path}"
+                )
+            present_sources.append(cand_path)
+    if not present_sources:
+        return None, (
+            f"--bundle is missing a source body: expected one of "
+            f"{list(_BUNDLE_SOURCE_CANDIDATES)} under {bundle_dir}"
+        )
+    if len(present_sources) > 1:
+        return None, (
+            f"--bundle declares more than one source body "
+            f"({[p.name for p in present_sources]}); keep exactly one of "
+            f"{list(_BUNDLE_SOURCE_CANDIDATES)} under {bundle_dir}"
+        )
+    source = present_sources[0]
+
+    brief_path, err = _check_regular_file(_BUNDLE_BRIEF_NAME)
+    if err is not None:
+        return None, err
+    plan_spec, err = _check_regular_file(_BUNDLE_PLAN_SPEC_NAME)
+    if err is not None:
+        return None, err
+    slide_specs_dir, err = _check_directory(_BUNDLE_SLIDE_SPECS_NAME)
+    if err is not None:
+        return None, err
+    # Refuse symlinked entries INSIDE slide_specs/ before any subprocess
+    # fires. init_slide_plans applies the same per-file refusal
+    # downstream, but resolving it here keeps the diagnostic at the
+    # runner boundary and prevents a partially-staged workspace from
+    # ever being created. The check covers every .json file in
+    # slide_specs/ (the only files init_slide_plans reads) AND refuses
+    # any nested entry that is itself a symlink (so an attacker cannot
+    # plant a symlink at a non-.json path that init_slide_plans would
+    # still follow when globbing). Iteration order is sorted so the
+    # diagnostic is deterministic across filesystems.
+    try:
+        nested = sorted(slide_specs_dir.iterdir())
+    except OSError as exc:
+        return None, (
+            f"--bundle slide_specs/ at {slide_specs_dir} could not be "
+            f"listed: {type(exc).__name__}: {exc}"
+        )
+    for entry in nested:
+        if entry.is_symlink():
+            try:
+                target = str(entry.readlink())
+            except OSError:
+                target = "<unreadable>"
+            return None, (
+                f"--bundle slide_specs/{entry.name} is a symlink "
+                f"(-> {target}); refusing"
+            )
+    image_manifest_spec, err = _check_regular_file(
+        _BUNDLE_IMAGE_MANIFEST_SPEC_NAME,
+    )
+    if err is not None:
+        return None, err
+    d_one_spec, err = _check_regular_file(_BUNDLE_D_ONE_SPEC_NAME)
+    if err is not None:
+        return None, err
+
+    # Design-system mode resolution. The bundle's design_system_spec.json
+    # selects --design-system-spec mode; --theme-from-template lets the
+    # caller opt out, but mixing both is ambiguous so we refuse.
+    ds_path = bundle_dir / _BUNDLE_DESIGN_SYSTEM_SPEC_NAME
+    if ds_path.is_symlink():
+        return None, (
+            f"--bundle entry {_BUNDLE_DESIGN_SYSTEM_SPEC_NAME} is a "
+            f"symlink (refused): {ds_path}"
+        )
+    ds_present = ds_path.exists()
+    if ds_present and not ds_path.is_file():
+        return None, (
+            f"--bundle entry {_BUNDLE_DESIGN_SYSTEM_SPEC_NAME} is not a "
+            f"regular file: {ds_path}"
+        )
+    if theme_from_template and ds_present:
+        return None, (
+            f"--bundle includes {_BUNDLE_DESIGN_SYSTEM_SPEC_NAME} but "
+            f"--theme-from-template was also passed; pick exactly one "
+            f"design-system mode"
+        )
+    if not theme_from_template and not ds_present:
+        return None, (
+            f"--bundle is missing {_BUNDLE_DESIGN_SYSTEM_SPEC_NAME} and "
+            f"--theme-from-template was not passed: {ds_path}"
+        )
+    design_system_spec = ds_path if ds_present else None
+
+    # Optional descriptor_vocabulary.json. Bundle-resolved when present;
+    # otherwise the caller may still pass --descriptor-vocabulary
+    # explicitly. Symlinks refused either way.
+    vocab_path = bundle_dir / _BUNDLE_DESCRIPTOR_VOCABULARY_NAME
+    if vocab_path.is_symlink():
+        return None, (
+            f"--bundle entry {_BUNDLE_DESCRIPTOR_VOCABULARY_NAME} is a "
+            f"symlink (refused): {vocab_path}"
+        )
+    if vocab_path.exists() and not vocab_path.is_file():
+        return None, (
+            f"--bundle entry {_BUNDLE_DESCRIPTOR_VOCABULARY_NAME} is "
+            f"not a regular file: {vocab_path}"
+        )
+    descriptor_vocabulary = vocab_path if vocab_path.is_file() else None
+
+    # Read brief.json.
+    try:
+        raw_brief = brief_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, (
+            f"--bundle entry {_BUNDLE_BRIEF_NAME} is not UTF-8 readable: "
+            f"{brief_path}: {type(exc).__name__}: {exc}"
+        )
+    try:
+        brief = json.loads(raw_brief)
+    except json.JSONDecodeError as exc:
+        return None, (
+            f"--bundle entry {_BUNDLE_BRIEF_NAME} is malformed JSON: "
+            f"{brief_path}: {exc}"
+        )
+    if not isinstance(brief, dict):
+        return None, (
+            f"--bundle entry {_BUNDLE_BRIEF_NAME} top-level value is not "
+            f"a JSON object; got {type(brief).__name__} at {brief_path}"
+        )
+    missing = [k for k in _BUNDLE_BRIEF_REQUIRED_FIELDS if k not in brief]
+    if missing:
+        return None, (
+            f"--bundle entry {_BUNDLE_BRIEF_NAME} is missing required "
+            f"field(s): {', '.join(missing)} at {brief_path}"
+        )
+    unknown = sorted(set(brief.keys()) - _BUNDLE_BRIEF_ALLOWED_FIELDS)
+    if unknown:
+        return None, (
+            f"--bundle entry {_BUNDLE_BRIEF_NAME} contains unknown "
+            f"field(s): {', '.join(unknown)} at {brief_path}; allowed: "
+            f"{sorted(_BUNDLE_BRIEF_ALLOWED_FIELDS)}"
+        )
+
+    # Type-validate brief fields the bundle forwards verbatim. The
+    # explicit-flag path is type-coerced by argparse (--source-id
+    # type=str, --approximate-slide-count type=int); the bundle path
+    # reads brief.json untyped, so without this gate a malformed value
+    # would surface as a downstream TypeError / schema crash rather
+    # than a clean CLI diagnostic. bool is rejected for
+    # approximate_slide_count even though isinstance(True, int) is True
+    # — a literal JSON true is not a slide count.
+    for str_field in (
+        "title", "audience", "objective", "tone", "language", "source_id",
+    ):
+        if str_field in brief and not isinstance(brief[str_field], str):
+            return None, (
+                f"--bundle entry {_BUNDLE_BRIEF_NAME} field {str_field} "
+                f"must be a string if present; got "
+                f"{type(brief[str_field]).__name__} at {brief_path}"
+            )
+    if "approximate_slide_count" in brief:
+        value = brief["approximate_slide_count"]
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None, (
+                f"--bundle entry {_BUNDLE_BRIEF_NAME} field "
+                f"approximate_slide_count must be an integer if present; "
+                f"got {type(value).__name__} at {brief_path}"
+            )
+
+    return {
+        "source": source,
+        "source_id": brief.get("source_id"),
+        "title": brief["title"],
+        "audience": brief["audience"],
+        "objective": brief["objective"],
+        "tone": brief.get("tone"),
+        "language": brief.get("language"),
+        "approximate_slide_count": brief.get("approximate_slide_count"),
+        "plan_spec": plan_spec,
+        "design_system_spec": design_system_spec,
+        "slide_specs_dir": slide_specs_dir,
+        "image_manifest_spec": image_manifest_spec,
+        "d_one_spec": d_one_spec,
+        "descriptor_vocabulary": descriptor_vocabulary,
+    }, None
+
+
 def _check_plan_taxonomy_preserved(
     plan_path: Path, *, expected_per_request: list[dict[str, str]],
 ) -> tuple[bool, str]:
@@ -853,8 +1245,29 @@ def main(argv: list[str]) -> int:
              "refused.",
     )
     parser.add_argument(
+        "--bundle", type=Path, default=None,
+        help="Resolve every stage-input spec from a single bundle "
+             "directory. Canonical layout: <dir>/source.md (or "
+             "source.txt), <dir>/brief.json (JSON object with title / "
+             "audience / objective and optional tone / language / "
+             "approximate_slide_count / source_id), "
+             "<dir>/plan_spec.json, <dir>/design_system_spec.json "
+             "(omit when --theme-from-template is passed), "
+             "<dir>/slide_specs/, <dir>/image_manifest_spec.json, "
+             "<dir>/d_one_spec.json, and optional "
+             "<dir>/descriptor_vocabulary.json (forwarded to "
+             "--descriptor-vocabulary when present; otherwise pass "
+             "--descriptor-vocabulary explicitly when d_one_spec.json "
+             "carries any of the seven taxonomy fields, the optional "
+             "custom_descriptor escape-hatch field, or the optional "
+             "placement_role field). Mutually exclusive with the "
+             "explicit per-input flags; --workspace, --output, "
+             "--report-dir, --template-root, --theme-from-template, "
+             "and --allow-synthetic-bytes remain explicit.",
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
-        help="Run 22 in-script tempfixture scenarios covering: the "
+        help="Run 37 in-script tempfixture scenarios covering: the "
              "happy-path mock chain (2-slide bundle with one "
              "d_one_local image carrying all 7 taxonomy dimensions; "
              "proves PPTX embeds an internal ppt/media PNG/JPG/JPEG "
@@ -901,7 +1314,34 @@ def main(argv: list[str]) -> int:
              "asserts scripts/__pycache__/ is byte-identical before "
              "and after the run (proves the in-script "
              "sys.dont_write_bytecode=True flip closes the .pyc-leak "
-             "hole even when the caller forgets the env prefix); and "
+             "hole even when the caller forgets the env prefix); a "
+             "--bundle happy-path probe asserting the canonical bundle "
+             "layout (source.md / brief.json / plan_spec.json / "
+             "design_system_spec.json / slide_specs/ / "
+             "image_manifest_spec.json / d_one_spec.json / optional "
+             "descriptor_vocabulary.json) drives the same mock chain "
+             "to a validated PPTX; --bundle fail-closed probes for "
+             "URI-shaped bundle paths, symlinked bundle dir, symlinked "
+             "brief.json inside the bundle, symlinked PARENT directory "
+             "of the bundle (the Codex review repro: a real bundle "
+             "copy reached through link_parent -> real_parent), "
+             "parent-traversal `..` bypass of the symlinked-ancestor "
+             "gate (the second Codex review finding: a path like "
+             "<td>/parent_dir/link/../atk_bundle collapses to "
+             "<td>/parent_dir/atk_bundle lexically but POSIX-resolves "
+             "through link to <td>/atk_bundle — the runner refuses "
+             "any `..` segment outright), "
+             "symlinked slide_specs/<name>.json inside the bundle, "
+             "symlinked optional descriptor_vocabulary.json inside the "
+             "bundle, brief.json with a "
+             "non-integer approximate_slide_count, brief.json with an "
+             "unknown field, missing descriptor_vocabulary.json with "
+             "taxonomy fields and no explicit --descriptor-vocabulary, "
+             "--bundle mixed with an explicit per-input flag, unsafe "
+             "local_path inside the bundle's image_manifest_spec, "
+             "d_one_spec request id not present in the bundle's "
+             "image_manifest_spec, and a --bundle no-repo-write probe "
+             "mirroring the explicit-flag one; and "
              "a failure-cleanup probe asserting no .pptx lands at "
              "--output when the run aborts (the staging tempdir is "
              "auto-cleaned by tempfile.TemporaryDirectory). Mutually "
@@ -918,7 +1358,7 @@ def main(argv: list[str]) -> int:
             args.design_system_spec, args.template_root,
             args.slide_specs_dir, args.image_manifest_spec,
             args.d_one_spec, args.descriptor_vocabulary,
-            args.output, args.report_dir,
+            args.output, args.report_dir, args.bundle,
         )
         if any(v is not None for v in orchestration) or \
                 args.theme_from_template or args.allow_synthetic_bytes:
@@ -928,6 +1368,74 @@ def main(argv: list[str]) -> int:
             )
             return 2
         return _run_self_test()
+
+    if args.bundle is not None:
+        # --bundle is a shortcut: every explicit per-input flag the
+        # bundle resolves must be absent so precedence is unambiguous.
+        # --workspace, --output, --report-dir, --template-root,
+        # --theme-from-template, and --allow-synthetic-bytes are the
+        # only flags that compose with --bundle. --descriptor-vocabulary
+        # composes ONLY when the bundle omits the optional
+        # descriptor_vocabulary.json (verified below).
+        conflicting = [
+            name for name, value in (
+                ("--source", args.source),
+                ("--source-id", args.source_id),
+                ("--title", args.title),
+                ("--audience", args.audience),
+                ("--objective", args.objective),
+                ("--tone", args.tone),
+                ("--language", args.language),
+                ("--approximate-slide-count", args.approximate_slide_count),
+                ("--plan-spec", args.plan_spec),
+                ("--design-system-spec", args.design_system_spec),
+                ("--slide-specs-dir", args.slide_specs_dir),
+                ("--image-manifest-spec", args.image_manifest_spec),
+                ("--d-one-spec", args.d_one_spec),
+            )
+            if value is not None
+        ]
+        if conflicting:
+            print(
+                f"FAIL: --bundle is mutually exclusive with the explicit "
+                f"per-input flags ({', '.join(conflicting)}); pass one "
+                f"or the other, not both",
+                file=sys.stderr,
+            )
+            return 2
+        resolved, err = _resolve_bundle(
+            args.bundle, theme_from_template=args.theme_from_template,
+        )
+        if err is not None:
+            print(f"FAIL: {err}", file=sys.stderr)
+            return 2
+        args.source = resolved["source"]
+        args.source_id = resolved["source_id"]
+        args.title = resolved["title"]
+        args.audience = resolved["audience"]
+        args.objective = resolved["objective"]
+        args.tone = resolved["tone"]
+        args.language = resolved["language"]
+        args.approximate_slide_count = resolved["approximate_slide_count"]
+        args.plan_spec = resolved["plan_spec"]
+        args.design_system_spec = resolved["design_system_spec"]
+        args.slide_specs_dir = resolved["slide_specs_dir"]
+        args.image_manifest_spec = resolved["image_manifest_spec"]
+        args.d_one_spec = resolved["d_one_spec"]
+        # Bundle-supplied vocab wins; otherwise leave whatever the
+        # caller passed explicitly. Refuse mixing both so the source of
+        # truth is unambiguous.
+        if resolved["descriptor_vocabulary"] is not None:
+            if args.descriptor_vocabulary is not None:
+                print(
+                    f"FAIL: --bundle includes "
+                    f"{_BUNDLE_DESCRIPTOR_VOCABULARY_NAME} but "
+                    f"--descriptor-vocabulary was also passed; pass "
+                    f"exactly one source of the descriptor vocabulary",
+                    file=sys.stderr,
+                )
+                return 2
+            args.descriptor_vocabulary = resolved["descriptor_vocabulary"]
 
     missing = [
         name for name, value in (
@@ -2290,6 +2798,700 @@ def _scenario_placement_role_local_ordinary_passes(td: Path) -> _Scenario:
     )
 
 
+# ---------------------------------------------------------------------------
+# --bundle path scenarios. These probe the canonical bundle layout under
+# the --bundle shortcut. The helpers below materialize a bundle dir
+# whose layout matches the _resolve_bundle contract (source.md /
+# brief.json / plan_spec.json / design_system_spec.json /
+# slide_specs/ / image_manifest_spec.json / d_one_spec.json /
+# optional descriptor_vocabulary.json), then invoke the runner with
+# --bundle <dir> instead of the per-input explicit flags.
+# ---------------------------------------------------------------------------
+
+
+def _brief_body(*, extras: dict | None = None) -> dict:
+    """Default synthetic brief.json body. ``extras`` overrides /
+    augments the result (used by the malformed-value-type scenarios)."""
+    body = {
+        "title": _SYNTHETIC_TITLE,
+        "audience": _SYNTHETIC_AUDIENCE,
+        "objective": _SYNTHETIC_OBJECTIVE,
+        "tone": _SYNTHETIC_TONE,
+        "language": _SYNTHETIC_LANGUAGE,
+        "approximate_slide_count": _SYNTHETIC_APPROXIMATE_SLIDE_COUNT,
+        "source_id": _SYNTHETIC_SOURCE_ID,
+    }
+    if extras:
+        body.update(extras)
+    return body
+
+
+def _materialize_canonical_bundle(
+    bundle_root: Path,
+    *,
+    d_one_spec_body: dict,
+    include_vocab: bool = True,
+    include_design_system_spec: bool = True,
+    brief_body: dict | None = None,
+    image_manifest_body: dict | None = None,
+) -> Path:
+    """Materialize the canonical --bundle layout under ``bundle_root``
+    and return the resolved bundle path. Mirrors the per-input shapes
+    the resolver expects; switches let scenarios poke specific holes
+    (missing vocab, missing design_system_spec, malformed brief)."""
+    bundle_root.mkdir(parents=True, exist_ok=True)
+    (bundle_root / "source.md").write_text(_source_md_text())
+    _write_json(
+        bundle_root / "brief.json",
+        brief_body if brief_body is not None else _brief_body(),
+    )
+    _write_json(bundle_root / "plan_spec.json", _plan_spec_body())
+    if include_design_system_spec:
+        _write_json(
+            bundle_root / "design_system_spec.json", _design_system_body(),
+        )
+    (bundle_root / "slide_specs").mkdir(exist_ok=True)
+    _write_json(
+        bundle_root / "slide_specs" / "01_cover.json", _slide_cover_body(),
+    )
+    _write_json(
+        bundle_root / "slide_specs" / "02_conclusion.json",
+        _slide_conclusion_body(),
+    )
+    _write_json(
+        bundle_root / "image_manifest_spec.json",
+        image_manifest_body if image_manifest_body is not None
+        else _image_manifest_body(),
+    )
+    _write_json(bundle_root / "d_one_spec.json", d_one_spec_body)
+    if include_vocab:
+        _write_json(
+            bundle_root / "descriptor_vocabulary.json",
+            _descriptor_vocabulary_body(),
+        )
+    return bundle_root
+
+
+def _bundle_runner_args(
+    *,
+    bundle: Path,
+    workspace: Path,
+    output: Path,
+    report_dir: Path | None = None,
+    descriptor_vocabulary: Path | None = None,
+    with_allow_synthetic: bool = True,
+) -> list[str]:
+    args = [
+        "--bundle", str(bundle),
+        "--workspace", str(workspace),
+        "--template-root", str(TEMPLATE_ROOT),
+        "--output", str(output),
+    ]
+    if with_allow_synthetic:
+        args.append("--allow-synthetic-bytes")
+    if descriptor_vocabulary is not None:
+        args += ["--descriptor-vocabulary", str(descriptor_vocabulary)]
+    if report_dir is not None:
+        args += ["--report-dir", str(report_dir)]
+    return args
+
+
+def _scenario_bundle_happy_path(td: Path) -> _Scenario:
+    """``--bundle`` happy path: the canonical layout (source.md +
+    brief.json + plan_spec.json + design_system_spec.json +
+    slide_specs/ + image_manifest_spec.json + d_one_spec.json +
+    descriptor_vocabulary.json) drives the mock chain end-to-end and
+    produces a PPTX whose ppt/media/ carries an embeddable PNG/JPG/JPEG
+    with no external relationships and whose stdout fires the [PASS]
+    taxonomy preservation marker."""
+    bundle = _materialize_canonical_bundle(
+        td / "bundle_happy",
+        d_one_spec_body=_d_one_spec_body_with_taxonomy(),
+    )
+    ws = td / "bundle_happy_ws"
+    out = td / "bundle_happy.pptx"
+    report = td / "bundle_happy_report"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=bundle, workspace=ws, output=out, report_dir=report,
+    ))
+    if outcome.exit_code != 0:
+        return _Scenario(
+            "--bundle happy path: canonical layout drives the mock "
+            "chain end-to-end and produces a validated PPTX",
+            False,
+            f"rc={outcome.exit_code}; "
+            f"stderr tail: {outcome.stderr.splitlines()[-10:]!r}; "
+            f"stdout tail: {outcome.stdout.splitlines()[-10:]!r}",
+        )
+    if not out.is_file() or out.is_symlink():
+        return _Scenario(
+            "--bundle happy path PPTX exists as regular non-symlink file",
+            False, f"out={out}, is_file={out.is_file()}",
+        )
+    ok, msg = _pptx_embeds_internal_media_only(out)
+    if not ok:
+        return _Scenario(
+            "--bundle happy-path PPTX embeds at least one internal "
+            "ppt/media/<name>.<png|jpg|jpeg> part with no external/"
+            "file/data/scheme relationships",
+            False, msg,
+        )
+    if "[PASS] taxonomy preservation check" not in outcome.stdout:
+        return _Scenario(
+            "--bundle happy-path stdout includes the [PASS] taxonomy "
+            "preservation marker",
+            False,
+            f"stdout tail: {outcome.stdout.splitlines()[-10:]!r}",
+        )
+    return _Scenario(
+        "--bundle happy path: canonical bundle (source.md / brief.json "
+        "/ plan_spec.json / design_system_spec.json / slide_specs/ / "
+        "image_manifest_spec.json / d_one_spec.json / "
+        "descriptor_vocabulary.json) produces a validated PPTX whose "
+        "ppt/media/ carries a native PNG/JPG/JPEG and whose stdout "
+        "fires the taxonomy preservation gate",
+        True,
+    )
+
+
+def _scenario_bundle_uri_path(td: Path) -> _Scenario:
+    """``--bundle file://...`` (URI-shaped) is refused at the runner
+    boundary before any subprocess fires."""
+    ws = td / "bundle_uri_ws"
+    out = td / "bundle_uri.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=Path("file:///tmp/bundle_uri_shape"),
+        workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "URI" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "--bundle URI-shaped path (file://...) is refused before any "
+        "subprocess fires",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_symlinked_dir(td: Path) -> _Scenario:
+    """A symlinked --bundle directory is refused even when the link
+    points at a real bundle. Symlinks let an attacker who controls the
+    bundle path redirect reads."""
+    real = _materialize_canonical_bundle(
+        td / "bundle_sym_dir_real",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+        include_vocab=False,
+    )
+    link = td / "bundle_sym_dir_link"
+    link.symlink_to(real)
+    ws = td / "bundle_sym_dir_ws"
+    out = td / "bundle_sym_dir.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=link, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "symlink" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "--bundle dir that is itself a symlink is refused at the "
+        "runner boundary before any subprocess fires",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_symlinked_file(td: Path) -> _Scenario:
+    """A symlinked file inside the bundle is refused even when the
+    target points at a real spec file. The resolver refuses any
+    symlinked canonical entry."""
+    bundle = _materialize_canonical_bundle(
+        td / "bundle_sym_file",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+        include_vocab=False,
+    )
+    # Replace brief.json with a symlink to a sibling real brief file.
+    brief = bundle / "brief.json"
+    real_target = td / "real_brief.json"
+    _write_json(real_target, _brief_body())
+    brief.unlink()
+    brief.symlink_to(real_target)
+    ws = td / "bundle_sym_file_ws"
+    out = td / "bundle_sym_file.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "symlink" in combined
+        and "brief.json" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "--bundle file entry (brief.json) that is itself a symlink is "
+        "refused at the runner boundary before any subprocess fires",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_symlinked_parent(td: Path) -> _Scenario:
+    """A real bundle reached through a symlinked PARENT directory is
+    refused at the resolver boundary. Regression gate for the Codex
+    review repro: a per-entry ``is_symlink()`` check passes (the bundle
+    dir itself and every named entry inside it are non-symlink) but the
+    parent segment ``link_parent`` is a symlink to the real holder."""
+    real_parent = td / "bundle_sym_parent_real"
+    real_parent.mkdir()
+    real_bundle = _materialize_canonical_bundle(
+        real_parent / "synthetic_mock_image_trial",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+        include_vocab=False,
+    )
+    link_parent = td / "bundle_sym_parent_link"
+    link_parent.symlink_to(real_parent)
+    bundle_via_link = link_parent / "synthetic_mock_image_trial"
+    ws = td / "bundle_sym_parent_ws"
+    out = td / "bundle_sym_parent.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=bundle_via_link, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "parent" in combined
+        and "symlink" in combined
+        and not out.exists()
+        and not ws.exists()
+        # Real bundle bytes survive the failure (no destructive cleanup).
+        and (real_bundle / "brief.json").is_file()
+    )
+    return _Scenario(
+        "--bundle reached through a symlinked PARENT directory "
+        "(link_parent -> real_parent) is refused at the resolver "
+        "boundary before any subprocess fires; no workspace, no PPTX",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"real_bundle_intact="
+         f"{(real_bundle / 'brief.json').is_file()}, "
+         f"tail={combined.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_parent_traversal_bypass(td: Path) -> _Scenario:
+    """A ``--bundle`` path that uses ``..`` to ``cancel out`` a
+    symlinked component is refused at the resolver boundary.
+
+    Regression gate for the second Codex review finding: the
+    lexical-absolute parent walk uses ``os.path.abspath`` which
+    collapses ``..`` lexically without following symlinks, so a path
+    like ``<td>/parent_dir/link/../atk_bundle`` (where ``link`` is a
+    symlink to a decoy directory) collapses lexically to
+    ``<td>/parent_dir/atk_bundle`` — the lexical chain shows no
+    symlinks and the symlinked-ancestor walk would silently pass.
+    POSIX resolution of ``link/..`` follows the link to the decoy
+    and then steps up to the decoy's parent (the same ``<td>``),
+    so the runner ends up reading from ``<td>/atk_bundle`` (a real
+    bundle the test placed there to prove the path was actually
+    followed). The ``..``-refusal closes the bypass before any
+    subprocess fires."""
+    attacker_bundle = _materialize_canonical_bundle(
+        td / "atk_bundle",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+        include_vocab=False,
+    )
+    decoy = td / "dotdot_decoy"
+    decoy.mkdir()
+    parent_dir = td / "dotdot_parent"
+    parent_dir.mkdir()
+    (parent_dir / "link").symlink_to(decoy)
+    # Lexical: <td>/dotdot_parent/atk_bundle (no symlink anywhere).
+    # POSIX: follow link to <td>/dotdot_decoy, .. to <td>, then
+    # atk_bundle → <td>/atk_bundle (the real attacker bundle).
+    bundle_arg = parent_dir / "link" / ".." / "atk_bundle"
+    ws = td / "dotdot_ws"
+    out = td / "dotdot.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=bundle_arg, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "`..`" in combined
+        and "refusing" in combined
+        and not out.exists()
+        and not ws.exists()
+        and (attacker_bundle / "brief.json").is_file()
+    )
+    return _Scenario(
+        "--bundle path with a `..` segment that cancels a symlinked "
+        "component lexically while still following the symlink "
+        "POSIX-ly is refused at the resolver boundary before any "
+        "subprocess fires; no workspace, no PPTX",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"attacker_bundle_intact="
+         f"{(attacker_bundle / 'brief.json').is_file()}, "
+         f"tail={combined.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_symlinked_slide_spec_file(td: Path) -> _Scenario:
+    """A symlinked JSON file INSIDE the bundle's ``slide_specs/`` is
+    refused at the resolver boundary. Until now the resolver only
+    checked the slide_specs/ directory itself; symlinked entries inside
+    were only caught by init_slide_plans downstream. Failing at the
+    runner boundary keeps the diagnostic local and avoids creating any
+    staging workspace."""
+    bundle = _materialize_canonical_bundle(
+        td / "bundle_sym_slide_spec",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+        include_vocab=False,
+    )
+    # Replace 01_cover.json with a symlink to a real spec sibling.
+    slide_path = bundle / "slide_specs" / "01_cover.json"
+    real_target = td / "real_cover_spec.json"
+    _write_json(real_target, _slide_cover_body())
+    slide_path.unlink()
+    slide_path.symlink_to(real_target)
+    ws = td / "bundle_sym_slide_spec_ws"
+    out = td / "bundle_sym_slide_spec.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "slide_specs/01_cover.json" in combined
+        and "symlink" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "--bundle slide_specs/<name>.json that is itself a symlink is "
+        "refused at the resolver boundary before any subprocess fires",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_symlinked_vocab(td: Path) -> _Scenario:
+    """A symlinked optional ``descriptor_vocabulary.json`` inside the
+    bundle is refused at the resolver boundary. The existing per-entry
+    check on the vocab path was always present; this scenario pins it
+    so a future refactor cannot regress it silently."""
+    bundle = _materialize_canonical_bundle(
+        td / "bundle_sym_vocab",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+        # include_vocab=True so the canonical layout writes the real
+        # vocab file; we then replace it with a symlink to a sibling.
+        include_vocab=True,
+    )
+    vocab_path = bundle / "descriptor_vocabulary.json"
+    real_target = td / "real_vocab.json"
+    _write_json(real_target, _descriptor_vocabulary_body())
+    vocab_path.unlink()
+    vocab_path.symlink_to(real_target)
+    ws = td / "bundle_sym_vocab_ws"
+    out = td / "bundle_sym_vocab.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "descriptor_vocabulary.json" in combined
+        and "symlink" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "--bundle descriptor_vocabulary.json that is itself a symlink "
+        "is refused at the resolver boundary before any subprocess "
+        "fires",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_malformed_brief_value_type(td: Path) -> _Scenario:
+    """``brief.json`` with a value of the wrong type fails without a
+    Python traceback. Probes the integer type-guard on
+    approximate_slide_count (JSON ``true`` would otherwise satisfy
+    isinstance(True, int))."""
+    bundle = _materialize_canonical_bundle(
+        td / "bundle_bad_brief_type",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+        include_vocab=False,
+        brief_body=_brief_body(extras={"approximate_slide_count": True}),
+    )
+    ws = td / "bundle_bad_brief_type_ws"
+    out = td / "bundle_bad_brief_type.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "approximate_slide_count" in combined
+        and "must be an integer" in combined
+        and "Traceback" not in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "--bundle brief.json with approximate_slide_count=true (JSON "
+        "bool) is refused with a clean diagnostic (no Python "
+        "traceback) before any subprocess fires",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"traceback_in_output={'Traceback' in combined}, "
+         f"tail={combined.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_unknown_brief_field(td: Path) -> _Scenario:
+    """``brief.json`` with a field not on the closed allow-list is
+    refused at the resolver boundary."""
+    bundle = _materialize_canonical_bundle(
+        td / "bundle_unknown_brief",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+        include_vocab=False,
+        brief_body=_brief_body(extras={"unexpected_field": "x"}),
+    )
+    ws = td / "bundle_unknown_brief_ws"
+    out = td / "bundle_unknown_brief.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "unknown field" in combined
+        and "unexpected_field" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "--bundle brief.json with an unknown field is refused at the "
+        "resolver boundary before any subprocess fires",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_missing_vocab_with_taxonomy(td: Path) -> _Scenario:
+    """A bundle WITHOUT ``descriptor_vocabulary.json`` whose
+    ``d_one_spec.json`` carries taxonomy / custom_descriptor /
+    placement_role fields AND no explicit ``--descriptor-vocabulary``
+    flag MUST be refused at the runner boundary before any subprocess
+    fires. The bundle does not paper over the vocab requirement."""
+    bundle = _materialize_canonical_bundle(
+        td / "bundle_no_vocab_with_tax",
+        d_one_spec_body=_d_one_spec_body_with_taxonomy(),
+        include_vocab=False,
+    )
+    ws = td / "bundle_no_vocab_with_tax_ws"
+    out = td / "bundle_no_vocab_with_tax.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "--descriptor-vocabulary" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "--bundle without descriptor_vocabulary.json + d_one_spec "
+        "carrying taxonomy fields + no explicit --descriptor-"
+        "vocabulary flag is refused before any subprocess fires",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_mixed_explicit_flag(td: Path) -> _Scenario:
+    """``--bundle`` mixed with an explicit per-input flag is refused at
+    the runner boundary. The resolver's per-input outputs are the
+    single source of truth; mixing modes is ambiguous."""
+    bundle = _materialize_canonical_bundle(
+        td / "bundle_mixed_flag",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+        include_vocab=False,
+    )
+    ws = td / "bundle_mixed_flag_ws"
+    out = td / "bundle_mixed_flag.pptx"
+    args = _bundle_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ) + ["--title", "Overridden Title"]
+    outcome = _invoke_runner(args)
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "mutually exclusive" in combined
+        and "--title" in combined
+        and not out.exists()
+        and not ws.exists()
+    )
+    return _Scenario(
+        "--bundle mixed with an explicit per-input flag (--title) is "
+        "refused at the runner boundary before any subprocess fires",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"ws_exists={ws.exists()}, "
+         f"tail={combined.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_unsafe_local_path(td: Path) -> _Scenario:
+    """An ``image_manifest_spec.json`` inside the bundle whose
+    ``local_path`` carries a URI scheme is refused by the downstream
+    chain; no PPTX is produced."""
+    body = _image_manifest_body()
+    body["images"][0]["local_path"] = "http://attacker/x.png"
+    bundle = _materialize_canonical_bundle(
+        td / "bundle_unsafe_lp",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+        include_vocab=False,
+        image_manifest_body=body,
+    )
+    ws = td / "bundle_unsafe_lp_ws"
+    out = td / "bundle_unsafe_lp.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and not out.exists()
+        and ("http://attacker" in combined or "local_path" in combined)
+    )
+    return _Scenario(
+        "--bundle image_manifest_spec.local_path with a URI scheme "
+        "(`http://...`) is refused by the downstream chain; no PPTX "
+        "is produced",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"tail={combined.splitlines()[-10:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_id_mismatch(td: Path) -> _Scenario:
+    """A bundle whose ``d_one_spec.json`` carries a request id that is
+    not present in ``image_manifest_spec.json`` is refused by
+    done_image_adapter."""
+    spec_body = _d_one_spec_body_with_taxonomy()
+    spec_body["requests"][0]["id"] = "not_in_manifest"
+    bundle = _materialize_canonical_bundle(
+        td / "bundle_id_mismatch",
+        d_one_spec_body=spec_body,
+    )
+    ws = td / "bundle_id_mismatch_ws"
+    out = td / "bundle_id_mismatch.pptx"
+    outcome = _invoke_runner(_bundle_runner_args(
+        bundle=bundle, workspace=ws, output=out,
+    ))
+    combined = outcome.combined
+    ok = (
+        outcome.exit_code != 0
+        and "not_in_manifest" in combined
+        and not out.exists()
+    )
+    return _Scenario(
+        "--bundle d_one_spec request id not present in the bundle's "
+        "image_manifest_spec is refused by done_image_adapter; no "
+        "PPTX is produced",
+        ok,
+        (f"rc={outcome.exit_code}, out_exists={out.exists()}, "
+         f"tail={combined.splitlines()[-10:]!r}")
+        if not ok else "",
+    )
+
+
+def _scenario_bundle_no_repo_writes(td: Path) -> _Scenario:
+    """``--bundle`` happy-path run without ``PYTHONDONTWRITEBYTECODE``
+    in env does NOT mutate ``scripts/__pycache__/``. Same probe as
+    ``_scenario_no_repo_bytecode_write`` but on the bundle path so the
+    new code path is also covered."""
+    bundle = _materialize_canonical_bundle(
+        td / "bundle_no_pyc",
+        d_one_spec_body=_d_one_spec_body_without_taxonomy(),
+        include_vocab=False,
+    )
+    ws = td / "bundle_no_pyc_ws"
+    out = td / "bundle_no_pyc.pptx"
+    before = _snapshot_pycache()
+    base_env = {k: v for k, v in os.environ.items()
+                if k != "PYTHONDONTWRITEBYTECODE"}
+    cmd = [
+        sys.executable, str(Path(__file__).resolve()),
+    ] + _bundle_runner_args(bundle=bundle, workspace=ws, output=out)
+    proc = subprocess.run(
+        cmd, cwd=REPO_ROOT, capture_output=True, text=True, env=base_env,
+    )
+    after = _snapshot_pycache()
+    drift = [
+        k for k in sorted(set(before) | set(after))
+        if before.get(k) != after.get(k)
+    ]
+    ok = (
+        proc.returncode == 0
+        and out.is_file()
+        and not drift
+    )
+    return _Scenario(
+        "--bundle no-repo-write: runner invoked without "
+        "PYTHONDONTWRITEBYTECODE=1 in env on the --bundle path does "
+        "NOT mutate scripts/__pycache__/",
+        ok,
+        (f"rc={proc.returncode}, out_exists={out.exists()}, "
+         f"drift={drift!r}, "
+         f"stderr_tail={proc.stderr.splitlines()[-5:]!r}")
+        if not ok else "",
+    )
+
+
 def _scenario_failure_no_residue(td: Path) -> _Scenario:
     """After a downstream failure, no .pptx must exist at --output AND
     no staging tempdir must remain under the caller's tempdir."""
@@ -2354,6 +3556,21 @@ def _run_self_test() -> int:
             _scenario_symlinked_workspace(td),
             _scenario_symlinked_report_dir(td),
             _scenario_no_repo_bytecode_write(td),
+            _scenario_bundle_happy_path(td),
+            _scenario_bundle_uri_path(td),
+            _scenario_bundle_symlinked_dir(td),
+            _scenario_bundle_symlinked_file(td),
+            _scenario_bundle_symlinked_parent(td),
+            _scenario_bundle_parent_traversal_bypass(td),
+            _scenario_bundle_symlinked_slide_spec_file(td),
+            _scenario_bundle_symlinked_vocab(td),
+            _scenario_bundle_malformed_brief_value_type(td),
+            _scenario_bundle_unknown_brief_field(td),
+            _scenario_bundle_missing_vocab_with_taxonomy(td),
+            _scenario_bundle_mixed_explicit_flag(td),
+            _scenario_bundle_unsafe_local_path(td),
+            _scenario_bundle_id_mismatch(td),
+            _scenario_bundle_no_repo_writes(td),
             _scenario_failure_no_residue(td),
         ]
         fails = 0

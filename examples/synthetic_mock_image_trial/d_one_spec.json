@@ -1,0 +1,19 @@
+{
+  "requests": [
+    {
+      "id": "cover_accent",
+      "prompt": "abstract geometric pattern in a calm neutral gradient, soft edges, leaves calm space on the right for the title overlay, no text, no logo",
+      "intended_use": "spot illustration",
+      "width_px": 320,
+      "height_px": 320,
+      "rendering_style": "flat_vector",
+      "palette_family": "neutral_grey",
+      "image_role": "decorative_accent",
+      "layout_pattern": "single_center",
+      "modifier": "soft_edges",
+      "text_policy": "no_text",
+      "subject_domain": "abstract_geometry",
+      "placement_role": "hero_page"
+    }
+  ]
+}

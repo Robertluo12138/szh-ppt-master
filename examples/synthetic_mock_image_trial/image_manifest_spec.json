@@ -1,0 +1,11 @@
+{
+  "images": [
+    {
+      "id": "cover_accent",
+      "local_path": "media/cover_accent.png",
+      "source": "d_one_local",
+      "alt_text": "Synthetic abstract pattern (mock D-One output).",
+      "intended_use": "spot illustration"
+    }
+  ]
+}
