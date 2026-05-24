@@ -47,14 +47,21 @@ The happy path additionally asserts the runner writes
 ``<report-dir>/mock_d_one_adapter_plan.json`` — a byte-identical
 audit-evidence copy of the staging ``d_one_adapter_plan.json`` after
 ``done_image_adapter`` succeeds and the taxonomy preservation check
-passes. The sidecar gates verify the bytes carry
-``schema_version == 4``, both committed request ids and both
-``placement_role`` values byte-identical to ``d_one_spec.json``, the
-expected safe ``local_path`` values from ``image_manifest_spec.json``,
-and no external URL / URI scheme / credential-shaped / public-upload
-/ confidential / raw-source substring — so the two generated-image
-roles are auditable from the sidecar bytes ALONE, no dependency on
-the runner's stdout marker.
+passes. The sidecar is then re-validated via the standalone
+``scripts/validate_mock_d_one_adapter_plan.py --plan <sidecar>
+--d-one-spec <bundle/d_one_spec.json> --image-manifest-spec
+<bundle/image_manifest_spec.json> --require-both-placement-roles``
+subprocess; the validator's gates assert the bytes carry
+``schema_version == 4``, ``request_count`` consistency, per-id
+``placement_role`` parity, both committed request ids byte-identical
+to ``d_one_spec.json``, both ``hero_page`` AND ``local_region``
+coverage, manifest_local_path byte-identity with
+``image_manifest_spec.json``, and no URI / path-traversal /
+credential / public-upload / public-hosting / confidential /
+raw-source substring anywhere in the file — so the two generated-
+image roles are auditable from the sidecar bytes ALONE, no
+dependency on the runner's stdout marker. Per-gate refusal coverage
+lives in ``validate_mock_d_one_adapter_plan.py --self-test``.
 
 ``--self-test`` also runs tempfixture fail-closed probes; each
 asserts the runner exits non-zero (or the static evidence helper
@@ -85,22 +92,7 @@ flags the regression) AND the output PPTX is never created:
      static placement_role helper): stripping the local_region
      request from a bundle copy makes ``_bundle_placement_roles``
      return only ``{'hero_page'}``, which is what the happy-path
-     gate would detect as a regression on the committed bundle;
-  8. sidecar baseline (direct probe): the synthesized baseline
-     sidecar (built from the committed bundle) passes EVERY
-     ``_check_sidecar_invariants`` PostCondition — gates a
-     regression that desyncs the baseline builder from the gates;
-  9. tampered sidecar schema_version (direct probe): a sidecar with
-     ``schema_version`` flipped to a non-4 value trips the schema-
-     version PostCondition;
-  10. missing local_region request in the sidecar (direct probe):
-      a sidecar with the local_region request stripped trips BOTH
-      the per-id request-id parity gate and the ``BOTH
-      placement_role values`` coverage gate;
-  11. unsafe sidecar local_path (direct probe): a sidecar with one
-      ``manifest_local_path`` overwritten by ``http://attacker/x.png``
-      trips BOTH the manifest_local_path byte-identity gate AND the
-      external-leakage substring scan.
+     gate would detect as a regression on the committed bundle.
 
 MOCK / STUB acceptance ONLY — NOT real D-One integration. Nothing in
 this smoke calls D-One, MCP, Qoder, a public network, telemetry, any
@@ -185,34 +177,6 @@ TAXONOMY_PRESERVATION_MARKER = "[PASS] taxonomy preservation check"
 # d_one_adapter_plan.json. Must stay in sync with
 # run_mock_image_pipeline.EVIDENCE_SIDECAR_FILENAME.
 EVIDENCE_SIDECAR_FILENAME = "mock_d_one_adapter_plan.json"
-
-# Locked plan-schema version the runner refuses to forward. Must stay
-# in sync with run_mock_image_pipeline.LOCKED_PLAN_SCHEMA_VERSION. The
-# sidecar's schema_version must equal this value for the audit
-# evidence to be trusted; a tampered or downgraded value fails the
-# sidecar gate.
-EXPECTED_SIDECAR_SCHEMA_VERSION = 4
-
-# Audit-evidence allow-list. Every value the sidecar carries must be
-# accounted for by these structural rules; anything else is treated as
-# external-leakage suspicion. The sidecar is local / mock / synthetic
-# evidence ONLY — by construction it cannot contain external URLs,
-# file:// URIs, credential-shaped tokens, public-upload wording,
-# confidential markers, or raw-source phrasing because every upstream
-# stage scrubs those before the plan is written. The smoke re-checks
-# the produced bytes so a regression that loosens the upstream scrub
-# (or a future hand-authored plan that bypasses the writer) surfaces
-# at this gate.
-_SIDECAR_FORBIDDEN_SUBSTRINGS: tuple[str, ...] = (
-    "http://", "https://", "ftp://", "file://", "data:",
-    "://",  # any other RFC-3986-shaped URI scheme
-    "password", "secret", "credential", "api_key", "api-key", "apikey",
-    "upload to public", "public upload", "share publicly",
-    "public hosting", "publish to web", "public url",
-    "public link", "public cdn", "host publicly",
-    "confidential", "internal use only", "do not share",
-    "raw source", "raw_source", "raw-source", "source text",
-)
 
 # Must match scripts/inspect_pptx_inventory.py::EVIDENCE_BASIS verbatim.
 EXPECTED_EVIDENCE_BASIS = (
@@ -498,277 +462,6 @@ def _check_inventory_invariants(
     return results
 
 
-def _walk_strings(value: object):
-    """Yield every string scalar reachable from ``value`` (recursive).
-    Used by the sidecar leakage scan so a forbidden substring buried
-    under any depth of dict / list nesting still surfaces."""
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for k, v in value.items():
-            yield from _walk_strings(k)
-            yield from _walk_strings(v)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _walk_strings(item)
-
-
-def _bundle_request_placement_roles_by_id(
-    bundle: Path,
-) -> tuple[dict[str, str], str]:
-    """Return ({id -> placement_role}, msg). Empty placement_role values
-    are dropped (sidecar parity check ignores omitted roles). ``msg`` is
-    non-empty on any read / decode error."""
-    spec_path = bundle / "d_one_spec.json"
-    if spec_path.is_symlink() or not spec_path.is_file():
-        return {}, f"d_one_spec.json missing or non-regular at {spec_path}"
-    try:
-        doc = json.loads(spec_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        return {}, f"cannot parse {spec_path}: {type(exc).__name__}: {exc}"
-    if not isinstance(doc, dict):
-        return {}, (
-            f"d_one_spec.json top-level value is not an object "
-            f"(got {type(doc).__name__})"
-        )
-    out: dict[str, str] = {}
-    for entry in doc.get("requests", []) or []:
-        if not isinstance(entry, dict):
-            continue
-        rid = entry.get("id")
-        role = entry.get("placement_role")
-        if isinstance(rid, str) and isinstance(role, str) and role:
-            out[rid] = role
-    return out, ""
-
-
-def _bundle_manifest_local_paths_by_id(
-    bundle: Path,
-) -> tuple[dict[str, str], str]:
-    """Return ({image_id -> local_path}, msg). ``msg`` is non-empty on
-    any read / decode error. Used to assert the sidecar's
-    manifest_local_path values match the bundle's
-    image_manifest_spec.json byte-for-byte."""
-    manifest_path = bundle / "image_manifest_spec.json"
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        return {}, (
-            f"image_manifest_spec.json missing or non-regular at "
-            f"{manifest_path}"
-        )
-    try:
-        doc = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        return {}, (
-            f"cannot parse {manifest_path}: {type(exc).__name__}: {exc}"
-        )
-    if not isinstance(doc, dict):
-        return {}, (
-            f"image_manifest_spec.json top-level value is not an object "
-            f"(got {type(doc).__name__})"
-        )
-    out: dict[str, str] = {}
-    for entry in doc.get("images", []) or []:
-        if not isinstance(entry, dict):
-            continue
-        iid = entry.get("id")
-        lp = entry.get("local_path")
-        if isinstance(iid, str) and isinstance(lp, str):
-            out[iid] = lp
-    return out, ""
-
-
-def _check_sidecar_invariants(
-    *, sidecar_path: Path, bundle: Path,
-) -> list[PostCondition]:
-    """Assert every documented invariant on the runner-written
-    ``mock_d_one_adapter_plan.json`` evidence sidecar. The sidecar
-    must exist as a regular non-symlink JSON file under the report
-    directory, parse as a JSON object, carry the locked
-    ``schema_version``, preserve every request id and placement_role
-    from the committed ``d_one_spec.json`` (proving both generated-
-    image roles are auditable without relying only on stdout),
-    preserve the manifest's safe ``local_path`` values, and contain
-    no external URLs / URI scheme prefixes / credential-shaped tokens
-    / public-upload / confidential / raw-source wording. Each
-    invariant lands as its own PostCondition so a partial regression
-    surfaces exactly which assertion broke."""
-    results: list[PostCondition] = []
-
-    if sidecar_path.is_symlink() or not sidecar_path.is_file():
-        results.append(PostCondition(
-            f"evidence sidecar {EVIDENCE_SIDECAR_FILENAME} exists as a "
-            f"regular non-symlink file under --report-dir",
-            False,
-            (f"path={sidecar_path}, is_file={sidecar_path.is_file()}, "
-             f"is_symlink={sidecar_path.is_symlink()}"),
-        ))
-        # Can't continue without the file — emit empty placeholders
-        # for the remaining gates so the caller's PASS/FAIL summary
-        # makes the missing surface obvious.
-        return results
-    results.append(PostCondition(
-        f"evidence sidecar {EVIDENCE_SIDECAR_FILENAME} exists as a "
-        f"regular non-symlink file under --report-dir",
-        True,
-    ))
-
-    try:
-        raw = sidecar_path.read_text()
-    except OSError as exc:
-        results.append(PostCondition(
-            "evidence sidecar is readable as UTF-8 text",
-            False, f"{type(exc).__name__}: {exc}",
-        ))
-        return results
-    try:
-        doc = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        results.append(PostCondition(
-            "evidence sidecar parses as JSON",
-            False, f"{type(exc).__name__}: {exc}",
-        ))
-        return results
-    results.append(PostCondition(
-        "evidence sidecar parses as JSON", True,
-    ))
-    if not isinstance(doc, dict):
-        results.append(PostCondition(
-            "evidence sidecar top-level value is a JSON object",
-            False, f"got: type={type(doc).__name__}",
-        ))
-        return results
-    results.append(PostCondition(
-        "evidence sidecar top-level value is a JSON object", True,
-    ))
-
-    results.append(PostCondition(
-        f"evidence sidecar.schema_version == "
-        f"{EXPECTED_SIDECAR_SCHEMA_VERSION}",
-        doc.get("schema_version") == EXPECTED_SIDECAR_SCHEMA_VERSION,
-        f"got: {doc.get('schema_version')!r}",
-    ))
-
-    requests = doc.get("requests")
-    if not isinstance(requests, list):
-        results.append(PostCondition(
-            "evidence sidecar.requests is a list",
-            False, f"got: type={type(requests).__name__}",
-        ))
-        return results
-    results.append(PostCondition(
-        "evidence sidecar.requests is a list", True,
-    ))
-
-    # Cross-check IDs + placement_roles against the committed spec.
-    expected_roles, roles_err = _bundle_request_placement_roles_by_id(bundle)
-    sidecar_roles: dict[str, str] = {}
-    for entry in requests:
-        if not isinstance(entry, dict):
-            continue
-        rid = entry.get("id")
-        role = entry.get("placement_role")
-        if isinstance(rid, str) and isinstance(role, str) and role:
-            sidecar_roles[rid] = role
-
-    results.append(PostCondition(
-        "evidence sidecar preserves every request id from the "
-        "committed d_one_spec.json",
-        not roles_err and set(sidecar_roles.keys()) == set(expected_roles.keys()),
-        (f"expected ids: {sorted(expected_roles.keys())!r}; "
-         f"sidecar ids: {sorted(sidecar_roles.keys())!r}; "
-         f"missing: {sorted(set(expected_roles) - set(sidecar_roles))!r}; "
-         f"unexpected: {sorted(set(sidecar_roles) - set(expected_roles))!r}"
-         + (f"; bundle read err: {roles_err}" if roles_err else "")),
-    ))
-    results.append(PostCondition(
-        "evidence sidecar preserves every placement_role byte-"
-        "identical to the committed d_one_spec.json (per id)",
-        not roles_err and sidecar_roles == expected_roles,
-        (f"expected: {sorted(expected_roles.items())!r}; "
-         f"got: {sorted(sidecar_roles.items())!r}"
-         + (f"; bundle read err: {roles_err}" if roles_err else "")),
-    ))
-    # Belt-and-braces: the SET of placement_role values must equal the
-    # canonical {hero_page, local_region} pair. Catches the case where
-    # the per-id check passes (e.g. the test happened to rebind both
-    # ids to the same role on both sides) but a placement_role
-    # disappeared from the audit evidence.
-    results.append(PostCondition(
-        f"evidence sidecar carries BOTH placement_role values "
-        f"{sorted(EXPECTED_PLACEMENT_ROLES)!r} — proves the two "
-        f"generated-image roles are auditable from the sidecar bytes "
-        f"alone (no stdout dependency)",
-        set(sidecar_roles.values()) == EXPECTED_PLACEMENT_ROLES,
-        f"sidecar placement_role values: "
-        f"{sorted(set(sidecar_roles.values()))!r}",
-    ))
-
-    # Cross-check manifest_local_path values against the bundle's
-    # image_manifest_spec.json. Anything other than the safe declared
-    # local_path values means upstream wiring drifted.
-    expected_lp, lp_err = _bundle_manifest_local_paths_by_id(bundle)
-    sidecar_lp: dict[str, str] = {}
-    for entry in requests:
-        if not isinstance(entry, dict):
-            continue
-        rid = entry.get("id")
-        lp = entry.get("manifest_local_path")
-        if isinstance(rid, str) and isinstance(lp, str):
-            sidecar_lp[rid] = lp
-    results.append(PostCondition(
-        "evidence sidecar preserves the manifest_local_path values "
-        "byte-identical to the committed image_manifest_spec.json "
-        "(per id)",
-        not lp_err and sidecar_lp == expected_lp,
-        (f"expected: {sorted(expected_lp.items())!r}; "
-         f"got: {sorted(sidecar_lp.items())!r}"
-         + (f"; bundle read err: {lp_err}" if lp_err else "")),
-    ))
-
-    # External-leakage scan. The sidecar is local / mock / synthetic
-    # evidence by construction — upstream stages refuse URIs,
-    # credential-shaped tokens, public-upload wording, confidential
-    # markers, and raw-source phrasing before the plan is written.
-    # Re-check the produced bytes so a regression that loosens any
-    # upstream scrub (or a hand-authored plan that bypassed the
-    # writer) is caught here. The raw text scan covers literals like
-    # ``http://`` / ``://`` / ``password`` regardless of structural
-    # nesting — these forbidden substrings have no legitimate place
-    # in a local mock plan, so a substring hit is a leak no matter
-    # which field carries it.
-    raw_hits: list[str] = []
-    for needle in _SIDECAR_FORBIDDEN_SUBSTRINGS:
-        if needle.lower() in raw.lower():
-            raw_hits.append(needle)
-    results.append(PostCondition(
-        "evidence sidecar carries no external URL / URI scheme / "
-        "credential-shaped / public-upload / confidential / raw-"
-        "source substrings",
-        not raw_hits,
-        f"forbidden substrings found: {raw_hits!r}" if raw_hits else "",
-    ))
-    # Structural walk: each string scalar is also re-scanned with the
-    # same allow-list so the diagnostic can point at the offending
-    # value (rather than just the substring). Duplicates the raw-text
-    # scan above intentionally — the raw scan catches a leak even if
-    # _walk_strings missed a node (defensive depth), and this walk
-    # surfaces the exact value when a leak occurs.
-    structural_hits: list[tuple[str, str]] = []
-    for s in _walk_strings(doc):
-        for needle in _SIDECAR_FORBIDDEN_SUBSTRINGS:
-            if needle.lower() in s.lower():
-                structural_hits.append((needle, s))
-                break
-    results.append(PostCondition(
-        "evidence sidecar's structural walk surfaces no forbidden "
-        "substring under any string field (recursive scan)",
-        not structural_hits,
-        f"first 5 hits: {structural_hits[:5]!r}"
-        if structural_hits else "",
-    ))
-    return results
-
-
 def _bundle_placement_roles(bundle: Path) -> tuple[set[str], str]:
     """Return (roles, msg). ``roles`` is the set of ``placement_role``
     values declared on the bundle's ``d_one_spec.json`` requests; ``msg``
@@ -829,6 +522,33 @@ def _run_contract_validator(
             sys.executable, str(SCRIPTS_DIR / "validate_pptx_contract.py"),
             "--pptx", str(pptx),
             "--expected-slide-count", str(expected_slide_count),
+        ],
+    )
+
+
+def _run_sidecar_validator(
+    *, sidecar_path: Path, bundle: Path,
+) -> StageOutcome:
+    """Re-run scripts/validate_mock_d_one_adapter_plan.py against the
+    runner-written sidecar with --require-both-placement-roles active
+    (the committed examples/synthetic_mock_image_trial invariant).
+    The validator schema-validates the sidecar and asserts parity with
+    the committed d_one_spec.json + image_manifest_spec.json plus the
+    forbidden-substring scan; per-gate refusal coverage lives in the
+    validator's own --self-test so the smoke only owns the integration
+    PostCondition (rc == 0 for the runner-written sidecar against the
+    committed bundle)."""
+    return _run_stage(
+        "validate_mock_d_one_adapter_plan "
+        "(belt-and-braces, --require-both-placement-roles)",
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "validate_mock_d_one_adapter_plan.py"),
+            "--plan", str(sidecar_path),
+            "--d-one-spec", str(bundle / "d_one_spec.json"),
+            "--image-manifest-spec",
+            str(bundle / "image_manifest_spec.json"),
+            "--require-both-placement-roles",
         ],
     )
 
@@ -936,20 +656,35 @@ def _run_happy_path(td: Path) -> tuple[int, list[PostCondition]]:
         expected_slide_count=EXPECTED_SLIDE_COUNT,
     ))
 
-    # Sidecar audit-evidence checks. The runner writes
+    # Sidecar audit-evidence check. The runner writes
     # mock_d_one_adapter_plan.json under --report-dir AFTER
     # done_image_adapter succeeds AND the taxonomy preservation
-    # check passes AND run_explicit_pipeline succeeds — the bytes are
-    # therefore a byte-identical copy of the validated staging plan.
-    # Asserting the sidecar carries schema_version=4, both request
-    # ids and both placement_role values byte-identical to the
-    # committed spec, the expected safe local_path values, and no
-    # external-leakage substrings proves the two generated-image
-    # roles are auditable from the bytes alone — no reliance on the
-    # runner's stdout marker.
-    results.extend(_check_sidecar_invariants(
-        sidecar_path=report_dir / EVIDENCE_SIDECAR_FILENAME,
-        bundle=COMMITTED_BUNDLE,
+    # check passes AND run_explicit_pipeline succeeds — the bytes
+    # are therefore a byte-identical copy of the validated staging
+    # plan. The standalone validator
+    # `scripts/validate_mock_d_one_adapter_plan.py` runs against the
+    # produced sidecar + the committed d_one_spec.json +
+    # image_manifest_spec.json with --require-both-placement-roles
+    # active, so the assertion stack (schema_version=4, request_count
+    # consistency, request-id + placement_role parity per id,
+    # both-placement-role coverage, manifest_local_path parity +
+    # safety, recursive forbidden-substring scan) is exercised
+    # against the actual runner-written bytes. Per-gate refusal
+    # coverage lives in the validator's own --self-test.
+    sidecar_path = report_dir / EVIDENCE_SIDECAR_FILENAME
+    sidecar_validator = _run_sidecar_validator(
+        sidecar_path=sidecar_path, bundle=COMMITTED_BUNDLE,
+    )
+    _print_stage(sidecar_validator)
+    results.append(PostCondition(
+        f"validate_mock_d_one_adapter_plan --plan <{EVIDENCE_SIDECAR_FILENAME}> "
+        "--d-one-spec <bundle/d_one_spec.json> --image-manifest-spec "
+        "<bundle/image_manifest_spec.json> --require-both-placement-roles "
+        "exits 0 against the runner-written sidecar",
+        sidecar_validator.ok,
+        (f"rc={sidecar_validator.exit_code}; tail: "
+         f"{(sidecar_validator.stdout + sidecar_validator.stderr).splitlines()[-10:]!r}")
+        if not sidecar_validator.ok else "",
     ))
 
     # Static placement_role coverage on the committed bundle. Combined
@@ -1421,222 +1156,6 @@ def _probe_missing_local_region_evidence(td: Path) -> _NegativeOutcome:
     )
 
 
-def _build_baseline_sidecar_body(bundle: Path) -> dict:
-    """Synthesize a baseline-valid sidecar body that mirrors what the
-    runner would write for ``bundle``. The shape covers exactly the
-    fields ``_check_sidecar_invariants`` inspects (schema_version /
-    mode / note / request_count / requests, with per-request id /
-    prompt / manifest_local_path / manifest_source / placement_role
-    populated from the bundle's d_one_spec.json + image_manifest_spec
-    .json). Used by the focused tamper probes below — each takes this
-    baseline, mutates one field, and asserts the matching gate flips.
-
-    Reading the committed bundle (not hard-coding the values) keeps
-    the probes self-updating if the committed spec / manifest is
-    ever extended; the probes test the smoke's own gates, not the
-    runner's plan-writing logic, so a minimal shape is sufficient."""
-    spec_doc = json.loads((bundle / "d_one_spec.json").read_text())
-    manifest_doc = json.loads(
-        (bundle / "image_manifest_spec.json").read_text(),
-    )
-    manifest_by_id: dict[str, str] = {}
-    for img in manifest_doc.get("images", []) or []:
-        if not isinstance(img, dict):
-            continue
-        iid = img.get("id")
-        lp = img.get("local_path")
-        if isinstance(iid, str) and isinstance(lp, str):
-            manifest_by_id[iid] = lp
-    requests_out: list[dict] = []
-    for req in spec_doc.get("requests", []) or []:
-        if not isinstance(req, dict):
-            continue
-        rid = req.get("id")
-        if not isinstance(rid, str) or rid not in manifest_by_id:
-            continue
-        plan_req: dict = {
-            "id": rid,
-            "prompt": req.get("prompt", ""),
-            "manifest_local_path": manifest_by_id[rid],
-            "manifest_source": "d_one_local",
-        }
-        if isinstance(req.get("placement_role"), str):
-            plan_req["placement_role"] = req["placement_role"]
-        requests_out.append(plan_req)
-    return {
-        "schema_version": EXPECTED_SIDECAR_SCHEMA_VERSION,
-        "mode": "dry_run",
-        "note": "D-One adapter contract stub",
-        "request_count": len(requests_out),
-        "requests": requests_out,
-    }
-
-
-def _write_baseline_sidecar(td: Path, body: dict) -> Path:
-    """Write ``body`` deterministically to a sidecar file under ``td``.
-    Mirrors the runner's byte-deterministic write shape (sorted keys,
-    2-space indent, trailing newline)."""
-    report_dir = td
-    report_dir.mkdir(parents=True, exist_ok=True)
-    sidecar = report_dir / EVIDENCE_SIDECAR_FILENAME
-    sidecar.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n")
-    return sidecar
-
-
-def _probe_sidecar_baseline_passes(td: Path) -> _NegativeOutcome:
-    """Sanity probe: the unmodified baseline sidecar must pass EVERY
-    PostCondition emitted by ``_check_sidecar_invariants``. Without
-    this gate a tamper-probe regression could green silently if the
-    baseline itself were broken (e.g. a future bundle field rename
-    that desyncs `_build_baseline_sidecar_body` from the gates)."""
-    probe_dir = td / "probe_sidecar_baseline"
-    body = _build_baseline_sidecar_body(COMMITTED_BUNDLE)
-    sidecar = _write_baseline_sidecar(probe_dir, body)
-    results = _check_sidecar_invariants(
-        sidecar_path=sidecar, bundle=COMMITTED_BUNDLE,
-    )
-    fails = [r for r in results if not r.ok]
-    ok = not fails
-    detail = ""
-    if not ok:
-        detail = f"baseline failed: {[(r.name, r.detail) for r in fails]!r}"
-    return _NegativeOutcome(
-        "sanity (direct): unmodified baseline sidecar passes every "
-        "_check_sidecar_invariants PostCondition",
-        ok, detail,
-    )
-
-
-def _probe_tampered_sidecar_schema_version(td: Path) -> _NegativeOutcome:
-    """Direct probe: a sidecar whose ``schema_version`` is anything
-    other than ``EXPECTED_SIDECAR_SCHEMA_VERSION`` flips the
-    schema_version PostCondition to ``ok=False``. Catches a regression
-    where a future writer downgrades the plan shape (or a hand-
-    tampered sidecar tries to look like an older plan)."""
-    probe_dir = td / "probe_tampered_sidecar_schema_version"
-    body = _build_baseline_sidecar_body(COMMITTED_BUNDLE)
-    body["schema_version"] = EXPECTED_SIDECAR_SCHEMA_VERSION + 1
-    sidecar = _write_baseline_sidecar(probe_dir, body)
-    results = _check_sidecar_invariants(
-        sidecar_path=sidecar, bundle=COMMITTED_BUNDLE,
-    )
-    schema_pc = next(
-        (r for r in results
-         if r.name == f"evidence sidecar.schema_version == "
-                       f"{EXPECTED_SIDECAR_SCHEMA_VERSION}"),
-        None,
-    )
-    ok = schema_pc is not None and not schema_pc.ok
-    detail = ""
-    if not ok:
-        detail = (
-            f"schema_version gate did not flip; "
-            f"results: {[(r.name, r.ok) for r in results]!r}"
-        )
-    return _NegativeOutcome(
-        "negative (direct): tampered sidecar.schema_version "
-        f"(={EXPECTED_SIDECAR_SCHEMA_VERSION + 1}) flips the schema_"
-        "version PostCondition to ok=False",
-        ok, detail,
-    )
-
-
-def _probe_missing_local_region_in_sidecar(td: Path) -> _NegativeOutcome:
-    """Direct probe: a sidecar with the ``local_region`` request
-    stripped trips BOTH the per-id parity gate and the
-    ``BOTH placement_role values`` coverage gate. The coverage gate
-    is the one that proves both generated-image roles are auditable
-    from the sidecar bytes alone — losing it means the audit no
-    longer certifies the local_region path."""
-    probe_dir = td / "probe_missing_local_region_in_sidecar"
-    body = _build_baseline_sidecar_body(COMMITTED_BUNDLE)
-    body["requests"] = [
-        r for r in body["requests"]
-        if r.get("placement_role") != "local_region"
-    ]
-    body["request_count"] = len(body["requests"])
-    sidecar = _write_baseline_sidecar(probe_dir, body)
-    results = _check_sidecar_invariants(
-        sidecar_path=sidecar, bundle=COMMITTED_BUNDLE,
-    )
-    coverage_pc = next(
-        (r for r in results if "BOTH placement_role values" in r.name),
-        None,
-    )
-    id_parity_pc = next(
-        (r for r in results
-         if "preserves every request id" in r.name),
-        None,
-    )
-    ok = (
-        coverage_pc is not None and not coverage_pc.ok
-        and id_parity_pc is not None and not id_parity_pc.ok
-    )
-    detail = ""
-    if not ok:
-        detail = (
-            f"coverage / id-parity gates did not both flip; "
-            f"results: {[(r.name, r.ok) for r in results]!r}"
-        )
-    return _NegativeOutcome(
-        "negative (direct): sidecar with the local_region request "
-        "stripped trips BOTH the per-id request-id parity gate and "
-        "the 'BOTH placement_role values' coverage gate (proves the "
-        "audit cannot silently de-scope to a single placement_role)",
-        ok, detail,
-    )
-
-
-def _probe_unsafe_sidecar_local_path(td: Path) -> _NegativeOutcome:
-    """Direct probe: a sidecar with a tampered ``manifest_local_path``
-    carrying a URI scheme (``http://attacker/x.png``) trips BOTH the
-    manifest_local_path byte-identity gate AND the external-leakage
-    substring scan (``http://`` is on the forbidden allow-list). A
-    valid sidecar can only carry the manifest's safe local_path
-    values byte-identical."""
-    probe_dir = td / "probe_unsafe_sidecar_local_path"
-    body = _build_baseline_sidecar_body(COMMITTED_BUNDLE)
-    if not body["requests"]:
-        return _NegativeOutcome(
-            "probe setup: baseline sidecar has no requests to tamper",
-            False,
-            "expected at least one request from the committed bundle",
-        )
-    body["requests"][0]["manifest_local_path"] = "http://attacker/x.png"
-    sidecar = _write_baseline_sidecar(probe_dir, body)
-    results = _check_sidecar_invariants(
-        sidecar_path=sidecar, bundle=COMMITTED_BUNDLE,
-    )
-    lp_pc = next(
-        (r for r in results
-         if "manifest_local_path values" in r.name),
-        None,
-    )
-    leak_pc = next(
-        (r for r in results
-         if "no external URL / URI scheme" in r.name),
-        None,
-    )
-    ok = (
-        lp_pc is not None and not lp_pc.ok
-        and leak_pc is not None and not leak_pc.ok
-    )
-    detail = ""
-    if not ok:
-        detail = (
-            f"manifest_local_path / external-leakage gates did not "
-            f"both flip; results: "
-            f"{[(r.name, r.ok) for r in results]!r}"
-        )
-    return _NegativeOutcome(
-        "negative (direct): sidecar with one manifest_local_path "
-        "overwritten by `http://attacker/x.png` trips BOTH the "
-        "manifest_local_path byte-identity gate AND the external-"
-        "leakage substring scan",
-        ok, detail,
-    )
-
-
 _NEGATIVE_PROBES = (
     _probe_missing_bundle,
     _probe_symlinked_bundle_parent,
@@ -1645,10 +1164,6 @@ _NEGATIVE_PROBES = (
     _probe_traversal_local_path,
     _probe_wrong_placement_role_on_hero,
     _probe_missing_local_region_evidence,
-    _probe_sidecar_baseline_passes,
-    _probe_tampered_sidecar_schema_version,
-    _probe_missing_local_region_in_sidecar,
-    _probe_unsafe_sidecar_local_path,
 )
 
 
@@ -1763,26 +1278,26 @@ def _run_self_test() -> int:
         "external relationships; the taxonomy preservation marker "
         "fires (proving each spec request's placement_role landed "
         "byte-identical on the produced plan); the runner writes "
-        "<report-dir>/mock_d_one_adapter_plan.json with "
-        "schema_version=4, both committed request ids and both "
-        "placement_role values byte-identical to d_one_spec.json, "
-        "the safe local_path values from image_manifest_spec.json, "
-        "and no external/URI/credential/public-upload/confidential/"
-        "raw-source substrings (so both generated-image roles are "
-        "auditable from the sidecar bytes alone); and "
+        "<report-dir>/mock_d_one_adapter_plan.json and the standalone "
+        "validate_mock_d_one_adapter_plan.py subprocess "
+        "(--require-both-placement-roles) exits 0 against it, "
+        "asserting schema_version=4, request_count consistency, both "
+        "committed request ids byte-identical to d_one_spec.json, "
+        "both hero_page AND local_region placement_role coverage, "
+        "manifest_local_path byte-identity with image_manifest_spec"
+        ".json, and no URI/path-traversal/credential/public-upload/"
+        "confidential/raw-source substring (so both generated-image "
+        "roles are auditable from the sidecar bytes alone); and "
         "scripts/__pycache__/ is byte-identical even without "
         "PYTHONDONTWRITEBYTECODE in the subprocess env. All "
         "negative probes (missing bundle, symlinked bundle parent, "
         "parent-traversal `..`, URI-shaped image_manifest_spec "
         "local_path, traversal `../` image_manifest_spec local_path, "
         "wrong placement_role on the hero_page request, missing "
-        "local_region evidence under the static helper, sidecar "
-        "baseline-passes sanity, tampered sidecar.schema_version, "
-        "missing local_region request in the sidecar, unsafe "
-        "sidecar local_path) aborted the runner with no PPTX "
-        "written (or — for the direct helper probes — surfaced the "
-        "regression at the static-evidence layer). MOCK / STUB "
-        "only — NOT real D-One integration."
+        "local_region evidence under the static helper) aborted the "
+        "runner with no PPTX written (or — for the direct helper "
+        "probe — surfaced the regression at the static-evidence "
+        "layer). MOCK / STUB only — NOT real D-One integration."
     )
     return 0
 
@@ -1806,12 +1321,16 @@ def main(argv: list[str]) -> int:
             "indices; the committed d_one_spec.json declares BOTH "
             "placement_role values (hero_page AND local_region); "
             "stdout carries the [PASS] taxonomy preservation check "
-            "marker; <report-dir>/mock_d_one_adapter_plan.json exists "
-            "as a regular non-symlink JSON file with schema_version=4, "
-            "every committed request id and placement_role byte-"
-            "identical to d_one_spec.json, every manifest_local_path "
-            "byte-identical to image_manifest_spec.json, and no "
-            "external/URI/credential/public-upload/confidential/raw-"
+            "marker; the runner writes <report-dir>/"
+            "mock_d_one_adapter_plan.json AND the standalone "
+            "validate_mock_d_one_adapter_plan.py subprocess "
+            "(--require-both-placement-roles) exits 0 against it, "
+            "asserting schema_version=4, request_count consistency, "
+            "both committed request ids byte-identical to "
+            "d_one_spec.json, both hero_page AND local_region "
+            "placement_role coverage, manifest_local_path byte-"
+            "identity with image_manifest_spec.json, and no URI/path-"
+            "traversal/credential/public-upload/confidential/raw-"
             "source substring (so both generated-image roles are "
             "auditable from the sidecar bytes ALONE — no stdout "
             "dependency); scripts/__pycache__/ is byte-identical "
@@ -1826,22 +1345,21 @@ def main(argv: list[str]) -> int:
             "flipping cover_accent to local_region while the prompt "
             "still carries overlay-reservation cues, direct probe of "
             "_bundle_placement_roles against a bundle copy missing "
-            "the local_region request, sidecar baseline-passes "
-            "sanity, tampered sidecar.schema_version, missing "
-            "local_region request in the sidecar, unsafe sidecar "
-            "manifest_local_path) and asserts each aborts the runner "
-            "with no PPTX produced (or — for the direct helper "
-            "probes — surfaces the regression at the static-evidence "
-            "layer). MOCK / STUB only — NOT real D-One integration; "
-            "no MCP, no public network, no model API, no image "
-            "search, no Qoder, no telemetry, no external service. "
-            "Stdlib-only."
+            "the local_region request) and asserts each aborts the "
+            "runner with no PPTX produced (or — for the direct "
+            "helper probe — surfaces the regression at the static-"
+            "evidence layer). Per-gate refusal coverage for the "
+            "sidecar validator lives in validate_mock_d_one_adapter_"
+            "plan.py --self-test. MOCK / STUB only — NOT real D-One "
+            "integration; no MCP, no public network, no model API, "
+            "no image search, no Qoder, no telemetry, no external "
+            "service. Stdlib-only."
         ),
     )
     parser.add_argument(
         "--self-test", action="store_true",
         help=(
-            "Run the happy path + eleven fail-closed probes under a "
+            "Run the happy path + seven fail-closed probes under a "
             "single tempfile.TemporaryDirectory(). The smoke has no "
             "other mode today; --self-test is required."
         ),
