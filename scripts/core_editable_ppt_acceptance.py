@@ -137,6 +137,41 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     passes — and a static helper refusing any evidence JSON that
     claims real D-One / MCP / public network / model API / image
     search / Qoder success). MOCK / STUB ONLY — no real D-One.
+  - ``scripts/mock_generated_image_provenance_smoke.py`` —
+    tempdir-only generated-image provenance smoke. Drives the
+    COMMITTED ``examples/synthetic_mock_image_trial/`` bundle
+    through ``run_mock_image_pipeline.py --bundle`` and derives a
+    per-request provenance object linking each generated-image
+    request id from the bundle's ``d_one_spec.json`` to (a) the
+    schema-allowed prompt/request metadata (``placement_role`` /
+    ``text_policy`` / ``subject_domain`` / ``manifest_local_path``),
+    (b) the runner-written
+    ``<report-dir>/mock_d_one_adapter_plan.json`` sidecar
+    metadata, (c) the on-disk generated mock asset under the
+    tempdir-owned workspace (absolute path, ``byte_count``,
+    ``sha256``, ``extension``, conservative ``media_type``), and
+    (d) PPTX inventory evidence matching the workspace asset by
+    sha256 byte-for-byte under ``ppt/media/*`` with no external
+    relationship. Asserts at least two request rows, both
+    placement_role values, at least two distinct text_policy
+    values, per-id equality with the committed
+    ``d_one_spec.json`` + the runner sidecar, asset files exist
+    as regular non-symlink PNG/JPG/JPEG, byte_count > 0, sha256
+    is lowercase 64 hex, no URI / traversal / absolute-output-
+    escape on any path field, no credential / token / public-
+    upload / public-hosting / raw-source / confidential / customer
+    markers anywhere in the derived object, and no real-D-One /
+    MCP / public-network / model-API / image-search / Qoder
+    success claim. Eight fail-closed probes (P1..P8) cover
+    missing row for a committed request id, mismatched
+    text_policy vs the spec, collapsed text_policy coverage,
+    tampered ``sha256`` / ``byte_count``, unsafe path / URI-
+    shaped asset path, public-hosting wording, confidential /
+    raw-source markers, and positive real-D-One success claims.
+    The derived provenance object is emitted to stdout AND to a
+    per-run tempfile that the tempdir cleanup removes on exit;
+    nothing is written under the repo tree and ``REPO_ROOT/dist``
+    is left untouched. MOCK / STUB ONLY — no real D-One.
   - ``scripts/validate_mock_image_bundle_trial_evidence.py`` —
     stdlib-only, read-only, tempdir-only validator for the JSON
     evidence record emitted by
@@ -236,6 +271,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "run_mock_image_pipeline.py",
     SCRIPTS_DIR / "mock_image_bundle_acceptance_smoke.py",
     SCRIPTS_DIR / "mock_image_bundle_trial_evidence.py",
+    SCRIPTS_DIR / "mock_generated_image_provenance_smoke.py",
     SCRIPTS_DIR / "validate_mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
     SCRIPTS_DIR / "trace_acceptance_smoke.py",
@@ -468,6 +504,7 @@ def main(argv: list[str]) -> int:
             "text_policy_decision_smoke + run_mock_image_pipeline "
             "+ mock_image_bundle_acceptance_smoke + "
             "mock_image_bundle_trial_evidence + "
+            "mock_generated_image_provenance_smoke + "
             "validate_mock_image_bundle_trial_evidence + "
             "render_model_roundtrip_smoke + trace_acceptance_smoke). "
             "Runs each delegated smoke as a subprocess from REPO_ROOT; "
