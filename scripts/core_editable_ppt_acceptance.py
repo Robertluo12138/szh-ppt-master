@@ -17,6 +17,23 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     ``image_manifest.json`` + ``slide_plans/*.json``, materialization
     into the workspace, native ``<p:pic>`` embed under
     ``ppt/media/imageN.<ext>``, contract + inventory validators).
+  - ``scripts/source_image_asset_pipeline_smoke.py`` — the
+    **explicit-input pipeline integration** for the source-attached
+    image-asset path: drives ``scripts/run_explicit_pipeline.py``
+    (Stage 1-10 + the Stage-5.5 materialize step) with a staged
+    synthetic PNG and asserts the PPTX media part's sha256 equals
+    the source asset's sha256 byte-for-byte, the produced deck still
+    carries native editable text (``minimal_evidence.editable_text`` +
+    ``not_all_image_slide`` + ``every_slide_has_native_shape`` PASS),
+    the read-only registry validator G1..G13 passes against the
+    pipeline-produced workspace augmented with the source-attached
+    registry, and eight fail-closed probes fire on registry sha
+    mismatch, source symlink (leaf + parent), unsafe local_path
+    (traversal + URI), image_manifest missing declared id,
+    unsupported media type, public-upload wording, and a tampered
+    PPTX media-bytes injection (the byte-identity gate detects the
+    drift). MOCK / STUB ONLY — no real D-One / MCP / Qoder /
+    network.
   - ``scripts/image_asset_acceptance_smoke.py`` — the mockable
     D-One-stub chain end-to-end through the explicit-input
     acceptance path (``done_image_adapter`` ->
@@ -303,6 +320,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 # aggregator's stdout stays diff-stable across runs.
 _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "source_image_asset_acceptance_smoke.py",
+    SCRIPTS_DIR / "source_image_asset_pipeline_smoke.py",
     SCRIPTS_DIR / "image_asset_acceptance_smoke.py",
     SCRIPTS_DIR / "image_asset_trial_evidence.py",
     SCRIPTS_DIR / "image_asset_negative_probes_smoke.py",
@@ -539,6 +557,7 @@ def main(argv: list[str]) -> int:
         description=(
             "Aggregator for the existing core editable-PPT acceptance "
             "smokes (source_image_asset_acceptance_smoke + "
+            "source_image_asset_pipeline_smoke + "
             "image_asset_acceptance_smoke + image_asset_trial_evidence "
             "+ image_asset_negative_probes_smoke + "
             "image_taxonomy_acceptance_smoke + "
