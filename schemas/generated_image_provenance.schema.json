@@ -1,0 +1,442 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "generated_image_provenance.schema.json",
+  "title": "Generated Image Provenance Handoff Record",
+  "description": "Committed-safe contract for a generated-image provenance handoff record a reviewer reads alongside a local mock-image trial. The runtime smoke scripts/mock_generated_image_provenance_smoke.py writes a TEMP-ONLY object using absolute tempdir paths under a tempdir that is removed on exit — that runtime shape is NOT what this validator gates. THIS schema gates a committed-safe / package-safe version of the same shape (workspace-relative / placeholder paths only — no leading '/', no URI scheme, no '..' segment) so a synthetic example template and any committed reviewer-handoff record can be schema-validated without leaking absolute machine paths or real on-disk artifacts. The schema mirrors the runtime row taxonomy (id / placement_role / text_policy / subject_domain / manifest_local_path / spec / sidecar / asset / pptx_media) but no real PPTX bytes, no real assets, and no real D-One / MCP / public-network / model-API / image-search / Qoder run are produced or claimed. real_d_one_status is locked to a self-describing UNVERIFIED sentence; the validator's semantic gate refuses any positive success claim about real D-One / MCP / public network / model API / image search / Qoder anywhere in the record. schema_version is locked to '1' and evidence_id is locked to 'generated_image_provenance' so a future shape change forces a paired schema/validator bump. additionalProperties:false at every declared object level so a tampered record carrying an unrecognised field (smuggle slot) is refused at the schema layer.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_id",
+    "real_d_one_status",
+    "bundle_path",
+    "workspace_path",
+    "report_dir",
+    "pptx_path",
+    "sidecar",
+    "inventory",
+    "rows",
+    "notes",
+    "summary"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1"],
+      "description": "Record-file schema version. Locked to the string '1'; bumped only with a paired emitter + schema + validator change so a future consumer can refuse a shape it does not recognise."
+    },
+    "evidence_id": {
+      "type": "string",
+      "enum": ["generated_image_provenance"],
+      "description": "Self-describing record identifier. Locked so a reader scanning a directory of mixed JSON evidence can recognise this record without inspecting the structure."
+    },
+    "real_d_one_status": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "description": "Fixed sentence pinned to the literal 'UNVERIFIED' substring AND explicit negation that real D-One / MCP / public network / model API / image search / Qoder / telemetry were called. The validator's semantic gate (G3) enforces the substring + negation in addition to the minLength/maxLength bounds the schema can express."
+    },
+    "bundle_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative or placeholder-safe path to the committed mock-image bundle the trial drove. Refuses leading '/', URI schemes, and '..' segments by pattern (validator G12 re-asserts at runtime)."
+    },
+    "workspace_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative or placeholder-safe path the trial materialized assets under. Same path-shape rules as bundle_path."
+    },
+    "report_dir": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative or placeholder-safe path to the trial report directory. Same path-shape rules as bundle_path."
+    },
+    "pptx_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative or placeholder-safe path to the produced mock PPTX. Same path-shape rules as bundle_path."
+    },
+    "sidecar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "schema_version", "request_count"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+          "description": "Workspace-relative or placeholder-safe path to <report-dir>/mock_d_one_adapter_plan.json. Validator G12 refuses URI / traversal / absolute-output shapes."
+        },
+        "schema_version": {
+          "type": "integer",
+          "enum": [4],
+          "description": "Locked sidecar plan schema version mirroring run_mock_image_pipeline.LOCKED_PLAN_SCHEMA_VERSION; refused when drifted (validator G16)."
+        },
+        "request_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "Number of requests recorded on the sidecar. The summary gate refuses a record whose request_count disagrees with len(rows)."
+        }
+      }
+    },
+    "inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "ok",
+        "findings_empty",
+        "slide_count",
+        "relationships_external_count"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+          "description": "Workspace-relative or placeholder-safe path to <report-dir>/inventory.json."
+        },
+        "ok": {
+          "type": "boolean",
+          "description": "True iff the produced PPTX's inventory walker reported no findings."
+        },
+        "findings_empty": {
+          "type": "boolean",
+          "description": "True iff inventory.findings is an empty list. Cross-checked against ok by the validator."
+        },
+        "slide_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Number of slide parts in the produced PPTX."
+        },
+        "relationships_external_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Number of OOXML relationships whose Target carries a URI scheme OR whose TargetMode != Internal. Locked to 0 by validator G15."
+        }
+      }
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1024,
+      "uniqueItems": false,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "placement_role",
+          "text_policy",
+          "subject_domain",
+          "manifest_local_path",
+          "spec",
+          "sidecar",
+          "asset",
+          "pptx_media"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]*$",
+            "description": "Request id mirrored verbatim from the bundle's d_one_spec.json. Identifier-safe pattern; validator G6 refuses duplicate ids across rows."
+          },
+          "placement_role": {
+            "type": "string",
+            "enum": ["hero_page", "local_region"],
+            "description": "Closed enumeration mirroring scripts/done_image_adapter.py's placement_role surface. Both roles must appear across the rows (validator G7)."
+          },
+          "text_policy": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "description": "Caller-declared text_policy on the spec. Lowercase-identifier shape; validator G8 refuses a rows[] where every value collapsed to one entry."
+          },
+          "subject_domain": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "description": "Caller-declared subject_domain on the spec. Lowercase-identifier shape."
+          },
+          "manifest_local_path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+            "description": "Workspace-relative local_path mirrored from the manifest. Refuses leading '/', URI schemes, and '..' segments by pattern; validator G12 re-asserts at runtime."
+          },
+          "spec": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "placement_role",
+              "text_policy",
+              "subject_domain",
+              "intended_use"
+            ],
+            "properties": {
+              "placement_role": {
+                "type": "string",
+                "enum": ["hero_page", "local_region"],
+                "description": "spec.placement_role mirrors the bundle's d_one_spec.json request value. Validator G9 refuses spec/sidecar/row drift."
+              },
+              "text_policy": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "subject_domain": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "intended_use": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Free-text intended-use note mirrored from the spec. Validator G13 string-safety scan applies."
+              }
+            }
+          },
+          "sidecar": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "placement_role",
+              "text_policy",
+              "subject_domain",
+              "manifest_local_path"
+            ],
+            "properties": {
+              "placement_role": {
+                "type": "string",
+                "enum": ["hero_page", "local_region"]
+              },
+              "text_policy": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "subject_domain": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "manifest_local_path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$"
+              }
+            }
+          },
+          "asset": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "exists",
+              "byte_count",
+              "sha256",
+              "extension",
+              "media_type",
+              "error"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+                "description": "Workspace-relative or placeholder-safe path to the on-disk asset. Committed-safe contract: refuses leading '/', URI schemes, '..' segments (validator G12). NOTE: the runtime smoke records absolute tempdir paths here — that runtime shape is intentionally not gated by this committed-safe schema; the deliberate narrowed mapping is documented in references/quality-gates.md."
+              },
+              "exists": {
+                "type": "boolean",
+                "description": "True iff the recorded asset path resolved to a regular non-symlink file at evidence-write time."
+              },
+              "byte_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 268435456,
+                "description": "File byte length. Validator G10 refuses byte_count <= 0 on any row whose summary.ok is true."
+              },
+              "sha256": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase 64-character hex sha256 of the asset bytes. Validator G10 refuses uppercase / non-hex / wrong-length values."
+              },
+              "extension": {
+                "type": "string",
+                "enum": ["png", "jpg", "jpeg"],
+                "description": "Lower-cased file extension. Mirrors scripts/export_pptx.py's embed-surface allow-list (PNG / JPG / JPEG)."
+              },
+              "media_type": {
+                "type": "string",
+                "enum": ["image/png", "image/jpeg"],
+                "description": "Conservative media-type projection from extension; validator G10 cross-checks the pair."
+              },
+              "error": {
+                "type": "string",
+                "maxLength": 256,
+                "description": "Empty string on a successful row; carries a per-row diagnostic when asset read failed. Validator G4 refuses summary.ok=true when any row carries a non-empty error."
+              }
+            }
+          },
+          "pptx_media": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "part",
+              "size_bytes",
+              "sha256",
+              "extension",
+              "content_type"
+            ],
+            "properties": {
+              "part": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^ppt/media/[A-Za-z0-9_][A-Za-z0-9_.\\-]*$",
+                "description": "Package-internal OOXML part path. Must sit under 'ppt/media/' (validator G11). The pattern refuses any URI scheme, '..' segment, or leading '/' by construction."
+              },
+              "size_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 268435456,
+                "description": "Byte length of the PPTX-embedded media part. Validator cross-checks against asset.byte_count is OUT OF SCOPE — the exporter renames and may pad on transcode-free embed; only sha256 byte-equality is gated (G11)."
+              },
+              "sha256": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase 64-character hex sha256 of the PPTX media bytes. Validator G11 requires this to equal asset.sha256 byte-for-byte."
+              },
+              "extension": {
+                "type": "string",
+                "enum": ["png", "jpg", "jpeg"]
+              },
+              "content_type": {
+                "type": "string",
+                "enum": ["image/png", "image/jpeg"]
+              },
+              "referencing_slides": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": 1024,
+                "items": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1024
+                },
+                "description": "Optional list of 1-based slide indices that reference this media part. Provenance-only; the validator does not require non-empty membership."
+              }
+            }
+          }
+        }
+      },
+      "description": "One record per generated request, mirroring the runtime smoke's rows[] order. The schema enforces per-row required fields + identifier-safe id pattern + closed placement_role enum + closed extension / media_type / content_type enums + lowercase-identifier text_policy / subject_domain patterns; the validator enforces row-count >= 1, request_id uniqueness, placement_role coverage, text_policy diversity, spec/sidecar/row parity, sha256/byte_count/media-type shape, pptx_media sha equality, and committed-safe path shapes across every path-typed field."
+    },
+    "notes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "embed_surface"],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "description": "Fixed framing that names what this record does NOT prove (mock chain only, NOT real D-One / MCP / Qoder / public network / model API / image search / telemetry; not a prompt/report-to-PPTX automation). Validator G13 string-safety scan + G14 real-D-One claim refusal apply here too."
+        },
+        "embed_surface": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Fixed framing for the embed subset scripts/export_pptx.py supports today (PNG/JPG/JPEG under ppt/media/*). Anything outside that subset is fail-closed by the exporter."
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "row_count",
+        "placement_role_coverage",
+        "text_policy_coverage",
+        "failures"
+      ],
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "description": "Single-boolean summary derived from every gate. Validator G4 refuses summary.ok=true when any of the documented sub-conditions does not hold."
+        },
+        "row_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Derived len(rows). Validator G4 refuses summary.ok=true when this disagrees with the actual length of rows[]."
+        },
+        "placement_role_coverage": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["hero_page", "local_region"]
+          },
+          "description": "Sorted unique placement_role values across rows. Validator G7 refuses summary.ok=true unless this equals exactly ['hero_page', 'local_region']."
+        },
+        "text_policy_coverage": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "description": "Sorted unique text_policy values across rows. Validator G8 refuses summary.ok=true unless this carries at least two distinct entries (a rows[] that collapsed to a single text_policy — typically all 'no_text' — is refused)."
+        },
+        "failures": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "description": "Per-gate failure strings the in-script gate stack produced. A summary.ok=true record MUST carry an empty failures[]."
+        }
+      }
+    }
+  }
+}
