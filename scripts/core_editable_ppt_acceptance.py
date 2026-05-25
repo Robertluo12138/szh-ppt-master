@@ -18,21 +18,43 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     into the workspace, native ``<p:pic>`` embed under
     ``ppt/media/imageN.<ext>``, contract + inventory validators).
   - ``scripts/source_image_asset_pipeline_smoke.py`` — the
-    **explicit-input pipeline integration** for the source-attached
-    image-asset path: drives ``scripts/run_explicit_pipeline.py``
-    (Stage 1-10 + the Stage-5.5 materialize step) with a staged
-    synthetic PNG and asserts the PPTX media part's sha256 equals
-    the source asset's sha256 byte-for-byte, the produced deck still
-    carries native editable text (``minimal_evidence.editable_text`` +
-    ``not_all_image_slide`` + ``every_slide_has_native_shape`` PASS),
-    the read-only registry validator G1..G13 passes against the
-    pipeline-produced workspace augmented with the source-attached
-    registry, and eight fail-closed probes fire on registry sha
-    mismatch, source symlink (leaf + parent), unsafe local_path
-    (traversal + URI), image_manifest missing declared id,
-    unsupported media type, public-upload wording, and a tampered
-    PPTX media-bytes injection (the byte-identity gate detects the
-    drift). MOCK / STUB ONLY — no real D-One / MCP / Qoder /
+    **explicit-input multi-asset pipeline integration** for the
+    source-attached image-asset path: drives
+    ``scripts/run_explicit_pipeline.py`` (Stage 1-10 + the
+    Stage-5.5 materialize step) with TWO caller-staged synthetic
+    local image assets — one PNG AND one JPEG — referenced from
+    two distinct cover slides, and asserts the embedded
+    ``ppt/media/*.png`` part's sha256 equals the PNG source
+    asset's sha256 AND the embedded ``ppt/media/*.jpg``/``.jpeg``
+    part's sha256 equals the JPEG source asset's sha256
+    byte-for-byte (load-bearing per-asset byte-identity proof),
+    the on-disk media-part sha set contains BOTH expected source
+    shas (no per-format collapse) AND >= 2 distinct media parts
+    exist (no per-part collapse), the produced deck still carries
+    native editable text (``minimal_evidence.editable_text`` +
+    ``not_all_image_slide`` + ``every_slide_has_native_shape``
+    PASS), the read-only registry validator G1..G13 passes
+    against the pipeline-produced workspace augmented with the
+    two-entry source-attached registry, the inventory readback
+    names BOTH source shas in ``media_parts[].sha256`` and lists
+    >= 2 distinct slide indices across
+    ``media_parts[].referencing_slides`` (the two assets land on
+    distinct slides), and seventeen fail-closed probes fire —
+    single-asset N1..N7 (registry sha mismatch G8 / source
+    symlink leaf + parent G6 / unsafe registry path schema + G5
+    + G11 for traversal + URI / image_manifest missing declared
+    id G13 / unsupported media type G9 / public-upload wording
+    G12), multi-asset M1..M7 (duplicate registry id G3 /
+    duplicate destination_path smoke-owned multi-asset invariant
+    / second registry id missing from image_manifest G13
+    per-asset / JPEG bytes declared as ``image/png`` G9
+    magic-byte / PNG bytes declared as ``image/jpeg`` G9
+    magic-byte / ``.jpg`` declared as ``media_type=image/png`` G9
+    extension-vs-media / one-asset sha mismatch G8 with the
+    second valid), plus tampered-first-part (N8) and
+    tampered-second-part-only (M8) PPTX media-bytes injections —
+    the per-part byte-identity gate detects the drift on EITHER
+    part. MOCK / STUB ONLY — no real D-One / MCP / Qoder /
     network.
   - ``scripts/image_asset_acceptance_smoke.py`` — the mockable
     D-One-stub chain end-to-end through the explicit-input
