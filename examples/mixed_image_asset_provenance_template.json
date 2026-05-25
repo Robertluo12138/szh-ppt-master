@@ -1,0 +1,91 @@
+{
+  "bundle_path": "synthetic-tempdir/mixed_bundle",
+  "evidence_id": "mixed_image_asset_provenance",
+  "inventory": {
+    "findings_empty": true,
+    "media_parts": [
+      {
+        "part": "ppt/media/image1.png",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "part": "ppt/media/image2.png",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ],
+    "ok": true,
+    "path": "synthetic-tempdir/report/inventory.json",
+    "relationships_external_count": 0,
+    "slide_count": 2
+  },
+  "notes": {
+    "embed_surface": "PNG, JPG, and JPEG inside the ppt media slot of the produced deck. The subset scripts export_pptx supports today; anything outside that subset is fail-closed by the exporter.",
+    "scope": "Synthetic placeholder mixed image-asset provenance template. Local mixed-lane mock chain only (d_one_local stub bytes plus a caller-staged local_asset PNG). NOT real D-One, NOT MCP, NOT Qoder, NOT a public-network run, NOT telemetry, NOT a prompt or report to PPTX automation. Replace every placeholder value with what an actual local mixed-lane mock run produced; the runtime handoff smoke writes the TEMP-ONLY object under a tempdir that is removed on exit and never commits."
+  },
+  "pptx_path": "synthetic-tempdir/output/mixed.pptx",
+  "real_d_one_status": "UNVERIFIED. Real D-One is NOT called by this provenance handoff. The d_one_local bytes embedded in the produced PPTX come from the in-script mock provider, and the local_asset bytes come from caller-staged synthetic payloads under <bundle>/source_assets/. No MCP, no public network, no model API, no image search, no Qoder, no telemetry.",
+  "report_dir": "synthetic-tempdir/report",
+  "rows": [
+    {
+      "asset": {
+        "byte_count": 87,
+        "error": "",
+        "exists": true,
+        "extension": "png",
+        "media_type": "image/png",
+        "path": "synthetic-tempdir/workspace/media/mixed_d_one_accent.png",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "id": "mixed_d_one_accent",
+      "intended_use": "spot illustration",
+      "manifest_local_path": "media/mixed_d_one_accent.png",
+      "pptx_media": {
+        "content_type": "image/png",
+        "extension": "png",
+        "part": "ppt/media/image1.png",
+        "referencing_slides": [1],
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "size_bytes": 87
+      },
+      "source_class": "d_one_local"
+    },
+    {
+      "asset": {
+        "byte_count": 79,
+        "error": "",
+        "exists": true,
+        "extension": "png",
+        "media_type": "image/png",
+        "path": "synthetic-tempdir/workspace/media/mixed_local_asset_accent.png",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "id": "mixed_local_asset_accent",
+      "intended_use": "spot illustration",
+      "manifest_local_path": "media/mixed_local_asset_accent.png",
+      "pptx_media": {
+        "content_type": "image/png",
+        "extension": "png",
+        "part": "ppt/media/image2.png",
+        "referencing_slides": [2],
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "size_bytes": 79
+      },
+      "source_class": "local_asset"
+    }
+  ],
+  "schema_version": "1",
+  "sidecar": {
+    "path": "synthetic-tempdir/report/mock_d_one_adapter_plan.json",
+    "request_ids": ["mixed_d_one_accent"],
+    "schema_version": 4
+  },
+  "summary": {
+    "d_one_local_id_count": 1,
+    "failures": [],
+    "local_asset_id_count": 1,
+    "ok": true,
+    "row_count": 2,
+    "source_class_coverage": ["d_one_local", "local_asset"]
+  },
+  "workspace_path": "synthetic-tempdir/workspace"
+}

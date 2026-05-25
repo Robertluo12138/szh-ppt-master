@@ -283,6 +283,48 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     Sanitized record is written to a per-run tempfile that the
     tempdir cleanup removes on exit; nothing is written under the
     repo tree. MOCK / STUB ONLY — no real D-One.
+  - ``scripts/mixed_image_asset_provenance_handoff_smoke.py`` —
+    tempdir-only **mixed image-asset provenance handoff smoke**.
+    Reuses the synthetic mixed-lane bundle materializer +
+    runner-args helper from
+    ``scripts/mixed_image_asset_pipeline_smoke.py`` so the bundle
+    taxonomy stays single-source-of-truth across both smokes.
+    Drives its OWN mock-pipeline subprocess once per self-test
+    (mixed lane = one d_one_local generated request + one
+    local_asset caller-staged PNG, two cover slides). Then
+    derives a runtime per-id provenance object (source_class,
+    workspace asset sha256, PPTX-embedded media part sha256,
+    audit sidecar request id set, inventory media_parts
+    ``(part, sha256)`` pairs) and
+    **sanitizes** it into a committed-safe handoff record
+    (workspace-relative / placeholder paths only — no leading
+    ``/``, no URI scheme, no ``..``) matching
+    ``schemas/mixed_image_asset_provenance.schema.json``.
+    Validates the sanitized record through
+    ``scripts/validate_mixed_image_asset_provenance.py --evidence
+    <tempfile>`` so the same gate stack the committed template
+    ships against is what the handoff smoke drives. Asserts:
+    pipeline rc=0; runtime provenance carries exactly two rows
+    with source_class coverage equal to {d_one_local,
+    local_asset}; sanitizer accepts the input AND emits a
+    committed-safe record; validator subprocess returns rc=0 on
+    the sanitized baseline; committed tree under REPO_ROOT is
+    byte-identical before and after the run. Nine fail-closed
+    probes (P1..P9): missing local_asset row, missing
+    d_one_local row, local_asset id leaked into sidecar,
+    d_one_local id missing from sidecar, ``asset.sha256`` vs
+    ``pptx_media.sha256`` mismatch, absolute path leak on
+    ``asset.path``, public-hosting wording (``public hosting
+    enabled``) in ``intended_use``, credential token
+    (``token=value``) in ``intended_use``, and a real-D-One
+    success claim (``Real D-One verified online``) in
+    ``notes.scope``. Each probe asserts the validator
+    subprocess returns rc=1 with the documented diagnostic
+    substring while the canonical sanitized baseline still
+    passes. Sanitized record is written to a per-run tempfile
+    that the tempdir cleanup removes on exit; nothing is
+    written under the repo tree. MOCK / STUB only — no real
+    D-One.
   - ``scripts/validate_mock_image_bundle_trial_evidence.py`` —
     stdlib-only, read-only, tempdir-only validator for the JSON
     evidence record emitted by
@@ -386,6 +428,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "mock_generated_image_provenance_smoke.py",
     SCRIPTS_DIR / "generated_image_provenance_handoff_smoke.py",
+    SCRIPTS_DIR / "mixed_image_asset_provenance_handoff_smoke.py",
     SCRIPTS_DIR / "validate_mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
     SCRIPTS_DIR / "trace_acceptance_smoke.py",
@@ -622,6 +665,7 @@ def main(argv: list[str]) -> int:
             "mock_image_bundle_trial_evidence + "
             "mock_generated_image_provenance_smoke + "
             "generated_image_provenance_handoff_smoke + "
+            "mixed_image_asset_provenance_handoff_smoke + "
             "validate_mock_image_bundle_trial_evidence + "
             "render_model_roundtrip_smoke + trace_acceptance_smoke). "
             "Runs each delegated smoke as a subprocess from REPO_ROOT; "

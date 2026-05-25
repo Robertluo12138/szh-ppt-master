@@ -1,0 +1,398 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "mixed_image_asset_provenance.schema.json",
+  "title": "Mixed Image Asset Provenance Handoff Record",
+  "description": "Committed-safe contract for a mixed d_one_local + local_asset image-asset provenance handoff record a reviewer reads alongside a local mixed-lane mock trial driven by scripts/run_mock_image_pipeline.py. The handoff smoke scripts/mixed_image_asset_provenance_handoff_smoke.py writes a TEMP-ONLY runtime object under a per-run tempdir that the tempdir cleanup removes on exit; the runtime shape is NOT what this validator gates. THIS schema gates a committed-safe / package-safe version of the same shape (workspace-relative / placeholder paths only — no leading '/', no URI scheme, no '..' segment) so a synthetic example template AND any committed reviewer-handoff record can be schema-validated without leaking absolute machine paths or real on-disk artifacts. The schema mirrors the runtime row taxonomy for the mixed lane (id / source_class / manifest_local_path / intended_use / asset / pptx_media) with a closed source_class enum locking each row to either d_one_local (the runner's mock D-One stub chain) or local_asset (caller-supplied bytes staged through <bundle>/source_assets/). No real PPTX bytes, no real assets, and no real D-One / MCP / public-network / model-API / image-search / Qoder run are produced or claimed. real_d_one_status is locked to a self-describing UNVERIFIED sentence; the validator's semantic gate refuses any positive success claim about real D-One / MCP / public network / model API / image search / Qoder anywhere in the record. schema_version is locked to '1' and evidence_id is locked to 'mixed_image_asset_provenance' so a future shape change forces a paired schema/validator bump. additionalProperties:false at every declared object level so a tampered record carrying an unrecognised field (smuggle slot) is refused at the schema layer.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_id",
+    "real_d_one_status",
+    "bundle_path",
+    "workspace_path",
+    "report_dir",
+    "pptx_path",
+    "sidecar",
+    "inventory",
+    "rows",
+    "notes",
+    "summary"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1"],
+      "description": "Record-file schema version. Locked to the string '1'; bumped only with a paired emitter + schema + validator change so a future consumer can refuse a shape it does not recognise."
+    },
+    "evidence_id": {
+      "type": "string",
+      "enum": ["mixed_image_asset_provenance"],
+      "description": "Self-describing record identifier. Locked so a reader scanning a directory of mixed JSON evidence can recognise this record without inspecting the structure."
+    },
+    "real_d_one_status": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "description": "Fixed sentence pinned to the literal 'UNVERIFIED' substring AND explicit negation that real D-One / MCP / public network / model API / image search / Qoder / telemetry were called. The validator's semantic gate enforces the substring + negation in addition to the minLength/maxLength bounds the schema can express."
+    },
+    "bundle_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative or placeholder-safe path to the synthetic mixed-lane bundle the trial drove. Refuses leading '/', URI schemes, and '..' segments by pattern (the validator's path-safety gate re-asserts at runtime)."
+    },
+    "workspace_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative or placeholder-safe path the trial materialized assets under. Same path-shape rules as bundle_path."
+    },
+    "report_dir": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative or placeholder-safe path to the trial report directory. Same path-shape rules as bundle_path."
+    },
+    "pptx_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+      "description": "Workspace-relative or placeholder-safe path to the produced mock PPTX. Same path-shape rules as bundle_path."
+    },
+    "sidecar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "schema_version", "request_ids"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+          "description": "Workspace-relative or placeholder-safe path to <report-dir>/mock_d_one_adapter_plan.json."
+        },
+        "schema_version": {
+          "type": "integer",
+          "enum": [4],
+          "description": "Locked sidecar plan schema version mirroring run_mock_image_pipeline.LOCKED_PLAN_SCHEMA_VERSION."
+        },
+        "request_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]*$"
+          },
+          "description": "Sorted unique list of request ids the runner-written mock D-One sidecar covers. The validator's semantic gates enforce that every d_one_local row's id is a member of this list AND no local_asset row's id is a member (caller-staged bytes are not a generated artifact)."
+        }
+      }
+    },
+    "inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "ok",
+        "findings_empty",
+        "slide_count",
+        "relationships_external_count",
+        "media_parts"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+          "description": "Workspace-relative or placeholder-safe path to <report-dir>/inventory.json."
+        },
+        "ok": {
+          "type": "boolean",
+          "description": "True iff the produced PPTX's inventory walker reported no findings."
+        },
+        "findings_empty": {
+          "type": "boolean",
+          "description": "True iff inventory.findings is an empty list."
+        },
+        "slide_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Number of slide parts in the produced PPTX."
+        },
+        "relationships_external_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Number of OOXML relationships whose Target carries a URI scheme OR whose TargetMode != Internal. Locked to 0 by the validator."
+        },
+        "media_parts": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["part", "sha256"],
+            "properties": {
+              "part": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^ppt/media/[A-Za-z0-9_][A-Za-z0-9_.\\-]*$",
+                "description": "Package-internal OOXML part path. Must sit under 'ppt/media/'."
+              },
+              "sha256": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase 64-character hex sha256 of the PPTX media bytes at this part."
+              }
+            }
+          },
+          "description": "Sorted unique (part, sha256) set across every embeddable ppt/media/* part inside the produced PPTX. The validator enforces PART-LEVEL BIDIRECTIONAL equality between this set and the set of rows[*].pptx_media.{part, sha256} pairs: (a) every row pair must appear here (a row claiming a (part, sha) pair that does not actually live inside the produced PPTX is refused) AND (b) every entry here must be referenced by some row pair (an unreferenced media part inside the produced PPTX means the provenance record is incomplete or the mixed-lane bundle leaked an extra asset). The part name is co-checked alongside the sha so a part rename without a corresponding row update, or two parts that happen to share the same sha, are also caught."
+        }
+      }
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 1024,
+      "uniqueItems": false,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "source_class",
+          "manifest_local_path",
+          "intended_use",
+          "asset",
+          "pptx_media"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]*$",
+            "description": "Manifest id mirrored verbatim from the bundle's image_manifest_spec.json."
+          },
+          "source_class": {
+            "type": "string",
+            "enum": ["d_one_local", "local_asset"],
+            "description": "Closed enumeration mirroring scripts/run_mock_image_pipeline's two supported manifest sources for the mixed lane. The validator refuses a rows[] where both members are not represented."
+          },
+          "manifest_local_path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+            "description": "Workspace-relative local_path mirrored from the manifest. Refuses leading '/', URI schemes, and '..' segments by pattern."
+          },
+          "intended_use": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Free-text intended-use note. Validator string-safety scan applies."
+          },
+          "asset": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "exists",
+              "byte_count",
+              "sha256",
+              "extension",
+              "media_type",
+              "error"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./\\-]*$",
+                "description": "Workspace-relative or placeholder-safe path to the on-disk asset under <workspace>/<manifest_local_path>. The runtime smoke records absolute tempdir paths here; the committed-safe schema intentionally refuses that shape."
+              },
+              "exists": {
+                "type": "boolean",
+                "description": "True iff the recorded asset path resolved to a regular non-symlink file at evidence-write time."
+              },
+              "byte_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 268435456,
+                "description": "File byte length."
+              },
+              "sha256": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase 64-character hex sha256 of the asset bytes."
+              },
+              "extension": {
+                "type": "string",
+                "enum": ["png", "jpg", "jpeg"],
+                "description": "Lower-cased file extension. Mirrors scripts/export_pptx.py's embed-surface allow-list (PNG / JPG / JPEG)."
+              },
+              "media_type": {
+                "type": "string",
+                "enum": ["image/png", "image/jpeg"],
+                "description": "Conservative media-type projection from extension; validator cross-checks the pair."
+              },
+              "error": {
+                "type": "string",
+                "maxLength": 256,
+                "description": "Empty string on a successful row; carries a per-row diagnostic when asset read failed."
+              }
+            }
+          },
+          "pptx_media": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "part",
+              "size_bytes",
+              "sha256",
+              "extension",
+              "content_type"
+            ],
+            "properties": {
+              "part": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^ppt/media/[A-Za-z0-9_][A-Za-z0-9_.\\-]*$",
+                "description": "Package-internal OOXML part path. Must sit under 'ppt/media/'."
+              },
+              "size_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 268435456,
+                "description": "Byte length of the PPTX-embedded media part."
+              },
+              "sha256": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase 64-character hex sha256 of the PPTX media bytes. Validator requires this to equal asset.sha256 byte-for-byte AND requires the (part, sha256) pair to appear in inventory.media_parts (part-level bidirectional gate)."
+              },
+              "extension": {
+                "type": "string",
+                "enum": ["png", "jpg", "jpeg"]
+              },
+              "content_type": {
+                "type": "string",
+                "enum": ["image/png", "image/jpeg"]
+              },
+              "referencing_slides": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": 1024,
+                "items": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1024
+                },
+                "description": "Optional list of 1-based slide indices that reference this media part."
+              }
+            }
+          }
+        }
+      },
+      "description": "One record per manifest entry crossing the mixed lane. The schema enforces per-row required fields + identifier-safe id pattern + closed source_class enum + closed extension / media_type / content_type enums; the validator enforces row-count >= 2, request_id uniqueness, source_class coverage = {d_one_local, local_asset}, sidecar membership rules (d_one_local in / local_asset out), asset-sha vs pptx_media-sha equality, part-level bidirectional pptx_media (part, sha) pair membership in inventory.media_parts, byte-distinctness between d_one_local and local_asset rows, and committed-safe path shapes across every path-typed field."
+    },
+    "notes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "embed_surface"],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "description": "Fixed framing that names what this record does NOT prove (mixed mock chain only, NOT real D-One / MCP / Qoder / public network / model API / image search / telemetry; not a prompt/report-to-PPTX automation)."
+        },
+        "embed_surface": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Fixed framing for the embed subset scripts/export_pptx.py supports today (PNG/JPG/JPEG under ppt/media/*)."
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "row_count",
+        "source_class_coverage",
+        "d_one_local_id_count",
+        "local_asset_id_count",
+        "failures"
+      ],
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "description": "Single-boolean summary derived from every gate. Refused true when any of the documented sub-conditions does not hold."
+        },
+        "row_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Derived len(rows). Validator refuses summary.ok=true when this disagrees with the actual length of rows[]."
+        },
+        "source_class_coverage": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["d_one_local", "local_asset"]
+          },
+          "description": "Sorted unique source_class values across rows. Validator refuses summary.ok=true unless this equals exactly ['d_one_local', 'local_asset']."
+        },
+        "d_one_local_id_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Number of rows whose source_class is d_one_local. Must equal the number of d_one_local member ids of sidecar.request_ids."
+        },
+        "local_asset_id_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Number of rows whose source_class is local_asset. Must equal 0 within sidecar.request_ids (caller-staged bytes are not a generated artifact)."
+        },
+        "failures": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "description": "Per-gate failure strings the in-script gate stack produced. A summary.ok=true record MUST carry an empty failures[]."
+        }
+      }
+    }
+  }
+}
