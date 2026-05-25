@@ -371,6 +371,28 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     missing / directory / symlinked evidence-PPTX-inventory-
     sidecar). Read-only / stdlib-only / tempdir-only — qualifies
     for inclusion in the aggregate.
+  - ``scripts/core_image_to_editable_ppt_demo.py`` — milestone
+    proof one-command demo smoke that drives the existing mixed-
+    lane mock pipeline once into a tempdir, runs the existing
+    validators (``validate_pptx_contract`` +
+    ``inspect_pptx_inventory`` +
+    ``validate_mixed_image_asset_provenance``), derives a concise
+    demo summary JSON describing the product truth (slide_count,
+    PPTX path, report dir, embedded media count, editable / native
+    shape / no-external-relationship evidence, source_class
+    coverage = {d_one_local, local_asset}, generated_intent
+    coverage on d_one_local, no generated_intent on local_asset,
+    real_d_one_status = UNVERIFIED, validator rc values), writes
+    every output under the tempdir, and runs seven direct fail-
+    closed probes (repo-output refused without ever calling
+    unlink() on a repo path, _safe_unlink_under_tempdir no-ops on
+    a REPO_ROOT path even with a tempdir root supplied, no stale
+    summary after failure, zero embedded media refused, missing
+    one image lane refused on either side, positive real-D-One /
+    MCP / network / model / image-search / Qoder success claim
+    refused) — proves
+    one local/mock command demonstrates image-to-editable-PPT
+    demo readiness. MOCK / STUB ONLY — no real D-One.
   - ``scripts/render_model_roundtrip_smoke.py`` — synthetic
     render_model -> editable .pptx round-trip exercising every
     primitive kind the exporter supports today (text, line, shape,
@@ -444,6 +466,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "mock_generated_image_provenance_smoke.py",
     SCRIPTS_DIR / "generated_image_provenance_handoff_smoke.py",
     SCRIPTS_DIR / "mixed_image_asset_provenance_handoff_smoke.py",
+    SCRIPTS_DIR / "core_image_to_editable_ppt_demo.py",
     SCRIPTS_DIR / "validate_mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
     SCRIPTS_DIR / "trace_acceptance_smoke.py",
@@ -681,6 +704,7 @@ def main(argv: list[str]) -> int:
             "mock_generated_image_provenance_smoke + "
             "generated_image_provenance_handoff_smoke + "
             "mixed_image_asset_provenance_handoff_smoke + "
+            "core_image_to_editable_ppt_demo + "
             "validate_mock_image_bundle_trial_evidence + "
             "render_model_roundtrip_smoke + trace_acceptance_smoke). "
             "Runs each delegated smoke as a subprocess from REPO_ROOT; "
