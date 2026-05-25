@@ -36,6 +36,12 @@
         "path": "synthetic-tempdir/workspace/media/mixed_d_one_accent.png",
         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       },
+      "generated_intent": {
+        "custom_descriptor": "hero_calm_motif",
+        "placement_role": "hero_page",
+        "subject_domain": "abstract_geometry",
+        "text_policy": "decorative_glyphs"
+      },
       "id": "mixed_d_one_accent",
       "intended_use": "spot illustration",
       "manifest_local_path": "media/mixed_d_one_accent.png",
@@ -73,10 +79,19 @@
       "source_class": "local_asset"
     }
   ],
-  "schema_version": "1",
+  "schema_version": "2",
   "sidecar": {
     "path": "synthetic-tempdir/report/mock_d_one_adapter_plan.json",
     "request_ids": ["mixed_d_one_accent"],
+    "requests": [
+      {
+        "custom_descriptor": "hero_calm_motif",
+        "id": "mixed_d_one_accent",
+        "placement_role": "hero_page",
+        "subject_domain": "abstract_geometry",
+        "text_policy": "decorative_glyphs"
+      }
+    ],
     "schema_version": 4
   },
   "summary": {

@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "mixed_image_asset_provenance.schema.json",
   "title": "Mixed Image Asset Provenance Handoff Record",
-  "description": "Committed-safe contract for a mixed d_one_local + local_asset image-asset provenance handoff record a reviewer reads alongside a local mixed-lane mock trial driven by scripts/run_mock_image_pipeline.py. The handoff smoke scripts/mixed_image_asset_provenance_handoff_smoke.py writes a TEMP-ONLY runtime object under a per-run tempdir that the tempdir cleanup removes on exit; the runtime shape is NOT what this validator gates. THIS schema gates a committed-safe / package-safe version of the same shape (workspace-relative / placeholder paths only — no leading '/', no URI scheme, no '..' segment) so a synthetic example template AND any committed reviewer-handoff record can be schema-validated without leaking absolute machine paths or real on-disk artifacts. The schema mirrors the runtime row taxonomy for the mixed lane (id / source_class / manifest_local_path / intended_use / asset / pptx_media) with a closed source_class enum locking each row to either d_one_local (the runner's mock D-One stub chain) or local_asset (caller-supplied bytes staged through <bundle>/source_assets/). No real PPTX bytes, no real assets, and no real D-One / MCP / public-network / model-API / image-search / Qoder run are produced or claimed. real_d_one_status is locked to a self-describing UNVERIFIED sentence; the validator's semantic gate refuses any positive success claim about real D-One / MCP / public network / model API / image search / Qoder anywhere in the record. schema_version is locked to '1' and evidence_id is locked to 'mixed_image_asset_provenance' so a future shape change forces a paired schema/validator bump. additionalProperties:false at every declared object level so a tampered record carrying an unrecognised field (smuggle slot) is refused at the schema layer.",
+  "description": "Committed-safe contract for a mixed d_one_local + local_asset image-asset provenance handoff record a reviewer reads alongside a local mixed-lane mock trial driven by scripts/run_mock_image_pipeline.py. The handoff smoke scripts/mixed_image_asset_provenance_handoff_smoke.py writes a TEMP-ONLY runtime object under a per-run tempdir that the tempdir cleanup removes on exit; the runtime shape is NOT what this validator gates. THIS schema gates a committed-safe / package-safe version of the same shape (workspace-relative / placeholder paths only — no leading '/', no URI scheme, no '..' segment) so a synthetic example template AND any committed reviewer-handoff record can be schema-validated without leaking absolute machine paths or real on-disk artifacts. The schema mirrors the runtime row taxonomy for the mixed lane (id / source_class / manifest_local_path / intended_use / asset / pptx_media / optional generated_intent) with a closed source_class enum locking each row to either d_one_local (the runner's mock D-One stub chain) or local_asset (caller-supplied bytes staged through <bundle>/source_assets/). Every d_one_local row additionally carries a generated_intent block (closed-enum placement_role / text_policy / subject_domain + optional pattern-locked custom_descriptor — aligned with upstream ppt-master image-generation's per-row text_policy / subject_domain depth and hero_page overlay-reservation split; no upstream code / prompts / examples / assets / wording copied) that the validator cross-checks against the sidecar's per-id requests[] taxonomy projection. Local_asset rows MUST NOT carry generated_intent. No real PPTX bytes, no real assets, and no real D-One / MCP / public-network / model-API / image-search / Qoder run are produced or claimed. real_d_one_status is locked to a self-describing UNVERIFIED sentence; the validator's semantic gate refuses any positive success claim about real D-One / MCP / public network / model API / image search / Qoder anywhere in the record. schema_version is locked to '2' (bumped from '1' as the paired schema/validator change that added sidecar.requests + row-level generated_intent for G18 parity) and evidence_id is locked to 'mixed_image_asset_provenance' so a future shape change forces a paired schema/validator bump. additionalProperties:false at every declared object level so a tampered record carrying an unrecognised field (smuggle slot) is refused at the schema layer.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -22,8 +22,8 @@
   "properties": {
     "schema_version": {
       "type": "string",
-      "enum": ["1"],
-      "description": "Record-file schema version. Locked to the string '1'; bumped only with a paired emitter + schema + validator change so a future consumer can refuse a shape it does not recognise."
+      "enum": ["2"],
+      "description": "Record-file schema version. Locked to the string '2' as of the shape change that added the required sidecar.requests per-id taxonomy projection (closed-enum placement_role / text_policy / subject_domain + optional pattern-locked custom_descriptor) AND the optional row-level generated_intent block. Earlier records pinned to '1' (pre-generated_intent shape) are intentionally refused at the schema layer so a downstream reader cannot silently accept the pre-bump shape against the new G18 parity gate. Bumped only with a paired emitter + schema + validator change so a future consumer can refuse a shape it does not recognise."
     },
     "evidence_id": {
       "type": "string",
@@ -67,7 +67,7 @@
     "sidecar": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "schema_version", "request_ids"],
+      "required": ["path", "schema_version", "request_ids", "requests"],
       "properties": {
         "path": {
           "type": "string",
@@ -93,6 +93,48 @@
             "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]*$"
           },
           "description": "Sorted unique list of request ids the runner-written mock D-One sidecar covers. The validator's semantic gates enforce that every d_one_local row's id is a member of this list AND no local_asset row's id is a member (caller-staged bytes are not a generated artifact)."
+        },
+        "requests": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "placement_role", "text_policy", "subject_domain"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_\\-]*$",
+                "description": "Sidecar request id; must equal one of sidecar.request_ids AND match a d_one_local row's id."
+              },
+              "placement_role": {
+                "type": "string",
+                "enum": ["hero_page", "local_region"],
+                "description": "Closed enumeration mirroring schemas/d_one_descriptor_vocabulary.schema.json image_taxonomy.placement_role.allowed_values. 'hero_page' permits overlay-reservation wording; 'local_region' refuses it. Sanitized verbatim from the sidecar's plan request."
+              },
+              "text_policy": {
+                "type": "string",
+                "enum": ["no_text", "decorative_glyphs", "caption_safe"],
+                "description": "Closed enumeration mirroring schemas/d_one_descriptor_vocabulary.schema.json image_taxonomy.text_policy.allowed_values. Per-request text-policy decision the sidecar's plan request recorded; sanitized verbatim."
+              },
+              "subject_domain": {
+                "type": "string",
+                "enum": ["abstract_geometry", "process_motif", "metric_emblem", "concept_diagram"],
+                "description": "Closed enumeration mirroring schemas/d_one_descriptor_vocabulary.schema.json image_taxonomy.subject_domain.allowed_values. Sanitized verbatim from the sidecar's plan request."
+              },
+              "custom_descriptor": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+                "description": "OPTIONAL approved custom-descriptor value the sidecar's plan request carried. Pattern locked to the same lowercase-identifier positive whitelist + forbidden-token deny clause schemas/d_one_descriptor_vocabulary.schema.json custom_descriptors[*].value uses (refuses 'public', 'upload', 'raw', 'customer', 'confidential', 'screenshot', 'credential', 'password', 'secret' bounded tokens AND the 'full slide' / 'image search' / 'web generation' / 'page generation' / 'slide generation' compounds). Absent when the request did not use the escape-hatch."
+              }
+            }
+          },
+          "description": "Per-request taxonomy projection mirroring the d_one_local entries of the runner-written mock_d_one_adapter_plan.json sidecar. The validator gate enforces 1:1 coverage with sidecar.request_ids AND with the d_one_local row id set, AND that every entry's (placement_role, text_policy, subject_domain, custom_descriptor) tuple equals the matching d_one_local row's generated_intent. Local_asset row ids MUST NOT appear here (caller-staged bytes are not a generated artifact and have no D-One intent)."
         }
       }
     },
@@ -312,10 +354,40 @@
                 "description": "Optional list of 1-based slide indices that reference this media part."
               }
             }
+          },
+          "generated_intent": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["placement_role", "text_policy", "subject_domain"],
+            "properties": {
+              "placement_role": {
+                "type": "string",
+                "enum": ["hero_page", "local_region"],
+                "description": "Closed enumeration mirroring schemas/d_one_descriptor_vocabulary.schema.json image_taxonomy.placement_role.allowed_values. Sanitized verbatim from the runner-written sidecar's plan request for this id."
+              },
+              "text_policy": {
+                "type": "string",
+                "enum": ["no_text", "decorative_glyphs", "caption_safe"],
+                "description": "Closed enumeration mirroring schemas/d_one_descriptor_vocabulary.schema.json image_taxonomy.text_policy.allowed_values."
+              },
+              "subject_domain": {
+                "type": "string",
+                "enum": ["abstract_geometry", "process_motif", "metric_emblem", "concept_diagram"],
+                "description": "Closed enumeration mirroring schemas/d_one_descriptor_vocabulary.schema.json image_taxonomy.subject_domain.allowed_values."
+              },
+              "custom_descriptor": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^(?!.*(?:^|[._\\-])(?:public|upload|raw|customer|confidential|screenshot|credential|password|secret)(?:[._\\-]|$))(?!.*(?:full[._\\-]*slide|image[._\\-]*search|web[._\\-]*generation|page[._\\-]*generation|slide[._\\-]*generation))[a-z][a-z0-9_.\\-]*$",
+                "description": "OPTIONAL approved custom-descriptor value, mirrored verbatim from the sidecar request. Pattern matches schemas/d_one_descriptor_vocabulary.schema.json custom_descriptors[*].value's positive whitelist + forbidden-token deny clause."
+              }
+            },
+            "description": "Generated-image intent / taxonomy projection from the runner-written sidecar's plan request for this id. REQUIRED on every d_one_local row (the semantic gate refuses a d_one_local row without it) AND FORBIDDEN on every local_asset row (the semantic gate refuses a local_asset row that carries it — caller-staged bytes are not a generated artifact and have no D-One intent). The validator additionally cross-checks generated_intent against the matching sidecar.requests entry for the same id: placement_role / text_policy / subject_domain / custom_descriptor must equal byte-for-byte. Aligned only with upstream ppt-master image-generation's per-row text_policy / subject_domain depth and hero_page overlay-reservation split; no upstream code / prompts / examples / assets / wording copied."
           }
         }
       },
-      "description": "One record per manifest entry crossing the mixed lane. The schema enforces per-row required fields + identifier-safe id pattern + closed source_class enum + closed extension / media_type / content_type enums; the validator enforces row-count >= 2, request_id uniqueness, source_class coverage = {d_one_local, local_asset}, sidecar membership rules (d_one_local in / local_asset out), asset-sha vs pptx_media-sha equality, part-level bidirectional pptx_media (part, sha) pair membership in inventory.media_parts, byte-distinctness between d_one_local and local_asset rows, and committed-safe path shapes across every path-typed field."
+      "description": "One record per manifest entry crossing the mixed lane. The schema enforces per-row required fields + identifier-safe id pattern + closed source_class enum + closed extension / media_type / content_type enums + (when present) generated_intent closed-enum block; the validator enforces row-count >= 2, request_id uniqueness, source_class coverage = {d_one_local, local_asset}, sidecar membership rules (d_one_local in / local_asset out), asset-sha vs pptx_media-sha equality, part-level bidirectional pptx_media (part, sha) pair membership in inventory.media_parts, byte-distinctness between d_one_local and local_asset rows, committed-safe path shapes across every path-typed field, generated_intent presence on every d_one_local row, generated_intent absence on every local_asset row, AND generated_intent equality with the matching sidecar.requests[] entry for the same id (placement_role / text_policy / subject_domain / custom_descriptor must match byte-for-byte)."
     },
     "notes": {
       "type": "object",

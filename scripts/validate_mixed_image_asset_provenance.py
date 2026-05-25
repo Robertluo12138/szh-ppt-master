@@ -47,7 +47,12 @@ non-zero on any failure):
       ``schemas/mixed_image_asset_provenance.schema.json`` under the
       same draft-07 subset ``scripts/validate_artifacts.py``
       implements (``additionalProperties:false`` at every declared
-      object level; ``schema_version`` enum-locked to ``"1"``;
+      object level; ``schema_version`` enum-locked to ``"2"``
+      (bumped from ``"1"`` as the paired schema / validator change
+      that added the required ``sidecar.requests`` per-id taxonomy
+      projection + the optional row-level ``generated_intent``
+      block — earlier ``"1"`` records do not carry those fields
+      and are intentionally refused at the schema layer);
       ``evidence_id`` enum-locked to
       ``"mixed_image_asset_provenance"``).
 
@@ -200,6 +205,35 @@ non-zero on any failure):
         * per row: every ``pptx_media.referencing_slides[i]`` value
           falls within ``[1, inventory.slide_count]``.
 
+  G18 ``generated_intent_parity``
+    - every d_one_local row MUST carry a ``generated_intent`` block
+      whose ``placement_role`` / ``text_policy`` / ``subject_domain``
+      values lie in the canonical closed allow-lists (the same
+      ``image_taxonomy.<dim>.allowed_values`` sets the upstream
+      ``schemas/d_one_descriptor_vocabulary.schema.json`` declares);
+      the optional ``custom_descriptor`` value, when present, must
+      additionally re-pass the same forbidden-token deny clause
+      ``custom_descriptors[*].value`` uses (no ``public`` / ``upload``
+      / ``raw`` / ``customer`` / ``confidential`` / ``screenshot`` /
+      ``credential`` / ``password`` / ``secret`` token; no ``full
+      slide`` / ``image search`` / ``web generation`` / ``page
+      generation`` / ``slide generation`` compound; lowercase-
+      identifier shape only);
+    - every local_asset row MUST NOT carry ``generated_intent``
+      (caller-staged bytes are not a generated artifact and have no
+      D-One intent);
+    - ``sidecar.requests[]`` MUST cover every d_one_local row id 1:1
+      (no missing, no orphan, no local_asset id leak) AND each
+      sidecar.requests[] entry's ``(placement_role, text_policy,
+      subject_domain, custom_descriptor)`` MUST equal the matching
+      d_one_local row's ``generated_intent`` byte-for-byte (so a
+      reviewer cannot smuggle a row-only intent past the sidecar
+      audit surface, AND a sidecar-only intent without a row counterpart
+      cannot pretend the row carried the same projection);
+    - ``sidecar.request_ids`` MUST equal the set of
+      ``sidecar.requests[*].id`` (the two sidecar projections agree on
+      which ids the runner generated).
+
 Exit codes:
   0  every gate passed.
   1  one or more gates failed.
@@ -248,7 +282,7 @@ COMMITTED_TEMPLATE = (
     EXAMPLES_DIR / "mixed_image_asset_provenance_template.json"
 )
 
-EXPECTED_SCHEMA_VERSION = "1"
+EXPECTED_SCHEMA_VERSION = "2"
 EXPECTED_EVIDENCE_ID = "mixed_image_asset_provenance"
 EXPECTED_SIDECAR_SCHEMA_VERSION = 4
 EXPECTED_SOURCE_CLASSES: frozenset[str] = frozenset({
@@ -266,6 +300,45 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _REQUIRED_ROW_STRING_FIELDS: tuple[str, ...] = (
     "id", "source_class", "manifest_local_path", "intended_use",
+)
+
+# Canonical generated_intent / sidecar.requests taxonomy allow-lists.
+# These mirror schemas/d_one_descriptor_vocabulary.schema.json's
+# image_taxonomy.<dim>.allowed_values blocks for the dimensions the
+# committed-safe handoff carries (placement_role / text_policy /
+# subject_domain). The schema layer already enum-locks every field; the
+# gate re-asserts membership at runtime so a future schema relaxation
+# cannot silently widen what counts as a valid intent value, AND so the
+# missing / mismatched / unknown / collapsed diagnostics are crisp.
+_PLACEMENT_ROLE_ALLOWED: frozenset[str] = frozenset({
+    "hero_page", "local_region",
+})
+_TEXT_POLICY_ALLOWED: frozenset[str] = frozenset({
+    "no_text", "decorative_glyphs", "caption_safe",
+})
+_SUBJECT_DOMAIN_ALLOWED: frozenset[str] = frozenset({
+    "abstract_geometry", "process_motif",
+    "metric_emblem", "concept_diagram",
+})
+_GENERATED_INTENT_REQUIRED_FIELDS: tuple[str, ...] = (
+    "placement_role", "text_policy", "subject_domain",
+)
+_GENERATED_INTENT_OPTIONAL_FIELDS: tuple[str, ...] = (
+    "custom_descriptor",
+)
+# custom_descriptor pattern — matches the schema's pattern + the
+# upstream d_one_descriptor_vocabulary.schema.json custom_descriptors[*]
+# .value rule. The gate re-applies it at runtime so a tampered record
+# whose schema-layer pattern check was skipped (defense in depth) still
+# fails closed.
+_CUSTOM_DESCRIPTOR_RE = re.compile(
+    r"^(?!.*(?:^|[._\-])"
+    r"(?:public|upload|raw|customer|confidential|screenshot|"
+    r"credential|password|secret)(?:[._\-]|$))"
+    r"(?!.*(?:full[._\-]*slide|image[._\-]*search|"
+    r"web[._\-]*generation|page[._\-]*generation|"
+    r"slide[._\-]*generation))"
+    r"[a-z][a-z0-9_.\-]*$"
 )
 
 # ---------------------------------------------------------------------------
@@ -1105,6 +1178,258 @@ def _check_internal_consistency(record: dict) -> list[str]:
     return errors
 
 
+def _check_generated_intent_parity(record: dict) -> list[str]:
+    """G18 — generated_intent / sidecar.requests parity.
+
+    The handoff record's d_one_local lane must carry a
+    ``generated_intent`` block on every row AND that block must equal
+    the matching ``sidecar.requests[]`` entry for the same id byte-
+    for-byte across ``placement_role`` / ``text_policy`` /
+    ``subject_domain`` / ``custom_descriptor``. The local_asset lane
+    must NOT carry ``generated_intent`` (caller-staged bytes are not a
+    generated artifact and have no D-One intent), and no local_asset
+    id may appear in ``sidecar.requests[]``. Every taxonomy value is
+    additionally re-asserted against the canonical closed allow-list
+    so a future schema relaxation cannot silently widen the surface
+    AND the ``custom_descriptor`` value re-passes the same forbidden-
+    token deny clause schemas/d_one_descriptor_vocabulary.schema.json
+    ``custom_descriptors[*].value`` enforces (defense in depth)."""
+    errors: list[str] = []
+    rows = record.get("rows") or []
+    sidecar = record.get("sidecar")
+    sidecar_requests = (
+        sidecar.get("requests") if isinstance(sidecar, dict) else None
+    )
+    if not isinstance(sidecar_requests, list):
+        sidecar_requests = []
+
+    # Index the sidecar requests by id. A duplicate id at the schema
+    # layer is already refused by the items.required.id contract, but
+    # the gate handles the dict collapse defensively.
+    sidecar_by_id: dict[str, dict] = {}
+    duplicate_ids: list[str] = []
+    for entry in sidecar_requests:
+        if not isinstance(entry, dict):
+            continue
+        rid = entry.get("id")
+        if not isinstance(rid, str) or not rid:
+            continue
+        if rid in sidecar_by_id:
+            duplicate_ids.append(rid)
+        else:
+            sidecar_by_id[rid] = entry
+    for rid in sorted(set(duplicate_ids)):
+        errors.append(
+            f"sidecar.requests: duplicate id {rid!r} (every sidecar "
+            f"request id must be unique so the per-id taxonomy "
+            f"cross-check is unambiguous)"
+        )
+
+    by_class = _rows_by_source_class(record)
+    d_one_ids: set[str] = {
+        r["id"] for r in by_class["d_one_local"]
+        if isinstance(r.get("id"), str)
+    }
+    local_ids: set[str] = {
+        r["id"] for r in by_class["local_asset"]
+        if isinstance(r.get("id"), str)
+    }
+
+    # 1:1 coverage between sidecar.requests and d_one_local rows.
+    missing_in_sidecar = sorted(d_one_ids - set(sidecar_by_id))
+    for mid in missing_in_sidecar:
+        errors.append(
+            f"sidecar.requests: d_one_local row id {mid!r} has NO "
+            f"matching sidecar.requests entry (every d_one_local row "
+            f"must carry a per-id taxonomy projection; missing "
+            f"generated_intent metadata)"
+        )
+    orphan_in_sidecar = sorted(set(sidecar_by_id) - d_one_ids)
+    for oid in orphan_in_sidecar:
+        errors.append(
+            f"sidecar.requests: id {oid!r} does not match any "
+            f"d_one_local row (no orphan sidecar entries; "
+            f"sidecar.requests[] mirrors d_one_local rows 1:1)"
+        )
+    leaked_local = sorted(local_ids & set(sidecar_by_id))
+    for lid in leaked_local:
+        errors.append(
+            f"sidecar.requests: local_asset row id {lid!r} leaked "
+            f"into the per-id taxonomy projection (caller-staged "
+            f"bytes are not a generated artifact and have no D-One "
+            f"intent — local_asset ids must not appear in "
+            f"sidecar.requests)"
+        )
+
+    # Per-row checks.
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("id")
+        sc = row.get("source_class")
+        gi = row.get("generated_intent")
+        if sc == "local_asset":
+            if gi is not None:
+                errors.append(
+                    f"rows[{i}] id={rid!r} source_class='local_asset' "
+                    f"carries generated_intent (forbidden — caller-"
+                    f"staged bytes are not a generated artifact and "
+                    f"have no D-One intent)"
+                )
+            continue
+        if sc != "d_one_local":
+            # Unknown source_class — the source_class enum / coverage
+            # gates handle that elsewhere; skip generated_intent check.
+            continue
+        # d_one_local row.
+        if gi is None:
+            errors.append(
+                f"rows[{i}] id={rid!r} source_class='d_one_local' "
+                f"is missing required generated_intent block (every "
+                f"d_one_local row must carry the per-row taxonomy "
+                f"projection)"
+            )
+            continue
+        if not isinstance(gi, dict):
+            errors.append(
+                f"rows[{i}] id={rid!r} generated_intent must be a "
+                f"JSON object (got {type(gi).__name__})"
+            )
+            continue
+        # Required fields + canonical allow-list re-check.
+        pr = gi.get("placement_role")
+        if pr not in _PLACEMENT_ROLE_ALLOWED:
+            errors.append(
+                f"rows[{i}] id={rid!r} generated_intent.placement_role"
+                f"={pr!r} is not in canonical allow-list "
+                f"{sorted(_PLACEMENT_ROLE_ALLOWED)!r}"
+            )
+        tp = gi.get("text_policy")
+        if tp not in _TEXT_POLICY_ALLOWED:
+            errors.append(
+                f"rows[{i}] id={rid!r} generated_intent.text_policy="
+                f"{tp!r} is not in canonical allow-list "
+                f"{sorted(_TEXT_POLICY_ALLOWED)!r}"
+            )
+        sd = gi.get("subject_domain")
+        if sd not in _SUBJECT_DOMAIN_ALLOWED:
+            errors.append(
+                f"rows[{i}] id={rid!r} generated_intent.subject_domain"
+                f"={sd!r} is not in canonical allow-list "
+                f"{sorted(_SUBJECT_DOMAIN_ALLOWED)!r}"
+            )
+        cd = gi.get("custom_descriptor")
+        if cd is not None:
+            if not (isinstance(cd, str) and _CUSTOM_DESCRIPTOR_RE.match(cd)):
+                errors.append(
+                    f"rows[{i}] id={rid!r} generated_intent."
+                    f"custom_descriptor={cd!r} does not match the "
+                    f"approved custom-descriptor pattern (lowercase "
+                    f"identifier; no public / upload / raw / customer "
+                    f"/ confidential / screenshot / credential / "
+                    f"password / secret tokens; no full-slide / "
+                    f"image-search / web/page/slide-generation "
+                    f"compounds)"
+                )
+
+        # Per-id parity with sidecar.requests.
+        if not isinstance(rid, str) or not rid:
+            continue
+        sidecar_entry = sidecar_by_id.get(rid)
+        if sidecar_entry is None:
+            # Missing-in-sidecar diagnostic already emitted above; the
+            # parity check has nothing to compare against.
+            continue
+        for field in _GENERATED_INTENT_REQUIRED_FIELDS:
+            row_val = gi.get(field)
+            sc_val = sidecar_entry.get(field)
+            if row_val != sc_val:
+                errors.append(
+                    f"rows[{i}] id={rid!r} generated_intent.{field}="
+                    f"{row_val!r} drifted from sidecar.requests entry "
+                    f"value {sc_val!r} (per-id taxonomy must match "
+                    f"byte-for-byte across the row + sidecar so a "
+                    f"reviewer cannot smuggle a row-only intent past "
+                    f"the audit surface)"
+                )
+        # custom_descriptor parity — both must be absent, OR both
+        # present and equal. An asymmetric pair (row has it, sidecar
+        # does not, or vice versa) is mismatched.
+        row_cd = gi.get("custom_descriptor")
+        sc_cd = sidecar_entry.get("custom_descriptor")
+        if row_cd != sc_cd:
+            errors.append(
+                f"rows[{i}] id={rid!r} generated_intent."
+                f"custom_descriptor={row_cd!r} drifted from "
+                f"sidecar.requests entry value {sc_cd!r} (per-id "
+                f"custom_descriptor must match byte-for-byte across "
+                f"the row + sidecar)"
+            )
+
+    # Sidecar.requests entry — re-validate its taxonomy values against
+    # the canonical allow-lists too (defense in depth alongside the
+    # schema's enum locks).
+    for j, entry in enumerate(sidecar_requests):
+        if not isinstance(entry, dict):
+            continue
+        rid = entry.get("id")
+        for field, allowed in (
+            ("placement_role", _PLACEMENT_ROLE_ALLOWED),
+            ("text_policy", _TEXT_POLICY_ALLOWED),
+            ("subject_domain", _SUBJECT_DOMAIN_ALLOWED),
+        ):
+            val = entry.get(field)
+            if val not in allowed:
+                errors.append(
+                    f"sidecar.requests[{j}] id={rid!r} {field}={val!r}"
+                    f" is not in canonical allow-list "
+                    f"{sorted(allowed)!r}"
+                )
+        cd = entry.get("custom_descriptor")
+        if cd is not None:
+            if not (isinstance(cd, str) and _CUSTOM_DESCRIPTOR_RE.match(cd)):
+                errors.append(
+                    f"sidecar.requests[{j}] id={rid!r} "
+                    f"custom_descriptor={cd!r} does not match the "
+                    f"approved custom-descriptor pattern"
+                )
+
+    # sidecar.request_ids must equal the set of sidecar.requests[].id
+    # — a drift here would mean the request_ids audit surface and the
+    # per-id taxonomy projection disagree about which ids the runner
+    # generated.
+    if isinstance(sidecar, dict):
+        ids_list = sidecar.get("request_ids")
+        if isinstance(ids_list, list):
+            request_ids_set: set[str] = {
+                s for s in ids_list if isinstance(s, str)
+            }
+            requests_id_set: set[str] = set(sidecar_by_id)
+            in_ids_not_in_requests = sorted(
+                request_ids_set - requests_id_set,
+            )
+            for mid in in_ids_not_in_requests:
+                errors.append(
+                    f"sidecar.request_ids: id {mid!r} is present but "
+                    f"has no matching sidecar.requests entry (the two "
+                    f"sidecar projections must agree on which ids the "
+                    f"runner generated)"
+                )
+            in_requests_not_in_ids = sorted(
+                requests_id_set - request_ids_set,
+            )
+            for mid in in_requests_not_in_ids:
+                errors.append(
+                    f"sidecar.requests: id {mid!r} has a per-id "
+                    f"taxonomy entry but is missing from "
+                    f"sidecar.request_ids (the two sidecar "
+                    f"projections must agree on which ids the runner "
+                    f"generated)"
+                )
+
+    return errors
+
+
 def _check_summary_ok_consistency(record: dict) -> list[str]:
     summary = record.get("summary")
     if not isinstance(summary, dict):
@@ -1177,6 +1502,7 @@ def _all_gates(record: dict) -> list[str]:
         + _check_inventory_external_zero(record)
         + _check_sidecar_schema_version(record)
         + _check_internal_consistency(record)
+        + _check_generated_intent_parity(record)
         + _check_summary_ok_consistency(record)
     )
 
@@ -1467,7 +1793,9 @@ def _missing_negation_in_status(record):
 
 
 def _schema_version_wrong(record):
-    record["schema_version"] = "2"
+    # "2" is the current locked version; pick a future unknown so
+    # the schema enum + validator gate both refuse.
+    record["schema_version"] = "3"
 
 
 def _evidence_id_wrong(record):
@@ -1576,6 +1904,152 @@ def _collapse_source_class_to_local_asset(record):
     sc["request_ids"] = ["orphan_sidecar_id"]
 
 
+def _drop_generated_intent_from_d_one_row(record):
+    """Strip ``generated_intent`` from the d_one_local row. G18 fires
+    because every d_one_local row must carry the per-row taxonomy
+    projection."""
+    rows = record.get("rows") or []
+    for r in rows:
+        if r.get("source_class") == "d_one_local" and "generated_intent" in r:
+            del r["generated_intent"]
+
+
+def _attach_generated_intent_to_local_asset_row(record):
+    """Attach generated_intent to a local_asset row. G18 fires because
+    caller-staged bytes are not a generated artifact and have no
+    D-One intent."""
+    rows = record.get("rows") or []
+    for r in rows:
+        if r.get("source_class") == "local_asset":
+            r["generated_intent"] = {
+                "placement_role": "local_region",
+                "text_policy": "no_text",
+                "subject_domain": "abstract_geometry",
+            }
+            break
+
+
+def _mismatch_generated_intent_text_policy(record):
+    """Flip the d_one_local row's text_policy so it diverges from the
+    sidecar.requests entry for the same id. G18 fires on per-id
+    parity mismatch."""
+    rows = record.get("rows") or []
+    for r in rows:
+        if r.get("source_class") == "d_one_local":
+            gi = r.get("generated_intent") or {}
+            if gi.get("text_policy") == "decorative_glyphs":
+                gi["text_policy"] = "caption_safe"
+            else:
+                gi["text_policy"] = "decorative_glyphs"
+            r["generated_intent"] = gi
+            break
+
+
+def _mismatch_generated_intent_placement_role(record):
+    """Flip the d_one_local row's placement_role so it diverges from
+    the sidecar.requests entry. G18 fires on per-id parity mismatch."""
+    rows = record.get("rows") or []
+    for r in rows:
+        if r.get("source_class") == "d_one_local":
+            gi = r.get("generated_intent") or {}
+            if gi.get("placement_role") == "hero_page":
+                gi["placement_role"] = "local_region"
+            else:
+                gi["placement_role"] = "hero_page"
+            r["generated_intent"] = gi
+            break
+
+
+def _mismatch_generated_intent_custom_descriptor(record):
+    """Drop the row's custom_descriptor while sidecar.requests retains
+    it. G18 fires on per-id parity mismatch (asymmetric custom_descriptor
+    pair)."""
+    rows = record.get("rows") or []
+    for r in rows:
+        if r.get("source_class") == "d_one_local":
+            gi = r.get("generated_intent") or {}
+            if "custom_descriptor" in gi:
+                del gi["custom_descriptor"]
+                r["generated_intent"] = gi
+            break
+
+
+def _drop_sidecar_requests_entry_for_d_one_row(record):
+    """Drop the d_one_local id from sidecar.requests. G18 fires because
+    every d_one_local row must have a matching sidecar.requests entry."""
+    rows = record.get("rows") or []
+    d_one_ids = {
+        r["id"] for r in rows
+        if r.get("source_class") == "d_one_local"
+        and isinstance(r.get("id"), str)
+    }
+    sc = record.get("sidecar") or {}
+    sc["requests"] = [
+        e for e in (sc.get("requests") or [])
+        if not (isinstance(e, dict) and e.get("id") in d_one_ids)
+    ] or [
+        {
+            "id": "zzz_orphan_request_id",
+            "placement_role": "local_region",
+            "text_policy": "no_text",
+            "subject_domain": "abstract_geometry",
+        }
+    ]
+
+
+def _leak_local_asset_into_sidecar_requests(record):
+    """Insert a sidecar.requests entry for a local_asset id. G18 fires
+    because caller-staged bytes are not a generated artifact."""
+    rows = record.get("rows") or []
+    local_ids = [
+        r["id"] for r in rows
+        if r.get("source_class") == "local_asset"
+        and isinstance(r.get("id"), str)
+    ]
+    if not local_ids:
+        return
+    sc = record.get("sidecar") or {}
+    existing = list(sc.get("requests") or [])
+    existing.append({
+        "id": local_ids[0],
+        "placement_role": "local_region",
+        "text_policy": "no_text",
+        "subject_domain": "abstract_geometry",
+    })
+    sc["requests"] = existing
+    # Also leak into request_ids so the request_ids/requests gate
+    # cannot mask the parity gate diagnostic.
+    rid_list = list(sc.get("request_ids") or [])
+    if local_ids[0] not in rid_list:
+        sc["request_ids"] = sorted(set(rid_list + local_ids[:1]))
+
+
+def _unknown_placement_role_in_generated_intent(record):
+    """Set generated_intent.placement_role to an out-of-vocab token
+    that bypasses the enum at the schema layer via direct mutation. G18
+    re-asserts the canonical allow-list."""
+    rows = record.get("rows") or []
+    for r in rows:
+        if r.get("source_class") == "d_one_local":
+            gi = r.get("generated_intent") or {}
+            gi["placement_role"] = "rogue_placement"
+            r["generated_intent"] = gi
+            break
+
+
+def _credential_shape_custom_descriptor(record):
+    """Force a credential-shape value into generated_intent.custom_
+    descriptor. The custom_descriptor pattern + the G13 string-safety
+    scan both fail closed."""
+    rows = record.get("rows") or []
+    for r in rows:
+        if r.get("source_class") == "d_one_local":
+            gi = r.get("generated_intent") or {}
+            gi["custom_descriptor"] = "token=value"
+            r["generated_intent"] = gi
+            break
+
+
 def _run_probes() -> int:
     print("--- self-test fail-closed probes ---")
     probes: list[tuple[str, callable, str]] = [
@@ -1677,6 +2151,42 @@ def _run_probes() -> int:
          "source_class coverage gate fires)",
          _collapse_source_class_to_local_asset,
          "source_class coverage"),
+        ("P35 d_one_local row missing generated_intent refused "
+         "(G18 generated_intent parity)",
+         _drop_generated_intent_from_d_one_row,
+         "missing required generated_intent"),
+        ("P36 local_asset row carrying generated_intent refused "
+         "(G18 generated_intent parity)",
+         _attach_generated_intent_to_local_asset_row,
+         "carries generated_intent (forbidden"),
+        ("P37 generated_intent.text_policy drift from "
+         "sidecar.requests entry refused (G18 per-id parity)",
+         _mismatch_generated_intent_text_policy,
+         "generated_intent.text_policy"),
+        ("P38 generated_intent.placement_role drift from "
+         "sidecar.requests entry refused (G18 per-id parity)",
+         _mismatch_generated_intent_placement_role,
+         "generated_intent.placement_role"),
+        ("P39 generated_intent.custom_descriptor asymmetric pair "
+         "vs sidecar.requests refused (G18 per-id parity)",
+         _mismatch_generated_intent_custom_descriptor,
+         "custom_descriptor"),
+        ("P40 d_one_local row id missing from sidecar.requests "
+         "refused (G18 1:1 coverage)",
+         _drop_sidecar_requests_entry_for_d_one_row,
+         "has NO matching sidecar.requests entry"),
+        ("P41 local_asset id leaks into sidecar.requests refused "
+         "(G18 lane separation)",
+         _leak_local_asset_into_sidecar_requests,
+         "leaked into the per-id taxonomy projection"),
+        ("P42 generated_intent.placement_role out-of-vocab token "
+         "refused (schema enum + G18 canonical allow-list re-check)",
+         _unknown_placement_role_in_generated_intent,
+         "not in enum"),
+        ("P43 generated_intent.custom_descriptor credential-shape "
+         "refused (G18 pattern + G13 string-safety)",
+         _credential_shape_custom_descriptor,
+         "custom_descriptor"),
     ]
     fails = 0
     for name, mutator, expect in probes:

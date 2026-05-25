@@ -33,7 +33,9 @@ walk a single mixed-lane mock-image trial run end-to-end:
      leaking absolute machine paths;
   4. validate the sanitized record through
      ``scripts/validate_mixed_image_asset_provenance.py --evidence
-     <tempfile>`` (schema + every documented G1..G17 semantic gate)
+     <tempfile>`` (schema + every documented G1..G18 semantic gate,
+     including the new G18 generated_intent / sidecar.requests per-id
+     parity gate)
      so the same gate stack the committed template ships against
      is what the handoff smoke drives;
   5. assert the committed tree under ``REPO_ROOT`` is byte-identical
@@ -60,11 +62,27 @@ the validator + schema require. The deliberate narrowed mapping is:
   rows[*].source_class         -> preserved (one of d_one_local / local_asset)
   rows[*].manifest_local_path  -> preserved (already workspace-relative)
   rows[*].intended_use         -> preserved verbatim
+  rows[*].generated_intent     -> preserved verbatim on every
+                                  d_one_local row; ABSENT on every
+                                  local_asset row (taxonomy values are
+                                  closed enums + pattern-locked
+                                  custom_descriptor — committed-safe
+                                  by construction)
   sidecar.request_ids          -> preserved (sorted unique list of request ids)
+  sidecar.requests             -> preserved (sorted per-id taxonomy
+                                  projection mirroring the runner-
+                                  written mock_d_one_adapter_plan.json
+                                  per-request placement_role /
+                                  text_policy / subject_domain /
+                                  optional custom_descriptor)
   inventory.media_parts        -> preserved (sorted unique
                                   {part, sha256} pair set, part-level
                                   bidirectional with rows[*].pptx_media)
-  schema_version               -> "1" (locked)
+  schema_version               -> "2" (locked; bumped from "1"
+                                  as the paired schema/validator
+                                  change that added sidecar.requests
+                                  + row-level generated_intent for
+                                  G18 parity)
   evidence_id                  -> "mixed_image_asset_provenance" (locked)
   real_d_one_status            -> a fresh canonical UNVERIFIED sentence
                                   matching the schema's negation-token
@@ -97,7 +115,7 @@ arg builder / synthetic-id constants imported from
 taxonomy stays single-source-of-truth across both smokes. Every
 fail-closed probe in THIS smoke runs the validator SUBPROCESS on a
 tampered clone of the sanitized record so the canonical
-G1..G17 gate stack is exercised on the probe path.
+G1..G18 gate stack is exercised on the probe path.
 
 Clean-room: this smoke shares no prompts, assets, examples, tables,
 CSV rows, wording, code, or deck structure with any upstream
@@ -110,12 +128,19 @@ matrix are this repo's own.
 Happy-path assertions:
 
   H1  the bundle materializer + runner-args helpers reused from
-      ``mixed_image_asset_pipeline_smoke`` drive a pipeline
-      subprocess that returns rc=0;
+      ``mixed_image_asset_pipeline_smoke`` (driven with a taxonomy-
+      rich ``d_one_spec`` override carrying ``placement_role=hero_page``,
+      a non-default ``text_policy``, ``subject_domain``, AND an
+      approved ``custom_descriptor`` plus a paired
+      ``descriptor_vocabulary.json`` the runner resolves bundle-
+      relative) drive a pipeline subprocess that returns rc=0;
   H2  the runtime provenance derivation produces a non-empty
       dict with exactly two rows (one d_one_local, one local_asset)
       both pointing at on-disk PNG/JPG/JPEG bytes whose recomputed
-      sha256 matches the recorded sha256;
+      sha256 matches the recorded sha256 AND the d_one_local row's
+      ``generated_intent`` equals the spec-supplied taxonomy values
+      byte-for-byte (spec -> sidecar -> runtime preservation) AND
+      the local_asset row carries NO ``generated_intent``;
   H3  the sanitizer's input path-prefix gate refuses any path-typed
       field that does not sit under the expected tempdir-anchored
       root;
@@ -123,7 +148,8 @@ Happy-path assertions:
       that still carries a URI scheme, a ``..`` segment, a leading
       ``/`` or ``~`` (defense in depth);
   H5  the validator subprocess on the sanitized record returns
-      rc=0 (every G1..G17 gate held);
+      rc=0 (every G1..G18 gate held, including the
+      generated_intent / sidecar.requests per-id parity gate);
   H6  the committed tree under REPO_ROOT is byte-identical before
       and after the run.
 
@@ -160,7 +186,19 @@ sanitized baseline still passes):
       credential gate refuses;
   P9  real-D-One success claim: rewrite ``notes.scope`` to
       ``Real D-One verified online`` and assert the validator's
-      claim-refusal walker fires.
+      claim-refusal walker fires;
+  P10 strip ``generated_intent`` from the d_one_local row and
+      assert validator G18 refuses (every d_one_local row must
+      carry the per-row taxonomy projection);
+  P11 attach ``generated_intent`` to the local_asset row and
+      assert validator G18 refuses (caller-staged bytes are not
+      a generated artifact);
+  P12 flip ``generated_intent.text_policy`` on the d_one_local
+      row away from its sidecar.requests entry and assert the
+      validator's G18 per-id parity gate fires;
+  P13 drop the d_one_local id from ``sidecar.requests`` and
+      assert validator G18 refuses (every d_one_local row must
+      have a matching sidecar.requests entry).
 
 Wiring decision: this smoke IS wired into the aggregate
 ``scripts/core_editable_ppt_acceptance.py`` as the seventeenth
@@ -232,6 +270,19 @@ from core_editable_ppt_acceptance import (  # noqa: E402
     _snapshot_committed_tree,
 )
 
+# Synthetic taxonomy values the handoff smoke pins on the d_one_local
+# request. Aligned only with upstream ppt-master's hero-page +
+# per-row text_policy / subject_domain depth; no upstream code /
+# prompts / examples / assets / wording copied. The values are
+# baked into both the d_one_spec the smoke writes AND the validator-
+# checked generated_intent block on the d_one_local row, so a
+# spec -> sidecar -> sanitized evidence drift trips G18 in the
+# validator subprocess.
+_D_ONE_PLACEMENT_ROLE = "hero_page"
+_D_ONE_TEXT_POLICY = "decorative_glyphs"
+_D_ONE_SUBJECT_DOMAIN = "abstract_geometry"
+_D_ONE_CUSTOM_DESCRIPTOR = "hero_calm_motif"
+
 # Canonical committed-safe placeholders.
 _PLACEHOLDER_BUNDLE_PATH = "synthetic-tempdir/mixed_bundle"
 _PLACEHOLDER_WORKSPACE_PATH = "synthetic-tempdir/workspace"
@@ -272,6 +323,99 @@ _EMBEDDABLE_MEDIA_EXTS: tuple[str, ...] = (".png", ".jpg", ".jpeg")
 _EXT_TO_MEDIA_TYPE: dict[str, str] = {
     "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
 }
+
+
+def _taxonomy_d_one_spec_body() -> dict:
+    """Synthetic d_one_spec carrying the per-row taxonomy + custom-
+    descriptor escape-hatch the goal pins. The runner forwards
+    --descriptor-vocabulary to done_image_adapter, which validates the
+    request fields, projects them onto the deterministic plan, and the
+    runner copies that plan byte-identical into the audit sidecar
+    <report-dir>/mock_d_one_adapter_plan.json."""
+    return {
+        "requests": [
+            {
+                "id": D_ONE_IMAGE_ID,
+                "prompt": (
+                    "abstract calm geometric accent, no text, no logo"
+                ),
+                "intended_use": "spot illustration",
+                "width_px": 320, "height_px": 320,
+                "placement_role": _D_ONE_PLACEMENT_ROLE,
+                "text_policy": _D_ONE_TEXT_POLICY,
+                "subject_domain": _D_ONE_SUBJECT_DOMAIN,
+                "custom_descriptor": _D_ONE_CUSTOM_DESCRIPTOR,
+            },
+        ],
+    }
+
+
+def _descriptor_vocab_body() -> dict:
+    """Synthetic descriptor vocabulary that approves the d_one_spec's
+    placement_role / text_policy / subject_domain values AND the
+    custom_descriptor escape-hatch value. Mirrors the canonical-set
+    membership invariant the descriptor-vocabulary schema enforces
+    (every allowed_values array is exactly the canonical-length unique
+    enum). Aligned only with upstream ppt-master image-generation; no
+    upstream code / prompts / examples / assets / wording copied."""
+    return {
+        "schema_version": 1,
+        "note": (
+            "Synthetic D-One descriptor vocabulary for the mixed image-"
+            "asset provenance handoff smoke (taxonomy parity proof)."
+        ),
+        "kind_enum": [
+            "color_token",
+            "geometric_noun",
+            "mood_adjective",
+            "composition_adjective",
+        ],
+        "descriptors": [
+            {"kind": "color_token", "value": "palette.accent"},
+            {"kind": "geometric_noun", "value": "circle"},
+            {"kind": "mood_adjective", "value": "calm"},
+            {"kind": "composition_adjective", "value": "centered"},
+        ],
+        "image_taxonomy": {
+            "rendering_style": {"allowed_values": [
+                "flat_vector", "line_diagram", "isometric_lite",
+                "low_poly", "solid_shape",
+            ]},
+            "palette_family": {"allowed_values": [
+                "neutral_grey", "accent_only", "dual_tone",
+                "mono_brand", "palette_default",
+            ]},
+            "image_role": {"allowed_values": [
+                "decorative_accent", "metaphor_icon", "divider_motif",
+                "kpi_emblem", "cover_motif",
+            ]},
+            "layout_pattern": {"allowed_values": [
+                "single_center", "left_anchor", "right_anchor",
+                "top_band", "bottom_band",
+            ]},
+            "modifier": {"allowed_values": [
+                "low_contrast", "soft_edges", "grid_aligned",
+                "negative_space",
+            ]},
+            "text_policy": {"allowed_values": [
+                "no_text", "decorative_glyphs", "caption_safe",
+            ]},
+            "subject_domain": {"allowed_values": [
+                "abstract_geometry", "process_motif",
+                "metric_emblem", "concept_diagram",
+            ]},
+            "placement_role": {"allowed_values": [
+                "hero_page", "local_region",
+            ]},
+        },
+        "custom_descriptors": [
+            {
+                "kind": "composition_adjective",
+                "value": _D_ONE_CUSTOM_DESCRIPTOR,
+                "approved_in_review_ref": "synthetic_review.handoff",
+            },
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +569,28 @@ def _derive_runtime_provenance(
         r.get("id") for r in sidecar_requests
         if isinstance(r, dict) and isinstance(r.get("id"), str)
     })
+    # Build a per-id taxonomy projection from the sidecar's plan
+    # requests (placement_role / text_policy / subject_domain /
+    # optional custom_descriptor). The validator's G18 cross-checks
+    # row.generated_intent against this projection.
+    sidecar_taxonomy_by_id: dict[str, dict] = {}
+    for r in sidecar_requests:
+        if not isinstance(r, dict):
+            continue
+        rid = r.get("id")
+        if not isinstance(rid, str) or not rid:
+            continue
+        entry: dict = {"id": rid}
+        for field in (
+            "placement_role", "text_policy", "subject_domain",
+        ):
+            v = r.get(field)
+            if isinstance(v, str) and v:
+                entry[field] = v
+        cd = r.get("custom_descriptor")
+        if isinstance(cd, str) and cd:
+            entry["custom_descriptor"] = cd
+        sidecar_taxonomy_by_id[rid] = entry
 
     # Parse the inventory.
     try:
@@ -536,7 +702,7 @@ def _derive_runtime_provenance(
                 f"not appear inside the produced PPTX media parts"
             )
             return None, errors
-        rows.append({
+        row: dict = {
             "id": manifest_id,
             "source_class": source_class,
             "manifest_local_path": manifest_local_path,
@@ -560,7 +726,28 @@ def _derive_runtime_provenance(
                     inventory_path, matched_part,
                 ),
             },
-        })
+        }
+        # generated_intent — REQUIRED on every d_one_local row;
+        # FORBIDDEN on every local_asset row. Projected from the
+        # runner-written sidecar's per-id plan request so a smoke
+        # without the descriptor_vocabulary + taxonomy-rich d_one_spec
+        # surfaces as a missing-intent G18 failure in the validator
+        # subprocess (no silent default).
+        if source_class == "d_one_local":
+            tax = sidecar_taxonomy_by_id.get(manifest_id) or {}
+            gi: dict = {}
+            for field in (
+                "placement_role", "text_policy", "subject_domain",
+            ):
+                v = tax.get(field)
+                if isinstance(v, str) and v:
+                    gi[field] = v
+            cd = tax.get("custom_descriptor")
+            if isinstance(cd, str) and cd:
+                gi["custom_descriptor"] = cd
+            if gi:
+                row["generated_intent"] = gi
+        rows.append(row)
 
     runtime: dict = {
         "bundle_path": str(bundle_dir),
@@ -571,6 +758,10 @@ def _derive_runtime_provenance(
             "path": str(sidecar_path),
             "schema_version": sidecar_schema_version,
             "request_ids": sidecar_ids,
+            "requests": sorted(
+                sidecar_taxonomy_by_id.values(),
+                key=lambda e: e.get("id") or "",
+            ),
         },
         "inventory": {
             "path": str(inventory_path),
@@ -708,7 +899,7 @@ def _sanitize(runtime: dict, *, tempdir_root: str) -> _SanitizerOutcome:
             sanitized_committed_safe_path,
         ))
 
-        sanitized_rows.append({
+        sanitized_row: dict = {
             "id": row.get("id"),
             "source_class": row.get("source_class"),
             "manifest_local_path": manifest_local_path,
@@ -723,7 +914,15 @@ def _sanitize(runtime: dict, *, tempdir_root: str) -> _SanitizerOutcome:
                 "error": asset.get("error") or "",
             },
             "pptx_media": dict(row.get("pptx_media") or {}),
-        })
+        }
+        # generated_intent is preserved verbatim (taxonomy enum values
+        # are committed-safe by construction — closed enums + pattern-
+        # locked custom_descriptor). The validator's G18 cross-checks
+        # this block against the sanitized sidecar.requests projection.
+        gi = row.get("generated_intent")
+        if isinstance(gi, dict):
+            sanitized_row["generated_intent"] = dict(gi)
+        sanitized_rows.append(sanitized_row)
 
     # H2 — every committed-safe placeholder must pass the path
     # contract. Belt-and-braces: the placeholders are constants today.
@@ -750,8 +949,20 @@ def _sanitize(runtime: dict, *, tempdir_root: str) -> _SanitizerOutcome:
         if isinstance(r.get("source_class"), str)
     })
 
+    # sidecar.requests projection — preserve the per-id taxonomy
+    # block byte-for-byte so the validator's G18 cross-check against
+    # row.generated_intent has a sidecar surface to compare against.
+    sanitized_sidecar_requests: list[dict] = []
+    for entry in (sidecar.get("requests") or []):
+        if not isinstance(entry, dict):
+            continue
+        sanitized_sidecar_requests.append(dict(entry))
+    sanitized_sidecar_requests.sort(
+        key=lambda e: e.get("id") or "",
+    )
+
     record: dict = {
-        "schema_version": "1",
+        "schema_version": "2",
         "evidence_id": "mixed_image_asset_provenance",
         "real_d_one_status": _COMMITTED_SAFE_STATUS,
         "bundle_path": _PLACEHOLDER_BUNDLE_PATH,
@@ -762,6 +973,7 @@ def _sanitize(runtime: dict, *, tempdir_root: str) -> _SanitizerOutcome:
             "path": _PLACEHOLDER_SIDECAR_PATH,
             "schema_version": sidecar.get("schema_version"),
             "request_ids": sorted(sidecar.get("request_ids") or []),
+            "requests": sanitized_sidecar_requests,
         },
         "inventory": {
             "path": _PLACEHOLDER_INVENTORY_PATH,
@@ -835,13 +1047,25 @@ def _run_validator(
 
 def _run_happy_path(td: Path) -> tuple[int, dict | None]:
     print(
-        "--- happy path: synthetic mixed-lane bundle -> mock "
-        "pipeline -> runtime provenance -> sanitize -> committed-"
-        "safe handoff -> validator ---"
+        "--- happy path: synthetic mixed-lane bundle (taxonomy-rich "
+        "d_one_spec + descriptor_vocabulary.json) -> mock pipeline -> "
+        "runtime provenance -> sanitize -> committed-safe handoff -> "
+        "validator ---"
     )
 
-    bundle_info = _materialize_bundle(td)
+    bundle_info = _materialize_bundle(
+        td, d_one_spec_overrides=_taxonomy_d_one_spec_body(),
+    )
     bundle_dir = bundle_info["bundle"]
+    # Add the descriptor_vocabulary.json the runner resolves through
+    # _BUNDLE_DESCRIPTOR_VOCABULARY_NAME so the taxonomy fields the
+    # spec carries are approved end-to-end.
+    vocab_path = bundle_dir / "descriptor_vocabulary.json"
+    vocab_path.write_text(
+        json.dumps(_descriptor_vocab_body(), indent=2, sort_keys=True)
+        + "\n",
+    )
+
     workspace = td / "happy_ws"
     output = td / "happy.pptx"
     report_dir = td / "happy_report"
@@ -850,6 +1074,7 @@ def _run_happy_path(td: Path) -> tuple[int, dict | None]:
     print(f"  workspace: {workspace}")
     print(f"  output:    {output}")
     print(f"  report:    {report_dir}")
+    print(f"  vocab:     {vocab_path}")
     print()
 
     rc, stdout, stderr = _run_pipeline(
@@ -891,6 +1116,54 @@ def _run_happy_path(td: Path) -> tuple[int, dict | None]:
     print(
         f"  [PASS] runtime provenance derived; "
         f"{len(rows)} row(s); source_class coverage={coverage!r}"
+    )
+
+    # Explicit spec -> sidecar -> runtime preservation assertion for
+    # every taxonomy field the d_one_spec asked for. A drift here
+    # surfaces as a clear diagnostic rather than being inferred from
+    # a downstream G18 failure.
+    expected_intent = {
+        "placement_role": _D_ONE_PLACEMENT_ROLE,
+        "text_policy": _D_ONE_TEXT_POLICY,
+        "subject_domain": _D_ONE_SUBJECT_DOMAIN,
+        "custom_descriptor": _D_ONE_CUSTOM_DESCRIPTOR,
+    }
+    d_one_row = next(
+        (r for r in rows if r.get("source_class") == "d_one_local"),
+        None,
+    )
+    if d_one_row is None:
+        print("  [FAIL] runtime provenance has no d_one_local row")
+        return 1, None
+    runtime_intent = d_one_row.get("generated_intent")
+    if runtime_intent != expected_intent:
+        print(
+            f"  [FAIL] runtime d_one_local row generated_intent="
+            f"{runtime_intent!r}; expected {expected_intent!r}. "
+            f"The spec -> sidecar -> runtime preservation chain "
+            f"dropped or mutated a taxonomy field."
+        )
+        return 1, None
+    print(
+        f"  [PASS] runtime d_one_local row.generated_intent equals "
+        f"the spec-supplied taxonomy {expected_intent!r}"
+    )
+    local_row = next(
+        (r for r in rows if r.get("source_class") == "local_asset"),
+        None,
+    )
+    if local_row is None:
+        print("  [FAIL] runtime provenance has no local_asset row")
+        return 1, None
+    if "generated_intent" in local_row:
+        print(
+            f"  [FAIL] runtime local_asset row leaked "
+            f"generated_intent={local_row.get('generated_intent')!r}"
+            f"; caller-staged bytes are not a generated artifact"
+        )
+        return 1, None
+    print(
+        "  [PASS] runtime local_asset row carries no generated_intent"
     )
 
     sanitizer = _sanitize(runtime, tempdir_root=str(td))
@@ -1049,6 +1322,73 @@ def _mutate_real_d_one_claim_scope(record: dict) -> None:
         )
 
 
+def _mutate_drop_d_one_generated_intent(record: dict) -> None:
+    """Strip generated_intent from the d_one_local row. Validator G18
+    must refuse (every d_one_local row must carry the per-row
+    taxonomy projection)."""
+    rows = record.get("rows") or []
+    for r in rows:
+        if r.get("source_class") == "d_one_local" and "generated_intent" in r:
+            del r["generated_intent"]
+
+
+def _mutate_attach_local_asset_generated_intent(record: dict) -> None:
+    """Attach generated_intent to a local_asset row. Validator G18
+    must refuse (caller-staged bytes are not a generated artifact and
+    have no D-One intent)."""
+    rows = record.get("rows") or []
+    for r in rows:
+        if r.get("source_class") == "local_asset":
+            r["generated_intent"] = {
+                "placement_role": "local_region",
+                "text_policy": "no_text",
+                "subject_domain": "abstract_geometry",
+            }
+            break
+
+
+def _mutate_generated_intent_text_policy_drift(record: dict) -> None:
+    """Flip the d_one_local row's text_policy so it diverges from the
+    sidecar.requests entry. Validator G18 must refuse on per-id
+    parity."""
+    rows = record.get("rows") or []
+    for r in rows:
+        if r.get("source_class") == "d_one_local":
+            gi = r.get("generated_intent") or {}
+            current = gi.get("text_policy")
+            gi["text_policy"] = (
+                "caption_safe"
+                if current == "decorative_glyphs"
+                else "decorative_glyphs"
+            )
+            r["generated_intent"] = gi
+            break
+
+
+def _mutate_sidecar_requests_drop_d_one(record: dict) -> None:
+    """Drop the d_one_local id from sidecar.requests. Validator G18
+    must refuse (every d_one_local row must have a matching
+    sidecar.requests entry)."""
+    rows = record.get("rows") or []
+    d_one_ids = {
+        r["id"] for r in rows
+        if r.get("source_class") == "d_one_local"
+        and isinstance(r.get("id"), str)
+    }
+    sc = record.get("sidecar") or {}
+    sc["requests"] = [
+        e for e in (sc.get("requests") or [])
+        if not (isinstance(e, dict) and e.get("id") in d_one_ids)
+    ] or [
+        {
+            "id": "zzz_orphan_request_id",
+            "placement_role": "local_region",
+            "text_policy": "no_text",
+            "subject_domain": "abstract_geometry",
+        }
+    ]
+
+
 _PROBES: tuple[tuple[str, callable, int, str], ...] = (
     (
         "P1 missing local_asset row refused",
@@ -1094,6 +1434,30 @@ _PROBES: tuple[tuple[str, callable, int, str], ...] = (
         "P9 real-D-One success claim in notes.scope refused",
         _mutate_real_d_one_claim_scope, 1,
         "real-D-One / MCP / network / model / image-search / Qoder",
+    ),
+    (
+        "P10 d_one_local row missing generated_intent refused "
+        "(validator G18 generated_intent parity)",
+        _mutate_drop_d_one_generated_intent, 1,
+        "missing required generated_intent",
+    ),
+    (
+        "P11 local_asset row carrying generated_intent refused "
+        "(validator G18 generated_intent parity)",
+        _mutate_attach_local_asset_generated_intent, 1,
+        "carries generated_intent (forbidden",
+    ),
+    (
+        "P12 generated_intent.text_policy drift from "
+        "sidecar.requests entry refused (validator G18 per-id parity)",
+        _mutate_generated_intent_text_policy_drift, 1,
+        "text_policy",
+    ),
+    (
+        "P13 d_one_local id missing from sidecar.requests refused "
+        "(validator G18 1:1 coverage)",
+        _mutate_sidecar_requests_drop_d_one, 1,
+        "has NO matching sidecar.requests entry",
     ),
 )
 

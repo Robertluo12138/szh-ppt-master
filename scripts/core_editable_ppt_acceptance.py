@@ -291,10 +291,17 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     taxonomy stays single-source-of-truth across both smokes.
     Drives its OWN mock-pipeline subprocess once per self-test
     (mixed lane = one d_one_local generated request + one
-    local_asset caller-staged PNG, two cover slides). Then
-    derives a runtime per-id provenance object (source_class,
-    workspace asset sha256, PPTX-embedded media part sha256,
-    audit sidecar request id set, inventory media_parts
+    local_asset caller-staged PNG, two cover slides); the d_one
+    request carries a taxonomy-rich payload (placement_role =
+    hero_page, non-default text_policy, subject_domain, AND an
+    approved custom_descriptor) plus a paired
+    descriptor_vocabulary.json the runner resolves bundle-
+    relative, so per-row D-One intent flows spec -> sidecar ->
+    sanitized evidence. Derives a runtime per-id provenance
+    object (source_class, workspace asset sha256, PPTX-embedded
+    media part sha256, per-row generated_intent on d_one_local
+    rows only, audit sidecar request id set + per-id
+    requests[] taxonomy projection, inventory media_parts
     ``(part, sha256)`` pairs) and
     **sanitizes** it into a committed-safe handoff record
     (workspace-relative / placeholder paths only — no leading
@@ -302,23 +309,31 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     ``schemas/mixed_image_asset_provenance.schema.json``.
     Validates the sanitized record through
     ``scripts/validate_mixed_image_asset_provenance.py --evidence
-    <tempfile>`` so the same gate stack the committed template
-    ships against is what the handoff smoke drives. Asserts:
-    pipeline rc=0; runtime provenance carries exactly two rows
-    with source_class coverage equal to {d_one_local,
-    local_asset}; sanitizer accepts the input AND emits a
+    <tempfile>`` so the same G1..G18 gate stack the committed
+    template ships against (including the new G18
+    generated_intent / sidecar.requests per-id parity gate) is
+    what the handoff smoke drives. Asserts: pipeline rc=0;
+    runtime provenance carries exactly two rows with source_class
+    coverage equal to {d_one_local, local_asset} AND the
+    d_one_local row's generated_intent equals the spec-supplied
+    taxonomy byte-for-byte AND the local_asset row carries no
+    generated_intent; sanitizer accepts the input AND emits a
     committed-safe record; validator subprocess returns rc=0 on
     the sanitized baseline; committed tree under REPO_ROOT is
-    byte-identical before and after the run. Nine fail-closed
-    probes (P1..P9): missing local_asset row, missing
-    d_one_local row, local_asset id leaked into sidecar,
+    byte-identical before and after the run. Thirteen
+    fail-closed probes (P1..P13): missing local_asset row,
+    missing d_one_local row, local_asset id leaked into sidecar,
     d_one_local id missing from sidecar, ``asset.sha256`` vs
     ``pptx_media.sha256`` mismatch, absolute path leak on
     ``asset.path``, public-hosting wording (``public hosting
     enabled``) in ``intended_use``, credential token
-    (``token=value``) in ``intended_use``, and a real-D-One
-    success claim (``Real D-One verified online``) in
-    ``notes.scope``. Each probe asserts the validator
+    (``token=value``) in ``intended_use``, a real-D-One success
+    claim (``Real D-One verified online``) in ``notes.scope``,
+    AND four new G18-driving probes (d_one_local row stripped of
+    generated_intent, local_asset row attached to
+    generated_intent, generated_intent.text_policy flipped away
+    from the sidecar.requests entry, d_one_local id dropped
+    from sidecar.requests). Each probe asserts the validator
     subprocess returns rc=1 with the documented diagnostic
     substring while the canonical sanitized baseline still
     passes. Sanitized record is written to a per-run tempfile
