@@ -172,6 +172,46 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     per-run tempfile that the tempdir cleanup removes on exit;
     nothing is written under the repo tree and ``REPO_ROOT/dist``
     is left untouched. MOCK / STUB ONLY — no real D-One.
+  - ``scripts/generated_image_provenance_handoff_smoke.py`` —
+    tempdir-only **generated-image provenance handoff smoke**.
+    Reuses the helper functions (``_run_runner`` +
+    ``_derive_provenance``) from
+    ``mock_generated_image_provenance_smoke.py`` so the runtime
+    row taxonomy is not re-implemented here. Drives its OWN
+    mock-pipeline subprocess once per self-test — the pipeline
+    therefore runs twice end-to-end inside this aggregate (once
+    inside this handoff smoke, once inside the sibling mock-
+    provenance smoke), with the shared helpers keeping the
+    derivation code single-source-of-truth across both smokes.
+    Then **sanitizes** the runtime TEMP-ONLY provenance object
+    into a committed-safe
+    handoff record (workspace-relative / placeholder paths only —
+    no leading ``/``, no URI scheme, no ``..``) and validates the
+    result through ``scripts/validate_generated_image_provenance.py
+    --evidence <tempfile>`` so the same gate stack the committed
+    template ships against is what the handoff smoke drives.
+    Asserts the runtime runner returns rc=0, the runtime provenance
+    carries at least one row with both ``placement_role`` values
+    and at least two distinct ``text_policy`` values, the sanitizer
+    refuses any input path that does not lexically anchor under
+    the expected tempdir root (H1), refuses any committed-safe
+    output that does not satisfy the path contract (H2), the
+    validator subprocess returns rc=0 on the sanitized baseline
+    (H5), and the committed tree under REPO_ROOT is byte-identical
+    before and after the run. Eleven fail-closed probes (P1..P11)
+    inject the documented regression classes — absolute path leak
+    on ``asset.path``, URI / traversal on ``manifest_local_path``,
+    credential / public-hosting / confidential wording in
+    ``intended_use``, real-D-One success claim in ``notes.scope``,
+    ``sidecar.schema_version`` drift, collapsed ``text_policy`` /
+    ``placement_role`` coverage, ``asset.sha256`` vs
+    ``pptx_media.sha256`` mismatch, and ``pptx_media.part`` outside
+    ``ppt/media/`` — and assert the validator subprocess refuses
+    each tampered clone with rc=1 plus the documented diagnostic
+    substring while the canonical baseline still passes.
+    Sanitized record is written to a per-run tempfile that the
+    tempdir cleanup removes on exit; nothing is written under the
+    repo tree. MOCK / STUB ONLY — no real D-One.
   - ``scripts/validate_mock_image_bundle_trial_evidence.py`` —
     stdlib-only, read-only, tempdir-only validator for the JSON
     evidence record emitted by
@@ -272,6 +312,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "mock_image_bundle_acceptance_smoke.py",
     SCRIPTS_DIR / "mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "mock_generated_image_provenance_smoke.py",
+    SCRIPTS_DIR / "generated_image_provenance_handoff_smoke.py",
     SCRIPTS_DIR / "validate_mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
     SCRIPTS_DIR / "trace_acceptance_smoke.py",
@@ -505,6 +546,7 @@ def main(argv: list[str]) -> int:
             "+ mock_image_bundle_acceptance_smoke + "
             "mock_image_bundle_trial_evidence + "
             "mock_generated_image_provenance_smoke + "
+            "generated_image_provenance_handoff_smoke + "
             "validate_mock_image_bundle_trial_evidence + "
             "render_model_roundtrip_smoke + trace_acceptance_smoke). "
             "Runs each delegated smoke as a subprocess from REPO_ROOT; "
