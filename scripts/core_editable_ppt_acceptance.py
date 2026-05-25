@@ -17,6 +17,38 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     ``image_manifest.json`` + ``slide_plans/*.json``, materialization
     into the workspace, native ``<p:pic>`` embed under
     ``ppt/media/imageN.<ext>``, contract + inventory validators).
+  - ``scripts/mixed_image_asset_pipeline_smoke.py`` — the
+    **mixed d_one_local + local_asset image-asset lane** through
+    ``scripts/run_mock_image_pipeline.py --bundle``: builds a
+    tempdir-only synthetic bundle with two cover slides (one
+    referencing a d_one_local image, one referencing a local_asset
+    image staged through ``<bundle>/source_assets/``), runs the
+    runner end-to-end into a tempfile-owned workspace / output /
+    report directory, and asserts the documented invariants —
+    ``validate_pptx_contract.py --expected-slide-count 2`` returns
+    rc=0 and every ``minimal_evidence.*`` gate emits ``[PASS]``;
+    ``<report-dir>/inventory.json`` exists with ``ok=true`` /
+    ``findings=[]`` / ``slide_count=2`` and AT LEAST TWO internal
+    ``ppt/media/*`` PNG/JPG/JPEG entries; no external / file:// /
+    data: / URI-scheme relationships anywhere in the produced
+    PPTX; the caller-staged local_asset PNG sha256 appears in
+    ``inventory.media_parts[].sha256``; the generated d_one_local
+    media sha is byte-distinct from the local_asset sha (the two
+    lanes carry independent bytes end-to-end); and the runner's
+    audit sidecar ``<report-dir>/mock_d_one_adapter_plan.json``
+    covers ONLY the d_one_local request id (the local_asset id
+    MUST NOT leak into the sidecar — caller-staged bytes are not
+    a generated artifact). Four fail-closed probes: missing
+    ``source_assets/`` directory (runner refuses at its own
+    boundary), wrong local_asset magic bytes
+    (``_stage_local_assets`` refuses), local_asset id leaked into
+    ``d_one_spec`` (``_check_d_one_spec_covers_generated``
+    refuses), and a d_one_local / local_asset ``local_path``
+    collision in the image_manifest_spec
+    (``_check_local_path_collision`` refuses) — each exits
+    non-zero AND leaves no ``.pptx`` at the nominated
+    ``--output``. MOCK / STUB ONLY — no real D-One / MCP / Qoder /
+    network.
   - ``scripts/source_image_asset_pipeline_smoke.py`` — the
     **explicit-input multi-asset pipeline integration** for the
     source-attached image-asset path: drives
@@ -343,6 +375,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "source_image_asset_acceptance_smoke.py",
     SCRIPTS_DIR / "source_image_asset_pipeline_smoke.py",
+    SCRIPTS_DIR / "mixed_image_asset_pipeline_smoke.py",
     SCRIPTS_DIR / "image_asset_acceptance_smoke.py",
     SCRIPTS_DIR / "image_asset_trial_evidence.py",
     SCRIPTS_DIR / "image_asset_negative_probes_smoke.py",
@@ -580,6 +613,7 @@ def main(argv: list[str]) -> int:
             "Aggregator for the existing core editable-PPT acceptance "
             "smokes (source_image_asset_acceptance_smoke + "
             "source_image_asset_pipeline_smoke + "
+            "mixed_image_asset_pipeline_smoke + "
             "image_asset_acceptance_smoke + image_asset_trial_evidence "
             "+ image_asset_negative_probes_smoke + "
             "image_taxonomy_acceptance_smoke + "
