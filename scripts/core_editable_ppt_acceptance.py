@@ -371,6 +371,57 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     missing / directory / symlinked evidence-PPTX-inventory-
     sidecar). Read-only / stdlib-only / tempdir-only — qualifies
     for inclusion in the aggregate.
+  - ``scripts/image_placement_readback_smoke.py`` — tempdir-only
+    **slide-level image placement / readback smoke**. Drives the
+    existing mixed-lane mock pipeline once into a per-run tempdir
+    and walks the produced PPTX + report ``inventory.json`` +
+    workspace ``render_models`` + runner sidecar to assemble a
+    placement-readback object proving each image lane lands on
+    its intended slide AND inside the intended ``image_slot``
+    bounds (px -> EMU via ``EMU_PER_PX = 9525``, 1-px tolerance).
+    Asserts: slide_count == 2; both image lanes carry distinct
+    ``ppt/media/*.{png,jpg,jpeg}`` parts; the d_one_local
+    workspace sha256 lands on slide 1 exactly; the local_asset
+    workspace sha256 lands on slide 2 exactly; each lane's
+    intended slide's first ``<p:pic>`` blip embed
+    ``r:embed="rIdN"`` resolves via the slide's
+    ``_rels/slideN.xml.rels`` file to EXACTLY the lane's
+    expected media part (closes the "rel declared but blip
+    embeds something else" gap — a slide that merely OWNS a
+    rel to a media part isn't proof the slide BODY shows it;
+    the blip embed walk is); every media part is referenced
+    by at least one slide (no orphan); every relationship is
+    internal (no External / ``file://`` / ``data:`` /
+    URI-scheme target); every slide carries native editable
+    text + shape evidence (no full-slide raster fallback);
+    the slide-1 + slide-2 ``<p:pic>`` xfrm ``<a:off>`` +
+    ``<a:ext>`` match the matching render_model ``image_slot``
+    bounds within 1-px EMU tolerance; the hero_page d_one_local
+    request preserves spec-supplied ``placement_role`` /
+    ``text_policy`` / ``subject_domain`` / ``custom_descriptor``
+    byte-for-byte through the runner sidecar; the local_asset
+    row carries NO ``generated_intent``; sidecar requests
+    cover ONLY the d_one_local id. Direct fail-closed probes
+    (no pipeline re-run): missing d_one_local media reference,
+    missing local_asset media reference, swapped slide
+    references (d_one on slide 2 / local_asset on slide 1),
+    orphan embedded media, External relationship, ``file://``
+    relationship, ``data:`` URI relationship, full-slide / all-
+    image slide evidence, six positive real-D-One / MCP /
+    public network / model API / image search / Qoder success
+    claim variants, ``real_d_one_status="VERIFIED"`` drift,
+    d_one_local ``generated_intent`` stripped, local_asset
+    attached to ``generated_intent``, bounds drift on slide 1
+    offset, bounds drift on slide 1 size, slide ``<p:pic>``
+    blip embed cross-swap (each lane's
+    ``intended_slide_blip_embed_part`` flipped to the OTHER
+    lane's part while ``referencing_slides`` stays untouched —
+    locks the new blip-embed gate as load-bearing, not
+    incidentally redundant), slide ``<p:pic>`` blip embed
+    unresolved, AND a defense-in-depth re-check that the
+    baseline still passes the truth-checker after every probe
+    ran (catches a probe that secretly mutated the shared
+    baseline). MOCK / STUB ONLY — no real D-One.
   - ``scripts/core_image_to_editable_ppt_demo.py`` — milestone
     proof one-command demo smoke that drives the existing mixed-
     lane mock pipeline once into a tempdir, runs the existing
@@ -467,6 +518,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "generated_image_provenance_handoff_smoke.py",
     SCRIPTS_DIR / "mixed_image_asset_provenance_handoff_smoke.py",
     SCRIPTS_DIR / "core_image_to_editable_ppt_demo.py",
+    SCRIPTS_DIR / "image_placement_readback_smoke.py",
     SCRIPTS_DIR / "validate_mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
     SCRIPTS_DIR / "trace_acceptance_smoke.py",
@@ -705,6 +757,7 @@ def main(argv: list[str]) -> int:
             "generated_image_provenance_handoff_smoke + "
             "mixed_image_asset_provenance_handoff_smoke + "
             "core_image_to_editable_ppt_demo + "
+            "image_placement_readback_smoke + "
             "validate_mock_image_bundle_trial_evidence + "
             "render_model_roundtrip_smoke + trace_acceptance_smoke). "
             "Runs each delegated smoke as a subprocess from REPO_ROOT; "
