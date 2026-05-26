@@ -329,6 +329,36 @@ _NEGATION_TOKENS: tuple[str, ...] = (
 )
 
 _URI_SCHEME_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
+_ALLOWED_SYSTEM_SYMLINK_ALIASES = {
+    "/tmp": "/private/tmp",
+    "/var": "/private/var",
+    "/etc": "/private/etc",
+}
+
+
+def _allowed_system_symlink_alias(path: Path) -> bool:
+    expected = _ALLOWED_SYSTEM_SYMLINK_ALIASES.get(str(path))
+    if expected is None:
+        return False
+    try:
+        return str(path.resolve(strict=False)) == expected
+    except OSError:
+        return False
+
+
+def _forbidden_symlink_ancestor(path: Path) -> tuple[Path, str] | None:
+    """Return the first non-system symlink ancestor in the typed path."""
+    for ancestor in path.parents:
+        if not ancestor.is_symlink():
+            continue
+        if _allowed_system_symlink_alias(ancestor):
+            continue
+        try:
+            target = os.readlink(ancestor)
+        except OSError:
+            target = "<unreadable>"
+        return ancestor, target
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -957,29 +987,14 @@ def _validate_out_dir_arg(out_dir_str: str) -> tuple[Path | None, list[str]]:
             f"a symlink target cannot redirect demo outputs."
         ]
 
-    # Walk ancestors of out_dir, checking each for a symlink. Stop at
-    # the first existing real (non-symlink) directory — the operator's
-    # typed path components above that point are an OS-level concern
-    # the operator already trusts (e.g. /tmp -> /private/tmp on macOS,
-    # which would otherwise false-positive without weakening any
-    # operator-namespace attack surface).
-    ancestor = out_dir.parent
-    while True:
-        if ancestor.is_symlink():
-            try:
-                tgt = os.readlink(ancestor)
-            except OSError:
-                tgt = "<unreadable>"
-            return None, [
-                f"--out-dir {out_dir} has a symlink ancestor "
-                f"{ancestor} (-> {tgt}); refused so a symlink in the "
-                f"operator's typed path cannot redirect demo outputs."
-            ]
-        if ancestor.exists() and ancestor.is_dir():
-            break
-        if ancestor.parent == ancestor:
-            break
-        ancestor = ancestor.parent
+    forbidden_ancestor = _forbidden_symlink_ancestor(out_dir)
+    if forbidden_ancestor is not None:
+        ancestor, tgt = forbidden_ancestor
+        return None, [
+            f"--out-dir {out_dir} has a symlink ancestor "
+            f"{ancestor} (-> {tgt}); refused so a symlink in the "
+            f"operator's typed path cannot redirect demo outputs."
+        ]
 
     try:
         resolved = out_dir.resolve(strict=False)
@@ -1573,9 +1588,19 @@ def _probe_out_dir_symlink_ancestor_refused(td: Path) -> _ProbeOutcome:
             name, False,
             f"cannot create probe symlink: {type(exc).__name__}: {exc}",
         )
-    leaf = link_parent / "op3_child_out"
+    nested_parent = real_parent / "nested"
+    try:
+        nested_parent.mkdir()
+    except OSError as exc:
+        return _ProbeOutcome(
+            name, False,
+            f"cannot create nested target: {type(exc).__name__}: {exc}",
+        )
+    leaf = link_parent / "nested" / "op3_child_out"
     # Sanity: the leaf must NOT pre-exist (we want the symlink-
-    # ancestor refusal, not a pre-existing-leaf refusal).
+    # ancestor refusal, not a pre-existing-leaf refusal). The nested
+    # parent exists through the symlink, so this probe catches a gate
+    # that only checks the direct parent and misses deeper ancestors.
     if leaf.exists() or leaf.is_symlink():
         return _ProbeOutcome(
             name, False,

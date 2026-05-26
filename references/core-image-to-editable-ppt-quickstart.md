@@ -77,6 +77,46 @@ TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
   python3 scripts/core_image_to_editable_ppt_demo.py --self-test
 ```
 
+## Bring your own local images
+
+After `scripts/core_image_to_editable_ppt_demo.py --out-dir` (which proves the lane on the repo's synthetic mock bytes), the next operator step for a reviewer who has their **own** folder of local PNG / JPG / JPEG bytes is `scripts/operator_local_images_to_editable_ppt.py`. It discovers operator-supplied images in a flat directory, generates the smallest viable fixture (one cover slide per image, each carrying the operator file as a native `ppt/media` accent + a native editable title), drives `run_explicit_pipeline.py` with the existing Stage-5.5 materialize step, runs the same `validate_source_image_assets` (G1..G13), `validate_pptx_contract --expected-slide-count N`, and `inspect_pptx_inventory` validators, and writes a compact `summary.json` + per-image provenance record that maps each operator filename straight to the embedded `ppt/media/*` part.
+
+```bash
+# Caller-supplied flat images directory; PNG / JPG / JPEG only; filename
+# stems must match the schema id pattern ^[A-Za-z0-9][A-Za-z0-9_.\-]*$ and
+# the deck is capped at 12 images. Pre-flatten any subdirectories.
+IMAGES_DIR=/path/to/your/local/png_or_jpg/images
+
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/szh-operator-XXXX")
+echo "Operator artifacts will land under: $RUN_DIR/operator_out"
+
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_local_images_to_editable_ppt.py \
+  --images-dir "$IMAGES_DIR" \
+  --out-dir "$RUN_DIR/operator_out"
+
+# When done inspecting, clean up:
+#   rm -rf "$RUN_DIR"
+```
+
+Outputs (every path lives under `--out-dir`; nothing lands under the repo tree):
+
+- `deck.pptx` — native editable PPTX, one cover slide per operator image, each carrying the operator file embedded in `ppt/media/`.
+- `inventory.json` — `scripts/inspect_pptx_inventory.py` readback (`ok=true`, `findings=[]`, internal-only relationships, every embedded `ppt/media/*` part).
+- `summary.json` — compact summary record (slide count, image count, embedded media count, `source_classes = ["local_asset"]`, `no_external_relationships=true`, `minimal_evidence.*` booleans, per-image provenance mapping each `operator_filename` to the embedded `ppt/media/*` parts via shared sha256, validator rc values, `real_d_one_status = "UNVERIFIED"`, locked `explicit_boundaries`).
+- `workspace/` — production workspace seeded by `run_explicit_pipeline.py` (Stage 1-10); includes the source-attached `source_image_assets.json` registry the post-run validator ran against.
+- `reports/` — `pipeline_report.{json,txt}` and runner-written inventory from the underlying `run_pipeline.py`.
+- `_pipeline_fixture/` — the generated explicit-input fixture (plan_spec, slide specs, image_manifest_spec, staged asset bytes) the run consumed; useful for a reviewer who wants to inspect what the helper handed to the orchestrator.
+
+Fail-closed gates fire before any subprocess runs: URI-shaped paths, symlink `--images-dir` or symlink ancestor, missing / empty / non-directory `--images-dir`, subdirectories or symlinks or unsupported extensions inside the images directory, filenames whose stem does not match the schema id pattern (`my photo.png` with a space, `-leading.jpg` with a leading separator), two files that share a stem, magic-byte mismatch (PNG bytes inside `.jpg`), more than 12 images, URI-shaped `--out-dir`, symlink `--out-dir` or symlink ancestor, `--out-dir` inside the repo tree, missing `--out-dir` parent, non-directory at `--out-dir`, or pre-existing non-empty `--out-dir`. Run `--self-test` to exercise every gate against synthetic fixtures under a per-run tempdir:
+
+```bash
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+  python3 scripts/operator_local_images_to_editable_ppt.py --self-test
+```
+
+Local-only — does NOT call D-One, MCP, Qoder, a public network, telemetry, a model API, an image search, or any external service. Real D-One remains UNVERIFIED.
+
 For the broader aggregate that runs every delegated core editable-PPT smoke in order (placement readback, image-asset acceptance, taxonomy / text-policy / provenance handoff smokes, render-model roundtrip, trace acceptance, …):
 
 ```bash
