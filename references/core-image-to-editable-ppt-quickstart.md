@@ -99,16 +99,56 @@ python3 scripts/operator_local_images_to_editable_ppt.py \
 #   rm -rf "$RUN_DIR"
 ```
 
+### Optional `--manifest` for per-image slide intent
+
+Without `--manifest`, slide order is alphabetical by filename and the slide title / `image_manifest` `alt_text` / `intended_use` use the helper's deterministic defaults. To control any of those — slide order, native editable slide title, alt-text, intended-use — supply a local JSON manifest:
+
+```bash
+cat >"$RUN_DIR/manifest.json" <<'JSON'
+{
+  "schema_version": "1",
+  "images": [
+    {
+      "filename": "hero_marker.png",
+      "slide_title": "Hero concept",
+      "alt_text": "Synthetic hero marker",
+      "intended_use": "spot illustration"
+    },
+    {
+      "filename": "supporting_chart.jpg",
+      "slide_title": "Supporting chart",
+      "alt_text": "Synthetic supporting chart accent",
+      "intended_use": "decorative pattern"
+    }
+  ]
+}
+JSON
+
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_local_images_to_editable_ppt.py \
+  --images-dir "$IMAGES_DIR" \
+  --out-dir "$RUN_DIR/operator_out" \
+  --manifest "$RUN_DIR/manifest.json"
+```
+
+Contract for `--manifest`:
+
+- Local file only — `--manifest` itself, no ancestor up to the filesystem root (closed macOS aliases such as `/tmp -> /private/tmp` excepted), and the JSON must parse as a single object.
+- Root carries exactly `schema_version == "1"` and a non-empty `images` array; each entry carries exactly the four required fields `filename` / `slide_title` / `alt_text` / `intended_use` (no extras, no missing).
+- `filename` must match a discovered basename under `--images-dir` exactly once; every discovered image must appear in the manifest exactly once.
+- Each free-text field must be a non-empty, length-bounded string with no leading / trailing whitespace, no control characters, no `://` or `<scheme>:` URL / URI shape, no `/` or `\` path separator, and no credential / token / API-key / public-upload / public-share / public-hosting / raw-source / confidential / customer / D-One / MCP / Qoder / model-API / image-search / network / telemetry marker. Mention of any upstream service this lane does NOT call (positive or negative) is refused — the boundary statement is concentrated in the locked `summary.explicit_boundaries` tuple, not in operator metadata.
+- The operator-typed `slide_title` becomes the native editable slide title; `alt_text` and `intended_use` flow into the generated `image_manifest.json` and are echoed back under `summary.image_provenance[]` as `operator_slide_title` / `operator_alt_text` / `operator_intended_use`. The manifest's `images[]` array order replaces the alphabetical-filename order as the deck slide order. `summary.manifest_path` echoes the supplied path verbatim (and is `null` when `--manifest` is omitted).
+
 Outputs (every path lives under `--out-dir`; nothing lands under the repo tree):
 
 - `deck.pptx` — native editable PPTX, one cover slide per operator image, each carrying the operator file embedded in `ppt/media/`.
 - `inventory.json` — `scripts/inspect_pptx_inventory.py` readback (`ok=true`, `findings=[]`, internal-only relationships, every embedded `ppt/media/*` part).
-- `summary.json` — compact summary record (slide count, image count, embedded media count, `source_classes = ["local_asset"]`, `no_external_relationships=true`, `minimal_evidence.*` booleans, per-image provenance mapping each `operator_filename` to the embedded `ppt/media/*` parts via shared sha256, validator rc values, `real_d_one_status = "UNVERIFIED"`, locked `explicit_boundaries`).
+- `summary.json` — compact summary record (slide count, image count, embedded media count, `source_classes = ["local_asset"]`, `no_external_relationships=true`, `minimal_evidence.*` booleans, per-image provenance mapping each `operator_filename` to the embedded `ppt/media/*` parts via shared sha256 — with `operator_slide_title` / `operator_alt_text` / `operator_intended_use` keys also present when `--manifest` was supplied, `manifest_path` echoing the supplied path or `null` otherwise, validator rc values, `real_d_one_status = "UNVERIFIED"`, locked `explicit_boundaries`).
 - `workspace/` — production workspace seeded by `run_explicit_pipeline.py` (Stage 1-10); includes the source-attached `source_image_assets.json` registry the post-run validator ran against.
 - `reports/` — `pipeline_report.{json,txt}` and runner-written inventory from the underlying `run_pipeline.py`.
 - `_pipeline_fixture/` — the generated explicit-input fixture (plan_spec, slide specs, image_manifest_spec, staged asset bytes) the run consumed; useful for a reviewer who wants to inspect what the helper handed to the orchestrator.
 
-Fail-closed gates fire before any subprocess runs: URI-shaped paths, symlink `--images-dir` or symlink ancestor, missing / empty / non-directory `--images-dir`, subdirectories or symlinks or unsupported extensions inside the images directory, filenames whose stem does not match the schema id pattern (`my photo.png` with a space, `-leading.jpg` with a leading separator), two files that share a stem, magic-byte mismatch (PNG bytes inside `.jpg`), more than 12 images, URI-shaped `--out-dir`, symlink `--out-dir` or symlink ancestor, `--out-dir` inside the repo tree, missing `--out-dir` parent, non-directory at `--out-dir`, or pre-existing non-empty `--out-dir`. Run `--self-test` to exercise every gate against synthetic fixtures under a per-run tempdir:
+Fail-closed gates fire before any subprocess runs: URI-shaped paths, symlink `--images-dir` or symlink ancestor, missing / empty / non-directory `--images-dir`, subdirectories or symlinks or unsupported extensions inside the images directory, filenames whose stem does not match the schema id pattern (`my photo.png` with a space, `-leading.jpg` with a leading separator), two files that share a stem, magic-byte mismatch (PNG bytes inside `.jpg`), more than 12 images, URI-shaped `--out-dir`, symlink `--out-dir` or symlink ancestor, `--out-dir` inside the repo tree, missing `--out-dir` parent, non-directory at `--out-dir`, or pre-existing non-empty `--out-dir`. When `--manifest` is supplied, the same boundary applies to the manifest path (URI / symlink / symlink-ancestor / missing / non-file) plus structural refusals for malformed JSON, non-object root, unknown / missing root key, `schema_version != "1"`, empty / wrong-shape entries, unsafe field values (URL / URI / path separator / credential / public-upload / confidential / fake-success), duplicate filename, orphan filename (not in discovered set), and missing filename (discovered but unnamed). Run `--self-test` to exercise every gate against synthetic fixtures under a per-run tempdir:
 
 ```bash
 TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \

@@ -11,12 +11,17 @@ evidence.
 
 Two modes share one happy path:
 
-  * ``--images-dir DIR --out-dir OUT`` — **operator mode**: takes a
-    caller-supplied flat directory of PNG / JPG / JPEG image files plus
-    a caller-supplied output directory that lives **outside the repo
-    tree**. Discovers the image files deterministically (sorted by
-    filename), generates the smallest viable pipeline fixture (one
-    cover slide per image, native title + image_slot accent), invokes
+  * ``--images-dir DIR --out-dir OUT [--manifest PATH]`` — **operator
+    mode**: takes a caller-supplied flat directory of PNG / JPG / JPEG
+    image files plus a caller-supplied output directory that lives
+    **outside the repo tree**, plus the OPTIONAL ``--manifest PATH``
+    naming per-image slide intent. Discovers the image files
+    deterministically (filename-sorted when ``--manifest`` is omitted;
+    reordered to manifest array order when supplied), generates the
+    smallest viable pipeline fixture (one cover slide per image, native
+    title + image_slot accent — with the operator-typed slide_title /
+    alt_text / intended_use flowing through verbatim when
+    ``--manifest`` is supplied), invokes
     ``scripts/run_explicit_pipeline.py`` with ``--theme-from-template``
     + ``--assets-dir <staged>`` so the existing Stage-5.5 materialize
     step copies the bytes into the workspace, then runs every existing
@@ -25,8 +30,10 @@ Two modes share one happy path:
     ``inspect_pptx_inventory``) against the produced workspace + PPTX
     and writes a compact ``summary.json`` + a per-image provenance map
     naming the operator filename, the workspace path the bytes landed
-    at, the sha256, and the embedded ``ppt/media/*`` part. Leaves every
-    intermediate artifact on disk under OUT for a reviewer to inspect.
+    at, the sha256, the embedded ``ppt/media/*`` part, and (when
+    ``--manifest`` was supplied) the operator-typed slide_title /
+    alt_text / intended_use. Leaves every intermediate artifact on
+    disk under OUT for a reviewer to inspect.
 
   * ``--self-test`` — drives the same happy path inside a per-run
     ``tempfile.TemporaryDirectory()`` using two tiny generated PNG /
@@ -108,6 +115,23 @@ or PPTX is created):
         pre-existing — one contract for every operator helper that
         writes outside the repo).
 
+  MAN1..MAN12 (only when ``--manifest`` is supplied)
+        the manifest path is not URI-shaped (MAN1), is not a symlink
+        (MAN2), has no symlink ancestor (MAN3), exists as a regular
+        file (MAN4), parses as a single UTF-8 JSON object (MAN5),
+        carries exactly the required root keys (MAN6) with
+        ``schema_version == "1"`` (MAN7), names a non-empty
+        ``images`` array (MAN8) of objects with EXACTLY the four
+        required fields filename / slide_title / alt_text /
+        intended_use (MAN9), each field passes the safe-string gates
+        (MAN10 — type, length, whitespace, control char, URL / URI,
+        path separator, credential / token / API-key shape, public
+        upload / share / hosting wording, raw-source / confidential /
+        customer marker, positive D-One / MCP / Qoder / model API /
+        image search / network / telemetry success claim), no
+        filename appears twice (MAN11), and the manifest filename
+        set equals the discovered filename set (MAN12).
+
 After the pipeline run, the helper additionally runs the existing
 ``validate_source_image_assets`` validator against a freshly-authored
 ``<workspace>/source_image_assets.json`` registry (PNG / JPG / JPEG
@@ -138,10 +162,16 @@ verbatim — the helper's load-bearing operator-facing output):
   * ``image_provenance`` — one entry per operator image: ``{
     "operator_filename", "asset_id", "sha256",
     "workspace_local_path", "workspace_destination_path",
-    "media_type", "byte_count", "embedded_media_parts" }``. The last
-    field is the sorted list of ``ppt/media/*`` parts whose sha256
-    equals the operator file's sha256, so a reviewer can trace each
-    operator filename straight to its embedded PPTX part.
+    "media_type", "byte_count", "embedded_media_parts" }``, plus
+    (only when ``--manifest`` was supplied) ``operator_slide_title``,
+    ``operator_alt_text``, ``operator_intended_use``. The
+    ``embedded_media_parts`` field is the sorted list of
+    ``ppt/media/*`` parts whose sha256 equals the operator file's
+    sha256, so a reviewer can trace each operator filename straight
+    to its embedded PPTX part.
+  * ``manifest_path`` — absolute (or caller-typed) path to the
+    operator manifest when ``--manifest`` was supplied; ``null``
+    otherwise.
   * ``pptx_path`` — absolute path inside ``--out-dir``.
   * ``workspace_path`` / ``report_dir`` / ``inventory_path`` /
     ``registry_path`` — absolute paths inside ``--out-dir``.
@@ -167,7 +197,7 @@ operator bytes flow through the existing local pipeline ONLY.
 
 Usage:
   python3 scripts/operator_local_images_to_editable_ppt.py \\
-      --images-dir DIR --out-dir OUT
+      --images-dir DIR --out-dir OUT [--manifest PATH]
 
   python3 scripts/operator_local_images_to_editable_ppt.py --self-test
 
@@ -191,7 +221,7 @@ import shutil  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 import zipfile  # noqa: E402
-from dataclasses import dataclass  # noqa: E402
+from dataclasses import dataclass, replace  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -302,6 +332,870 @@ _URI_SCHEME_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
 
 
 # ---------------------------------------------------------------------------
+# Optional --manifest validation.
+# ---------------------------------------------------------------------------
+
+# Optional caller-supplied local JSON manifest that names per-image
+# slide intent (order, slide_title, alt_text, intended_use). When the
+# operator omits --manifest the helper preserves its deterministic
+# filename-sort ordering AND its built-in default strings verbatim;
+# when the operator supplies --manifest the helper uses the manifest's
+# array order as the deck slide order and routes the per-entry strings
+# into the native editable slide title (slide_title) and the generated
+# image_manifest's alt_text / intended_use fields. The manifest itself
+# is NEVER written to the produced deck; only the per-entry strings
+# flow through, and the summary echoes them under image_provenance for
+# a reviewer to trace each embedded ppt/media part back to the
+# manifest entry that ordered + labelled it.
+_MANIFEST_SCHEMA_VERSION = "1"
+_MANIFEST_REQUIRED_ROOT_KEYS: tuple[str, ...] = (
+    "images", "schema_version",
+)
+_MANIFEST_IMAGE_REQUIRED_KEYS: tuple[str, ...] = (
+    "alt_text", "filename", "intended_use", "slide_title",
+)
+
+_MAX_FILENAME_LEN = 128
+_MAX_SLIDE_TITLE_LEN = 120
+_MAX_ALT_TEXT_LEN = 300
+_MAX_INTENDED_USE_LEN = 120
+
+# Denied substrings for every manifest free-text field. All checks
+# are case-insensitive against the stripped lower-cased string. The
+# fields are local-only operator deck metadata — they must not carry
+# credentials, network identifiers / public hosting wording, raw
+# confidential or customer markers, or positive success claims for
+# upstream services this lane does NOT call. Each category emits a
+# distinct diagnostic so the operator can rename / re-phrase the
+# offending field without guessing which gate fired.
+_DENY_CREDENTIAL: tuple[str, ...] = (
+    "api_key", "api-key", "apikey",
+    "secret_key", "secret-key", "client_secret",
+    "private_key", "access_key", "access-key",
+    "x-api-key", "password", "passwd",
+    "bearer ", "authorization:",
+    "auth_token", "auth-token",
+    "access_token", "access-token",
+)
+
+# OpenAI-style API key prefix (sk-XXXX...). The bounded
+# {16,} length avoids collisions with short benign tokens that
+# happen to begin with "sk-" (e.g. "sk-1" embedded in a phrase).
+_OPENAI_KEY_REGEX = re.compile(r"\bsk-[A-Za-z0-9]{16,}\b")
+
+_DENY_UPLOAD: tuple[str, ...] = (
+    "upload to", "uploaded to", "share to", "shared to",
+    "publish to", "published to", "hosted on", "host on",
+    "s3://", "gs://", "azure blob",
+    "google drive", "dropbox", "onedrive",
+    "public url", "amazonaws", "googleusercontent",
+    "githubusercontent", "imgur", "flickr",
+    # Distribution-channel phrases. The regex below catches most
+    # public-share / public-hosting shapes; these substrings
+    # additionally lock specific well-known phrases the regex would
+    # otherwise have to enumerate as alternations.
+    "public domain", "on social media",
+    # Social-media platform names. Their presence in operator
+    # metadata reveals a public-distribution channel for the deck's
+    # image bytes — refused regardless of surrounding wording so
+    # "posted on twitter" / "instagram-style export" / "share on
+    # linkedin" all trip without alt 14/15 having to enumerate every
+    # provider name. Marginal benign uses ("instagram-style filter")
+    # are refused by design; the operator can rephrase the metadata.
+    "twitter", "instagram", "facebook", "linkedin",
+    "reddit", "tiktok", "youtube", "mastodon",
+    "threads.net", "bluesky", "tumblr", "pinterest",
+    "snapchat",
+)
+
+# Public-share / public-hosting wording that the substring list above
+# does NOT catch on its own. The substring tokens lock specific
+# provider-named phrasings ("upload to <provider>", "share to <name>"),
+# a couple of high-signal noun phrases ("public domain",
+# "on social media"), AND the bare social-media platform names
+# (twitter, instagram, facebook, linkedin, reddit, tiktok, youtube,
+# mastodon, threads.net, bluesky, tumblr, pinterest, snapchat) so
+# "posted on twitter" / "shared on linkedin" / "youtube post" all
+# trip without the regex enumerating each platform; this regex
+# closes the broader no-provider gap with the following 22 bounded
+# shapes (case-insensitive, word-boundary anchored, separator class
+# ``[\s-]+`` applied uniformly to every shape so BOTH space- and
+# hyphen-joined variants trip — "internet hosted" / "internet-
+# hosted", "cloud hosted" / "cloud-hosted", "make public" /
+# "make-public", "anyone can download" / "anyone-can-download",
+# "upload to s3" / "upload-to-s3", "hosted on aws" /
+# "hosted-on-aws", "stored on cloud" / "stored-on-cloud",
+# "cloud-stored" / "cdn-served" — while concatenations without ANY
+# separator — "publichosting", "uploadtos3" — do not):
+#
+# IMPORTANT — the regex is DELIBERATELY NARROW around storage verbs.
+# Alt 14 ("verb to") only fires for unambiguous distribution verbs
+# {post, upload, share, sharing, publish, distribute, broadcast,
+# stream, mirror}; save / store / sync / backup / deliver / serve /
+# send / forward / host are NOT in alt 14 because phrases like
+# "save to file", "send to printer", "stored to disk", "forwarded
+# to inbox" are ordinary local-action wording an operator might
+# legitimately use in alt_text / intended_use. The same verbs ARE
+# refused — but only when paired with a recognised cloud channel —
+# via alt 16 ("verb + (on|to|via|from|across|over|through) +
+# <channel>") and alts 7 / 7b ("<channel> + verb"). So "saved to
+# project" passes but "saved to cloud" / "synced-to-cloud" /
+# "cloud-stored" refuse.
+#
+#   1. ``public(ly)? / freely / openly`` + sharing / hosting /
+#      distribution / disclosure / display / view verb or noun
+#      (``host``, ``share``, ``upload``, ``publish``, ``release``,
+#      ``distribut(e/ion)``, ``broadcast``, ``stream``, ``mirror``,
+#      ``disclos(e)``, ``display``, ``view(able/ing)``, ``url``,
+#      ``link``, ``access(ible)``, ``available``, ``visible``).
+#   2. the same verbs followed by ``public(ly) / freely / openly``.
+#   3. ``make / made (it / this / them) public``.
+#   4. sharing / distribution verb followed by ``online``.
+#   5. ``online`` followed by the same verb.
+#   6. ``on the internet`` / ``on the web``.
+#   7. ``<channel> + distribution verb`` where channel ∈ {internet,
+#      web, cloud, cdn, aws, azure, gcp, s3} (NO "remote",
+#      NO "external") and verb ∈ {host(ed/ing), share(d)/sharing,
+#      upload(ed/ing), publish(ed/ing), distribute(d/ing),
+#      broadcast(ed/ing/s), stream(ed/ing/s), mirror(ed/ing)}.
+#      "remote" and "external(ly)" are deliberately NOT in the
+#      channel list — they are ambiguous on their own ("remote
+#      backup icon", "external hard drive", "remote server
+#      diagram" describe local hardware / LAN devices, NOT
+#      public-cloud channels). alt 18 still catches the
+#      distribution-y "remotely-hosted" / "externally-distributed"
+#      via the distance-modifier path where they are paired with
+#      a distribution verb. Noun forms like "distribution" /
+#      "storage" are NOT in the verb list (so "cdn distribution
+#      diagram" / "cloud storage diagram" pass as benign
+#      architecture references).
+#   7b. ``<cloud-provider channel> + storage/delivery verb`` where
+#       channel ∈ {cloud, cdn, aws, azure, gcp, s3} (NARROWER than
+#       alt 7) and verb ∈ {store(d)/storing, save(d)/saving,
+#       serve(d)/serving, sync(ed/ing), backup, backed,
+#       deliver(ed/ing/s)}. Catches "cloud-stored", "cdn-served",
+#       "aws-saved", "s3-backed", "cdn-delivered". The narrower
+#       channel vocab is what lets "internet save dialog" /
+#       "remote backup icon" stay benign — internet/remote are
+#       NOT in this list.
+#   8. ``anyone / everyone`` + ``can / has`` + reach verb (``access``,
+#      ``download``, ``see``, ``view``, ``read``, ``reach``, ``find``,
+#      ``get``, ``obtain``, ``share``).
+#   9. ``open access`` / ``open to (the) (public|anyone|world|everyone)``.
+#   10. ``for / to (the) public`` (catches ``for the public``,
+#       ``to the public``, ``released to the public``, etc. — bare
+#       ``public`` as a content noun like ``image of a public square``
+#       stays clean because it lacks the ``for/to`` lead-in).
+#   11. ``wide(ly) / global(ly) / world(wide)`` + ``distribut /
+#       broadcast / share / circulat`` verbs.
+#   12. the same verbs + ``wide(ly) / global(ly) / world(wide)``.
+#   13. ``live (stream / broadcast)`` / ``livestream``.
+#   14. ``<distribution verb> to`` — verb vocab DELIBERATELY
+#       NARROW: only post / upload / share(d/s) / sharing /
+#       publish(ed/ing) / distribute(d/ing) / broadcast(ed/ing/s)
+#       / stream(ed/ing/s) / mirror(ed/ing). save / store / sync /
+#       backup / deliver / serve / send / forward / host are NOT
+#       here because phrases like ``save to file``, ``send to
+#       printer``, ``stored to disk``, ``delivered to mailbox``,
+#       ``forwarded to inbox`` are ordinary local-action wording.
+#       Catches ``post to twitter``, ``upload-to-s3``,
+#       ``share-to-dropbox``, ``publish-to-web``,
+#       ``shared-to-linkedin``, ``uploaded-to-server``.
+#       ``sync to cloud`` / ``saved to s3`` / ``backup to cloud``
+#       still refuse via alt 16 (which requires a channel suffix).
+#   15. ``<host/broadcast/publish/stream verb> on`` — catches
+#       ``hosted-on-aws``, ``host-on-cloud``, ``broadcast-on-air``,
+#       ``published-on-blog``. ``post`` is NOT here because
+#       ``post on canvas`` / ``post on Monday`` are benign local
+#       wording; ``post on twitter`` / ``posted on linkedin`` trip
+#       via the social-media platform substring denylist instead.
+#   16. ``<sharing/storage/delivery verb> + (on|to|via|from|across|
+#       over|through) + <cloud channel>`` — channel ∈ {internet,
+#       web, cloud, cdn, aws, azure, gcp, s3} (NO "remote", NO
+#       "external"). Catches ``stored on cloud``, ``served via
+#       cdn``, ``delivered via web``, ``synced to cloud``,
+#       ``available via web``, ``served from cdn``, ``backup to
+#       cloud`` and their hyphen-joined forms. Ordinary local-
+#       network / local-hardware wording like ``saved to remote
+#       drive``, ``synced to remote backup``, ``stored on remote
+#       server``, ``saved to external drive``, ``stored on
+#       external HDD``, ``backed up to remote server`` PASSES
+#       because "remote" / "external" are NOT in the channel
+#       vocab here. Closes the gap left by alt 14 (which only
+#       takes ``to``) and alt 15 (which only takes ``on``).
+#   17. ``<content-class noun> + host(ed|ing)`` — content nouns are
+#       {image, file, video, content, media, static, photo,
+#       document, page}. Catches ``image-hosting``,
+#       ``file-hosting``, ``video-hosting``, ``content-hosting``,
+#       ``static-hosting``, ``image hosting service``.
+#   18. ``<distance modifier> + distribution verb`` — modifiers are
+#       {external(ly), remote(ly), third-party, 3rd-party}; verbs
+#       cover host(ed/ing) / distribut(e/ed/ing) / shar(e/ed/ing)
+#       / broadcast(ed/ing/s) / publish(ed/ing) / stream(ed/ing/s).
+#       Catches ``externally-hosted``, ``externally-distributed``,
+#       ``externally-shared``, ``remotely-hosted``,
+#       ``third-party-hosted``, ``3rd-party-shared``. Excludes
+#       ``self-hosted`` and ``privately-hosted`` (benign local
+#       hosting) — both are intentionally NOT in the modifier list.
+#   19. ``download(able)? from <cloud/public destination>`` — the
+#       destination must be a cloud channel ({internet, web, cloud,
+#       cdn, aws, azure, gcp, s3} — NO "remote") OR a public-reach
+#       token ({anywhere, everywhere, anyone, everyone, public}).
+#       Catches ``downloadable from anywhere``, ``download from
+#       web``, ``downloadable-from-anywhere``. Local UI wording like
+#       ``download from menu`` / ``download from app`` /
+#       ``download from cache`` / ``download from external drive``
+#       / ``downloaded from remote disk`` PASSES (the suffix is
+#       not in channel-or-public-reach vocab).
+#   20. ``back(ed|ing)? up to <cloud channel>`` — destination must
+#       be a cloud channel ({internet, web, cloud, cdn, aws, azure,
+#       gcp, s3} — NO "remote"). Catches ``back up to cloud``,
+#       ``backed-up-to-s3``, ``backing up to aws``. Local backup
+#       wording like ``back up to file`` / ``backed up to local
+#       disk`` / ``back up to backup drive`` / ``back up to remote
+#       folder`` / ``backed up to remote server`` PASSES.
+#   21. ``<share|shared|sharing> + (link|url)`` — catches
+#       ``share link``, ``share-link``, ``sharing url``. Benign UI
+#       references like ``share button mockup`` still pass because
+#       ``button`` is not in the link/url alternation.
+#
+# Benign uses stay clean by design: "public square", "public service
+# announcement", "publication date", "make a public statement",
+# "open book", "online tutorial illustration", "internet of things
+# diagram", "live action photograph", "on-the-fly diagram",
+# "to-do list", "user-to-user flow", "go-to action", "host icon",
+# "host server icon", "hosting industry chart", "cdn architecture
+# diagram", "cloud architecture diagram", "cdn icon", "file icon",
+# "video icon", "media playback icon", "saved icon", "backup icon",
+# "sync icon", "share button mockup", "share price chart",
+# "shareholder report chart", "self-hosted server icon",
+# "post-modern style", and "blog post illustration" all lack the
+# verb / channel / reach modifier or the specific noun adjacency
+# that any alternation requires next to its trigger token.
+_DENY_PUBLIC_SHARE_REGEX = re.compile(
+    # 1. public(ly) / freely / openly + sharing/distribution/disclosure verb
+    r"\b(?:public(?:ly)?|freely|openly)[\s-]+"
+    r"(?:host(?:ed|ing)?|shar(?:e|ed|ing)|upload(?:ed|ing)?|"
+    r"publish(?:ed|ing)?|releas(?:e|ed|ing)|"
+    r"distribut(?:e|ed|ing|ion)|broadcast(?:ed|ing|s)?|"
+    r"stream(?:ed|ing|s)?|mirror(?:ed|ing)?|disclos(?:e|ed|ing)|"
+    r"display(?:ed|ing|s)?|view(?:able|ing)?|"
+    r"url|link|access(?:ible)?|available|visible)\b"
+
+    # 2. sharing/distribution/disclosure verb + public(ly) / freely / openly
+    r"|\b(?:host(?:ed|ing)?|shar(?:e|ed|ing)|upload(?:ed|ing)?|"
+    r"publish(?:ed|ing)?|releas(?:e|ed|ing)|"
+    r"distribut(?:e|ed|ing)|broadcast(?:ed|ing|s)?|"
+    r"stream(?:ed|ing|s)?|mirror(?:ed|ing)?|disclos(?:e|ed|ing)|"
+    r"display(?:ed|ing|s)?)[\s-]+(?:public(?:ly)?|freely|openly)\b"
+
+    # 3. make / made (it / this / them) public
+    #    (separator class [\s-]+ so "make-public" / "make-it-public"
+    #    also trip)
+    r"|\b(?:make|made)[\s-]+(?:it[\s-]+|this[\s-]+|them[\s-]+)?public\b"
+
+    # 4. sharing/distribution verb + online
+    r"|\b(?:host(?:ed|ing)?|shar(?:e|ed|ing)|upload(?:ed|ing)?|"
+    r"publish(?:ed|ing)?|distribut(?:e|ed|ing|ion)|"
+    r"broadcast(?:ed|ing|s)?|stream(?:ed|ing|s)?|"
+    r"mirror(?:ed|ing)?)[\s-]+online\b"
+
+    # 5. online + sharing/distribution verb
+    r"|\bonline[\s-]+(?:host(?:ing)?|hosted|shar(?:e|ing|ed)|"
+    r"upload(?:ing|ed)?|publish(?:ing|ed)?|"
+    r"distribut(?:ion|ing|ed|e)?|broadcast(?:ing|ed|s)?|"
+    r"stream(?:ing|ed|s)?|mirror(?:ed|ing)?)\b"
+
+    # 6. on the internet / on the web
+    #    (separator class [\s-]+ so "on-the-internet" also trips)
+    r"|\bon[\s-]+the[\s-]+(?:internet|web)\b"
+
+    # 7. channel noun + sharing/distribution verb
+    #    Channel vocab is restricted to UNAMBIGUOUS public channels:
+    #    internet / web AND cloud-provider nouns (cloud, cdn, aws,
+    #    azure, gcp, s3). "remote" and "external(ly)?" are
+    #    deliberately NOT in the channel list — they are too benign
+    #    on their own ("external hard drive", "remote backup icon",
+    #    "remote server diagram"); alt 18 still catches
+    #    "remotely-hosted" / "externally-hosted" /
+    #    "externally-distributed" via the distance-modifier path
+    #    where they are paired with a distribution verb.
+    #    Verb vocab uses verb-forms ONLY (no nouns like "distribution"
+    #    or "storage"), so benign architecture descriptions like
+    #    "cdn distribution diagram" / "cloud storage diagram" pass.
+    r"|\b(?:internet|web|cloud|cdn|aws|azure|gcp|s3)[\s-]+"
+    r"(?:host(?:ed|ing)?|shar(?:e|ed|ing)|upload(?:ed|ing)?|"
+    r"publish(?:ed|ing)?|distribut(?:e|ed|ing)|"
+    r"broadcast(?:ed|ing|s)?|stream(?:ed|ing|s)?|"
+    r"mirror(?:ed|ing)?)\b"
+
+    # 7b. cloud-provider channel + storage/delivery verb. Narrower
+    #     than alt 7 — the channel vocab here is restricted to
+    #     unambiguous cloud-provider nouns (cloud, cdn, aws, azure,
+    #     gcp, s3) so storage-style verbs (store/save/serve/sync/
+    #     backup/deliver) only trip when paired with a clear cloud
+    #     channel. "internet save dialog" / "remote backup icon"
+    #     stay benign because internet/remote are not in this
+    #     narrower channel vocab. "cloud-stored" / "cdn-served" /
+    #     "aws-saved" / "s3-backed" / "cdn-delivered" trip.
+    r"|\b(?:cloud|cdn|aws|azure|gcp|s3)[\s-]+"
+    r"(?:stor(?:e|ed|ing)|sav(?:e|ed|ing)|"
+    r"serv(?:e|ed|ing)|sync(?:ed|ing)?|"
+    r"backup|backed|deliver(?:ed|ing|s)?)\b"
+
+    # 8. anyone / everyone + can / has + reach verb
+    #    (separator class [\s-]+ so "anyone-can-download" also trips)
+    r"|\b(?:anyone|everyone)[\s-]+(?:can|has)[\s-]+"
+    r"(?:access(?:es)?|download(?:s)?|see(?:s)?|view(?:s)?|"
+    r"read(?:s)?|reach(?:es)?|find(?:s)?|get(?:s)?|"
+    r"obtain(?:s)?|share(?:s)?)\b"
+
+    # 9. open access / open to (the) (public|anyone|world|everyone)
+    #    (separator class [\s-]+ so "open-access" / "open-to-public"
+    #    / "open-to-the-public" also trip)
+    r"|\bopen[\s-]+access\b"
+    r"|\bopen[\s-]+to[\s-]+(?:the[\s-]+)?"
+    r"(?:public|anyone|world|everyone)\b"
+
+    # 10. for / to (the) public
+    #     (separator class [\s-]+ so "for-the-public" /
+    #     "to-the-public" / "for-public" / "to-public" also trip)
+    r"|\b(?:for|to)[\s-]+(?:the[\s-]+)?public\b"
+
+    # 11. wide(ly) / global(ly) / world(wide) + distribut/share/broadcast/circulat
+    r"|\b(?:wide(?:ly)?|global(?:ly)?|world(?:wide)?)[\s-]+"
+    r"(?:distribut(?:e|ed|ing|ion)|broadcast(?:ed|ing|s)?|"
+    r"shar(?:e|ed|ing)|circulat(?:e|ed|ing))\b"
+
+    # 12. distribut/share/broadcast/circulat + wide(ly) / global(ly) / worldwide
+    r"|\b(?:distribut(?:e|ed|ing|ion)|broadcast(?:ed|ing|s)?|"
+    r"shar(?:e|ed|ing)|circulat(?:e|ed|ing))[\s-]+"
+    r"(?:wide(?:ly)?|global(?:ly)?|world(?:wide)?)\b"
+
+    # 13. live stream / live broadcast / livestream
+    r"|\blive[\s-]+(?:stream(?:ed|ing|s)?|broadcast(?:ed|ing|s)?)\b"
+    r"|\blivestream(?:ed|ing|s)?\b"
+
+    # 14. sharing / distribution verb [\s-]+ to
+    #     Verb vocab is INTENTIONALLY narrow — only verbs that
+    #     unambiguously imply public distribution regardless of
+    #     what follows: post / upload / share / publish / distribute
+    #     / broadcast / stream / mirror. Verbs like save / store /
+    #     sync / backup / deliver / serve / send / forward are NOT
+    #     here because they are typical local-action wording ("save
+    #     to file", "send to printer", "stored to disk") — those
+    #     verbs are only refused when alt 16 sees them paired with
+    #     a recognised cloud channel ("saved to cloud" /
+    #     "synced to s3"). Generalises the social-media-post shape
+    #     ("post to twitter") AND catches the hyphen-joined forms
+    #     of the substring tokens ("upload-to-s3" /
+    #     "share-to-dropbox" / "publish-to-web" /
+    #     "shared-to-linkedin").
+    r"|\b(?:post(?:ed|ing)?|upload(?:ed|ing)?|"
+    r"share(?:d|s)?|sharing|"
+    r"publish(?:ed|ing)?|distribut(?:e|ed|ing)|"
+    r"broadcast(?:ed|ing|s)?|stream(?:ed|ing|s)?|"
+    r"mirror(?:ed|ing)?)[\s-]+to\b"
+
+    # 15. host / broadcast / publish / stream verb [\s-]+ on
+    #     Catches the hyphen-joined forms of "hosted on" / "host on"
+    #     ("hosted-on-aws", "host-on-cloud") plus equivalents
+    #     ("broadcast-on-air", "published-on-blog"). "post" is NOT
+    #     here because "post on canvas" / "post on Monday" are
+    #     benign local wording; "post on twitter" / "posted on
+    #     linkedin" trip via the social-media substring denylist
+    #     entries instead.
+    r"|\b(?:host(?:ed|ing)?|broadcast(?:ed|ing|s)?|"
+    r"publish(?:ed|ing)?|stream(?:ed|ing|s)?)[\s-]+on\b"
+
+    # 16. sharing / distribution / storage / delivery verb [\s-]+
+    #     preposition [\s-]+ channel noun. Catches "stored on cloud",
+    #     "served via cdn", "delivered via web", "saved to cloud",
+    #     "synced to cloud", "backup to cloud", "served from cdn"
+    #     and their hyphenated variants. Channel vocab is restricted
+    #     to UNAMBIGUOUS public channels (internet / web / cloud /
+    #     cdn / aws / azure / gcp / s3); "remote" and "external(ly)"
+    #     are deliberately NOT here because phrases like
+    #     "saved to remote drive", "synced to remote backup",
+    #     "stored on remote server", "saved to external drive" are
+    #     ordinary local-storage wording (LAN, NAS, external HDD)
+    #     that operators legitimately use to describe local
+    #     backup / storage workflows. The distance-modifier path
+    #     (alt 18) still catches "remotely-hosted" / "externally-
+    #     distributed" when paired with an unambiguous distribution
+    #     verb. The verb vocab here is broader than alt 14 because
+    #     some of these verbs ("stored", "served", "delivered")
+    #     naturally take "on/via/from" rather than "to".
+    r"|\b(?:host(?:ed|ing)?|shar(?:e|ed|ing)|upload(?:ed|ing)?|"
+    r"publish(?:ed|ing)?|distribut(?:e|ed|ing|ion)|"
+    r"broadcast(?:ed|ing|s)?|stream(?:ed|ing|s)?|"
+    r"mirror(?:ed|ing)?|deliver(?:ed|ing|s)?|"
+    r"serv(?:e|ed|ing)|sav(?:e|ed|ing)|"
+    r"stor(?:e|ed|ing)|sync(?:ed|ing)?|backup|backed|"
+    r"post(?:ed|ing)?|available)[\s-]+"
+    r"(?:on|to|via|from|across|over|through)[\s-]+"
+    r"(?:internet|web|cloud|cdn|aws|azure|gcp|s3)\b"
+
+    # 17. content-class noun [\s-]+ host(ed|ing).
+    #     Catches "image-hosting", "file-hosting", "video-hosting",
+    #     "content-hosting", "media-hosting", "static-hosting",
+    #     "photo-hosting", "document-hosting", "page-hosting" and
+    #     their space-separated forms. Content vocab is restricted
+    #     to high-signal nouns so benign phrases like "host icon"
+    #     / "hosting industry chart" (no content prefix) still pass.
+    r"|\b(?:image|file|video|content|media|static|photo|"
+    r"document|page)[\s-]+host(?:ed|ing)\b"
+
+    # 18. distance modifier [\s-]+ distribution verb.
+    #     Distance modifiers are external(ly) / remote(ly) /
+    #     third-party / 3rd-party. Verb vocab covers
+    #     host(ed|ing) / distribut(e|ed|ing) / shar(e|ed|ing) /
+    #     broadcast(ed|ing|s) / publish(ed|ing) / stream(ed|ing|s)
+    #     so "externally-hosted" / "externally-distributed" /
+    #     "externally-shared" / "third-party-hosted" /
+    #     "remotely-broadcasted" all trip. Excludes "self-hosted"
+    #     and "privately-hosted" — those describe local hosting and
+    #     are benign. (Alt 7 no longer covers "external(ly)?" as
+    #     a channel, so this alt is the load-bearing path for
+    #     externally- / remotely- / third-party- prefixes.)
+    r"|\b(?:external(?:ly)?|remote(?:ly)?|"
+    r"third[\s-]+party|3rd[\s-]+party)[\s-]+"
+    r"(?:host(?:ed|ing)|distribut(?:e|ed|ing)|"
+    r"shar(?:e|ed|ing)|broadcast(?:ed|ing|s)?|"
+    r"publish(?:ed|ing)|stream(?:ed|ing|s)?)\b"
+
+    # 19. download(able) from <cloud/public destination>.
+    #     Requires the destination to be a known cloud channel
+    #     (internet / web / cloud / cdn / aws / azure / gcp / s3)
+    #     OR a public-reach modifier (anywhere / everywhere /
+    #     anyone / everyone / public). "remote" is NOT in this list
+    #     because "download from remote disk" / "downloadable from
+    #     remote storage" describe local-network downloads.
+    #     Benign local wording like "download from menu" /
+    #     "download from app" / "downloadable from cache" /
+    #     "download from external drive" passes because their
+    #     destinations are not in the channel vocab.
+    r"|\bdownload(?:able)?[\s-]+from[\s-]+"
+    r"(?:internet|web|cloud|cdn|aws|azure|gcp|s3|"
+    r"anywhere|everywhere|anyone|everyone|public)\b"
+
+    # 20. back(ed/ing)? up to <cloud channel>. Requires the
+    #     destination to be a known cloud channel so benign local
+    #     wording like "back up to file" / "backed up to local disk"
+    #     / "back up to backup drive" / "back up to remote disk"
+    #     passes. "backup to cloud" / "backed-up-to-s3" still trip.
+    #     "remote" is NOT in this channel list because "back up to
+    #     remote disk" / "backed up to remote server" describe
+    #     legitimate local-network or external-device backup
+    #     workflows.
+    r"|\bback(?:ed|ing)?[\s-]+up[\s-]+to[\s-]+"
+    r"(?:internet|web|cloud|cdn|aws|azure|gcp|s3)\b"
+
+    # 21. share/shared/sharing + link/url. Catches "share link",
+    #     "share-link", "sharing url". Benign UI references like
+    #     "share button mockup" still pass because "button" is not
+    #     in the link/url alternation.
+    r"|\b(?:share|shared|sharing)[\s-]+(?:link|url)\b",
+    re.IGNORECASE,
+)
+
+_DENY_CONFIDENTIAL: tuple[str, ...] = (
+    "confidential", "internal use only", "internal only",
+    "do not share", "raw source", "customer name",
+    "customer pii", "customer data", "nda only",
+    "trade secret", "personal data", "sensitive data",
+    "proprietary data", "non-public", "classified",
+)
+
+# Brand / service tokens for the upstream services this lane does
+# NOT call AND the public-network success claim shapes that an
+# operator manifest might use to inject the appearance of a real
+# upstream call into the deck or summary. Refusing ANY mention of
+# the lane-specific brands (D-One, MCP, Qoder) keeps the boundary
+# statements concentrated in ``_EXPLICIT_BOUNDARIES``; refusing
+# generic network-operation success vocab ("API call succeeded",
+# "HTTP request returned", "successfully invoked the model",
+# "generated by stable diffusion") keeps tampered manifests from
+# claiming a successful network / model / image-gen touchpoint
+# that the lane has not made.
+#
+# Shape categories:
+#   A. Lane-specific brands (d-one / mcp / qoder).
+#   B. Upstream service indicators (model api / image search /
+#      telemetry).
+#   C. Network / API / HTTP operation success vocab.
+#   D. Network protocol mentions (rest api / graphql / webhook /
+#      websocket / grpc).
+#   E. "real / live / production / real-time" + upstream service.
+#   F. "successful(ly) / actually" + action verb.
+#   G. Action verb + (preposition + article)* + upstream target.
+#   H. AI / ML / model / machine "generated" claims.
+#   I. "<production-verb> + <prep> + <AI brand>" — production
+#      verb covers generated / created / made / produced / drawn
+#      / painted / rendered / synthesized / crafted / composed /
+#      written / prompted / powered / output; prep covers by /
+#      via / with / through / from / using; brand list covers
+#      every AI upstream the helper does NOT call. Benign
+#      authorship like "drawn by hand" / "painted by Monet" /
+#      "composed by Bach" / "written by John" / "produced by
+#      company" PASSES because the brand token must be one of
+#      the AI-product names.
+#   J. Image-gen model brand mentions (mid[\s-]*journey,
+#      dall-e, stable diffusion, imagen, leonardo ai). The
+#      ``[\s-]*`` separator class on ``mid[\s-]*journey`` makes
+#      ``Mid Journey`` / ``Mid-Journey`` / ``Midjourney`` all
+#      trip; ``[\s-]*-?[\s-]*`` on ``dall[\s-]*-?[\s-]*e``
+#      handles ``DALL E`` / ``DALL-E`` / ``DALLE`` / ``dalle``.
+#   J+. Unambiguous LLM-product brand mentions standalone:
+#       chatgpt, open[\s-]*ai (single AND multi-word: catches
+#       "openai" / "open ai" / "open-ai" alike — the helper
+#       USED to keep two-word "Open AI" benign for benign uses
+#       like "Open AI architecture book", but Codex flagged
+#       that as a fake-success vector; the trade-off cost is
+#       that "Open AI architecture book" / "Open AI initiative"
+#       type phrases now refuse and the operator must rephrase
+#       to "AI architecture book" or "open-source AI initiative"
+#       — see also the alt I brand list which mirrors the same
+#       open[\s-]*ai expansion), anthropic, gpt(-N(.N))?.
+#       Catches "ChatGPT illustration" / "OpenAI image" /
+#       "Open AI illustration" / "open-ai render" /
+#       "Anthropic creation" / "GPT-4 output" while keeping
+#       "GPS map" / "Egyptian art" benign (the ``\b`` boundary
+#       keeps "gpt" out of "Egypt" / "GPS"; "open" followed by
+#       a non-"ai" word like "book", "source", "API",
+#       "license", "standard", "SSL" still passes).
+#   K. ``claude`` / ``gemini`` + (model version | distribution-
+#      style noun). Refuses "Claude 3 illustration" /
+#      "Claude opus render" / "Claude renderings" / "Claude
+#      paintings" / "Gemini Pro output" / "Gemini-generated"
+#      while keeping "Claude Monet painting" / "Claude Debussy
+#      biography" / "Claude Shannon information theory" /
+#      "Gemini constellation" / "Gemini horoscope reading" /
+#      "Gemini spacecraft" benign because the closed suffix
+#      vocab requires a model version OR a distribution-style
+#      noun.
+_FAKE_SUCCESS_REGEX = re.compile(
+    # A. Lane-specific brands.
+    r"\bd-?one\b"
+    r"|\bmcp\b"
+    r"|\bqoder\b"
+
+    # B. Upstream service indicators.
+    r"|\bmodel[\s-]+(?:api|call|request|response|endpoint|"
+    r"service|invocation)\b"
+    r"|\bimage[\s-]+search\b"
+    r"|\btelemetry\b"
+
+    # C. Network / API / HTTP operation success vocab.
+    r"|\bnetwork[\s-]+(?:call|reached|hit|success|response|"
+    r"connection|request|connected|established|"
+    r"succeeded|returned|completed|received)\b"
+    r"|\bapi[\s-]+(?:call|request|response|hit|success|"
+    r"endpoint|succeeded|returned|completed|invocation|"
+    r"received|integration)\b"
+    r"|\bhttps?[\s-]+(?:call|request|response|hit|success|"
+    r"connection|succeeded|returned|completed|received|"
+    r"endpoint)\b"
+
+    # D. Network protocol mentions.
+    r"|\brest[\s-]+(?:api|call|endpoint|request)\b"
+    r"|\bgraphql\b"
+    r"|\bwebhook(?:s)?\b"
+    r"|\bwebsocket(?:s)?\b"
+    r"|\bgrpc\b"
+
+    # E. "real / live / production / real-time" + upstream service.
+    r"|\b(?:real|live|production|real[\s-]*time)[\s-]+"
+    r"(?:d-?one|mcp|qoder|network|model|api|call|"
+    r"integration|endpoint|service|backend|host(?:ing|ed)?|"
+    r"invocation|response|request)\b"
+
+    # F. "successful(ly) / actually" + action verb.
+    r"|\b(?:successful(?:ly)?|actually)[\s-]+"
+    r"(?:called|invoked|queried|fetched|reached|"
+    r"contacted|connected|integrated|hit|posted|"
+    r"published|received|sent)\b"
+
+    # G. Action verb + (preposition + article)* + upstream target.
+    #    Allows zero or more intermediate filler words drawn from
+    #    a small closed set {from, the, to, with, on, for, at, via,
+    #    through, by} so phrases like "called the model" /
+    #    "fetched from the api" / "integrated with the endpoint"
+    #    all trip while keeping benign "called for review" /
+    #    "fetched from local source" PASS (because "review" /
+    #    "source" are not in the target list).
+    r"|\b(?:called|invoked|queried|hit|reached|contacted|"
+    r"integrated|fetched|retrieved|received|downloaded|got)"
+    r"[\s-]+(?:(?:from|the|to|with|on|via|through|by)[\s-]+)*"
+    r"(?:model|api|endpoint|network|service|server|"
+    r"d-?one|mcp|qoder|backend|llm)\b"
+
+    # H. AI / ML / machine / model "generated" claims.
+    r"|\b(?:ai|ml|machine|model)[\s-]+generated\b"
+    r"|\bai[\s-]*-?[\s-]*gen(?:erated)?\b"
+
+    # I. "<production verb> + <prep> + <AI brand>". Production
+    #    verbs cover the full generation / authorship vocabulary
+    #    (generated / created / made / produced / drawn / painted /
+    #    rendered / synthesized / crafted / composed / written /
+    #    prompted / powered / output). Preps cover by / via / with
+    #    / through / from / using. Brand list covers every AI
+    #    upstream the helper does NOT call. So "made by Claude",
+    #    "powered by OpenAI" / "powered by Open AI" (two-word),
+    #    "rendered by GPT-4", "drawn by Midjourney" / "drawn by
+    #    Mid Journey" (two-word), "created with Anthropic",
+    #    "composed by Claude" all refuse. Benign authorship
+    #    ("drawn by hand", "painted by Monet", "composed by Bach",
+    #    "written by John", "produced by company") passes because
+    #    the brand token must be one of the specific AI-product
+    #    names below — and bare prepositions ("by hand", "by
+    #    Monet") don't match any brand token.
+    r"|\b(?:generated|created|made|produced|drawn|painted|"
+    r"rendered|synthesized|crafted|composed|written|"
+    r"prompted|powered|output)[\s-]+"
+    r"(?:by|via|with|through|from|using)[\s-]+"
+    r"(?:ai|ml|machine|model|api|"
+    r"d-?one|mcp|qoder|"
+    r"mid[\s-]*journey|dall[\s-]*-?[\s-]*e|"
+    r"stable[\s-]+diffusion|imagen|firefly|"
+    r"leonardo[\s-]+ai|gpt|chatgpt|open[\s-]*ai|"
+    r"anthropic|claude|gemini|llama|mistral)\b"
+
+    # J. Image-gen model brand mentions (high-signal standalone).
+    #    Multi-word / hyphenated variants are covered via
+    #    ``[\s-]*`` between the brand tokens so "Mid Journey" /
+    #    "Mid-Journey" / "Midjourney" all trip; same for the
+    #    "DALL E" / "DALL-E" / "DALLE" / "Open AI" / "Open-AI" /
+    #    "OpenAI" forms below.
+    r"|\bmid[\s-]*journey\b"
+    r"|\bdall[\s-]*-?[\s-]*e\b"
+    r"|\bstable[\s-]+diffusion\b"
+    r"|\bimagen\b"
+    r"|\bleonardo[\s-]+ai\b"
+
+    # J+. Standalone LLM-product brand mentions where the brand
+    #     name is unambiguous: ``chatgpt`` (the chatbot product),
+    #     ``open[\s-]*ai`` (catches "openai" / "open ai" /
+    #     "open-ai" — the helper used to keep "Open AI" two-word
+    #     benign, but Codex flagged that as a fake-success vector;
+    #     the trade-off cost is that benign "Open AI architecture
+    #     book" / "Open AI initiative" type phrases now refuse and
+    #     the operator must rephrase to "AI architecture book" or
+    #     similar), ``anthropic`` (rarely used outside the
+    #     company — "anthropic principle" is an accepted marginal
+    #     false-positive), ``gpt`` with optional
+    #     ``-<digit>(.<digit>)`` version suffix (catches ``GPT``,
+    #     ``GPT-3``, ``GPT-4``, ``GPT-3.5``, ``gpt4``; does NOT
+    #     match substrings inside ``GPS`` / ``Egyptian`` because
+    #     of the ``\b`` boundary). The "chat gpt" / "chat-gpt"
+    #     two-word forms ALSO trip via the standalone ``\bgpt\b``
+    #     match.
+    r"|\bchatgpt\b"
+    r"|\bopen[\s-]*ai\b"
+    r"|\banthropic\b"
+    r"|\bgpt(?:[\s-]*-?[\s-]*[0-9](?:\.[0-9])?)?\b"
+
+    # K. ``claude`` / ``gemini`` + (model version | distribution
+    #    context) — refuses ``Claude 3 illustration``,
+    #    ``Claude API documentation``, ``Claude opus render``,
+    #    ``Gemini Pro output``, ``Gemini-generated`` while
+    #    leaving benign ``Claude Monet painting``, ``Claude
+    #    Debussy biography``, ``Gemini constellation``, ``Gemini
+    #    spacecraft`` clean because the suffix must come from a
+    #    closed vocab of AI model versions or distribution-style
+    #    nouns.
+    r"|\bclaude[\s-]+"
+    r"(?:[2-9](?:\.[0-9])?|opus|sonnet|haiku|instant|chat|"
+    r"api|model(?:s)?|call(?:s)?|response(?:s)?|"
+    r"completion(?:s)?|"
+    r"generat(?:e|ed|ing|es|ion(?:s)?)|"
+    r"creat(?:e|ed|ing|es|ion(?:s)?)|"
+    r"render(?:ed|ings?|s)?|"
+    r"draw(?:n|ings?|s)?|"
+    r"illustrat(?:e|ed|ing|es|ion(?:s)?)|"
+    r"paint(?:ed|ings?|s)?|"
+    r"portrait(?:s)?|image(?:s)?|art|"
+    r"output(?:s)?|export(?:s)?)\b"
+    r"|\bgemini[\s-]+"
+    r"(?:pro|ultra|flash|nano|[0-9](?:\.[0-9])?|"
+    r"api|model(?:s)?|call(?:s)?|response(?:s)?|"
+    r"completion(?:s)?|"
+    r"generat(?:e|ed|ing|es|ion(?:s)?)|"
+    r"creat(?:e|ed|ing|es|ion(?:s)?)|"
+    r"render(?:ed|ings?|s)?|"
+    r"draw(?:n|ings?|s)?|"
+    r"illustrat(?:e|ed|ing|es|ion(?:s)?)|"
+    r"paint(?:ed|ings?|s)?|"
+    r"portrait(?:s)?|image(?:s)?|art|"
+    r"output(?:s)?|export(?:s)?)\b",
+    re.IGNORECASE,
+)
+
+
+def _safe_manifest_string(
+    *,
+    field: str,
+    value: object,
+    max_len: int,
+    entry_idx: int,
+) -> tuple[str | None, str | None]:
+    """Validate one manifest free-text field. Returns
+    ``(cleaned_or_None, failure_or_None)``.
+
+    All four manifest string fields share these gates:
+
+      * type — must be a Python ``str``;
+      * length — 1..``max_len`` bytes inclusive;
+      * whitespace — no leading / trailing space (operator trims);
+      * control character — refused (avoids embedding LF / CR / NUL
+        into the deck's editable text);
+      * URL / URI shape — ``://`` substring or leading ``<scheme>:``;
+      * path separator — ``/`` or ``\\`` is refused; the field is a
+        name / phrase, never a path;
+      * credential / token / API-key shape — substring denylist plus
+        the OpenAI-style ``sk-XXXX`` regex;
+      * public upload / share / hosting wording — substring denylist
+        for provider-named phrasings (``upload to <provider>``,
+        ``share to <name>``), high-signal phrases (``public domain``,
+        ``on social media``), and social-media platform names
+        (twitter / instagram / facebook / linkedin / reddit /
+        tiktok / youtube / mastodon / threads.net / bluesky /
+        tumblr / pinterest / snapchat) so ``posted on twitter`` /
+        ``shared on linkedin`` / ``youtube post`` trip without the
+        regex enumerating each provider; AND a 22-shape bounded
+        regex (separator class ``[\\s-]+`` applied uniformly so
+        BOTH space- and hyphen-joined variants of every shape trip
+        — ``make-public``, ``on-the-internet``,
+        ``anyone-can-download``, ``cloud-hosted``,
+        ``cdn-distributed``, ``aws-hosted``, ``image-hosting``,
+        ``third-party-hosted``, ``upload-to-s3``,
+        ``hosted-on-aws``, ``stored-on-cloud``, ``cloud-stored``,
+        ``cdn-served``, ``synced-to-cloud``, ``backup-to-cloud``,
+        ``downloadable-from-anywhere``, ``share-link``,
+        ``for-the-public`` all refuse alongside their space-
+        separated forms). The regex is DELIBERATELY NARROW around
+        storage verbs: alt 14 (``<verb> to``) only fires for
+        unambiguous distribution verbs (post / upload / share /
+        publish / distribute / broadcast / stream / mirror), so
+        ``save to file`` / ``send to printer`` / ``stored to disk``
+        / ``forwarded to inbox`` / ``delivered to mailbox`` PASS.
+        The same verbs refuse only when paired with a cloud channel
+        via alt 16 (``verb + (on|to|via|from|across|over|through) +
+        <channel>``) or alt 7/7b (``<channel> + verb``); so ``saved
+        to project`` passes but ``saved to cloud`` /
+        ``synced-to-cloud`` refuse. Alt 19 (``download(able)?
+        from``) and alt 20 (``back(ed|ing)? up to``) require their
+        suffix to be a cloud channel or public-reach token, so
+        ``download from menu`` / ``back up to file`` PASS but
+        ``downloadable from anywhere`` / ``backup-to-cloud`` refuse.
+        Excluded benign hosting modifiers: ``self-hosted`` /
+        ``privately-hosted`` (intentionally NOT in alt 18's
+        distance-modifier vocab). No-provider phrasings such as
+        ``cloud-hosted``, ``cdn-distributed``, ``image-hosting``,
+        ``third-party-hosted``, ``stored-on-cloud``,
+        ``cloud-stored``, ``cdn-served``, ``downloadable from
+        anywhere``, ``backup to cloud``, ``share-link``,
+        ``posted on twitter`` are refused;
+      * raw-source / confidential / customer marker — substring
+        denylist;
+      * positive real-D-One / MCP / Qoder / model API / image search /
+        network / telemetry claim — regex denylist.
+
+    The diagnostic names the entry index, the field, and the
+    offending token / shape so the operator can fix the manifest
+    without re-running to discover which gate fired."""
+    if not isinstance(value, str):
+        return None, (
+            f"--manifest images[{entry_idx}].{field} is "
+            f"{type(value).__name__}, expected string (MAN10)."
+        )
+    if not value:
+        return None, (
+            f"--manifest images[{entry_idx}].{field} is empty; expected "
+            f"a non-empty string (MAN10)."
+        )
+    if len(value) > max_len:
+        return None, (
+            f"--manifest images[{entry_idx}].{field} is {len(value)} "
+            f"chars; expected <= {max_len} (MAN10)."
+        )
+    if value != value.strip():
+        return None, (
+            f"--manifest images[{entry_idx}].{field}={value!r} has "
+            f"leading or trailing whitespace; trim and retry (MAN10)."
+        )
+    if any(ord(ch) < 0x20 for ch in value):
+        return None, (
+            f"--manifest images[{entry_idx}].{field} contains a "
+            f"control character (MAN10); refused so the deck's "
+            f"editable text never carries a non-printable byte."
+        )
+    if "://" in value:
+        return None, (
+            f"--manifest images[{entry_idx}].{field}={value!r} "
+            f"contains '://' (URL-shaped); refused — the manifest is "
+            f"local-only metadata (MAN10)."
+        )
+    if _has_uri_scheme(value):
+        return None, (
+            f"--manifest images[{entry_idx}].{field}={value!r} starts "
+            f"with a URI scheme; refused — the manifest is local-only "
+            f"metadata (MAN10)."
+        )
+    if "/" in value or "\\" in value:
+        return None, (
+            f"--manifest images[{entry_idx}].{field}={value!r} "
+            f"contains a path separator; refused — the field is a "
+            f"name / phrase, not a path (MAN10)."
+        )
+    lower = value.lower()
+    for token in _DENY_CREDENTIAL:
+        if token in lower:
+            return None, (
+                f"--manifest images[{entry_idx}].{field} contains "
+                f"credential-shaped substring {token!r}; refused — "
+                f"the helper does NOT receive credentials (MAN10)."
+            )
+    if _OPENAI_KEY_REGEX.search(value):
+        return None, (
+            f"--manifest images[{entry_idx}].{field} contains an "
+            f"API-key-shaped token (sk-XXXX...); refused (MAN10)."
+        )
+    for token in _DENY_UPLOAD:
+        if token in lower:
+            return None, (
+                f"--manifest images[{entry_idx}].{field} contains "
+                f"upload / share / hosting substring {token!r}; "
+                f"refused — the helper is local-only and does NOT "
+                f"publish outputs (MAN10)."
+            )
+    public_share_hit = _DENY_PUBLIC_SHARE_REGEX.search(value)
+    if public_share_hit is not None:
+        return None, (
+            f"--manifest images[{entry_idx}].{field}={value!r} "
+            f"matches public-share / public-hosting wording "
+            f"{public_share_hit.group(0)!r}; refused — the helper "
+            f"is local-only and does NOT publish outputs (MAN10)."
+        )
+    for token in _DENY_CONFIDENTIAL:
+        if token in lower:
+            return None, (
+                f"--manifest images[{entry_idx}].{field} contains "
+                f"confidential / customer marker {token!r}; refused "
+                f"— the helper does NOT receive raw confidential or "
+                f"customer text (MAN10)."
+            )
+    if _FAKE_SUCCESS_REGEX.search(value):
+        return None, (
+            f"--manifest images[{entry_idx}].{field}={value!r} "
+            f"mentions an upstream service this lane does NOT call "
+            f"(D-One, MCP, Qoder, model API, image search, network, "
+            f"telemetry); refused (MAN10)."
+        )
+    return value, None
+
+
+# ---------------------------------------------------------------------------
 # --images-dir gate + discovery.
 # ---------------------------------------------------------------------------
 
@@ -318,6 +1212,17 @@ class _DiscoveredImage:
     media_type: str                # image/png | image/jpeg
     byte_count: int
     sha256: str
+    # Optional operator-supplied metadata from --manifest. None means
+    # the helper applies its built-in default; a non-None value flows
+    # verbatim into the native editable slide title (slide_title), the
+    # image_manifest alt_text (alt_text), and the image_manifest
+    # intended_use (intended_use). The provenance entry in summary.json
+    # echoes whichever values were operator-supplied so a reviewer can
+    # trace each embedded ppt/media part back to the manifest entry
+    # that ordered + labelled it.
+    slide_title: str | None = None
+    alt_text: str | None = None
+    intended_use: str | None = None
 
 
 def _has_uri_scheme(s: str) -> bool:
@@ -582,6 +1487,382 @@ def _validate_images_dir_arg(
     return discovered, images_dir, []
 
 
+def _validate_manifest_arg(
+    manifest_path_str: str,
+    discovered_filenames: list[str] | None,
+) -> tuple[list[dict] | None, Path | None, list[str]]:
+    """Validate the optional ``--manifest`` argument and return the
+    per-image metadata in manifest order.
+
+    Returns ``(ordered_entries_or_None, resolved_path_or_None,
+    failures)``. The caller MUST treat the argument as refused
+    whenever ``failures`` is non-empty OR ``ordered_entries`` is
+    ``None``.
+
+    Gates fire in order, BEFORE any pipeline subprocess:
+
+      MAN1   URI-shaped argument.
+      MAN2   ``--manifest`` is itself a symlink (broken or resolvable).
+      MAN3   any ancestor up to the filesystem root is a symlink
+             (closed system aliases like ``/tmp -> /private/tmp``
+             remain accepted via ``_forbidden_symlink_ancestor``).
+      MAN4   path exists and is a regular non-symlink file.
+      MAN5   the file parses as a single UTF-8 JSON document AND the
+             root is a JSON object (not an array / scalar / null).
+      MAN6   the root carries exactly the required keys (no extras,
+             no missing — the manifest has a single locked shape).
+      MAN7   ``schema_version`` equals ``_MANIFEST_SCHEMA_VERSION``
+             ("1") verbatim.
+      MAN8   ``images`` is a non-empty JSON array.
+      MAN9   each entry is a JSON object with EXACTLY the four
+             required fields ``filename``, ``slide_title``,
+             ``alt_text``, ``intended_use`` — no extras, no missing.
+      MAN10  each field passes ``_safe_manifest_string`` (type,
+             length, whitespace, control char, URL / URI, path
+             separator, credential / token / API-key shape, public
+             upload / share / hosting wording — the substring
+             denylist locks provider-named phrasings,
+             ``public domain`` / ``on social media``, AND the bare
+             social-media platform names (twitter, instagram,
+             facebook, linkedin, reddit, tiktok, youtube, mastodon,
+             threads.net, bluesky, tumblr, pinterest, snapchat);
+             a 22-shape bounded regex with ``[\\s-]+`` separator
+             class applied uniformly so BOTH space- and
+             hyphen-joined variants of every shape trip catches
+             no-provider variants. The 22 shapes (in order):
+             1 ``public(ly)/freely/openly <verb>``;
+             2 ``<verb> public(ly)/freely/openly``;
+             3 ``make/made (it/this/them) public``;
+             4 ``<verb> online``; 5 ``online <verb>``;
+             6 ``on the internet/web``;
+             7 ``<channel> <distribution-verb>`` (channel ∈
+             {internet, web, cloud, cdn, aws, azure, gcp, s3} —
+             NO "remote", NO "external" so ``remote server
+             diagram`` / ``external hard drive`` stay benign;
+             verb-forms only — no nouns like "distribution" /
+             "storage", so benign architecture diagrams pass);
+             7b ``<cloud-provider channel> <storage/delivery
+             verb>`` (channel ∈ {cloud, cdn, aws, azure, gcp, s3}
+             — narrower than alt 7 so ``internet save dialog`` /
+             ``remote backup icon`` stay benign);
+             8 ``anyone/everyone (can|has) <reach-verb>``;
+             9 ``open access`` / ``open to (the) (public/anyone/
+             world/everyone)``;
+             10 ``for/to (the) public``;
+             11 ``wide(ly)/global(ly)/world(wide)
+             <distribution-verb>``;
+             12 the reverse;
+             13 ``live (stream/broadcast)`` / ``livestream``;
+             14 ``<distribution-verb> to`` (DELIBERATELY NARROW:
+             only post/upload/share/publish/distribute/broadcast/
+             stream/mirror — save/store/sync/backup/deliver/serve/
+             send/forward/host are NOT here so ``save to file`` /
+             ``send to printer`` / ``stored to disk`` PASS);
+             15 ``<host/broadcast/publish/stream verb> on``
+             (``post on`` is NOT here so ``post on canvas`` /
+             ``post on Monday`` pass; ``post on twitter`` trips
+             via the social-media platform substring);
+             16 ``<sharing/storage/delivery verb> +
+             (on|to|via|from|across|over|through) + <cloud
+             channel>`` (channel ∈ {internet, web, cloud, cdn,
+             aws, azure, gcp, s3} — NO "remote", NO "external" so
+             ``saved to remote drive`` / ``stored on external
+             disk`` / ``synced to remote backup`` PASS as
+             ordinary local-network or external-device wording);
+             17 ``<image|file|video|content|media|static|photo|
+             document|page> host(ed|ing)``;
+             18 ``<external(ly)|remote(ly)|third-party|3rd-party>
+             <distribution-verb>`` (catches externally-distributed/
+             shared/broadcast too; excludes self-hosted and
+             privately-hosted);
+             19 ``download(able)? from <cloud/public destination>``
+             (suffix must be a cloud channel or public-reach
+             token, so ``download from menu`` PASSES);
+             20 ``back(ed|ing)? up to <cloud channel>`` (suffix
+             must be a cloud channel, so ``back up to file``
+             PASSES);
+             21 ``<share|shared|sharing> (link|url)``.
+             Phrasings such as ``cloud-hosted``,
+             ``cdn-distributed``, ``image-hosting``,
+             ``third-party-hosted``, ``stored-on-cloud``,
+             ``cloud-stored``, ``cdn-served``,
+             ``synced-to-cloud``, ``backup-to-cloud``,
+             ``downloadable from anywhere``, ``share-link``,
+             ``anyone can download``, ``on the internet``,
+             ``globally distributed``, ``live stream``,
+             ``posted on twitter``, ``freely available``,
+             ``open access archive``, ``upload-to-s3``,
+             ``hosted-on-aws``, ``make-it-public`` refuse while
+             ordinary local wording (``save to file``,
+             ``send to printer``, ``forward to inbox``,
+             ``stored to disk``, ``cdn distribution diagram``,
+             ``external hard drive``, ``share button mockup``,
+             ``download from menu``, ``internet save dialog``)
+             passes; raw-source / confidential / customer marker;
+             positive real-D-One / MCP / Qoder / model API /
+             image search / network / telemetry / public-network
+             / LLM-brand success claim — the fake-success regex
+             covers twelve shape categories: lane-specific brand
+             mentions (d-one / mcp / qoder); upstream service
+             indicators (``model api`` / ``image search`` /
+             ``telemetry``); network / API / HTTP operation
+             success vocab (``network connection succeeded`` /
+             ``API request returned`` / ``HTTP response
+             received`` / ``API endpoint hit``); network
+             protocol mentions (``REST API endpoint hit``,
+             ``graphql query``, ``webhook delivered``,
+             ``websocket connection``, ``grpc call succeeded``);
+             ``real / live / production / real-time`` +
+             upstream service (``real network call`` / ``live
+             D-One call`` / ``production MCP integration``);
+             ``successful(ly) / actually`` + action verb
+             (``successfully called the model``); action verb +
+             ``(prep|article)* + upstream target``
+             (``called the model``, ``fetched from API``,
+             ``integrated with the endpoint``);
+             ``ai / ml / machine / model + generated``
+             (``AI-generated illustration``);
+             ``<production-verb> + <prep> + <AI brand>`` —
+             production verb covers generated / created / made /
+             produced / drawn / painted / rendered / synthesized
+             / crafted / composed / written / prompted / powered
+             / output; prep covers by / via / with / through /
+             from / using; so ``made by Claude`` / ``created
+             with Midjourney`` / ``powered by OpenAI`` /
+             ``drawn by GPT`` / ``rendered by Claude`` all
+             refuse (benign ``drawn by hand`` / ``painted by
+             Monet`` / ``composed by Bach`` PASSES); image-gen
+             model brand mentions (``mid[\\s-]*journey`` —
+             catches ``Midjourney`` / ``Mid Journey`` /
+             ``Mid-Journey`` — / ``dall-e`` / ``stable
+             diffusion`` / ``imagen`` / ``leonardo ai``);
+             unambiguous LLM-product brand
+             mentions standalone (``chatgpt`` /
+             ``open[\\s-]*ai`` — catches ``openai`` (single
+             word) AND ``Open AI`` (two words) AND ``open-ai``
+             (hyphen); Codex flagged the previous two-word
+             benign exception as a fake-success vector, so
+             ``Open AI architecture book`` / ``Open AI
+             initiative`` now REFUSE and the operator must
+             rephrase — / ``anthropic`` / ``gpt(-N(.N))?``) —
+             refuses ``ChatGPT illustration`` / ``OpenAI
+             image`` / ``Open AI illustration`` / ``open-ai
+             render`` / ``Anthropic creation`` / ``GPT-4
+             output`` while keeping ``GPS map`` / ``Egyptian
+             art`` / ``open book`` / ``open source code`` /
+             ``open API documentation`` / ``Open SSL diagram``
+             benign (the ``\\b`` boundary keeps ``gpt`` out of
+             ``Egypt`` / ``GPS``; ``open`` followed by a
+             non-``ai`` word still passes); ``claude`` /
+             ``gemini`` + (model version OR distribution-style
+             noun) — refuses ``Claude 3 illustration`` /
+             ``Claude opus render`` / ``Claude renderings`` /
+             ``Gemini Pro output`` while keeping
+             ``Claude Monet painting`` / ``Claude Shannon
+             information theory`` / ``Gemini constellation`` /
+             ``Gemini horoscope reading`` benign).
+      MAN11  no two manifest entries share a filename
+             (case-sensitive; the basenames must match what the
+             discovery pass on disk found).
+      MAN12  (cross-check, only runs when image discovery succeeded)
+             the manifest filename set equals the discovered set —
+             no orphan, no missing.
+    """
+    if _has_uri_scheme(manifest_path_str):
+        return None, None, [
+            f"--manifest argument {manifest_path_str!r} looks "
+            f"URI-shaped (MAN1); only local file paths are accepted."
+        ]
+
+    manifest_path = Path(manifest_path_str)
+
+    if manifest_path.is_symlink():
+        try:
+            tgt = os.readlink(manifest_path)
+        except OSError:
+            tgt = "<unreadable>"
+        return None, None, [
+            f"--manifest {manifest_path} is a symlink (-> {tgt}) "
+            f"(MAN2); refused so a symlink target cannot redirect "
+            f"what bytes the helper ingests."
+        ]
+
+    forbidden_ancestor = _forbidden_symlink_ancestor(manifest_path)
+    if forbidden_ancestor is not None:
+        ancestor, tgt = forbidden_ancestor
+        return None, None, [
+            f"--manifest {manifest_path} has a symlink ancestor "
+            f"{ancestor} (-> {tgt}) (MAN3); refused so a symlink "
+            f"in the operator's typed path cannot redirect what "
+            f"bytes the helper ingests."
+        ]
+
+    if not manifest_path.exists():
+        return None, None, [
+            f"--manifest {manifest_path} does not exist (MAN4)."
+        ]
+    if not manifest_path.is_file():
+        return None, None, [
+            f"--manifest {manifest_path} is not a regular file "
+            f"(MAN4)."
+        ]
+
+    try:
+        raw = manifest_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, None, [
+            f"--manifest {manifest_path} cannot be read as UTF-8: "
+            f"{type(exc).__name__}: {exc} (MAN5)."
+        ]
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return None, None, [
+            f"--manifest {manifest_path} is not valid JSON: "
+            f"{exc} (MAN5)."
+        ]
+
+    if not isinstance(data, dict):
+        return None, None, [
+            f"--manifest {manifest_path} root is "
+            f"{type(data).__name__}; expected a JSON object (MAN5)."
+        ]
+
+    failures: list[str] = []
+
+    required_root = set(_MANIFEST_REQUIRED_ROOT_KEYS)
+    present_root = set(data.keys())
+    missing_root = required_root - present_root
+    extras_root = present_root - required_root
+    if missing_root:
+        failures.append(
+            f"--manifest {manifest_path} root missing key(s) "
+            f"{sorted(missing_root)!r} (MAN6); required: "
+            f"{sorted(required_root)!r}."
+        )
+    if extras_root:
+        failures.append(
+            f"--manifest {manifest_path} root has unknown key(s) "
+            f"{sorted(extras_root)!r} (MAN6); allowed: "
+            f"{sorted(required_root)!r}."
+        )
+    if failures:
+        return None, None, failures
+
+    if data.get("schema_version") != _MANIFEST_SCHEMA_VERSION:
+        return None, None, [
+            f"--manifest {manifest_path} schema_version="
+            f"{data.get('schema_version')!r}; expected "
+            f"{_MANIFEST_SCHEMA_VERSION!r} (MAN7)."
+        ]
+
+    images = data.get("images")
+    if not isinstance(images, list):
+        return None, None, [
+            f"--manifest {manifest_path} images field is "
+            f"{type(images).__name__}; expected a JSON array (MAN8)."
+        ]
+    if not images:
+        return None, None, [
+            f"--manifest {manifest_path} images array is empty; the "
+            f"helper refuses to stage a zero-image deck (MAN8)."
+        ]
+
+    entry_required = set(_MANIFEST_IMAGE_REQUIRED_KEYS)
+    seen_filenames: dict[str, int] = {}
+    ordered_entries: list[dict] = []
+
+    for idx, entry in enumerate(images):
+        if not isinstance(entry, dict):
+            failures.append(
+                f"--manifest images[{idx}] is "
+                f"{type(entry).__name__}; expected a JSON object "
+                f"(MAN9)."
+            )
+            continue
+        entry_present = set(entry.keys())
+        entry_missing = entry_required - entry_present
+        entry_extras = entry_present - entry_required
+        if entry_missing:
+            failures.append(
+                f"--manifest images[{idx}] missing field(s) "
+                f"{sorted(entry_missing)!r} (MAN9); required: "
+                f"{sorted(entry_required)!r}."
+            )
+        if entry_extras:
+            failures.append(
+                f"--manifest images[{idx}] has unknown field(s) "
+                f"{sorted(entry_extras)!r} (MAN9); allowed: "
+                f"{sorted(entry_required)!r}."
+            )
+        if entry_missing or entry_extras:
+            continue
+
+        field_failed = False
+        cleaned: dict[str, str] = {}
+        for field, max_len in (
+            ("filename", _MAX_FILENAME_LEN),
+            ("slide_title", _MAX_SLIDE_TITLE_LEN),
+            ("alt_text", _MAX_ALT_TEXT_LEN),
+            ("intended_use", _MAX_INTENDED_USE_LEN),
+        ):
+            value, fail = _safe_manifest_string(
+                field=field, value=entry[field],
+                max_len=max_len, entry_idx=idx,
+            )
+            if fail:
+                failures.append(fail)
+                field_failed = True
+            else:
+                cleaned[field] = value
+        if field_failed:
+            continue
+
+        fname = cleaned["filename"]
+        if fname in seen_filenames:
+            failures.append(
+                f"--manifest images[{idx}].filename={fname!r} is a "
+                f"duplicate of images[{seen_filenames[fname]}] "
+                f"(MAN11); each operator image must appear in the "
+                f"manifest exactly once."
+            )
+            continue
+        seen_filenames[fname] = idx
+        ordered_entries.append(cleaned)
+
+    if failures:
+        return None, None, failures
+
+    # MAN12 — coverage cross-check. Only runs when image discovery
+    # succeeded; otherwise the helper already reported image failures
+    # at the IG-gate layer, and reporting a "coverage mismatch" on
+    # top would be redundant noise the operator has to wade through.
+    if discovered_filenames is not None:
+        discovered_set = set(discovered_filenames)
+        manifest_set = set(seen_filenames.keys())
+        orphan = manifest_set - discovered_set
+        missing = discovered_set - manifest_set
+        if orphan:
+            failures.append(
+                f"--manifest {manifest_path} names filename(s) "
+                f"{sorted(orphan)!r} not present under --images-dir "
+                f"(MAN12); the manifest must cover only discovered "
+                f"images."
+            )
+        if missing:
+            failures.append(
+                f"--manifest {manifest_path} does not name "
+                f"discovered filename(s) {sorted(missing)!r} "
+                f"(MAN12); the manifest must cover every discovered "
+                f"image exactly once."
+            )
+        if failures:
+            return None, None, failures
+
+    return ordered_entries, manifest_path, []
+
+
 # ---------------------------------------------------------------------------
 # Pipeline fixture composition.
 # ---------------------------------------------------------------------------
@@ -640,7 +1921,18 @@ def _build_pipeline_fixture(
     images_block: list[dict] = []
 
     for idx, image in enumerate(images, start=1):
-        title = _cover_title_for(image)
+        # When --manifest is supplied, the operator-typed slide_title /
+        # alt_text / intended_use flow through verbatim. When --manifest
+        # is omitted, the helper's deterministic defaults (filename-
+        # derived title, generic alt_text, fixed "spot illustration"
+        # intended_use) are used — preserving the pre-manifest behaviour
+        # byte-for-byte.
+        title = image.slide_title or _cover_title_for(image)
+        alt_text = image.alt_text or (
+            f"Operator-supplied local image "
+            f"{image.operator_filename!r}."
+        )
+        intended_use = image.intended_use or "spot illustration"
         slides_block.append({
             "index": idx,
             "layout": "cover",
@@ -679,11 +1971,8 @@ def _build_pipeline_fixture(
             "id": image.asset_id,
             "local_path": f"assets/{image.asset_id}.{image.extension}",
             "source": "local_asset",
-            "alt_text": (
-                f"Operator-supplied local image "
-                f"{image.operator_filename!r}."
-            ),
-            "intended_use": "spot illustration",
+            "alt_text": alt_text,
+            "intended_use": intended_use,
         })
         # Stage --assets-dir: bytes the Stage-5.5 materialize step
         # copies into <workspace>/<image_manifest local_path>. The
@@ -861,8 +2150,16 @@ def _provenance_for(
     """Per-image provenance record. ``pptx_media_shas`` maps each
     operator sha256 to the sorted list of ``ppt/media/*`` parts that
     carry the same bytes; the empty list means the operator file did
-    not embed (regression — the truth-checker refuses)."""
-    return {
+    not embed (regression — the truth-checker refuses).
+
+    The ``operator_slide_title`` / ``operator_alt_text`` /
+    ``operator_intended_use`` keys are present iff the operator
+    supplied them via ``--manifest`` (each one may flow through
+    independently in principle, though in practice all four manifest
+    string fields are checked together). When ``--manifest`` is
+    omitted the keys are absent and the helper's deterministic
+    defaults remain implicit (no operator-supplied override to echo)."""
+    entry = {
         "operator_filename": image.operator_filename,
         "asset_id": image.asset_id,
         "media_type": image.media_type,
@@ -878,6 +2175,13 @@ def _provenance_for(
             pptx_media_shas.get(image.sha256, [])
         ),
     }
+    if image.slide_title is not None:
+        entry["operator_slide_title"] = image.slide_title
+    if image.alt_text is not None:
+        entry["operator_alt_text"] = image.alt_text
+    if image.intended_use is not None:
+        entry["operator_intended_use"] = image.intended_use
+    return entry
 
 
 def _walk_pptx_media(pptx: Path) -> dict[str, list[str]]:
@@ -972,12 +2276,16 @@ def _build_summary(
     inventory_outcome: _ToolOutcome,
     registry_outcome: _ToolOutcome,
     pptx_media_shas: dict[str, list[str]],
+    manifest_path: Path | None,
 ) -> dict:
     contract_pass = _project_contract_gates(contract.stdout or "")
     return {
         "schema_version": "1",
         "helper_id": "operator_local_images_to_editable_ppt",
         "real_d_one_status": _REAL_D_ONE_STATUS,
+        "manifest_path": (
+            str(manifest_path) if manifest_path is not None else None
+        ),
         "slide_count": inventory.get("slide_count"),
         "image_count": len(images),
         "embedded_media_count": _embedded_media_count_from_inventory(
@@ -1151,6 +2459,45 @@ def _check_summary_truth(summary: dict) -> list[str]:
                     f"reached the PPTX)"
                 )
 
+    # manifest_path is required to be present in the summary record
+    # (either a non-empty string when --manifest was supplied, or None
+    # when it was not). When set to a string, every provenance entry
+    # MUST echo the operator-supplied slide_title / alt_text /
+    # intended_use so a reviewer can read the manifest's intent out of
+    # the summary without opening the source manifest file.
+    manifest_in_summary = summary.get("manifest_path")
+    if (
+        manifest_in_summary is not None
+        and not isinstance(manifest_in_summary, str)
+    ):
+        failures.append(
+            f"summary.manifest_path={manifest_in_summary!r}; expected "
+            f"either null (no --manifest supplied) or a non-empty "
+            f"string path"
+        )
+    if isinstance(manifest_in_summary, str):
+        if not manifest_in_summary:
+            failures.append(
+                f"summary.manifest_path is an empty string; expected "
+                f"either null or a non-empty path"
+            )
+        if isinstance(prov, list):
+            for i, entry in enumerate(prov):
+                if not isinstance(entry, dict):
+                    continue
+                for field in (
+                    "operator_slide_title",
+                    "operator_alt_text",
+                    "operator_intended_use",
+                ):
+                    val = entry.get(field)
+                    if not isinstance(val, str) or not val:
+                        failures.append(
+                            f"summary.image_provenance[{i}].{field}="
+                            f"{val!r}; expected non-empty string when "
+                            f"--manifest is supplied"
+                        )
+
     boundaries = summary.get("explicit_boundaries")
     if boundaries != list(_EXPLICIT_BOUNDARIES):
         failures.append(
@@ -1169,11 +2516,18 @@ def _run_happy_path(
     *,
     out_dir: Path,
     images: list[_DiscoveredImage],
+    manifest_path: Path | None = None,
 ) -> tuple[int, dict | None, Path | None]:
     """Build the fixture under ``out_dir``, drive the pipeline, run the
     validators, and write the summary. Returns ``(rc, summary,
     summary_path)``. Leaves every artifact on disk for inspection on
-    failure too."""
+    failure too.
+
+    ``manifest_path`` is the (already-validated) path to the optional
+    ``--manifest`` JSON file, or ``None`` when the operator did not
+    supply one. The path is echoed verbatim into ``summary.manifest_path``
+    so a reviewer can trace which manifest authored the per-image
+    operator_* strings in the provenance block."""
     print(
         f"--- operator local-image intake: "
         f"{len(images)} image(s) -> editable PPTX ---"
@@ -1309,6 +2663,7 @@ def _run_happy_path(
         inventory_outcome=inventory_outcome,
         registry_outcome=registry_outcome,
         pptx_media_shas=pptx_media_shas,
+        manifest_path=manifest_path,
     )
 
     truth_failures = _check_summary_truth(summary)
@@ -1349,22 +2704,80 @@ def _run_happy_path(
 # ---------------------------------------------------------------------------
 
 
-def _run_operator_mode(*, images_dir_str: str, out_dir_str: str) -> int:
-    """Validate both operator arguments, create ``--out-dir`` if needed,
-    and drive the happy path. Returns 0 on success, 1 on any failure
-    (with partial artifacts left under ``--out-dir`` for inspection),
-    2 on operator-input refusal (no filesystem mutation)."""
+def _run_operator_mode(
+    *,
+    images_dir_str: str,
+    out_dir_str: str,
+    manifest_path_str: str | None = None,
+) -> int:
+    """Validate every operator argument, create ``--out-dir`` if
+    needed, and drive the happy path. Returns 0 on success, 1 on any
+    failure (with partial artifacts left under ``--out-dir`` for
+    inspection), 2 on operator-input refusal (no filesystem mutation).
+
+    When ``manifest_path_str`` is provided, the manifest is validated
+    against the discovered images, the slide order is reordered to
+    match the manifest's array order, and each discovered image is
+    enriched with its operator-supplied slide_title / alt_text /
+    intended_use. When omitted, the helper preserves its deterministic
+    filename-sort behaviour and built-in default strings verbatim."""
     images, _images_dir, image_failures = _validate_images_dir_arg(
         images_dir_str,
     )
     out_dir, out_failures = _validate_out_dir_arg(out_dir_str)
 
-    # Report BOTH argument refusals so the operator does not have to
+    manifest_failures: list[str] = []
+    manifest_path: Path | None = None
+    if manifest_path_str is not None:
+        # Pass the discovered filenames in iff image discovery
+        # succeeded. When it failed, the helper already has IG-gate
+        # diagnostics to surface; piling a "manifest coverage
+        # mismatch" MAN12 diagnostic on top would be redundant noise.
+        # The MAN1..MAN11 structural gates still run so the operator
+        # sees every manifest-side problem in the same pass.
+        discovered_filenames = (
+            [img.operator_filename for img in images]
+            if images is not None
+            else None
+        )
+        ordered_entries, manifest_path, manifest_failures = (
+            _validate_manifest_arg(
+                manifest_path_str, discovered_filenames,
+            )
+        )
+        if (
+            not image_failures
+            and not manifest_failures
+            and images is not None
+            and ordered_entries is not None
+        ):
+            by_filename = {
+                img.operator_filename: img for img in images
+            }
+            images = [
+                replace(
+                    by_filename[entry["filename"]],
+                    slide_title=entry["slide_title"],
+                    alt_text=entry["alt_text"],
+                    intended_use=entry["intended_use"],
+                )
+                for entry in ordered_entries
+            ]
+
+    # Report every argument refusal so the operator does not have to
     # re-run twice to find every input problem.
-    if image_failures or out_failures or images is None or out_dir is None:
+    if (
+        image_failures
+        or out_failures
+        or manifest_failures
+        or images is None
+        or out_dir is None
+    ):
         for line in image_failures or []:
             print(f"FAIL: {line}", file=sys.stderr)
         for line in out_failures or []:
+            print(f"FAIL: {line}", file=sys.stderr)
+        for line in manifest_failures or []:
             print(f"FAIL: {line}", file=sys.stderr)
         return 2
 
@@ -1379,12 +2792,18 @@ def _run_operator_mode(*, images_dir_str: str, out_dir_str: str) -> int:
             )
             return 1
 
+    manifest_arg_display = (
+        f", --manifest {manifest_path}"
+        if manifest_path is not None
+        else ""
+    )
     print(
         f"=== operator_local_images_to_editable_ppt "
-        f"(--images-dir {images_dir_str}, --out-dir {out_dir}) ==="
+        f"(--images-dir {images_dir_str}, --out-dir {out_dir}"
+        f"{manifest_arg_display}) ==="
     )
     rc, summary, summary_path = _run_happy_path(
-        out_dir=out_dir, images=images,
+        out_dir=out_dir, images=images, manifest_path=manifest_path,
     )
     if rc != 0 or summary is None or summary_path is None:
         print(
@@ -1883,14 +3302,1320 @@ def _run_self_tests() -> int:
             f"uri_lexical_leak={uri_lexical_leak}",
         ))
 
-    # T19 — committed-tree snapshot. The whole self-test must not have
+    # ----- T19..T42: --manifest gates -----
+
+    # T19 happy path: operator supplies a manifest that reorders the
+    # two synthetic images (beta first, alpha second) and supplies
+    # custom slide_title / alt_text / intended_use; the produced
+    # summary echoes both the new order AND the new strings under
+    # image_provenance, AND the deck still embeds both images.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T19-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        manifest = td / "manifest.json"
+        _write_synthetic_images(images_dir)
+        manifest.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [
+                {
+                    "filename": "beta_marker.jpg",
+                    "slide_title": "Beta accent first",
+                    "alt_text": "Operator beta marker (reordered)",
+                    "intended_use": "decorative pattern",
+                },
+                {
+                    "filename": "alpha_marker.png",
+                    "slide_title": "Alpha accent second",
+                    "alt_text": "Operator alpha marker (reordered)",
+                    "intended_use": "icon",
+                },
+            ],
+        }) + "\n", encoding="utf-8")
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+            manifest_path_str=str(manifest),
+        )
+        ok = rc == 0
+        detail = ""
+        if ok:
+            try:
+                summary = json.loads((out_dir / "summary.json").read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"cannot parse summary.json: {exc}"
+            else:
+                prov = summary.get("image_provenance") or []
+                if summary.get("image_count") != 2:
+                    ok = False
+                    detail = (
+                        f"image_count={summary.get('image_count')!r}, "
+                        f"expected 2"
+                    )
+                elif summary.get("manifest_path") != str(manifest):
+                    ok = False
+                    detail = (
+                        f"manifest_path={summary.get('manifest_path')!r}, "
+                        f"expected {str(manifest)!r}"
+                    )
+                elif len(prov) != 2:
+                    ok = False
+                    detail = f"image_provenance has {len(prov)} entries"
+                elif prov[0].get("operator_filename") != "beta_marker.jpg":
+                    ok = False
+                    detail = (
+                        f"provenance[0] is "
+                        f"{prov[0].get('operator_filename')!r}; "
+                        f"expected beta_marker.jpg (manifest order)"
+                    )
+                elif prov[1].get("operator_filename") != "alpha_marker.png":
+                    ok = False
+                    detail = (
+                        f"provenance[1] is "
+                        f"{prov[1].get('operator_filename')!r}; "
+                        f"expected alpha_marker.png (manifest order)"
+                    )
+                else:
+                    expected_titles = (
+                        "Beta accent first", "Alpha accent second",
+                    )
+                    expected_intended = (
+                        "decorative pattern", "icon",
+                    )
+                    for i, (ttl, intent) in enumerate(zip(
+                        expected_titles, expected_intended,
+                    )):
+                        if prov[i].get("operator_slide_title") != ttl:
+                            ok = False
+                            detail = (
+                                f"provenance[{i}].operator_slide_title="
+                                f"{prov[i].get('operator_slide_title')!r}; "
+                                f"expected {ttl!r}"
+                            )
+                            break
+                        if prov[i].get("operator_intended_use") != intent:
+                            ok = False
+                            detail = (
+                                f"provenance[{i}].operator_intended_use="
+                                f"{prov[i].get('operator_intended_use')!r}; "
+                                f"expected {intent!r}"
+                            )
+                            break
+        if not ok and not detail:
+            detail = f"rc={rc}"
+        results.append(_ProbeResult(
+            "T19 happy path: --manifest reorders + supplies custom "
+            "slide_title/alt_text/intended_use; provenance echoes both",
+            ok, detail,
+        ))
+
+    # T20 MAN1 URI-shaped --manifest refused (no images discovery needed).
+    entries, _p, fails = _validate_manifest_arg(
+        "file:///tmp/manifest.json", None,
+    )
+    results.append(_ProbeResult(
+        "T20 MAN1: URI-shaped --manifest refused",
+        entries is None and any("MAN1" in f for f in fails),
+        f"entries={entries!r}, failures={fails!r}",
+    ))
+
+    # T21 MAN2 symlink --manifest refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T21-") as raw_td:
+        td = Path(raw_td)
+        real = td / "real.json"
+        real.write_text("{}", encoding="utf-8")
+        link = td / "link.json"
+        try:
+            link.symlink_to(real)
+        except (OSError, NotImplementedError):
+            results.append(_ProbeResult(
+                "T21 MAN2: skipped (symlink not supported on this OS)",
+                True,
+            ))
+        else:
+            entries, _p, fails = _validate_manifest_arg(str(link), None)
+            results.append(_ProbeResult(
+                "T21 MAN2: symlink --manifest refused",
+                entries is None and any("MAN2" in f for f in fails),
+                f"entries={entries!r}, failures={fails!r}",
+            ))
+
+    # T22 MAN3 symlink ancestor of --manifest refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T22-") as raw_td:
+        td = Path(raw_td)
+        real_parent = td / "real_parent"
+        real_parent.mkdir()
+        nested = real_parent / "nested"
+        nested.mkdir()
+        (nested / "manifest.json").write_text("{}", encoding="utf-8")
+        symlink_parent = td / "linked_parent"
+        try:
+            symlink_parent.symlink_to(
+                real_parent, target_is_directory=True,
+            )
+        except (OSError, NotImplementedError):
+            results.append(_ProbeResult(
+                "T22 MAN3: skipped (symlink not supported on this OS)",
+                True,
+            ))
+        else:
+            target = symlink_parent / "nested" / "manifest.json"
+            entries, _p, fails = _validate_manifest_arg(str(target), None)
+            results.append(_ProbeResult(
+                "T22 MAN3: symlink ancestor of --manifest refused",
+                entries is None and any("MAN3" in f for f in fails),
+                f"entries={entries!r}, failures={fails!r}",
+            ))
+
+    # T23 MAN4 missing manifest refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T23-") as raw_td:
+        entries, _p, fails = _validate_manifest_arg(
+            str(Path(raw_td) / "nope.json"), None,
+        )
+        results.append(_ProbeResult(
+            "T23 MAN4: missing --manifest refused",
+            entries is None and any("MAN4" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T24 MAN4 --manifest is a directory, not a regular file.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T24-") as raw_td:
+        td = Path(raw_td)
+        (td / "manifest.json").mkdir()
+        entries, _p, fails = _validate_manifest_arg(
+            str(td / "manifest.json"), None,
+        )
+        results.append(_ProbeResult(
+            "T24 MAN4: --manifest is a directory -> refused",
+            entries is None and any("MAN4" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T25 MAN5 malformed JSON refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T25-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text("not json {", encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T25 MAN5: malformed JSON refused",
+            entries is None and any("MAN5" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T26 MAN5 non-object root (top-level array) refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T26-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text("[]", encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T26 MAN5: top-level JSON array refused (root must be object)",
+            entries is None and any("MAN5" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T27 MAN6 unknown root key refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T27-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [],
+            "extra_root_key": "no",
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T27 MAN6: unknown root key refused",
+            entries is None and any("MAN6" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T28 MAN6 missing root key (no schema_version) refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T28-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({"images": []}), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T28 MAN6: missing schema_version root key refused",
+            entries is None and any("MAN6" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T29 MAN7 wrong schema_version refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T29-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "2", "images": [],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T29 MAN7: schema_version != '1' refused",
+            entries is None and any("MAN7" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T30 MAN8 empty images array refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T30-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1", "images": [],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T30 MAN8: empty images array refused",
+            entries is None and any("MAN8" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T31 MAN9 entry missing a field refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T31-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "A",
+                # intended_use missing
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T31 MAN9: entry missing required field refused",
+            entries is None and any("MAN9" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T32 MAN9 entry with unknown field refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T32-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "A",
+                "intended_use": "icon",
+                "extra_field": "no",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T32 MAN9: entry with unknown field refused",
+            entries is None and any("MAN9" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T33 MAN10 empty string refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T33-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "",
+                "alt_text": "A",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T33 MAN10: empty slide_title refused",
+            entries is None and any("MAN10" in f and "empty" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T34 MAN10 URL-shaped slide_title refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T34-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "see https://example.com/foo",
+                "alt_text": "A",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T34 MAN10: URL in slide_title refused",
+            entries is None and any(
+                "MAN10" in f and ("URL" in f or "://" in f) for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T35 MAN10 path separator in slide_title refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T35-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "../sneaky",
+                "alt_text": "A",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T35 MAN10: path separator in slide_title refused",
+            entries is None and any(
+                "MAN10" in f and "path separator" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T36 MAN10 credential-shaped alt_text refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T36-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "set api_key for the upload",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T36 MAN10: credential-shaped alt_text refused",
+            entries is None and any(
+                "MAN10" in f and "credential" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T37 MAN10 upload/share/hosting wording in intended_use refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T37-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "A",
+                "intended_use": "share to dropbox",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T37 MAN10: public upload/share wording in intended_use "
+            "refused",
+            entries is None and any(
+                "MAN10" in f and "upload" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T38 MAN10 confidential / customer marker refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T38-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "confidential customer data preview",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T38 MAN10: confidential / customer marker in alt_text "
+            "refused",
+            entries is None and any(
+                "MAN10" in f and "confidential" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T39 MAN10 positive D-One success claim refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T39-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "Generated by D-One",
+                "alt_text": "A",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T39 MAN10: D-One success claim in slide_title refused",
+            entries is None and any(
+                "MAN10" in f and "upstream service" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T40 MAN11 duplicate filename in manifest refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T40-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [
+                {
+                    "filename": "alpha.png", "slide_title": "T1",
+                    "alt_text": "A", "intended_use": "icon",
+                },
+                {
+                    "filename": "alpha.png", "slide_title": "T2",
+                    "alt_text": "A", "intended_use": "icon",
+                },
+            ],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T40 MAN11: duplicate filename in manifest refused",
+            entries is None and any("MAN11" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T41 MAN12 orphan manifest filename (not in discovered set) refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T41-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "ghost.png",
+                "slide_title": "Ghost",
+                "alt_text": "A",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(
+            str(path), ["real.png"],
+        )
+        results.append(_ProbeResult(
+            "T41 MAN12: manifest names a filename not in --images-dir "
+            "-> refused",
+            entries is None and any("MAN12" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T42 MAN12 missing manifest entry for a discovered file refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T42-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "A",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(
+            str(path), ["alpha.png", "beta.png"],
+        )
+        results.append(_ProbeResult(
+            "T42 MAN12: manifest does not name a discovered file -> "
+            "refused",
+            entries is None and any("MAN12" in f for f in fails),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T43 MAN10 public-hosting wording (no provider name) refused.
+    # The existing T37 probe locks the provider-named substring path
+    # (`share to dropbox`); this probe locks the new bounded regex
+    # path so a regression that drops `_DENY_PUBLIC_SHARE_REGEX`
+    # would let `public hosting enabled` slip through (the original
+    # Codex-flagged false-green).
+    with tempfile.TemporaryDirectory(prefix="op-helper-T43-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "public hosting enabled",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T43 MAN10: 'public hosting enabled' in alt_text refused "
+            "(no provider name; bounded regex must fire)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T44 MAN10 verb + public(ly) shape refused. Locks the SECOND
+    # alternation in the public-share regex (verb-first ordering).
+    with tempfile.TemporaryDirectory(prefix="op-helper-T44-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "A",
+                "intended_use": "share publicly",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T44 MAN10: 'share publicly' in intended_use refused "
+            "(verb + public(ly) regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T45 MAN10 'make / made (it / this) public' shape refused. Locks
+    # the THIRD alternation; an operator who writes 'make public' on
+    # the slide title would otherwise leak a public-release intent
+    # into the native editable text.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T45-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "Make this public",
+                "alt_text": "A",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T45 MAN10: 'make this public' in slide_title refused "
+            "(make / made (it / this) public regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T46 MAN10 'anyone can <reach-verb>' reach-modifier shape refused.
+    # Locks alt 8 — covers the common no-provider, no-"public" shape
+    # where the operator names *who* gets access ("anyone can
+    # download" / "everyone has access") rather than the channel.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T46-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "anyone can download this",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T46 MAN10: 'anyone can download' reach-modifier refused "
+            "(anyone / everyone + can / has + reach verb regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T47 MAN10 'on the internet' / internet-channel shape refused.
+    # Locks alt 6 + alt 7 — covers wording that names a public
+    # distribution channel without using the word "public".
+    with tempfile.TemporaryDirectory(prefix="op-helper-T47-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "asset on the internet",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T47 MAN10: 'on the internet' channel wording refused "
+            "(on the internet / web regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T48 MAN10 'globally distributed' scale-modifier shape refused.
+    # Locks alt 11 — covers wording that names scale ("global",
+    # "worldwide", "wide(ly)") attached to a distribution verb without
+    # using the word "public" or naming a provider. Uses the hyphen
+    # form to also lock the [\s-]+ separator class.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T48-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "A",
+                "intended_use": "globally-distributed asset",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T48 MAN10: 'globally-distributed' scale-modifier refused "
+            "(wide/global/worldwide + distribute/broadcast/share/"
+            "circulate regex path with hyphen separator)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T49 MAN10 'post to <name>' social-media post shape refused via
+    # the alt 14 regex path. The test value deliberately AVOIDS
+    # naming a known social-media platform (twitter / instagram /
+    # facebook / linkedin / ...) so the platform substring denylist
+    # does NOT fire first; the regex path is the load-bearing gate
+    # for this probe. ("post to twitter" with the platform name is
+    # refused TWICE — once via the substring "twitter", once via
+    # alt 14 — and the substring fires first; that combined refusal
+    # is regression-locked by T62's battery indirectly.)
+    with tempfile.TemporaryDirectory(prefix="op-helper-T49-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "Post to my channel",
+                "alt_text": "A",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T49 MAN10: 'post to <non-platform>' social-media post "
+            "wording refused via the alt 14 regex path (post + to)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T50 MAN10 'freely / openly + verb' shape refused. Locks the
+    # extended publicness vocab in alt 1 (public(ly) / freely /
+    # openly). A regression that narrowed the vocab back to "public"
+    # only would let "freely available" / "openly distributed" slip
+    # through.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T50-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "freely available image",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T50 MAN10: 'freely available' publicness-vocab extension "
+            "refused (public(ly) / freely / openly + verb regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T51 MAN10 hyphenated 'make-public' shape refused. Locks the
+    # [\s-]+ separator in alt 3. Earlier ``\s+`` separator would
+    # have let "make-it-public" slip through; the bounded separator
+    # class catches both "make public" (space) and "make-public"
+    # (hyphen).
+    with tempfile.TemporaryDirectory(prefix="op-helper-T51-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "Make-it-public asset",
+                "alt_text": "A",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T51 MAN10: hyphenated 'make-it-public' refused "
+            "(alt 3 [\\s-]+ separator class)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T52 MAN10 hyphenated 'upload-to-PROVIDER' refused. The
+    # substring denylist matches "upload to" (space-separated) but
+    # NOT "upload-to-s3" (hyphen). Alt 14's broader
+    # <sharing-verb>[\s-]+to\b catches the hyphenated form.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T52-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "upload-to-s3 backup pattern",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T52 MAN10: hyphenated 'upload-to-s3' refused "
+            "(alt 14 generalized <sharing-verb>[\\s-]+to regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T53 MAN10 hyphenated 'hosted-on-PROVIDER' refused. The
+    # substring "hosted on" misses "hosted-on-aws" (hyphen).
+    # Alt 15 (<host/broadcast/publish/stream verb>[\s-]+on\b) is the
+    # new shape that catches this.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T53-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "A",
+                "intended_use": "hosted-on-aws icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T53 MAN10: hyphenated 'hosted-on-aws' refused "
+            "(alt 15 <host/broadcast/publish/stream verb>[\\s-]+on "
+            "regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T54 MAN10 hyphenated 'anyone-can-download' refused. Locks the
+    # [\s-]+ separator in alt 8. T46 covers the space-separated
+    # form; this probe ensures the hyphen form is equally refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T54-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "anyone-can-download badge",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T54 MAN10: hyphenated 'anyone-can-download' refused "
+            "(alt 8 [\\s-]+ separator class)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T55 MAN10 hyphenated 'for-the-public' refused. Locks the
+    # [\s-]+ separator in alt 10. Important because the bare phrase
+    # "to-the-public" / "for-the-public" has no `public` adjacency
+    # with a verb — only the alt-10 reach-modifier path catches it.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T55-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "For-the-public release graphic",
+                "alt_text": "A",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T55 MAN10: hyphenated 'for-the-public' refused "
+            "(alt 10 [\\s-]+ separator class)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T56 MAN10 cloud-provider hosting refused. Locks alt 7's
+    # EXPANDED channel vocab — earlier the channel set was just
+    # {internet, web}; the expanded vocab also covers cloud / cdn /
+    # aws / azure / gcp / s3 / remote / external. Without this
+    # expansion, "cloud-hosted" / "cdn-hosted" / "aws-hosted" would
+    # all false-green.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T56-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "cloud-hosted asset",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T56 MAN10: 'cloud-hosted' refused (alt 7 expanded "
+            "channel vocab)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T57 MAN10 content-class hosting refused. Locks the new alt 17
+    # — catches "image-hosting" / "image hosting service" /
+    # "file-hosting" / "video-hosting" etc. without false-positives
+    # on benign UI nouns ("host icon", "hosting industry chart").
+    with tempfile.TemporaryDirectory(prefix="op-helper-T57-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "A",
+                "intended_use": "image-hosting badge",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T57 MAN10: 'image-hosting' refused (alt 17 "
+            "content-class noun + host(ed|ing) regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T58 MAN10 distance-modifier hosting refused. Locks the new
+    # alt 18 — catches "third-party-hosted" / "externally-hosted" /
+    # "remotely-hosted" while leaving benign "self-hosted" /
+    # "privately-hosted" alone.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T58-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "Third-party-hosted asset",
+                "alt_text": "A",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T58 MAN10: 'third-party-hosted' refused (alt 18 "
+            "distance modifier + host(ed|ing) regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T59 MAN10 storage-preposition-channel triple refused. Locks
+    # the new alt 16 — catches "stored on cloud", "served via cdn",
+    # "synced to cloud", "saved to drive", "delivered via web" and
+    # their hyphenated forms.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T59-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "stored-on-cloud asset",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T59 MAN10: 'stored-on-cloud' refused (alt 16 verb + "
+            "preposition + channel regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T60 MAN10 downloadable-from refused. Locks the new alt 19 —
+    # "downloadable from anywhere" / "downloadable from web" /
+    # "downloadable from cloud" with cloud / public-reach
+    # destination suffix.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T60-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "downloadable from anywhere badge",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T60 MAN10: 'downloadable from anywhere' refused "
+            "(alt 19 download(able)? from + public-destination "
+            "regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T61 — cloud-provider channel + storage/delivery verb refused.
+    # Locks the new alt 7b — narrower channel vocab than alt 7 so
+    # benign "internet save dialog" / "remote backup icon" pass,
+    # but "cloud-stored asset" / "cdn-served image" / "aws-saved"
+    # / "s3-backed" / "cdn-delivered" still trip.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T61-") as raw_td:
+        td = Path(raw_td)
+        path = td / "manifest.json"
+        path.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [{
+                "filename": "alpha.png",
+                "slide_title": "T",
+                "alt_text": "cloud-stored asset",
+                "intended_use": "icon",
+            }],
+        }), encoding="utf-8")
+        entries, _p, fails = _validate_manifest_arg(str(path), None)
+        results.append(_ProbeResult(
+            "T61 MAN10: 'cloud-stored' refused (alt 7b cloud-provider "
+            "channel + storage/delivery verb regex path)",
+            entries is None and any(
+                "MAN10" in f and "public-share" in f for f in fails
+            ),
+            f"entries={entries!r}, failures={fails!r}",
+        ))
+
+    # T62 — battery regression-lock for ordinary local-action wording
+    # that MUST PASS the MAN10 safe-string gates. Earlier rounds
+    # added save / store / sync / backup / deliver / serve / send /
+    # forward / "back up to anything" / "download from anything"
+    # patterns that false-refused common UI / file / printer / local-
+    # backup phrasings; this probe locks the narrow direction in
+    # place so a future re-broadening of alt 14/15/19/20 immediately
+    # turns a benign sample red. Samples are checked directly through
+    # the safe-string function (no full pipeline run needed; cheap).
+    benign_samples: tuple[str, ...] = (
+        # File / save UI references.
+        "save to file", "save to disk", "save to project",
+        "saved to drive", "save to backup folder",
+        "saved to local folder", "save dialog", "saved icon",
+        "save button mockup",
+        # Send / forward / deliver — local actions.
+        "send to printer", "send to email", "send to colleague",
+        "send icon", "forward to inbox", "forwarded to mailbox",
+        "forward button", "delivered to recipient",
+        "delivered to mailbox", "delivery icon", "served to user",
+        "served on plate", "serving size chart",
+        # Backup / sync — local.
+        "backup icon", "back up to file", "back up to backup drive",
+        "backed up to local disk", "backup workflow diagram",
+        "sync icon", "synced to laptop", "synced to backup",
+        "syncing icon", "sync workflow",
+        # Storage — local.
+        "stored to disk", "stored to project", "store to memory",
+        "stored on hard disk", "stored on local server",
+        # External / remote storage devices (local hardware /
+        # local-network references). These were false-refusing in
+        # the previous round because "remote" / "external" were in
+        # alts 7/16/19/20 channel lists; they are now removed so
+        # only alt 18 (distance modifier + distribution verb)
+        # catches the truly distribution-y "remotely-hosted" /
+        # "externally-distributed" forms.
+        "saved to external drive", "saved to external disk",
+        "save to external HDD", "saved-to-external-drive",
+        "backup to external drive", "back up to external disk",
+        "backed up to external disk",
+        "backed-up-to-external-drive",
+        "synced to external drive", "synced to external disk",
+        "stored on external drive", "stored on external disk",
+        "stored on external HDD",
+        "stored on remote disk", "stored on remote drive",
+        "stored on remote server",
+        "saved to remote drive", "saved to remote disk",
+        "saved to remote server", "synced to remote backup",
+        "synced to remote drive", "synced to remote folder",
+        "backed up to remote disk", "backed up to remote drive",
+        "backed up to remote server", "back up to remote folder",
+        "back up to remote backup",
+        "downloaded from external drive",
+        "downloaded from remote disk",
+        "downloadable from external storage",
+        "download from external drive",
+        "served from external", "served from remote",
+        "delivered from remote", "delivered from external",
+        "available from remote", "available from external",
+        "external storage diagram", "external disk icon",
+        "external drive backup", "remote storage diagram",
+        "remote disk icon", "remote server backup",
+        "remote desktop icon", "remote control icon",
+        "external hard drive", "external link icon",
+        "external storage workflow", "remote storage workflow",
+        # Cloud architecture / distribution diagrams (noun forms).
+        "cdn distribution diagram", "cloud distribution diagram",
+        "cdn architecture diagram", "cloud architecture diagram",
+        "cdn delivery diagram", "cdn storage diagram",
+        "cloud storage diagram", "internet of things diagram",
+        "internet save dialog", "remote backup icon",
+        # Share UI elements.
+        "share button mockup", "share price chart",
+        "shareholder report chart", "share icon",
+        # Download UI — local.
+        "download from menu", "download from app",
+        "download from cache", "downloadable from app",
+        # Misc benign.
+        "spot illustration", "decorative pattern", "icon",
+        "host icon", "hosting industry chart",
+        "make a public statement", "open book", "open source code",
+        "publication date", "on-the-fly diagram", "go-to action",
+        "to-do list", "blog post illustration", "post-modern style",
+        "publication design", "live action photograph",
+        "online tutorial illustration", "self-hosted server icon",
+        "privately-hosted", "image of a public square",
+        "public service announcement", "public art piece",
+    )
+    refused: list[tuple[str, str]] = []
+    for sample in benign_samples:
+        value, fail = _safe_manifest_string(
+            field="alt_text", value=sample,
+            max_len=300, entry_idx=0,
+        )
+        if fail:
+            refused.append((sample, fail))
+    results.append(_ProbeResult(
+        f"T62 MAN10 regression lock: {len(benign_samples)} ordinary-"
+        f"local wording samples (save-to / send-to / forward-to / "
+        f"delivered-to / served-to / stored-to / back-up-to / "
+        f"synced-to / <channel> distribution diagram / <channel> "
+        f"architecture / external hard drive / remote backup / "
+        f"share button / share price chart / shareholder / download "
+        f"from menu / spot illustration / decorative pattern / etc.) "
+        f"MUST PASS the MAN10 safe-string gates",
+        not refused,
+        f"refused {len(refused)} sample(s): {refused!r}"
+        if refused else "",
+    ))
+
+    # T63 — battery regression-lock for fake public-network /
+    # upstream-service success claims that MUST refuse the MAN10
+    # safe-string gates. Locks every category in
+    # ``_FAKE_SUCCESS_REGEX``: lane-specific brand mentions
+    # (already covered by T39 baseline); upstream service
+    # indicators (model api / image search / telemetry); network /
+    # API / HTTP operation success vocab; network protocol mentions
+    # (REST / GraphQL / webhook / websocket / gRPC); real-live-
+    # production + service; success-action shape; action-verb +
+    # upstream-target; AI / ML / model-generated claims;
+    # "generated by + AI brand"; image-gen model brand mentions.
+    # A future re-narrowing of the regex (or a regression that
+    # drops one of the categories) will immediately turn a sample
+    # green here.
+    fake_success_samples: tuple[str, ...] = (
+        # Network / API / HTTP success vocab.
+        "network connection succeeded",
+        "network connection established",
+        "network request completed",
+        "network connected successfully",
+        "API call succeeded",
+        "API request returned",
+        "API endpoint hit",
+        "API response received",
+        "successful API call",
+        "HTTP request succeeded",
+        "HTTPS call returned",
+        "http response received",
+        "successful https request",
+        "http endpoint hit",
+        # Network protocol mentions.
+        "REST API endpoint hit",
+        "REST call succeeded",
+        "graphql query returned",
+        "webhook delivered",
+        "websocket connection",
+        "grpc call succeeded",
+        # Real / live / production + service.
+        "real network call",
+        "live API integration",
+        "production endpoint hit",
+        "real-time API response",
+        "live D-One call",
+        "production MCP integration",
+        "real model call",
+        "live model invocation",
+        # Successfully / actually + action verb.
+        "successfully called the model",
+        "successfully invoked the API",
+        "successfully queried the endpoint",
+        "successfully fetched from the network",
+        "successfully hit the API",
+        "successfully reached the model",
+        "successfully integrated with the API",
+        "actually called the model",
+        # Action verb + upstream target.
+        "called the model",
+        "invoked the API",
+        "queried the endpoint",
+        "hit the api",
+        "reached the network",
+        "contacted the model",
+        "fetched from API",
+        "retrieved from model",
+        # AI / ML / model-generated claims.
+        "AI-generated illustration",
+        "ML-generated image",
+        "model-generated diagram",
+        "generated by AI",
+        "generated by ML",
+        "generated by model",
+        "generated by stable diffusion",
+        "generated by midjourney",
+        "generated by dall-e",
+        "generated by GPT-4",
+        "generated by chatgpt",
+        "image generated via API",
+        "ai-gen illustration",
+        # Image-gen model brand mentions.
+        "midjourney render",
+        "dall-e output",
+        "stable diffusion result",
+        "imagen output",
+        "leonardo ai render",
+        # Standalone LLM-product brand mentions (alt J+ category).
+        "ChatGPT illustration", "ChatGPT-style portrait",
+        "ChatGPT export", "GPT illustration", "GPT-4 output",
+        "GPT-3.5 image", "gpt4 render", "OpenAI image",
+        "OpenAI rendering", "OpenAI-style art",
+        "Anthropic creation", "Anthropic-style",
+        # Two-word / hyphenated brand variants (Codex flagged
+        # these as still slipping through when the brand was
+        # spelled with a space or hyphen).
+        "Open AI illustration", "Open AI rendering",
+        "Open AI output", "Open AI-style art",
+        "open-ai render", "open ai portrait",
+        "Made by Open AI", "Created with Open AI",
+        "Powered by Open AI", "Generated by Open AI",
+        "Mid Journey render", "mid journey output",
+        "Mid-Journey illustration",
+        "Generated by Mid Journey", "Made by Mid Journey",
+        "Made by Mid-Journey",
+        # "Chat GPT" two-word variant — caught via the standalone
+        # `\bgpt\b` alt regardless of the "chat" prefix; locked
+        # here to surface a regression that drops gpt's standalone
+        # refuse.
+        "Chat GPT illustration", "Chat-GPT export",
+        # Claude / Gemini in model-context (alt K category).
+        "Claude generated portrait", "Claude-generated illustration",
+        "Claude rendering", "Claude renderings", "Claude output",
+        "Claude outputs", "Claude drawing", "Claude paintings",
+        "Claude 3 illustration", "Claude 3.5 art",
+        "Claude sonnet image", "Claude opus render",
+        "Claude API documentation",
+        "Gemini Pro output", "Gemini Ultra render",
+        "Gemini paintings", "Gemini renderings",
+        "Gemini API call",
+        # Expanded "verb + prep + brand" coverage (alt I category).
+        "Made by GPT", "Made by ChatGPT", "Made by Claude",
+        "Made by OpenAI", "Created with Midjourney",
+        "Created by DALL-E", "Created with Claude",
+        "Powered by OpenAI", "Powered by Anthropic",
+        "Powered by Gemini", "Drawn by Midjourney",
+        "Drawn by stable diffusion", "Drawn by GPT",
+        "Rendered by Claude", "Rendered by AI",
+        "Rendered by GPT-4", "Produced by ChatGPT",
+        "Synthesized by Imagen", "Composed by Claude",
+        "Crafted by GPT", "Output by Midjourney",
+        "Output by OpenAI",
+    )
+    passed: list[tuple[str, str | None]] = []
+    for sample in fake_success_samples:
+        value, fail = _safe_manifest_string(
+            field="alt_text", value=sample,
+            max_len=300, entry_idx=0,
+        )
+        if not fail:
+            passed.append((sample, value))
+    results.append(_ProbeResult(
+        f"T63 MAN10 fake-success regression lock: "
+        f"{len(fake_success_samples)} public-network / API / HTTP / "
+        f"model success-claim samples (network call succeeded / "
+        f"API endpoint hit / HTTP response received / successful "
+        f"REST call / live D-One call / production MCP integration "
+        f"/ successfully invoked the model / fetched from API / "
+        f"AI-generated illustration / generated by midjourney / "
+        f"dall-e output / etc.) MUST REFUSE the MAN10 safe-string "
+        f"gates with a public-share diagnostic",
+        not passed,
+        f"falsely accepted {len(passed)} sample(s): {passed!r}"
+        if passed else "",
+    ))
+
+    # T64 — committed-tree snapshot. The whole self-test must not have
     # mutated any byte under REPO_ROOT/scripts/ or REPO_ROOT/examples/.
+    # Kept as the LAST probe so every manifest scenario above runs
+    # against the same pre-snapshot baseline.
     snapshot_rc = _check_repo_unchanged(
         examples_before=examples_before,
         scripts_before=scripts_before,
     )
     results.append(_ProbeResult(
-        "T19 snapshot: REPO_ROOT/scripts/ + REPO_ROOT/examples/ "
+        "T64 snapshot: REPO_ROOT/scripts/ + REPO_ROOT/examples/ "
         "byte-identical before and after self-test",
         snapshot_rc == 0,
     ))
@@ -1966,20 +4691,45 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--manifest", type=str, default=None,
+        help=(
+            "Optional caller-supplied local JSON file naming per-image "
+            "slide intent (order, slide_title, alt_text, intended_use). "
+            "When omitted, the helper preserves its deterministic "
+            "filename-sort order and built-in default strings. When "
+            "supplied, the file must be a regular non-symlink local "
+            "file with no symlink ancestor (closed system aliases "
+            "still allowed), must declare schema_version='1', and must "
+            "cover every discovered image exactly once by basename in "
+            "slide order. Each entry must carry exactly the four "
+            "fields filename / slide_title / alt_text / intended_use; "
+            "URL/URI/path-shaped strings, credentials, public "
+            "upload/share/hosting wording, raw-source / confidential / "
+            "customer markers, and positive success claims for the "
+            "upstream services this lane does NOT call (D-One, MCP, "
+            "Qoder, model API, image search, network, telemetry) are "
+            "refused before any subprocess fires."
+        ),
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios (happy path + "
             "every documented fail-closed probe). Mutually exclusive "
-            "with --images-dir / --out-dir."
+            "with --images-dir / --out-dir / --manifest."
         ),
     )
     args = parser.parse_args(argv)
 
     if args.self_test:
-        if args.images_dir is not None or args.out_dir is not None:
+        if (
+            args.images_dir is not None
+            or args.out_dir is not None
+            or args.manifest is not None
+        ):
             print(
                 "FAIL: --self-test does not take --images-dir / "
-                "--out-dir.",
+                "--out-dir / --manifest.",
                 file=sys.stderr,
             )
             return 2
@@ -2003,6 +4753,7 @@ def main(argv: list[str]) -> int:
     return _run_operator_mode(
         images_dir_str=args.images_dir,
         out_dir_str=args.out_dir,
+        manifest_path_str=args.manifest,
     )
 
 
