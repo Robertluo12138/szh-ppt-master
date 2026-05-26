@@ -1,16 +1,35 @@
 #!/usr/bin/env python3
 """core_image_to_editable_ppt_demo.py
 
-Tempdir-only, stdlib-only **one-command demo smoke** that proves the
-current core image-to-editable-PPT loop end-to-end on local / mock /
-synthetic inputs. This is a milestone proof — one ``--self-test``
-invocation drives the existing mixed-lane mock pipeline once, runs the
-existing validators (``validate_pptx_contract``,
+Stdlib-only **one-command demo** for the core image-to-editable-PPT
+loop on local / mock / synthetic inputs. Two modes share the same
+underlying happy path:
+
+  * ``--self-test`` — drives the demo entirely under a per-run
+    ``tempfile.TemporaryDirectory()`` (no caller-visible artifacts
+    retained), runs the documented fail-closed probes, and asserts the
+    committed tree under REPO_ROOT is byte-identical before and after.
+    The self-test exercises the operator-mode pathway from inside the
+    outer tempdir, so both modes share one code path.
+
+  * ``--out-dir DIR`` — **operator mode**: drives the same happy path
+    into a caller-supplied directory that lives **outside the repo
+    tree**, leaving the produced ``.pptx``, the runner-written report
+    artifacts (``inventory.json`` / ``mock_d_one_adapter_plan.json``),
+    the demo's per-run inventory snapshot, the sanitized handoff
+    record, and the concise ``demo_summary.json`` on disk for a
+    reviewer to inspect. The operator-mode arg gate refuses URI-shaped
+    paths, symlink ``--out-dir`` or any symlink ancestor, paths under
+    REPO_ROOT, paths whose parent does not exist, paths that are not a
+    directory, and pre-existing non-empty directories (overwrite
+    risk); refusals are reported with a per-failure diagnostic and
+    rc=2 before any subprocess fires.
+
+Either mode drives the existing mixed-lane mock pipeline once, runs
+the existing validators (``validate_pptx_contract``,
 ``inspect_pptx_inventory``,
-``validate_mixed_image_asset_provenance``), derives a concise demo
-summary describing the product truth, writes every output under a
-single ``tempfile.TemporaryDirectory()`` outside the committed repo
-tree, and asserts the documented invariants.
+``validate_mixed_image_asset_provenance``), and derives the same
+concise demo summary describing the product truth.
 
 The demo does NOT introduce a new schema, a new validator, or a new
 runtime contract. It reuses the existing helpers verbatim:
@@ -26,12 +45,20 @@ runtime contract. It reuses the existing helpers verbatim:
     ``_snapshot_committed_tree`` (no-repo-mutation gate, same broad
     surface the aggregate quality gate already protects).
 
-Demo summary (written to ``<tempdir>/demo_summary.json``):
+Demo summary (written to ``<run-root>/demo_summary.json`` — the
+per-run tempdir in ``--self-test`` mode, the operator's ``--out-dir``
+in operator mode):
 
   * ``slide_count`` — read from the produced PPTX inventory readback.
-  * ``pptx_path`` — absolute path inside the tempdir (no committed
-    artifact).
-  * ``report_dir`` — absolute path inside the tempdir.
+  * ``pptx_path`` — absolute path inside the run root (tempdir in
+    self-test, ``--out-dir`` in operator mode); never under REPO_ROOT.
+  * ``report_dir`` — absolute path inside the run root.
+  * ``explicit_boundaries`` — a fixed list of negation-pinned sentences
+    naming what this demo does NOT do: no real D-One, no MCP, no
+    Qoder, no model API, no image search, no public network access,
+    no telemetry, no raw prompt-or-report-to-PPT automation. The
+    truth-checker enforces the canonical list verbatim so a future
+    drift in the wording (or a deletion) is refused.
   * ``embedded_media_count`` — number of ``ppt/media/*.{png,jpg,jpeg}``
     parts the produced PPTX carries; must be >= 2 (one per image lane).
   * ``editable_text_evidence`` / ``not_all_image_evidence`` /
@@ -98,7 +125,8 @@ subprocess on the produced PPTX):
 
 Fail-closed probes (direct, no pipeline re-run — every probe takes a
 clone of the happy-path baseline, mutates one field, and asserts the
-truth-checker / output-gate refuses):
+truth-checker / output-gate refuses; the operator-mode-specific
+probes (OP*) exercise ``_validate_out_dir_arg`` directly):
 
   P1   ``_validate_summary_output_path`` refuses every path that
        lexically anchors under REPO_ROOT (the committed repo tree is
@@ -137,6 +165,24 @@ truth-checker / output-gate refuses):
        after the run (defense-in-depth alongside H7 — the snapshot
        fires after every probe ran, so a probe that secretly leaked
        under REPO_ROOT shows up here).
+  OP1  ``_validate_out_dir_arg`` refuses every URI-shaped argument
+       (``file://``, ``http://``, ``data:``, ``ftp://``, ...) before
+       any filesystem touch — the operator mode accepts local paths
+       only;
+  OP2  ``_validate_out_dir_arg`` refuses an ``--out-dir`` that is
+       itself a symlink (broken or resolvable) — silently following
+       a symlink would let an attacker who controls the symlink
+       target redirect demo outputs into an unexpected location;
+  OP3  ``_validate_out_dir_arg`` refuses an ``--out-dir`` whose parent
+       (or any ancestor up to filesystem root) is a symlink — same
+       attack surface as OP2 one level up;
+  OP4  ``_validate_out_dir_arg`` refuses any ``--out-dir`` whose
+       resolved path lexically anchors under REPO_ROOT (the committed
+       tree is off-limits for demo outputs); the gate refuses BEFORE
+       any mkdir, so the refused path is NEVER created;
+  OP5  ``_validate_out_dir_arg`` refuses a pre-existing non-empty
+       ``--out-dir`` (overwrite risk; the operator must opt in to a
+       fresh path) AND leaves the pre-existing bytes byte-identical.
 
 Clean-room: this demo shares no prompts, assets, examples, tables,
 CSV rows, wording, code, or deck structure with any upstream
@@ -154,6 +200,12 @@ demo summary is local audit evidence about that synthetic mock
 chain, not a claim that any external service ran or succeeded.
 
 Usage:
+  # Operator mode — inspectable artifacts under DIR (DIR must be
+  # outside the repo, non-URI, non-symlink, with no symlink ancestors,
+  # and either nonexistent or an empty pre-existing directory):
+  python3 scripts/core_image_to_editable_ppt_demo.py --out-dir DIR
+
+  # Self-test — happy path + probes under a per-run tempdir:
   python3 scripts/core_image_to_editable_ppt_demo.py --self-test
 
 Stdlib only. NETWORK-FREE. NO real D-One. NO MCP. NO Qoder. NO model
@@ -233,6 +285,25 @@ _DEMO_EMBED_SURFACE_NOTE = (
     "PNG, JPG, and JPEG inside the ppt/media slot of the produced "
     "deck. The subset scripts/export_pptx.py supports today; anything "
     "outside that subset is fail-closed by the exporter."
+)
+
+# Negation-pinned operator-facing boundary statements the demo summary
+# carries verbatim. Each line is shaped so the positive-claim refusal
+# walker sees a negation token (``no ``, ``not ``, ``never ``, …) in
+# the 15-character window before every flagged noun (``real d-one`` /
+# ``mcp`` / ``qoder`` / ``model api`` / ``image search`` /
+# ``public network``). Locked tuple — the truth-checker enforces
+# byte-equality so a future drift in the wording surfaces as a
+# refusal rather than as a quiet broadening of the demo's promise.
+_EXPLICIT_BOUNDARIES: tuple[str, ...] = (
+    "No real D-One call; image generation status is UNVERIFIED.",
+    "No MCP call.",
+    "No Qoder runtime invocation.",
+    "No model API contact.",
+    "No image search.",
+    "No public network access.",
+    "No telemetry emission.",
+    "Raw prompt or report-to-PPT automation is NOT implemented.",
 )
 
 # Word-boundary refusal walker. Any positive real-D-One / MCP / public
@@ -489,6 +560,7 @@ def _build_summary(
             "scope": _DEMO_SCOPE_NOTE,
             "embed_surface": _DEMO_EMBED_SURFACE_NOTE,
         },
+        "explicit_boundaries": list(_EXPLICIT_BOUNDARIES),
     }
 
 
@@ -675,6 +747,16 @@ def _check_summary_truth(summary: dict) -> list[str]:
                 f"summary.validators.{k}.rc={rc!r}; expected 0"
             )
 
+    boundaries = summary.get("explicit_boundaries")
+    if boundaries != list(_EXPLICIT_BOUNDARIES):
+        failures.append(
+            f"summary.explicit_boundaries={boundaries!r}; expected "
+            f"the locked tuple {list(_EXPLICIT_BOUNDARIES)!r} verbatim "
+            f"(any drift in the operator-facing boundary statements "
+            f"is refused so a quiet broadening of the demo's promise "
+            f"is impossible)"
+        )
+
     failures.extend(_scan_for_positive_real_d_one_claim(summary))
     return failures
 
@@ -818,6 +900,183 @@ def _write_demo_summary_under_tempdir(
         )
         return failures
     return []
+
+
+# ---------------------------------------------------------------------------
+# Operator-mode --out-dir argument gate.
+# ---------------------------------------------------------------------------
+
+
+def _validate_out_dir_arg(out_dir_str: str) -> tuple[Path | None, list[str]]:
+    """Validate an operator-supplied ``--out-dir`` argument string.
+
+    Returns ``(resolved_path_or_None, failures)``. The caller must
+    treat the argument as refused whenever ``failures`` is non-empty
+    OR ``resolved_path_or_None`` is ``None``, and MUST NOT mkdir /
+    write to the path in that case.
+
+    Refuses, in order, BEFORE any filesystem mutation:
+      * URI-shaped argument (``file://`` / ``http://`` / ``data:`` /
+        any RFC-3986 scheme prefix). The operator mode accepts local
+        paths only.
+      * ``out-dir`` is itself a symlink (broken or resolvable).
+        Silently following a symlink would let an attacker who
+        controls the link target redirect demo outputs into an
+        unexpected location.
+      * any ancestor of ``out-dir`` up to the filesystem root is a
+        symlink. Same attack surface one level up — the gate would
+        not see a symlink-on-write if the redirect is higher up.
+      * resolved ``out-dir`` lexically anchors under REPO_ROOT. The
+        committed tree is off-limits for demo outputs; the snapshot
+        check would catch a leak but the cheaper refusal here makes
+        the contract obvious at the API layer.
+      * ``out-dir`` parent does not exist. Refusing to ``mkdir -p``
+        avoids masking a typo in the operator's argument.
+      * ``out-dir`` exists and is not a directory (regular file,
+        device, FIFO, …). Refused outright.
+      * ``out-dir`` exists, is a directory, and is non-empty.
+        Overwrite risk — the operator must opt in to a fresh path.
+    """
+    failures: list[str] = []
+
+    if _URI_SCHEME_PREFIX.match(out_dir_str):
+        return None, [
+            f"--out-dir argument {out_dir_str!r} looks URI-shaped; "
+            f"operator mode only accepts local file paths."
+        ]
+
+    out_dir = Path(out_dir_str)
+
+    if out_dir.is_symlink():
+        try:
+            tgt = os.readlink(out_dir)
+        except OSError:
+            tgt = "<unreadable>"
+        return None, [
+            f"--out-dir {out_dir} is a symlink (-> {tgt}); refused so "
+            f"a symlink target cannot redirect demo outputs."
+        ]
+
+    # Walk ancestors of out_dir, checking each for a symlink. Stop at
+    # the first existing real (non-symlink) directory — the operator's
+    # typed path components above that point are an OS-level concern
+    # the operator already trusts (e.g. /tmp -> /private/tmp on macOS,
+    # which would otherwise false-positive without weakening any
+    # operator-namespace attack surface).
+    ancestor = out_dir.parent
+    while True:
+        if ancestor.is_symlink():
+            try:
+                tgt = os.readlink(ancestor)
+            except OSError:
+                tgt = "<unreadable>"
+            return None, [
+                f"--out-dir {out_dir} has a symlink ancestor "
+                f"{ancestor} (-> {tgt}); refused so a symlink in the "
+                f"operator's typed path cannot redirect demo outputs."
+            ]
+        if ancestor.exists() and ancestor.is_dir():
+            break
+        if ancestor.parent == ancestor:
+            break
+        ancestor = ancestor.parent
+
+    try:
+        resolved = out_dir.resolve(strict=False)
+    except OSError as exc:
+        return None, [
+            f"--out-dir {out_dir} could not be resolved: "
+            f"{type(exc).__name__}: {exc}"
+        ]
+
+    repo_root = REPO_ROOT.resolve(strict=False)
+    try:
+        resolved.relative_to(repo_root)
+        return None, [
+            f"--out-dir {resolved} lexically anchors under "
+            f"REPO_ROOT={repo_root}; refused — demo outputs must "
+            f"land outside the committed repo tree."
+        ]
+    except ValueError:
+        pass
+
+    if not out_dir.parent.exists():
+        return None, [
+            f"--out-dir {out_dir} parent {out_dir.parent} does not "
+            f"exist; create the parent explicitly before re-running "
+            f"so a typo in the path cannot be masked by an implicit "
+            f"mkdir -p."
+        ]
+
+    if out_dir.exists():
+        if not out_dir.is_dir():
+            return None, [
+                f"--out-dir {out_dir} exists and is not a directory "
+                f"(refusing to write under a regular file / device / "
+                f"FIFO / etc.)."
+            ]
+        try:
+            existing = list(out_dir.iterdir())
+        except OSError as exc:
+            return None, [
+                f"--out-dir {out_dir} cannot be listed: "
+                f"{type(exc).__name__}: {exc}"
+            ]
+        if existing:
+            return None, [
+                f"--out-dir {out_dir} exists and is non-empty "
+                f"({len(existing)} entr"
+                f"{'y' if len(existing) == 1 else 'ies'}); refused to "
+                f"avoid overwriting pre-existing artifacts. Pass a "
+                f"fresh path."
+            ]
+
+    return out_dir, failures
+
+
+def _run_operator_mode(out_dir: Path) -> int:
+    """Run the happy path into the operator-supplied ``--out-dir``.
+
+    The caller MUST have already passed ``out_dir`` through
+    ``_validate_out_dir_arg``; this function trusts the gate.
+
+    Creates the directory if it does not exist (strict, non-recursive
+    — the validator already confirmed the parent exists), then drives
+    the same ``_run_happy_path`` the self-test uses. Leaves all
+    artifacts on disk for a reviewer to inspect; does NOT scrub them
+    on failure (the operator asked for a directory of artifacts, so
+    partial outputs on failure are inspectable too).
+    """
+    if not out_dir.exists():
+        try:
+            out_dir.mkdir(parents=False, exist_ok=False)
+        except OSError as exc:
+            print(
+                f"FAIL: cannot create --out-dir {out_dir}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+    print(
+        f"=== core_image_to_editable_ppt_demo "
+        f"(--out-dir {out_dir}) ==="
+    )
+    happy_rc, summary, summary_path = _run_happy_path(out_dir)
+    if happy_rc != 0 or summary is None or summary_path is None:
+        print(
+            f"FAIL (operator mode): happy path did not complete; "
+            f"inspect {out_dir} for partial artifacts.",
+            file=sys.stderr,
+        )
+        return 1
+    print()
+    print(
+        f"OK (operator mode): inspectable artifacts under {out_dir}. "
+        f"Real D-One UNVERIFIED. No public network, no MCP, no "
+        f"Qoder, no model API, no image search, no telemetry. Raw "
+        f"prompt or report-to-PPT automation NOT implemented."
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1243,6 +1502,169 @@ def _probe_real_d_one_claim_refused(
     return _ProbeOutcome(name, True)
 
 
+def _probe_out_dir_uri_refused() -> _ProbeOutcome:
+    """OP1 — every URI-shaped argument is refused before any
+    filesystem touch."""
+    name = "OP1 URI-shaped --out-dir argument refused"
+    for cand in (
+        "file:///tmp/should-not-be-followed",
+        "http://example.invalid/out",
+        "data:text/plain;base64,QUJD",
+        "ftp://host.invalid/out",
+        "custom-scheme:foo",
+    ):
+        validated, failures = _validate_out_dir_arg(cand)
+        if validated is not None or not failures:
+            return _ProbeOutcome(
+                name, False,
+                f"expected refusal for URI-shaped --out-dir {cand!r}; "
+                f"got validated={validated!r}, failures={failures!r}",
+            )
+    return _ProbeOutcome(name, True)
+
+
+def _probe_out_dir_symlink_refused(td: Path) -> _ProbeOutcome:
+    """OP2 — an ``--out-dir`` that is itself a symlink is refused
+    even when the link target is a writable empty directory."""
+    name = "OP2 symlink --out-dir refused"
+    real_target = td / "op2_real_target"
+    try:
+        real_target.mkdir()
+    except OSError as exc:
+        return _ProbeOutcome(
+            name, False,
+            f"cannot create probe target: {type(exc).__name__}: {exc}",
+        )
+    link = td / "op2_symlink_out"
+    try:
+        os.symlink(real_target, link)
+    except (OSError, NotImplementedError) as exc:
+        return _ProbeOutcome(
+            name, False,
+            f"cannot create probe symlink: {type(exc).__name__}: {exc}",
+        )
+    validated, failures = _validate_out_dir_arg(str(link))
+    if validated is not None or not failures:
+        return _ProbeOutcome(
+            name, False,
+            f"expected refusal for symlink --out-dir {link}; got "
+            f"validated={validated!r}, failures={failures!r}",
+        )
+    return _ProbeOutcome(name, True)
+
+
+def _probe_out_dir_symlink_ancestor_refused(td: Path) -> _ProbeOutcome:
+    """OP3 — an ``--out-dir`` whose parent is a symlink is refused
+    even when the leaf path does not exist yet."""
+    name = "OP3 symlink ancestor of --out-dir refused"
+    real_parent = td / "op3_real_parent"
+    try:
+        real_parent.mkdir()
+    except OSError as exc:
+        return _ProbeOutcome(
+            name, False,
+            f"cannot create probe target: {type(exc).__name__}: {exc}",
+        )
+    link_parent = td / "op3_symlink_parent"
+    try:
+        os.symlink(real_parent, link_parent)
+    except (OSError, NotImplementedError) as exc:
+        return _ProbeOutcome(
+            name, False,
+            f"cannot create probe symlink: {type(exc).__name__}: {exc}",
+        )
+    leaf = link_parent / "op3_child_out"
+    # Sanity: the leaf must NOT pre-exist (we want the symlink-
+    # ancestor refusal, not a pre-existing-leaf refusal).
+    if leaf.exists() or leaf.is_symlink():
+        return _ProbeOutcome(
+            name, False,
+            f"probe pre-condition violated: {leaf} already exists",
+        )
+    validated, failures = _validate_out_dir_arg(str(leaf))
+    if validated is not None or not failures:
+        return _ProbeOutcome(
+            name, False,
+            f"expected refusal for symlink-ancestor --out-dir {leaf}; "
+            f"got validated={validated!r}, failures={failures!r}",
+        )
+    return _ProbeOutcome(name, True)
+
+
+def _probe_out_dir_under_repo_refused() -> _ProbeOutcome:
+    """OP4 — any path that resolves under REPO_ROOT is refused
+    BEFORE any mkdir, so the refused path is never created on disk."""
+    name = "OP4 --out-dir under REPO_ROOT refused"
+    for cand in (
+        REPO_ROOT / "should_not_land_here_op4",
+        REPO_ROOT / "scripts" / "should_not_land_here_op4",
+        REPO_ROOT / "examples" / "should_not_land_here_op4",
+    ):
+        # Pre-condition: never run against a pre-existing path under
+        # the repo (the probe must not destroy operator state).
+        if cand.exists() or cand.is_symlink():
+            return _ProbeOutcome(
+                name, False,
+                f"probe pre-condition violated: {cand} already exists; "
+                f"the probe refuses to run rather than touch a pre-"
+                f"existing repo path",
+            )
+        validated, failures = _validate_out_dir_arg(str(cand))
+        if validated is not None or not failures:
+            return _ProbeOutcome(
+                name, False,
+                f"expected refusal for repo-contained --out-dir {cand}; "
+                f"got validated={validated!r}, failures={failures!r}",
+            )
+        if cand.exists() or cand.is_symlink():
+            return _ProbeOutcome(
+                name, False,
+                f"refusal returned but {cand} now exists or is a "
+                f"symlink — the gate must refuse BEFORE any mkdir",
+            )
+    return _ProbeOutcome(name, True)
+
+
+def _probe_out_dir_non_empty_refused(td: Path) -> _ProbeOutcome:
+    """OP5 — a pre-existing non-empty ``--out-dir`` is refused AND
+    the pre-existing bytes are left byte-identical."""
+    name = "OP5 pre-existing non-empty --out-dir refused"
+    cand = td / "op5_non_empty_out"
+    try:
+        cand.mkdir()
+    except OSError as exc:
+        return _ProbeOutcome(
+            name, False,
+            f"cannot create probe target: {type(exc).__name__}: {exc}",
+        )
+    leftover_path = cand / "prior_run_marker.txt"
+    leftover_bytes = b"pre-existing operator bytes - must not be touched\n"
+    leftover_path.write_bytes(leftover_bytes)
+
+    validated, failures = _validate_out_dir_arg(str(cand))
+    if validated is not None or not failures:
+        return _ProbeOutcome(
+            name, False,
+            f"expected refusal for non-empty --out-dir {cand}; got "
+            f"validated={validated!r}, failures={failures!r}",
+        )
+    # Sanity: the leftover bytes must be untouched.
+    if not leftover_path.is_file():
+        return _ProbeOutcome(
+            name, False,
+            f"refusal returned but {leftover_path} was removed — the "
+            f"gate must refuse without touching pre-existing bytes",
+        )
+    if leftover_path.read_bytes() != leftover_bytes:
+        return _ProbeOutcome(
+            name, False,
+            f"refusal returned but {leftover_path} bytes were mutated "
+            f"— the gate must refuse without touching pre-existing "
+            f"bytes",
+        )
+    return _ProbeOutcome(name, True)
+
+
 def _run_probes(td: Path, baseline: dict) -> int:
     fails = 0
     print()
@@ -1257,6 +1679,11 @@ def _run_probes(td: Path, baseline: dict) -> int:
         _probe_missing_d_one_lane_fails(baseline=baseline),
         _probe_missing_local_asset_lane_fails(baseline=baseline),
         _probe_real_d_one_claim_refused(baseline=baseline),
+        _probe_out_dir_uri_refused(),
+        _probe_out_dir_symlink_refused(td),
+        _probe_out_dir_symlink_ancestor_refused(td),
+        _probe_out_dir_under_repo_refused(),
+        _probe_out_dir_non_empty_refused(td),
     ]
     for p in probes:
         mark = "PASS" if p.ok else "FAIL"
@@ -1291,13 +1718,54 @@ def _run_self_test() -> int:
     rc = 0
     with tempfile.TemporaryDirectory(
         prefix="szh_core_image_to_editable_ppt_demo_",
-    ) as raw_td:
-        td = Path(raw_td)
-        happy_rc, baseline, _summary_path = _run_happy_path(td)
-        if happy_rc != 0 or baseline is None:
+    ) as raw_outer:
+        outer = Path(raw_outer)
+
+        # Exercise the operator-mode pathway from inside the outer
+        # tempdir so --self-test and --out-dir share one code path.
+        # The leaf path does NOT pre-exist — _run_operator_mode mkdirs
+        # it via the strict, non-recursive mkdir the validator allows.
+        operator_out = outer / "operator_out"
+        validated, op_failures = _validate_out_dir_arg(str(operator_out))
+        if validated is None or op_failures:
+            print(
+                f"FAIL: self-test --out-dir gate refused the inner "
+                f"operator path ({len(op_failures)} failure(s)):",
+                file=sys.stderr,
+            )
+            for f in op_failures:
+                print(f"  - {f}", file=sys.stderr)
             rc = 1
+            baseline: dict | None = None
         else:
-            probe_fails = _run_probes(td, baseline)
+            operator_rc = _run_operator_mode(validated)
+            if operator_rc != 0:
+                rc = 1
+                baseline = None
+            else:
+                summary_path = validated / "demo_summary.json"
+                try:
+                    baseline = json.loads(
+                        summary_path.read_text(encoding="utf-8"),
+                    )
+                except (OSError, json.JSONDecodeError) as exc:
+                    print(
+                        f"FAIL: cannot re-read operator-mode "
+                        f"demo_summary.json at {summary_path}: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    rc = 1
+                    baseline = None
+
+        if rc == 0 and baseline is not None:
+            # Run the fail-closed probes against the just-produced
+            # baseline summary, using a fresh scratch tempdir inside
+            # the outer tempdir so probe-planted files do not collide
+            # with operator-mode artifacts.
+            probes_scratch = outer / "probes_scratch"
+            probes_scratch.mkdir()
+            probe_fails = _run_probes(probes_scratch, baseline)
             if probe_fails:
                 rc = 1
 
@@ -1317,10 +1785,11 @@ def _run_self_test() -> int:
     if rc == 0:
         print()
         print(
-            "OK (core image-to-editable-PPT demo): happy path + every "
-            "fail-closed probe passed; nothing under REPO_ROOT "
-            "mutated. Real D-One remains UNVERIFIED — one local/mock "
-            "command proves image-to-editable-PPT demo readiness."
+            "OK (core image-to-editable-PPT demo): operator-mode "
+            "happy path + every fail-closed probe passed; nothing "
+            "under REPO_ROOT mutated. Real D-One remains UNVERIFIED "
+            "— one local/mock command proves image-to-editable-PPT "
+            "demo readiness."
         )
     return rc
 
@@ -1328,30 +1797,56 @@ def _run_self_test() -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "One-command demo smoke proving the local/mock image-to-"
-            "editable-PPT loop end-to-end. Drives the existing mixed-"
-            "lane mock pipeline + validators once under a per-run "
-            "tempdir, derives a concise demo summary JSON, asserts "
-            "the documented invariants, and runs the documented fail-"
-            "closed probes. Stdlib-only. NETWORK-FREE. NO real D-One. "
+            "One-command demo for the local/mock image-to-editable-"
+            "PPT loop. Drives the existing mixed-lane mock pipeline "
+            "+ validators once, derives a concise demo summary JSON, "
+            "and asserts the documented invariants. Two modes share "
+            "one happy path: --self-test (per-run tempdir + fail-"
+            "closed probes) or --out-dir DIR (operator mode; "
+            "inspectable artifacts retained under DIR outside the "
+            "repo tree). Stdlib-only. NETWORK-FREE. NO real D-One. "
             "NO MCP. NO Qoder. NO model API. NO image search. NO "
-            "telemetry. Self-test surface only today."
+            "telemetry."
         ),
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
         "--self-test", action="store_true",
         help=(
-            "Required: run the happy path + every fail-closed probe."
+            "Self-test mode: drive the happy path through a per-run "
+            "tempdir (no caller-visible artifacts retained), then "
+            "run the fail-closed probes including the operator-mode "
+            "--out-dir argument-gate probes (OP1..OP5)."
+        ),
+    )
+    mode.add_argument(
+        "--out-dir", dest="out_dir", default=None, metavar="DIR",
+        help=(
+            "Operator mode: write the produced .pptx, the runner-"
+            "written report/inventory/sidecar artifacts, the demo's "
+            "per-run inventory snapshot, the sanitized handoff "
+            "record, and demo_summary.json under DIR. DIR must be "
+            "outside the repo tree, non-URI, non-symlink (with no "
+            "symlink ancestors), parent must exist, and DIR must be "
+            "either nonexistent (will be created) or an empty pre-"
+            "existing directory."
         ),
     )
     args = parser.parse_args(argv)
-    if not args.self_test:
-        print(
-            "FAIL: core_image_to_editable_ppt_demo.py requires "
-            "--self-test (no production CLI surface exists today).",
-            file=sys.stderr,
-        )
-        return 2
+
+    if args.out_dir is not None:
+        validated, failures = _validate_out_dir_arg(args.out_dir)
+        if validated is None or failures:
+            print(
+                f"FAIL: --out-dir refused ({len(failures)} "
+                f"failure(s)):",
+                file=sys.stderr,
+            )
+            for f in failures:
+                print(f"  - {f}", file=sys.stderr)
+            return 2
+        return _run_operator_mode(validated)
+
     return _run_self_test()
 
 

@@ -423,27 +423,43 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     ran (catches a probe that secretly mutated the shared
     baseline). MOCK / STUB ONLY — no real D-One.
   - ``scripts/core_image_to_editable_ppt_demo.py`` — milestone
-    proof one-command demo smoke that drives the existing mixed-
-    lane mock pipeline once into a tempdir, runs the existing
-    validators (``validate_pptx_contract`` +
-    ``inspect_pptx_inventory`` +
-    ``validate_mixed_image_asset_provenance``), derives a concise
-    demo summary JSON describing the product truth (slide_count,
-    PPTX path, report dir, embedded media count, editable / native
-    shape / no-external-relationship evidence, source_class
-    coverage = {d_one_local, local_asset}, generated_intent
-    coverage on d_one_local, no generated_intent on local_asset,
-    real_d_one_status = UNVERIFIED, validator rc values), writes
-    every output under the tempdir, and runs seven direct fail-
-    closed probes (repo-output refused without ever calling
-    unlink() on a repo path, _safe_unlink_under_tempdir no-ops on
-    a REPO_ROOT path even with a tempdir root supplied, no stale
-    summary after failure, zero embedded media refused, missing
-    one image lane refused on either side, positive real-D-One /
-    MCP / network / model / image-search / Qoder success claim
-    refused) — proves
-    one local/mock command demonstrates image-to-editable-PPT
-    demo readiness. MOCK / STUB ONLY — no real D-One.
+    one-command demo with two modes that share one happy path:
+    ``--out-dir DIR`` (operator mode — drives the same chain into
+    a caller-supplied directory outside the repo and leaves
+    inspectable artifacts on disk) AND ``--self-test`` (per-run
+    tempdir + every fail-closed probe; the aggregator invokes
+    this mode). Drives the existing mixed-lane mock pipeline
+    once into the run root, runs the existing validators
+    (``validate_pptx_contract`` + ``inspect_pptx_inventory`` +
+    ``validate_mixed_image_asset_provenance``), and derives a
+    concise demo summary JSON describing the product truth
+    (slide_count, PPTX path, report dir, embedded media count,
+    editable / native shape / no-external-relationship evidence,
+    source_class coverage = {d_one_local, local_asset},
+    generated_intent coverage on d_one_local, no
+    generated_intent on local_asset, real_d_one_status =
+    UNVERIFIED, validator rc values, AND a locked
+    ``explicit_boundaries`` list naming the lanes this demo does
+    NOT touch — real D-One, MCP, Qoder, model API, image search,
+    public network, telemetry, raw prompt-or-report-to-PPT
+    automation). Runs twelve direct fail-closed probes: the
+    seven existing checks (repo-output refused without ever
+    calling unlink() on a repo path; the
+    ``_safe_unlink_under_tempdir`` helper no-ops on a REPO_ROOT
+    path even with a tempdir root supplied; no stale summary
+    after a failed run; zero embedded media refused; missing one
+    image lane refused on either side; positive real-D-One / MCP
+    / network / model / image-search / Qoder success claim
+    refused) PLUS five operator-mode argument-gate probes that
+    exercise ``_validate_out_dir_arg`` directly: OP1 URI-shaped
+    ``--out-dir`` refused; OP2 symlink ``--out-dir`` refused; OP3
+    symlink ancestor of ``--out-dir`` refused; OP4 ``--out-dir``
+    under REPO_ROOT refused BEFORE any mkdir; OP5 pre-existing
+    non-empty ``--out-dir`` refused with the pre-existing bytes
+    byte-identical. The committed-tree snapshot is delegated to
+    ``core_editable_ppt_acceptance._snapshot_committed_tree``;
+    nothing is written under the repo tree in either mode.
+    MOCK / STUB ONLY — no real D-One.
   - ``scripts/render_model_roundtrip_smoke.py`` — synthetic
     render_model -> editable .pptx round-trip exercising every
     primitive kind the exporter supports today (text, line, shape,
