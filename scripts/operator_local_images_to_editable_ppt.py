@@ -205,13 +205,30 @@ verbatim — the helper's load-bearing operator-facing output):
   * ``image_provenance`` — one entry per operator image: ``{
     "operator_filename", "asset_id", "sha256",
     "workspace_local_path", "workspace_destination_path",
-    "media_type", "byte_count", "embedded_media_parts" }``, plus
-    (only when ``--manifest`` was supplied) ``operator_slide_title``,
-    ``operator_alt_text``, ``operator_intended_use``. The
-    ``embedded_media_parts`` field is the sorted list of
-    ``ppt/media/*`` parts whose sha256 equals the operator file's
-    sha256, so a reviewer can trace each operator filename straight
-    to its embedded PPTX part.
+    "media_type", "byte_count", "embedded_media_parts",
+    "intended_slide_index", "embedded_referencing_slides",
+    "placement_verified" }``, plus (only when ``--manifest`` was
+    supplied) ``operator_slide_title``, ``operator_alt_text``,
+    ``operator_intended_use``. The ``embedded_media_parts`` field is
+    the sorted list of ``ppt/media/*`` parts whose sha256 equals the
+    operator file's sha256, so a reviewer can trace each operator
+    filename straight to its embedded PPTX part.
+    ``intended_slide_index`` is the 1-based deck position the helper
+    assigned to this operator filename (manifest array order when
+    ``--manifest`` was supplied, filename-sorted order otherwise);
+    ``embedded_referencing_slides`` is the sorted union of the
+    1-based slide indices whose ``<a:blip r:embed>`` resolves to one
+    of the operator's ``ppt/media/*`` parts according to
+    ``inspect_pptx_inventory.slides[*].media_refs[*]`` filtered to
+    entries whose ``used_by_slide_blip`` is True (deliberately
+    blip-confirmed, NOT the inventory's rels-only
+    ``media_parts[*].referencing_slides`` — a slide whose rels file
+    declares an image rel but whose ``<p:pic>`` body does not embed
+    it would false-green a placement check otherwise; this mirrors
+    the sibling ``image_placement_readback_smoke`` H4b blip-embed
+    gate); ``placement_verified`` is True iff ``intended_slide_index``
+    is in ``embedded_referencing_slides`` (the truth-checker refuses
+    on a False so a misplaced operator image fails closed).
   * ``manifest_path`` — absolute (or caller-typed) path to the
     operator manifest when ``--manifest`` was supplied; ``null``
     otherwise.
@@ -2354,12 +2371,32 @@ def _author_source_registry(
 def _provenance_for(
     *,
     image: _DiscoveredImage,
+    intended_slide_index: int,
     pptx_media_shas: dict[str, list[str]],
+    part_to_referencing_slides: dict[str, list[int]],
 ) -> dict:
     """Per-image provenance record. ``pptx_media_shas`` maps each
     operator sha256 to the sorted list of ``ppt/media/*`` parts that
     carry the same bytes; the empty list means the operator file did
     not embed (regression — the truth-checker refuses).
+    ``part_to_referencing_slides`` projects
+    ``inspect_pptx_inventory.slides[*].media_refs[*]`` (filtered to
+    entries whose ``used_by_slide_blip`` is True) onto a
+    ``{part_name: [slide_idx, ...]}`` map; the row's
+    ``embedded_referencing_slides`` is the sorted union of those slide
+    indices across the operator file's embedded media parts. The
+    inventory's rels-only ``media_parts[*].referencing_slides`` is
+    deliberately NOT used: a slide that declares an image rel without
+    a matching ``<p:pic>`` in the slide body would false-green the
+    placement check otherwise, mirroring the sibling
+    ``image_placement_readback_smoke`` H4b blip-embed gate.
+    ``intended_slide_index`` is the 1-based deck position the helper
+    assigned to this operator filename (manifest array order when
+    ``--manifest`` is supplied, filename-sorted order otherwise); it
+    must appear in ``embedded_referencing_slides`` for the row to pass
+    the truth-checker — ``placement_verified`` is the precomputed
+    boolean a reviewer can read off the JSON without redoing the set
+    membership test.
 
     The ``operator_slide_title`` / ``operator_alt_text`` /
     ``operator_intended_use`` keys are present iff the operator
@@ -2368,6 +2405,14 @@ def _provenance_for(
     string fields are checked together). When ``--manifest`` is
     omitted the keys are absent and the helper's deterministic
     defaults remain implicit (no operator-supplied override to echo)."""
+    embedded_media_parts = sorted(
+        pptx_media_shas.get(image.sha256, [])
+    )
+    ref_slides: set[int] = set()
+    for part in embedded_media_parts:
+        for slide_idx in part_to_referencing_slides.get(part, []):
+            ref_slides.add(slide_idx)
+    embedded_referencing_slides = sorted(ref_slides)
     entry = {
         "operator_filename": image.operator_filename,
         "asset_id": image.asset_id,
@@ -2380,8 +2425,11 @@ def _provenance_for(
         "workspace_destination_path": (
             f"assets/{image.asset_id}.{image.extension}"
         ),
-        "embedded_media_parts": sorted(
-            pptx_media_shas.get(image.sha256, [])
+        "embedded_media_parts": embedded_media_parts,
+        "intended_slide_index": intended_slide_index,
+        "embedded_referencing_slides": embedded_referencing_slides,
+        "placement_verified": (
+            intended_slide_index in ref_slides
         ),
     }
     if image.slide_title is not None:
@@ -2453,6 +2501,48 @@ def _count_external_relationships_from_inventory(inv: dict) -> int:
         if isinstance(tg, str) and tg.lower().startswith("file://"):
             n += 1
     return n
+
+
+def _part_to_blip_referencing_slides_from_inventory(
+    inv: dict,
+) -> dict[str, list[int]]:
+    """Project ``inspect_pptx_inventory``'s
+    ``slides[*].media_refs[*]`` onto a ``{part_name: [slide_idx, ...]}``
+    map for the per-image provenance builder, using the **blip-
+    confirmed** signal — ``used_by_slide_blip`` is True iff the slide's
+    ``<a:blip r:embed>`` actually embeds the part. We deliberately do
+    NOT use ``inv.media_parts[*].referencing_slides`` here because that
+    field counts every slide whose ``_rels/slideN.xml.rels`` declares
+    an image rel for the part, regardless of whether any ``<p:pic>``
+    on the slide body actually embeds that rId — a rel declared but
+    not used in the slide body would false-green a placement check
+    that read ``media_parts[*].referencing_slides`` only. The
+    sibling ``image_placement_readback_smoke`` closes the same gap
+    via its blip-embed walker (H4b). We use the inventory output
+    verbatim — the helper adds no new XML walker. Malformed entries
+    are skipped silently; the truth-checker refuses on empty /
+    missing referencing slides per operator filename in the consumer.
+    """
+    out: dict[str, set[int]] = {}
+    for slide in inv.get("slides") or []:
+        if not isinstance(slide, dict):
+            continue
+        idx = slide.get("index")
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            continue
+        for ref in slide.get("media_refs") or []:
+            if not isinstance(ref, dict):
+                continue
+            if ref.get("used_by_slide_blip") is not True:
+                continue
+            resolved = ref.get("resolved")
+            if (
+                not isinstance(resolved, str)
+                or not resolved.startswith("ppt/media/")
+            ):
+                continue
+            out.setdefault(resolved, set()).add(idx)
+    return {part: sorted(slides) for part, slides in out.items()}
 
 
 def _embedded_media_count_from_inventory(inv: dict) -> int:
@@ -2550,6 +2640,9 @@ def _build_summary(
     manifest_path: Path | None,
 ) -> dict:
     contract_pass = _project_contract_gates(contract.stdout or "")
+    part_to_referencing_slides = (
+        _part_to_blip_referencing_slides_from_inventory(inventory)
+    )
     return {
         "schema_version": "1",
         "helper_id": "operator_local_images_to_editable_ppt",
@@ -2585,8 +2678,13 @@ def _build_summary(
             == 0
         ),
         "image_provenance": [
-            _provenance_for(image=img, pptx_media_shas=pptx_media_shas)
-            for img in images
+            _provenance_for(
+                image=img,
+                intended_slide_index=idx,
+                pptx_media_shas=pptx_media_shas,
+                part_to_referencing_slides=part_to_referencing_slides,
+            )
+            for idx, img in enumerate(images, start=1)
         ],
         "pptx_path": str(pptx_path),
         "workspace_path": str(workspace),
@@ -2762,6 +2860,65 @@ def _check_summary_truth(summary: dict) -> list[str]:
                     f"least one ppt/media/* part whose sha256 equals "
                     f"the operator file's sha256 (the bytes must have "
                     f"reached the PPTX)"
+                )
+            intended = entry.get("intended_slide_index")
+            intended_valid = (
+                isinstance(intended, int)
+                and not isinstance(intended, bool)
+                and intended >= 1
+            )
+            if not intended_valid:
+                failures.append(
+                    f"summary.image_provenance[{i}] for "
+                    f"{entry.get('operator_filename')!r} has "
+                    f"intended_slide_index={intended!r}; expected the "
+                    f"1-based slide index the helper assigned to this "
+                    f"operator filename"
+                )
+            ref_slides = entry.get("embedded_referencing_slides")
+            ref_slides_valid = (
+                isinstance(ref_slides, list)
+                and ref_slides
+                and all(
+                    isinstance(s, int) and not isinstance(s, bool)
+                    for s in ref_slides
+                )
+            )
+            if not ref_slides_valid:
+                failures.append(
+                    f"summary.image_provenance[{i}] for "
+                    f"{entry.get('operator_filename')!r} has "
+                    f"embedded_referencing_slides={ref_slides!r}; "
+                    f"expected a non-empty list of 1-based slide "
+                    f"indices whose <a:blip r:embed> resolves to the "
+                    f"operator's ppt/media part(s) per "
+                    f"inspect_pptx_inventory.slides[*].media_refs[*] "
+                    f"with used_by_slide_blip=True (the embedded "
+                    f"ppt/media part must actually appear in some "
+                    f"slide body, not just be declared as a rel)"
+                )
+            elif intended_valid and intended not in ref_slides:
+                failures.append(
+                    f"summary.image_provenance[{i}] for "
+                    f"{entry.get('operator_filename')!r} has "
+                    f"intended_slide_index={intended!r} not in "
+                    f"embedded_referencing_slides={ref_slides!r}; the "
+                    f"operator file must embed on its intended slide"
+                )
+            placement_verified = entry.get("placement_verified")
+            expected_placement = (
+                intended_valid
+                and ref_slides_valid
+                and intended in ref_slides
+            )
+            if placement_verified is not expected_placement:
+                failures.append(
+                    f"summary.image_provenance[{i}] for "
+                    f"{entry.get('operator_filename')!r} has "
+                    f"placement_verified={placement_verified!r}; "
+                    f"expected {expected_placement!r} (must equal "
+                    f"intended_slide_index in "
+                    f"embedded_referencing_slides)"
                 )
 
     # manifest_path is required to be present in the summary record
@@ -3420,6 +3577,55 @@ def _run_self_tests() -> int:
                             f"image_provenance missing media parts: "
                             f"{prov!r}"
                         )
+                    elif (
+                        [p.get("operator_filename") for p in prov]
+                        != ["alpha_marker.png", "beta_marker.jpg"]
+                    ):
+                        ok = False
+                        detail = (
+                            f"image_provenance filenames "
+                            f"{[p.get('operator_filename') for p in prov]!r}; "
+                            f"expected filename-sorted order "
+                            f"['alpha_marker.png', 'beta_marker.jpg']"
+                        )
+                    elif (
+                        [p.get("intended_slide_index") for p in prov]
+                        != [1, 2]
+                    ):
+                        ok = False
+                        detail = (
+                            f"image_provenance intended_slide_index "
+                            f"sequence "
+                            f"{[p.get('intended_slide_index') for p in prov]!r}; "
+                            f"expected [1, 2] (filename-sorted order "
+                            f"maps to intended slides 1, 2)"
+                        )
+                    elif not all(
+                        isinstance(
+                            p.get("embedded_referencing_slides"),
+                            list,
+                        )
+                        and p["embedded_referencing_slides"]
+                        and p.get("intended_slide_index")
+                        in p["embedded_referencing_slides"]
+                        for p in prov
+                    ):
+                        ok = False
+                        detail = (
+                            f"image_provenance missing or wrong "
+                            f"embedded_referencing_slides: "
+                            f"{[(p.get('operator_filename'), p.get('intended_slide_index'), p.get('embedded_referencing_slides')) for p in prov]!r}"
+                        )
+                    elif not all(
+                        p.get("placement_verified") is True
+                        for p in prov
+                    ):
+                        ok = False
+                        detail = (
+                            f"image_provenance placement_verified not "
+                            f"True for every row: "
+                            f"{[(p.get('operator_filename'), p.get('placement_verified')) for p in prov]!r}"
+                        )
                     elif not vq_path.is_file() or vq_path.is_symlink():
                         ok = False
                         detail = (
@@ -3893,6 +4099,42 @@ def _run_self_tests() -> int:
                                 f"provenance[{i}].operator_intended_use="
                                 f"{prov[i].get('operator_intended_use')!r}; "
                                 f"expected {intent!r}"
+                            )
+                            break
+                        if prov[i].get("intended_slide_index") != i + 1:
+                            ok = False
+                            detail = (
+                                f"provenance[{i}].intended_slide_index="
+                                f"{prov[i].get('intended_slide_index')!r}; "
+                                f"expected {i + 1!r} (manifest order "
+                                f"maps to 1-based slide index)"
+                            )
+                            break
+                        refs = prov[i].get(
+                            "embedded_referencing_slides",
+                        )
+                        if (
+                            not isinstance(refs, list)
+                            or (i + 1) not in refs
+                        ):
+                            ok = False
+                            detail = (
+                                f"provenance[{i}]."
+                                f"embedded_referencing_slides={refs!r}; "
+                                f"expected non-empty list containing "
+                                f"{i + 1!r} (inventory-derived slide "
+                                f"references must cover the intended "
+                                f"slide for the manifest-reordered "
+                                f"image)"
+                            )
+                            break
+                        if prov[i].get("placement_verified") is not True:
+                            ok = False
+                            detail = (
+                                f"provenance[{i}].placement_verified="
+                                f"{prov[i].get('placement_verified')!r}; "
+                                f"expected True for the manifest-"
+                                f"reordered image"
                             )
                             break
         if not ok and not detail:
@@ -5622,6 +5864,227 @@ def _run_self_tests() -> int:
             "validators.validate_visual_quality.rc != 0 fail truth-check",
             ok, f"rc={rc}, tampered_fails={tampered_fails!r}",
         ))
+
+    # T76 happy-path provenance rows include intended_slide_index +
+    # inventory-derived embedded_referencing_slides AND every row's
+    # placement_verified is True. Locks the goal's "a reviewer can
+    # answer: which slide was the operator file intended for, and which
+    # slide(s) reference the embedded ppt/media part(s)" assertion for
+    # the no-manifest filename-sorted path; T19 covers the manifest-
+    # reorder path. Cheap to re-run inside its own tempdir so a
+    # regression in either projection (intended index or inventory
+    # referencing slides) fires on the smallest possible probe.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T76-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        _write_synthetic_images(images_dir)
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+        )
+        ok = rc == 0
+        detail = ""
+        if ok:
+            try:
+                summary = json.loads(
+                    (out_dir / "summary.json").read_text(),
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"cannot parse summary.json: {exc}"
+            else:
+                prov = summary.get("image_provenance") or []
+                if [
+                    p.get("operator_filename") for p in prov
+                ] != ["alpha_marker.png", "beta_marker.jpg"]:
+                    ok = False
+                    detail = (
+                        f"filename-sorted order broke: "
+                        f"{[p.get('operator_filename') for p in prov]!r}"
+                    )
+                elif [
+                    p.get("intended_slide_index") for p in prov
+                ] != [1, 2]:
+                    ok = False
+                    detail = (
+                        f"intended_slide_index sequence "
+                        f"{[p.get('intended_slide_index') for p in prov]!r}; "
+                        f"expected [1, 2]"
+                    )
+                else:
+                    for i, p in enumerate(prov):
+                        refs = p.get("embedded_referencing_slides")
+                        if (
+                            not isinstance(refs, list)
+                            or (i + 1) not in refs
+                            or p.get("placement_verified") is not True
+                        ):
+                            ok = False
+                            detail = (
+                                f"row {i} "
+                                f"intended_slide_index={p.get('intended_slide_index')!r} "
+                                f"embedded_referencing_slides={refs!r} "
+                                f"placement_verified="
+                                f"{p.get('placement_verified')!r}"
+                            )
+                            break
+        results.append(_ProbeResult(
+            "T76 happy-path provenance rows include intended_slide_index "
+            "+ inventory-derived embedded_referencing_slides; "
+            "placement_verified is True for every operator filename in "
+            "filename-sorted order",
+            ok, detail,
+        ))
+
+    # T77 truth-check refuses a tampered summary whose
+    # image_provenance[i].intended_slide_index is not in
+    # embedded_referencing_slides — proves the operator-image-on-
+    # intended-slide gate routes through the existing summary truth-
+    # check path (the goal's "fail closed through the existing summary
+    # truth-check"). Built from a real happy-path summary so every other
+    # field stays valid; only the provenance row's intended index is
+    # rotated out of its reference set.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T77-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        _write_synthetic_images(images_dir)
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+        )
+        good_fails: list[str] = []
+        tampered_fails: list[str] = []
+        if rc == 0:
+            summary = json.loads(
+                (out_dir / "summary.json").read_text(encoding="utf-8"),
+            )
+            good_fails = _check_summary_truth(summary)
+            tampered = json.loads(json.dumps(summary))  # deep copy
+            row = tampered["image_provenance"][0]
+            row["embedded_referencing_slides"] = [
+                idx for idx in row["embedded_referencing_slides"]
+                if idx != row["intended_slide_index"]
+            ] or [row["intended_slide_index"] + 99]
+            row["placement_verified"] = (
+                row["intended_slide_index"]
+                in row["embedded_referencing_slides"]
+            )
+            tampered_fails = _check_summary_truth(tampered)
+        ok = (
+            rc == 0
+            and good_fails == []
+            and any(
+                "intended_slide_index" in f
+                and "embedded_referencing_slides" in f
+                for f in tampered_fails
+            )
+        )
+        results.append(_ProbeResult(
+            "T77 tampered summary image_provenance row whose "
+            "intended_slide_index is not in "
+            "embedded_referencing_slides fails truth-check",
+            ok,
+            f"rc={rc}, good_fails={good_fails!r}, "
+            f"tampered_fails={tampered_fails!r}",
+        ))
+
+    # T78 truth-check refuses a tampered summary whose
+    # image_provenance[i].embedded_referencing_slides is empty — proves
+    # the "every embedded operator part must be referenced by at least
+    # one slide" projection fails closed independently of the intended-
+    # index gate above.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T78-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        _write_synthetic_images(images_dir)
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+        )
+        tampered_fails: list[str] = []
+        if rc == 0:
+            summary = json.loads(
+                (out_dir / "summary.json").read_text(encoding="utf-8"),
+            )
+            tampered = json.loads(json.dumps(summary))
+            tampered["image_provenance"][0][
+                "embedded_referencing_slides"
+            ] = []
+            tampered["image_provenance"][0]["placement_verified"] = False
+            tampered_fails = _check_summary_truth(tampered)
+        ok = (
+            rc == 0
+            and any(
+                "embedded_referencing_slides" in f
+                and "non-empty" in f
+                for f in tampered_fails
+            )
+        )
+        results.append(_ProbeResult(
+            "T78 tampered summary image_provenance row with empty "
+            "embedded_referencing_slides fails truth-check",
+            ok,
+            f"rc={rc}, tampered_fails={tampered_fails!r}",
+        ))
+
+    # T79 blip-confirmed projection: synthesize an inventory dict where
+    # slide 1 declares an image rel to "ppt/media/image1.png" but the
+    # slide body does NOT use it (used_by_slide_blip=False), while slide
+    # 2 actually embeds it (used_by_slide_blip=True). The rels-only
+    # signal (inv.media_parts[0].referencing_slides) deliberately lists
+    # BOTH slides, but the projection MUST return only slide 2 — the
+    # blip-confirmed signal. A regression that switched back to reading
+    # media_parts[*].referencing_slides would false-green slide 1 as a
+    # placement target even though no <p:pic> on slide 1 embeds the
+    # operator's bytes. This probe is the load-bearing lock for the
+    # blip-vs-rels distinction the H4b sibling smoke documents.
+    fake_inv = {
+        "media_parts": [
+            {
+                "part": "ppt/media/image1.png",
+                "referencing_slides": [1, 2],  # rels-only false-green
+            },
+        ],
+        "slides": [
+            {
+                "index": 1,
+                "media_refs": [
+                    {
+                        "r_id": "rId7",
+                        "target": "../media/image1.png",
+                        "resolved": "ppt/media/image1.png",
+                        "used_by_slide_blip": False,
+                    },
+                ],
+            },
+            {
+                "index": 2,
+                "media_refs": [
+                    {
+                        "r_id": "rId7",
+                        "target": "../media/image1.png",
+                        "resolved": "ppt/media/image1.png",
+                        "used_by_slide_blip": True,
+                    },
+                ],
+            },
+        ],
+    }
+    projection = _part_to_blip_referencing_slides_from_inventory(
+        fake_inv,
+    )
+    results.append(_ProbeResult(
+        "T79 blip-confirmed projection: a slide that declares an image "
+        "rel without a matching <p:pic> blip (rels-only false-green) is "
+        "DROPPED from embedded_referencing_slides; only slides whose "
+        "media_refs[*].used_by_slide_blip is True are kept",
+        projection == {"ppt/media/image1.png": [2]},
+        f"projection={projection!r}; expected "
+        f"{{'ppt/media/image1.png': [2]}}",
+    ))
 
     # T75 --write-manifest-template mode is manifest-only — produces no
     # visual_quality.json / summary.json / deck.pptx / workspace under
