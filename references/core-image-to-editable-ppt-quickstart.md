@@ -139,6 +139,21 @@ Contract for `--manifest`:
 - Each free-text field must be a non-empty, length-bounded string with no leading / trailing whitespace, no control characters, no `://` or `<scheme>:` URL / URI shape, no `/` or `\` path separator, and no credential / token / API-key / public-upload / public-share / public-hosting / raw-source / confidential / customer / D-One / MCP / Qoder / model-API / image-search / network / telemetry marker. Mention of any upstream service this lane does NOT call (positive or negative) is refused — the boundary statement is concentrated in the locked `summary.explicit_boundaries` tuple, not in operator metadata.
 - The operator-typed `slide_title` becomes the native editable slide title; `alt_text` and `intended_use` flow into the generated `image_manifest.json` and are echoed back under `summary.image_provenance[]` as `operator_slide_title` / `operator_alt_text` / `operator_intended_use`. The manifest's `images[]` array order replaces the alphabetical-filename order as the deck slide order. `summary.manifest_path` echoes the supplied path verbatim (and is `null` when `--manifest` is omitted).
 
+### Optional `--write-manifest-template` for a starter manifest
+
+If you would rather start from a skeleton manifest than hand-author the JSON, run the helper in manifest-template writer mode:
+
+```bash
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_local_images_to_editable_ppt.py \
+  --images-dir "$IMAGES_DIR" \
+  --write-manifest-template "$RUN_DIR/manifest_template.json"
+```
+
+The writer reuses the same flat PNG / JPG / JPEG discovery the normal mode applies (same IG1..IG9 gates), then writes a JSON manifest at the supplied path whose `images[]` array carries one entry per discovered image, sorted by filename, with the helper's default `slide_title` (`Operator image: <filename>`) / `alt_text` (`Operator-supplied local image '<filename>'.`) / `intended_use` (`spot illustration`). The template is immediately usable: feed it back into the normal command as `--manifest "$RUN_DIR/manifest_template.json"` and the produced `summary.image_provenance[]` echoes those fields exactly as for a hand-authored manifest. Edit the JSON first if you want to override any field or reorder the deck.
+
+Contract for `--write-manifest-template PATH` mirrors the other operator paths: must not be URI-shaped, a symlink, or have a symlink ancestor, must not anchor under the repo tree, must have an existing directory parent, and must not already exist (the writer never overwrites operator files). The writer does NOT run the pipeline, does NOT produce a PPTX, and does NOT call D-One / MCP / Qoder / a public network / a model API / an image search / telemetry.
+
 Outputs (every path lives under `--out-dir`; nothing lands under the repo tree):
 
 - `deck.pptx` — native editable PPTX, one cover slide per operator image, each carrying the operator file embedded in `ppt/media/`.

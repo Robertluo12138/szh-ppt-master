@@ -9,7 +9,7 @@ wants to prove those bytes can flow through the existing local image
 asset pipeline into a native editable PPTX with inventory + provenance
 evidence.
 
-Two modes share one happy path:
+Three modes share one helper:
 
   * ``--images-dir DIR --out-dir OUT [--manifest PATH]`` — **operator
     mode**: takes a caller-supplied flat directory of PNG / JPG / JPEG
@@ -35,10 +35,28 @@ Two modes share one happy path:
     alt_text / intended_use. Leaves every intermediate artifact on
     disk under OUT for a reviewer to inspect.
 
-  * ``--self-test`` — drives the same happy path inside a per-run
-    ``tempfile.TemporaryDirectory()`` using two tiny generated PNG /
-    JPEG fixtures (no committed bytes; nothing leaks under REPO_ROOT)
-    and exercises every documented fail-closed probe.
+  * ``--images-dir DIR --write-manifest-template PATH`` — **manifest-
+    template writer mode**: discovers the same flat PNG / JPG / JPEG
+    folder operator mode uses (reuses the IG1..IG9 gate verbatim),
+    then writes a starter JSON manifest at PATH whose ``images[]``
+    array carries one entry per discovered image, sorted by filename,
+    using the same deterministic default ``slide_title`` /
+    ``alt_text`` / ``intended_use`` values the helper would apply if
+    ``--manifest`` were omitted. The template writer does NOT run the
+    pipeline, does NOT produce a PPTX, does NOT write anywhere under
+    ``REPO_ROOT`` (MT4 refuses the argument outright), and does NOT
+    call D-One / MCP / Qoder / a public network / a model API / an
+    image search / telemetry. The generated file is byte-compatible
+    with operator-mode ``--manifest`` input: a re-run such as
+    ``--images-dir DIR --out-dir OUT --manifest <this-path>`` accepts
+    the template verbatim and the produced summary echoes the
+    template's slide_title / alt_text / intended_use under
+    ``image_provenance[]`` exactly as for a hand-authored manifest.
+
+  * ``--self-test`` — drives the same happy paths inside per-run
+    ``tempfile.TemporaryDirectory()`` instances using two tiny
+    generated PNG / JPEG fixtures (no committed bytes; nothing leaks
+    under REPO_ROOT) and exercises every documented fail-closed probe.
 
 The helper itself adds NO new schema, NO new validator, and NO new
 runtime contract. It composes existing helpers:
@@ -132,6 +150,13 @@ or PPTX is created):
         filename appears twice (MAN11), and the manifest filename
         set equals the discovered filename set (MAN12).
 
+  MT1..MT6 (only when ``--write-manifest-template`` is supplied)
+        the template path is not URI-shaped (MT1), is not a symlink
+        (MT2), has no symlink ancestor (MT3), does not lexically
+        anchor under ``REPO_ROOT`` (MT4), has an existing directory
+        parent (MT5), and does not already exist (MT6 — the writer
+        never overwrites operator files).
+
 After the pipeline run, the helper additionally runs the existing
 ``validate_source_image_assets`` validator against a freshly-authored
 ``<workspace>/source_image_assets.json`` registry (PNG / JPG / JPEG
@@ -198,6 +223,9 @@ operator bytes flow through the existing local pipeline ONLY.
 Usage:
   python3 scripts/operator_local_images_to_editable_ppt.py \\
       --images-dir DIR --out-dir OUT [--manifest PATH]
+
+  python3 scripts/operator_local_images_to_editable_ppt.py \\
+      --images-dir DIR --write-manifest-template PATH
 
   python3 scripts/operator_local_images_to_editable_ppt.py --self-test
 
@@ -1864,6 +1892,136 @@ def _validate_manifest_arg(
 
 
 # ---------------------------------------------------------------------------
+# --write-manifest-template path gate.
+# ---------------------------------------------------------------------------
+
+
+def _validate_manifest_template_arg(
+    template_path_str: str,
+) -> tuple[Path | None, list[str]]:
+    """Validate the ``--write-manifest-template`` argument and return the
+    resolved path. The caller MUST treat the argument as refused whenever
+    ``failures`` is non-empty OR ``path`` is ``None``, and MUST NOT write
+    to the path in that case.
+
+    Refuses, in order, BEFORE any filesystem mutation:
+
+      MT1   URI-shaped argument (``file://`` / ``http://`` / ``data:`` /
+            any RFC-3986 scheme prefix). The template writer accepts
+            local paths only.
+      MT2   the path itself is a symlink (broken or resolvable).
+            Silently following a symlink would let an attacker who
+            controls the link target redirect operator writes.
+      MT3   any ancestor up to the filesystem root is a symlink. Same
+            attack surface one level up — closed system aliases like
+            ``/tmp -> /private/tmp`` remain accepted via
+            ``_forbidden_symlink_ancestor``.
+      MT4   the resolved path lexically anchors under ``REPO_ROOT``,
+            compared BOTH case-sensitively (Linux semantics) AND on
+            case-folded strings so a case-variant of the repo root
+            (e.g. ``/Users/ROBERT/...`` vs ``/Users/robert/...`` on a
+            case-insensitive APFS / HFS+ / NTFS volume) still trips
+            the gate. ``Path.resolve()`` does NOT canonicalise the
+            on-disk case, so a strict ``relative_to`` would otherwise
+            miss the variant and let the writer land bytes under the
+            committed tree on a case-insensitive filesystem.
+      MT5   the path's parent either does not exist or is not a
+            directory. Refusing to ``mkdir -p`` avoids masking a typo
+            in the operator's argument.
+      MT6   the path already exists (regular file, directory, or any
+            other entry). The helper does not overwrite operator files;
+            the operator must pass a fresh path.
+    """
+    if _has_uri_scheme(template_path_str):
+        return None, [
+            f"--write-manifest-template argument "
+            f"{template_path_str!r} looks URI-shaped (MT1); only local "
+            f"file paths are accepted."
+        ]
+
+    template_path = Path(template_path_str)
+
+    if template_path.is_symlink():
+        try:
+            tgt = os.readlink(template_path)
+        except OSError:
+            tgt = "<unreadable>"
+        return None, [
+            f"--write-manifest-template {template_path} is a symlink "
+            f"(-> {tgt}) (MT2); refused so a symlink target cannot "
+            f"redirect operator writes."
+        ]
+
+    forbidden_ancestor = _forbidden_symlink_ancestor(template_path)
+    if forbidden_ancestor is not None:
+        ancestor, tgt = forbidden_ancestor
+        return None, [
+            f"--write-manifest-template {template_path} has a symlink "
+            f"ancestor {ancestor} (-> {tgt}) (MT3); refused so a "
+            f"symlink in the operator's typed path cannot redirect "
+            f"operator writes."
+        ]
+
+    try:
+        resolved = template_path.resolve(strict=False)
+    except OSError as exc:
+        return None, [
+            f"--write-manifest-template {template_path} could not be "
+            f"resolved: {type(exc).__name__}: {exc} (MT3)."
+        ]
+
+    repo_root = REPO_ROOT.resolve(strict=False)
+    # Compare case-sensitively first (Linux / case-sensitive FS
+    # semantics). If that misses, fall through to a case-folded
+    # comparison so a case-variant of REPO_ROOT (e.g.
+    # ``/Users/ROBERT/Desktop/...`` vs ``/Users/robert/Desktop/...``)
+    # still refuses on case-insensitive APFS / HFS+ / NTFS volumes,
+    # where ``Path.resolve()`` preserves the typed case rather than
+    # canonicalising it. The case-folded check is anchored with the
+    # platform separator so ``/repo`` and ``/repo-foo`` don't collide.
+    under_root = False
+    try:
+        resolved.relative_to(repo_root)
+        under_root = True
+    except ValueError:
+        resolved_folded = str(resolved).casefold()
+        repo_root_folded = str(repo_root).casefold()
+        if (
+            resolved_folded == repo_root_folded
+            or resolved_folded.startswith(repo_root_folded + os.sep)
+        ):
+            under_root = True
+    if under_root:
+        return None, [
+            f"--write-manifest-template {resolved} lexically anchors "
+            f"under REPO_ROOT={repo_root} (MT4); refused — manifest "
+            f"templates must land outside the committed repo tree."
+        ]
+
+    if not template_path.parent.exists():
+        return None, [
+            f"--write-manifest-template {template_path} parent "
+            f"{template_path.parent} does not exist (MT5); create the "
+            f"parent explicitly before re-running so a typo cannot be "
+            f"masked by an implicit mkdir -p."
+        ]
+    if not template_path.parent.is_dir():
+        return None, [
+            f"--write-manifest-template {template_path} parent "
+            f"{template_path.parent} is not a directory (MT5); refused."
+        ]
+
+    if template_path.exists():
+        return None, [
+            f"--write-manifest-template {template_path} already exists "
+            f"(MT6); refused to avoid overwriting an operator file. "
+            f"Pass a fresh path."
+        ]
+
+    return template_path, []
+
+
+# ---------------------------------------------------------------------------
 # Pipeline fixture composition.
 # ---------------------------------------------------------------------------
 
@@ -1885,6 +2043,26 @@ def _cover_title_for(image: _DiscoveredImage) -> str:
     opening the deck. Title length is bounded by the operator filename
     + a fixed prefix (no derived content from the image bytes)."""
     return f"Operator image: {image.operator_filename}"
+
+
+# Built-in default per-image manifest field values. Centralised so the
+# pipeline-fixture composer (used by operator mode when --manifest is
+# omitted) AND the manifest-template writer (--write-manifest-template
+# mode) share one source of truth — a hand-edited template that the
+# operator re-runs through normal operator mode produces byte-identical
+# defaults to the no-manifest run.
+_DEFAULT_INTENDED_USE = "spot illustration"
+
+
+def _default_slide_title(image: _DiscoveredImage) -> str:
+    return _cover_title_for(image)
+
+
+def _default_alt_text(image: _DiscoveredImage) -> str:
+    return (
+        f"Operator-supplied local image "
+        f"{image.operator_filename!r}."
+    )
 
 
 def _build_pipeline_fixture(
@@ -1926,13 +2104,13 @@ def _build_pipeline_fixture(
         # is omitted, the helper's deterministic defaults (filename-
         # derived title, generic alt_text, fixed "spot illustration"
         # intended_use) are used — preserving the pre-manifest behaviour
-        # byte-for-byte.
-        title = image.slide_title or _cover_title_for(image)
-        alt_text = image.alt_text or (
-            f"Operator-supplied local image "
-            f"{image.operator_filename!r}."
-        )
-        intended_use = image.intended_use or "spot illustration"
+        # byte-for-byte. The same defaults are written by the
+        # --write-manifest-template mode so a hand-edited template that
+        # the operator re-runs through normal operator mode produces
+        # byte-identical defaults to the no-manifest run.
+        title = image.slide_title or _default_slide_title(image)
+        alt_text = image.alt_text or _default_alt_text(image)
+        intended_use = image.intended_use or _DEFAULT_INTENDED_USE
         slides_block.append({
             "index": idx,
             "layout": "cover",
@@ -2817,6 +2995,116 @@ def _run_operator_mode(
         f"Real D-One UNVERIFIED. No public network, no MCP, no Qoder, "
         f"no model API, no image search, no telemetry. Raw prompt or "
         f"report-to-PPT automation NOT implemented."
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Manifest-template writer entrypoint.
+# ---------------------------------------------------------------------------
+
+
+def _run_template_write_mode(
+    *,
+    images_dir_str: str,
+    template_path_str: str,
+) -> int:
+    """Validate every operator argument, discover the images, and write a
+    starter manifest template. Returns 0 on success, 2 on operator-input
+    refusal (no filesystem mutation), 1 on write failure.
+
+    The template writer does NOT run the pipeline, does NOT produce a
+    PPTX, does NOT touch any file under ``REPO_ROOT``, and does NOT call
+    D-One / MCP / Qoder / a public network / a model API / an image
+    search / telemetry. It composes the same image-discovery gate
+    (IG1..IG9) the normal operator mode applies plus the
+    ``--write-manifest-template`` path gate (MT1..MT6), then writes a
+    deterministic JSON manifest whose ``images[]`` array carries one
+    entry per discovered image, sorted by filename, with the same
+    default ``slide_title`` / ``alt_text`` / ``intended_use`` values the
+    helper would apply if the operator re-ran with no ``--manifest`` at
+    all.
+
+    The generated file is byte-compatible with the normal operator-mode
+    ``--manifest`` input: a re-run such as
+    ``--images-dir DIR --out-dir OUT --manifest <this-path>`` accepts
+    the template verbatim, and the produced ``summary.json`` echoes
+    each entry's ``slide_title`` / ``alt_text`` / ``intended_use`` under
+    ``image_provenance[]`` exactly as for a hand-authored manifest.
+    """
+    images, _images_dir, image_failures = _validate_images_dir_arg(
+        images_dir_str,
+    )
+    template_path, template_failures = _validate_manifest_template_arg(
+        template_path_str,
+    )
+
+    if (
+        image_failures
+        or template_failures
+        or images is None
+        or template_path is None
+    ):
+        for line in image_failures or []:
+            print(f"FAIL: {line}", file=sys.stderr)
+        for line in template_failures or []:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 2
+
+    body = {
+        "schema_version": _MANIFEST_SCHEMA_VERSION,
+        "images": [
+            {
+                "filename": img.operator_filename,
+                "slide_title": _default_slide_title(img),
+                "alt_text": _default_alt_text(img),
+                "intended_use": _DEFAULT_INTENDED_USE,
+            }
+            for img in images
+        ],
+    }
+
+    print(
+        f"=== operator_local_images_to_editable_ppt "
+        f"(--images-dir {images_dir_str}, "
+        f"--write-manifest-template {template_path}) ==="
+    )
+    for img in images:
+        print(
+            f"  image:     {img.operator_filename!r} "
+            f"(id={img.asset_id!r}, {img.media_type}, "
+            f"{img.byte_count} bytes, sha256={img.sha256[:12]}...)"
+        )
+
+    try:
+        template_path.write_text(
+            json.dumps(body, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(
+            f"FAIL: cannot write --write-manifest-template "
+            f"{template_path}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not template_path.is_file() or template_path.is_symlink():
+        print(
+            f"FAIL: expected --write-manifest-template "
+            f"{template_path} as a regular non-symlink file after write",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"OK (manifest template): wrote {len(images)} image entr"
+        f"{'y' if len(images) == 1 else 'ies'} to {template_path}. "
+        f"Edit the slide_title / alt_text / intended_use fields as "
+        f"needed, then re-run with --images-dir + --out-dir + "
+        f"--manifest <this-path>. Local-only — does NOT call D-One, "
+        f"MCP, Qoder, a public network, a model API, an image search, "
+        f"or telemetry."
     )
     return 0
 
@@ -4606,7 +4894,369 @@ def _run_self_tests() -> int:
         if passed else "",
     ))
 
-    # T64 — committed-tree snapshot. The whole self-test must not have
+    # ----- T64..T68: --write-manifest-template mode -----
+
+    # T64 happy path: write a manifest template, then reuse it verbatim
+    # in normal operator mode. Asserts the template has the documented
+    # shape (schema_version="1", one images[] entry per discovered file,
+    # sorted by filename, every required field populated with the same
+    # default value the helper applies when --manifest is omitted) AND
+    # that running the operator mode with that template echoes each
+    # entry's slide_title / alt_text / intended_use back into the
+    # summary's image_provenance block exactly as for a hand-authored
+    # manifest. The two-step round-trip is the load-bearing assertion
+    # of the spec ("the generated manifest must be immediately usable
+    # by the existing normal command").
+    with tempfile.TemporaryDirectory(prefix="op-helper-T64-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        template_path = td / "manifest_template.json"
+        out_dir = td / "out"
+        _write_synthetic_images(images_dir)
+        rc_t = _run_template_write_mode(
+            images_dir_str=str(images_dir),
+            template_path_str=str(template_path),
+        )
+        ok = rc_t == 0 and template_path.is_file()
+        detail = ""
+        template_body: dict | None = None
+        if not ok:
+            detail = (
+                f"rc_t={rc_t}, template_exists={template_path.is_file()}"
+            )
+        else:
+            try:
+                template_body = json.loads(template_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"cannot parse template {template_path}: {exc}"
+            else:
+                if template_body.get("schema_version") != "1":
+                    ok = False
+                    detail = (
+                        f"template schema_version="
+                        f"{template_body.get('schema_version')!r}; "
+                        f"expected '1'"
+                    )
+                elif not isinstance(template_body.get("images"), list):
+                    ok = False
+                    detail = (
+                        f"template images is "
+                        f"{type(template_body.get('images')).__name__}; "
+                        f"expected list"
+                    )
+                elif len(template_body["images"]) != 2:
+                    ok = False
+                    detail = (
+                        f"template has {len(template_body['images'])} "
+                        f"entries; expected 2"
+                    )
+                else:
+                    expected_filenames = [
+                        "alpha_marker.png", "beta_marker.jpg",
+                    ]
+                    actual_filenames = [
+                        e.get("filename")
+                        for e in template_body["images"]
+                    ]
+                    if actual_filenames != expected_filenames:
+                        ok = False
+                        detail = (
+                            f"template filenames {actual_filenames!r}; "
+                            f"expected sorted "
+                            f"{expected_filenames!r}"
+                        )
+                    else:
+                        for i, entry in enumerate(template_body["images"]):
+                            for field in (
+                                "filename", "slide_title",
+                                "alt_text", "intended_use",
+                            ):
+                                v = entry.get(field)
+                                if not isinstance(v, str) or not v:
+                                    ok = False
+                                    detail = (
+                                        f"template images[{i}].{field}"
+                                        f"={v!r}; expected non-empty "
+                                        f"string"
+                                    )
+                                    break
+                            if not ok:
+                                break
+                        # Spot-check the defaults match the helper's
+                        # built-in defaults so a regression that drifts
+                        # one source of truth is caught.
+                        if ok:
+                            alpha_image = _DiscoveredImage(
+                                operator_filename="alpha_marker.png",
+                                operator_path=Path(""),
+                                asset_id="alpha_marker",
+                                extension="png",
+                                media_type="image/png",
+                                byte_count=1,
+                                sha256="x" * 64,
+                            )
+                            if (
+                                template_body["images"][0].get(
+                                    "slide_title"
+                                ) != _default_slide_title(alpha_image)
+                                or template_body["images"][0].get(
+                                    "alt_text"
+                                ) != _default_alt_text(alpha_image)
+                                or template_body["images"][0].get(
+                                    "intended_use"
+                                ) != _DEFAULT_INTENDED_USE
+                            ):
+                                ok = False
+                                detail = (
+                                    f"template defaults drifted from "
+                                    f"helper defaults for "
+                                    f"alpha_marker.png entry: "
+                                    f"{template_body['images'][0]!r}"
+                                )
+        if ok:
+            rc_n = _run_operator_mode(
+                images_dir_str=str(images_dir),
+                out_dir_str=str(out_dir),
+                manifest_path_str=str(template_path),
+            )
+            if rc_n != 0:
+                ok = False
+                detail = (
+                    f"normal operator mode rc={rc_n} after using the "
+                    f"template; expected 0"
+                )
+            else:
+                try:
+                    summary = json.loads(
+                        (out_dir / "summary.json").read_text()
+                    )
+                except (OSError, json.JSONDecodeError) as exc:
+                    ok = False
+                    detail = f"cannot parse summary.json: {exc}"
+                else:
+                    if summary.get("manifest_path") != str(template_path):
+                        ok = False
+                        detail = (
+                            f"summary.manifest_path="
+                            f"{summary.get('manifest_path')!r}; "
+                            f"expected {str(template_path)!r}"
+                        )
+                    elif summary.get("image_count") != 2:
+                        ok = False
+                        detail = (
+                            f"summary.image_count="
+                            f"{summary.get('image_count')!r}; "
+                            f"expected 2"
+                        )
+                    else:
+                        prov = summary.get("image_provenance") or []
+                        expected_by_fname = {
+                            e["filename"]: e
+                            for e in template_body["images"]
+                        }
+                        for p in prov:
+                            fname = p.get("operator_filename")
+                            template_entry = expected_by_fname.get(fname)
+                            if template_entry is None:
+                                ok = False
+                                detail = (
+                                    f"provenance entry for {fname!r} "
+                                    f"not in template"
+                                )
+                                break
+                            for prov_field, tpl_field in (
+                                ("operator_slide_title", "slide_title"),
+                                ("operator_alt_text", "alt_text"),
+                                ("operator_intended_use", "intended_use"),
+                            ):
+                                if (
+                                    p.get(prov_field)
+                                    != template_entry[tpl_field]
+                                ):
+                                    ok = False
+                                    detail = (
+                                        f"provenance[{fname!r}]."
+                                        f"{prov_field}="
+                                        f"{p.get(prov_field)!r}; "
+                                        f"expected "
+                                        f"{template_entry[tpl_field]!r} "
+                                        f"(template's {tpl_field})"
+                                    )
+                                    break
+                            if not ok:
+                                break
+        if not ok and not detail:
+            detail = f"rc_t={rc_t}"
+        results.append(_ProbeResult(
+            "T64 template happy path: --write-manifest-template writes "
+            "the manifest, then re-running normal operator mode with "
+            "--manifest <that-template> validates the PPTX/summary and "
+            "echoes template fields verbatim under image_provenance",
+            ok, detail,
+        ))
+
+    # T65 MT1: URI-shaped --write-manifest-template refused. The
+    # assertion includes the "no filesystem entry materialised" check
+    # AND a direct gate call to lock the URI-specific diagnostic — the
+    # same belt-and-braces pattern T18 uses for --out-dir.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T65-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        _write_synthetic_images(images_dir)
+        uri_template = (
+            "file:///tmp/op_helper_t65_template_must_not_exist.json"
+        )
+        rc = _run_template_write_mode(
+            images_dir_str=str(images_dir),
+            template_path_str=uri_template,
+        )
+        _, fails_direct = _validate_manifest_template_arg(uri_template)
+        leaked = Path(uri_template).exists()
+        uri_specific = any(
+            "MT1" in f and "URI-shaped" in f
+            for f in (fails_direct or [])
+        )
+        results.append(_ProbeResult(
+            "T65 MT1: URI-shaped --write-manifest-template refused by "
+            "the URI-specific gate (rc=2 + MT1 diagnostic) with no "
+            "filesystem entry materialised",
+            (
+                rc == 2
+                and bool(fails_direct)
+                and uri_specific
+                and not leaked
+            ),
+            f"rc={rc}, uri_specific={uri_specific}, "
+            f"fails_direct={fails_direct!r}, leaked={leaked}",
+        ))
+
+    # T66 MT4: --write-manifest-template inside REPO_ROOT refused with
+    # no file materialised. Load-bearing for the "keep generated
+    # artifacts out of the repo" contract — a regression that removes
+    # the MT4 gate would let an operator typo land a template inside
+    # the committed tree.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T66-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        _write_synthetic_images(images_dir)
+        bad_template = (
+            REPO_ROOT
+            / "operator_manifest_template_should_not_land_here.json"
+        )
+        rc = _run_template_write_mode(
+            images_dir_str=str(images_dir),
+            template_path_str=str(bad_template),
+        )
+        leaked = bad_template.exists()
+        results.append(_ProbeResult(
+            "T66 MT4: --write-manifest-template inside REPO_ROOT "
+            "refused with no file materialised under the committed "
+            "tree",
+            rc == 2 and not leaked,
+            f"rc={rc}, leaked={leaked}",
+        ))
+
+    # T67 MT6: pre-existing target refused; stale bytes preserved
+    # byte-identical. The "does not overwrite operator files" contract
+    # is asserted by reading back the stale content after the refusal.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T67-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        _write_synthetic_images(images_dir)
+        existing = td / "existing_operator_file.json"
+        existing.write_text(
+            "OPERATOR-PRE-EXISTING-BYTES",
+            encoding="utf-8",
+        )
+        rc = _run_template_write_mode(
+            images_dir_str=str(images_dir),
+            template_path_str=str(existing),
+        )
+        results.append(_ProbeResult(
+            "T67 MT6: pre-existing --write-manifest-template target "
+            "refused; stale bytes preserved byte-identical",
+            (
+                rc == 2
+                and existing.is_file()
+                and existing.read_text(encoding="utf-8")
+                == "OPERATOR-PRE-EXISTING-BYTES"
+            ),
+            f"rc={rc}, existing_bytes="
+            f"{existing.read_text(encoding='utf-8')!r}",
+        ))
+
+    # T68 template mode: representative bad --images-dir case. Empty
+    # directory trips IG4 just like in operator mode (the template
+    # writer composes the same image-discovery gate verbatim); no
+    # template file may be written when the images argument is refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T68-") as raw_td:
+        td = Path(raw_td)
+        empty_images_dir = td / "empty_images"
+        empty_images_dir.mkdir()
+        template_path = td / "template.json"
+        rc = _run_template_write_mode(
+            images_dir_str=str(empty_images_dir),
+            template_path_str=str(template_path),
+        )
+        results.append(_ProbeResult(
+            "T68 template mode: empty --images-dir refused (IG4); no "
+            "template file written",
+            rc == 2 and not template_path.exists(),
+            f"rc={rc}, template_exists={template_path.exists()}",
+        ))
+
+    # T69 MT4 case-variant: a case-variant of REPO_ROOT must still
+    # trip MT4 on case-insensitive APFS / HFS+ / NTFS volumes.
+    # ``Path.resolve()`` preserves the typed case rather than
+    # canonicalising it, so a strict ``relative_to`` check alone would
+    # let ``/Users/ROBERT/...`` slip through when REPO_ROOT resolves
+    # to ``/Users/robert/...`` even though both paths point at the
+    # same on-disk directory. The case-folded comparison in the gate
+    # is what closes the gap; this probe locks that behaviour against
+    # a regression that drops the casefold step.
+    repo_root_str = str(REPO_ROOT)
+    variant_str: str | None = None
+    for ch_idx, ch in enumerate(repo_root_str):
+        if ch.isalpha() and ch.islower():
+            variant_str = (
+                repo_root_str[:ch_idx]
+                + ch.upper()
+                + repo_root_str[ch_idx + 1:]
+            )
+            break
+        if ch.isalpha() and ch.isupper():
+            variant_str = (
+                repo_root_str[:ch_idx]
+                + ch.lower()
+                + repo_root_str[ch_idx + 1:]
+            )
+            break
+    if variant_str is None or variant_str == repo_root_str:
+        # REPO_ROOT has no alpha characters (extremely unusual). Skip
+        # rather than emit a false-positive PASS.
+        results.append(_ProbeResult(
+            "T69 MT4 case-variant: skipped (REPO_ROOT has no alpha "
+            "characters to flip)",
+            True,
+        ))
+    else:
+        candidate = (
+            variant_str + os.sep + "case_variant_template.json"
+        )
+        _, t69_fails = _validate_manifest_template_arg(candidate)
+        is_mt4 = any("MT4" in f for f in (t69_fails or []))
+        leaked = Path(candidate).exists()
+        results.append(_ProbeResult(
+            "T69 MT4 case-variant: case-variant of REPO_ROOT refused "
+            "with MT4 diagnostic even on case-insensitive FSes; no "
+            "file materialised",
+            bool(t69_fails) and is_mt4 and not leaked,
+            f"variant={variant_str!r}, fails={t69_fails!r}, "
+            f"leaked={leaked}",
+        ))
+
+    # T70 — committed-tree snapshot. The whole self-test must not have
     # mutated any byte under REPO_ROOT/scripts/ or REPO_ROOT/examples/.
     # Kept as the LAST probe so every manifest scenario above runs
     # against the same pre-snapshot baseline.
@@ -4615,7 +5265,7 @@ def _run_self_tests() -> int:
         scripts_before=scripts_before,
     )
     results.append(_ProbeResult(
-        "T64 snapshot: REPO_ROOT/scripts/ + REPO_ROOT/examples/ "
+        "T70 snapshot: REPO_ROOT/scripts/ + REPO_ROOT/examples/ "
         "byte-identical before and after self-test",
         snapshot_rc == 0,
     ))
@@ -4712,11 +5362,31 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--write-manifest-template", type=str, default=None,
+        help=(
+            "Manifest-template writer mode. When supplied, the helper "
+            "discovers --images-dir using the same IG1..IG9 gates the "
+            "normal mode applies, then writes a starter JSON manifest "
+            "at the supplied PATH whose images[] array carries one "
+            "entry per discovered image (sorted by filename) with the "
+            "same default slide_title / alt_text / intended_use values "
+            "the helper applies when --manifest is omitted. The "
+            "template path must not be URI-shaped, a symlink, have a "
+            "symlink ancestor, anchor under the repo, point at a "
+            "missing or non-directory parent, or already exist. The "
+            "template writer does NOT run the pipeline, does NOT "
+            "produce a PPTX, and does NOT call any external service. "
+            "Mutually exclusive with --out-dir / --manifest / "
+            "--self-test."
+        ),
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios (happy path + "
             "every documented fail-closed probe). Mutually exclusive "
-            "with --images-dir / --out-dir / --manifest."
+            "with --images-dir / --out-dir / --manifest / "
+            "--write-manifest-template."
         ),
     )
     args = parser.parse_args(argv)
@@ -4726,14 +5396,35 @@ def main(argv: list[str]) -> int:
             args.images_dir is not None
             or args.out_dir is not None
             or args.manifest is not None
+            or args.write_manifest_template is not None
         ):
             print(
                 "FAIL: --self-test does not take --images-dir / "
-                "--out-dir / --manifest.",
+                "--out-dir / --manifest / --write-manifest-template.",
                 file=sys.stderr,
             )
             return 2
         return _run_self_tests()
+
+    if args.write_manifest_template is not None:
+        if args.images_dir is None:
+            print(
+                "FAIL: --write-manifest-template requires --images-dir.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.out_dir is not None or args.manifest is not None:
+            print(
+                "FAIL: --write-manifest-template does not take "
+                "--out-dir / --manifest (the template writer does not "
+                "run the pipeline).",
+                file=sys.stderr,
+            )
+            return 2
+        return _run_template_write_mode(
+            images_dir_str=args.images_dir,
+            template_path_str=args.write_manifest_template,
+        )
 
     missing = [
         name for name, value in (
@@ -4745,7 +5436,9 @@ def main(argv: list[str]) -> int:
     if missing:
         print(
             f"FAIL: missing required argument(s): {', '.join(missing)} "
-            f"(use --self-test for the in-script scenarios).",
+            f"(use --self-test for the in-script scenarios, or "
+            f"--write-manifest-template PATH to write a starter "
+            f"manifest without running the pipeline).",
             file=sys.stderr,
         )
         return 2
