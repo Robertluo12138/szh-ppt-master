@@ -460,6 +460,29 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     ``core_editable_ppt_acceptance._snapshot_committed_tree``;
     nothing is written under the repo tree in either mode.
     MOCK / STUB ONLY — no real D-One.
+  - ``scripts/operator_local_images_to_editable_ppt.py`` —
+    operator-facing **local-image intake** helper. The next operator
+    step after ``core_image_to_editable_ppt_demo --out-dir`` for a
+    reviewer who has their OWN folder of local PNG / JPG / JPEG bytes
+    and wants to prove those bytes flow through the existing local
+    image-asset pipeline into a native editable PPTX with inventory
+    + provenance evidence. The aggregate invokes ``--self-test``, which
+    drives the same happy path inside a per-run tempdir on tiny
+    generated PNG + JPEG fixtures (no committed image bytes) and
+    exercises every IG / OUT / MAN argument gate (URI / symlink /
+    symlink-ancestor / non-directory / empty / unsupported-extension /
+    stem-pattern / stem-collision / magic-byte / over-cap / inside-
+    REPO_ROOT / non-empty pre-existing OUT, plus the manifest-mode
+    structural and safe-string refusals — URL / URI / path separator
+    / credential / public-upload / confidential / D-One success-claim
+    wording / duplicate filename / orphan filename / missing
+    filename). Reuses ``scripts/run_explicit_pipeline.py`` (Stage 1-10
+    + the Stage-5.5 ``materialize_image_assets`` step the
+    ``--assets-dir`` flag activates) and the existing validator stack
+    (``validate_source_image_assets`` G1..G13,
+    ``validate_pptx_contract --expected-slide-count N``,
+    ``inspect_pptx_inventory``) — no new schema, no new validator, no
+    new runtime contract. LOCAL-ONLY — no real D-One.
   - ``scripts/render_model_roundtrip_smoke.py`` — synthetic
     render_model -> editable .pptx round-trip exercising every
     primitive kind the exporter supports today (text, line, shape,
@@ -534,6 +557,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "generated_image_provenance_handoff_smoke.py",
     SCRIPTS_DIR / "mixed_image_asset_provenance_handoff_smoke.py",
     SCRIPTS_DIR / "core_image_to_editable_ppt_demo.py",
+    SCRIPTS_DIR / "operator_local_images_to_editable_ppt.py",
     SCRIPTS_DIR / "image_placement_readback_smoke.py",
     SCRIPTS_DIR / "validate_mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
@@ -773,6 +797,7 @@ def main(argv: list[str]) -> int:
             "generated_image_provenance_handoff_smoke + "
             "mixed_image_asset_provenance_handoff_smoke + "
             "core_image_to_editable_ppt_demo + "
+            "operator_local_images_to_editable_ppt + "
             "image_placement_readback_smoke + "
             "validate_mock_image_bundle_trial_evidence + "
             "render_model_roundtrip_smoke + trace_acceptance_smoke). "
