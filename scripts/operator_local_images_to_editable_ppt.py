@@ -27,8 +27,9 @@ Three modes share one helper:
     step copies the bytes into the workspace, then runs every existing
     validator (``validate_source_image_assets``,
     ``validate_pptx_contract --expected-slide-count N``,
-    ``inspect_pptx_inventory``) against the produced workspace + PPTX
-    and writes a compact ``summary.json`` + a per-image provenance map
+    ``inspect_pptx_inventory``, ``validate_visual_quality``) against
+    the produced workspace + PPTX and writes a compact ``summary.json``
+    + a per-image provenance map
     naming the operator filename, the workspace path the bytes landed
     at, the sha256, the embedded ``ppt/media/*`` part, and (when
     ``--manifest`` was supplied) the operator-typed slide_title /
@@ -43,10 +44,13 @@ Three modes share one helper:
     using the same deterministic default ``slide_title`` /
     ``alt_text`` / ``intended_use`` values the helper would apply if
     ``--manifest`` were omitted. The template writer does NOT run the
-    pipeline, does NOT produce a PPTX, does NOT write anywhere under
-    ``REPO_ROOT`` (MT4 refuses the argument outright), and does NOT
-    call D-One / MCP / Qoder / a public network / a model API / an
-    image search / telemetry. The generated file is byte-compatible
+    pipeline, does NOT produce a PPTX, does NOT produce a
+    ``visual_quality.json`` report (the visual-quality validator only
+    runs in normal operator mode against a produced workspace), does
+    NOT write anywhere under ``REPO_ROOT`` (MT4 refuses the argument
+    outright), and does NOT call D-One / MCP / Qoder / a public
+    network / a model API / an image search / telemetry. The
+    generated file is byte-compatible
     with operator-mode ``--manifest`` input: a re-run such as
     ``--images-dir DIR --out-dir OUT --manifest <this-path>`` accepts
     the template verbatim and the produced summary echoes the
@@ -74,6 +78,13 @@ runtime contract. It composes existing helpers:
   * ``scripts/validate_pptx_contract.py`` /
     ``scripts/inspect_pptx_inventory.py`` — the same editable-PPTX
     contract gates the demo + smokes use;
+  * ``scripts/validate_visual_quality.py`` — inspection-only
+    post-pipeline review over the produced workspace's
+    ``render_models/`` + ``svg_previews/`` pair; the helper invokes
+    it with ``--output <out-dir>/visual_quality.json`` and the JSON
+    report's ``totals.errors`` / ``totals.warnings`` flow into
+    ``summary.visual_quality`` (warnings allowed; errors / non-zero
+    rc / missing-or-malformed report refuse via the truth-check);
   * ``scripts/core_image_to_editable_ppt_demo._validate_out_dir_arg``
     — operator ``--out-dir`` gate (URI / symlink / symlink-ancestor /
     inside-REPO_ROOT / missing-parent / non-directory / non-empty
@@ -163,8 +174,15 @@ After the pipeline run, the helper additionally runs the existing
 classes only, every entry source-class ``local_asset``, source_ref =
 ``operator_local_images_source``), then ``validate_pptx_contract
 --expected-slide-count N`` and ``inspect_pptx_inventory`` against the
-produced ``.pptx``. Any non-zero exit aborts with a clear diagnostic
-and leaves the partial artifacts on disk for the operator to inspect.
+produced ``.pptx``, and finally ``validate_visual_quality`` against the
+produced workspace's ``render_models/`` + ``svg_previews/`` pair with
+``--output <out-dir>/visual_quality.json``. The first three abort with
+a clear diagnostic on non-zero exit; ``validate_visual_quality`` runs
+to completion (so the JSON report it writes before a per-slide ERROR
+return is preserved for inspection) and the summary truth-check
+refuses on non-zero rc / missing or malformed report / error_count > 0.
+Warning findings do NOT refuse the run. Partial artifacts stay on disk
+for the operator to inspect on every failure path.
 
 Summary record written to ``<out-dir>/summary.json`` (echoed to stdout
 verbatim — the helper's load-bearing operator-facing output):
@@ -201,7 +219,19 @@ verbatim — the helper's load-bearing operator-facing output):
   * ``workspace_path`` / ``report_dir`` / ``inventory_path`` /
     ``registry_path`` — absolute paths inside ``--out-dir``.
   * ``validators`` — ``{validate_source_image_assets.rc,
-    validate_pptx_contract.rc, inspect_pptx_inventory.rc}``.
+    validate_pptx_contract.rc, inspect_pptx_inventory.rc,
+    validate_visual_quality.rc}``.
+  * ``visual_quality`` — small stable block surfacing the
+    ``validate_visual_quality`` outcome and parsed report: ``rc`` is
+    the validator's exit code, ``path`` is the JSON report path
+    (``<out-dir>/visual_quality.json``), ``report_parsed`` is True iff
+    the report file exists, parses as a JSON object, and carries
+    integer ``totals.errors`` / ``totals.warnings`` (False routes
+    through the truth-checker as a refusal), ``error_count`` /
+    ``warning_count`` are the projected totals (``null`` when
+    ``report_parsed`` is False). The truth-checker refuses the run on
+    any of: non-zero ``rc``, ``report_parsed`` False, ``error_count``
+    not zero. Warnings (``warning_count > 0``) are allowed.
   * ``real_d_one_status`` — fixed sentence ``"UNVERIFIED"``. Real
     D-One is NOT called. Public network / MCP / model API / image
     search / Qoder / telemetry are NOT called either; the helper is
@@ -275,6 +305,7 @@ RUN_EXPLICIT_PIPELINE = SCRIPTS_DIR / "run_explicit_pipeline.py"
 VALIDATE_SOURCE_IMAGE_ASSETS = SCRIPTS_DIR / "validate_source_image_assets.py"
 VALIDATE_PPTX_CONTRACT = SCRIPTS_DIR / "validate_pptx_contract.py"
 INSPECT_PPTX_INVENTORY = SCRIPTS_DIR / "inspect_pptx_inventory.py"
+VALIDATE_VISUAL_QUALITY = SCRIPTS_DIR / "validate_visual_quality.py"
 
 # Hard cap on operator image count. Keeps deck assembly + validation
 # runtime bounded and matches the small-deck-only contract the rest of
@@ -2441,6 +2472,65 @@ def _embedded_media_count_from_inventory(inv: dict) -> int:
     return len(embeds)
 
 
+# ---------------------------------------------------------------------------
+# Visual-quality review (post-pipeline, pre-summary).
+# ---------------------------------------------------------------------------
+
+
+def _read_visual_quality_report(path: Path) -> dict | None:
+    """Return the parsed JSON report at ``path`` or ``None`` when the file
+    is missing, is a symlink, is unreadable, is not UTF-8, is not valid
+    JSON, or does not decode to a JSON object. ``None`` routes through the
+    truth-checker as ``visual_quality.report_parsed=False`` so a missing
+    or malformed report fails closed without a separate raise site."""
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _project_visual_quality(
+    *,
+    outcome: _ToolOutcome,
+    path: Path,
+    report: dict | None,
+) -> dict:
+    """Project the validator's outcome + parsed report into the small
+    stable ``visual_quality`` block surfaced in ``summary.json``. Reads
+    ``totals.errors`` / ``totals.warnings`` from the report when both are
+    integers; otherwise records ``report_parsed=False`` so the
+    truth-checker refuses the run (the validator emits both keys on every
+    happy or error-bearing run, so a missing / non-int value means the
+    report shape is broken)."""
+    error_count: int | None = None
+    warning_count: int | None = None
+    report_parsed = False
+    if isinstance(report, dict):
+        totals = report.get("totals")
+        if isinstance(totals, dict):
+            errs = totals.get("errors")
+            warns = totals.get("warnings")
+            if (
+                isinstance(errs, int) and not isinstance(errs, bool)
+                and isinstance(warns, int) and not isinstance(warns, bool)
+            ):
+                error_count = errs
+                warning_count = warns
+                report_parsed = True
+    return {
+        "rc": outcome.rc,
+        "path": str(path),
+        "report_parsed": report_parsed,
+        "error_count": error_count,
+        "warning_count": warning_count,
+    }
+
+
 def _build_summary(
     *,
     images: list[_DiscoveredImage],
@@ -2453,6 +2543,9 @@ def _build_summary(
     contract: _ToolOutcome,
     inventory_outcome: _ToolOutcome,
     registry_outcome: _ToolOutcome,
+    visual_quality_outcome: _ToolOutcome,
+    visual_quality_path: Path,
+    visual_quality_report: dict | None,
     pptx_media_shas: dict[str, list[str]],
     manifest_path: Path | None,
 ) -> dict:
@@ -2509,7 +2602,13 @@ def _build_summary(
             "validate_source_image_assets": {"rc": registry_outcome.rc},
             "validate_pptx_contract": {"rc": contract.rc},
             "inspect_pptx_inventory": {"rc": inventory_outcome.rc},
+            "validate_visual_quality": {"rc": visual_quality_outcome.rc},
         },
+        "visual_quality": _project_visual_quality(
+            outcome=visual_quality_outcome,
+            path=visual_quality_path,
+            report=visual_quality_report,
+        ),
         "notes": {
             "scope": _HELPER_SCOPE_NOTE,
             "embed_surface": _HELPER_EMBED_SURFACE_NOTE,
@@ -2606,12 +2705,40 @@ def _check_summary_truth(summary: dict) -> list[str]:
         "validate_source_image_assets",
         "validate_pptx_contract",
         "inspect_pptx_inventory",
+        "validate_visual_quality",
     ):
         rc = (val.get(k) or {}).get("rc")
         if rc != 0:
             failures.append(
                 f"summary.validators.{k}.rc={rc!r}; expected 0"
             )
+
+    # visual_quality block — defense in depth over validators.rc above. The
+    # validator writes its JSON report BEFORE returning 1 on per-slide
+    # ERROR findings, so a missing or malformed report file (report_parsed
+    # is False) means something more fundamental went wrong than a per-
+    # slide finding — fail closed. Warnings (warning_count > 0) are
+    # allowed; only error_count > 0 refuses.
+    vq = summary.get("visual_quality") or {}
+    vq_rc = vq.get("rc")
+    if vq_rc != 0:
+        failures.append(
+            f"summary.visual_quality.rc={vq_rc!r}; expected 0"
+        )
+    if vq.get("report_parsed") is not True:
+        failures.append(
+            f"summary.visual_quality.report_parsed="
+            f"{vq.get('report_parsed')!r}; expected True (the JSON "
+            f"report at {vq.get('path')!r} must exist, parse as a JSON "
+            f"object, and carry totals.errors / totals.warnings as ints)"
+        )
+    err_count = vq.get("error_count")
+    if not isinstance(err_count, int) or err_count != 0:
+        failures.append(
+            f"summary.visual_quality.error_count={err_count!r}; "
+            f"expected 0 (per-slide ERROR findings refuse the run; "
+            f"warnings are allowed)"
+        )
 
     prov = summary.get("image_provenance")
     if not isinstance(prov, list) or len(prov) != (image_count or -1):
@@ -2724,6 +2851,7 @@ def _run_happy_path(
     output = out_dir / "deck.pptx"
     inventory_path = out_dir / "inventory.json"
     summary_path = out_dir / "summary.json"
+    visual_quality_path = out_dir / "visual_quality.json"
 
     fixture = _build_pipeline_fixture(
         fixture_root=fixture_root, images=images,
@@ -2829,6 +2957,33 @@ def _run_happy_path(
         )
         return 1, None, None
 
+    # Stage F — visual-quality review against the produced workspace's
+    # render_models/ + svg_previews/ pair. Inspection-only; the validator
+    # never mutates the workspace, never re-renders, never calls any
+    # external service. The JSON report is written even on rc==1 (per-
+    # slide ERROR findings), so a missing report file means something
+    # more fundamental went wrong than a finding. Warnings do NOT fail
+    # this stage; the truth-checker routes errors / nonzero rc / missing
+    # or malformed report through summary.visual_quality.
+    visual_quality_outcome = _run(
+        "validate_visual_quality",
+        [
+            sys.executable, str(VALIDATE_VISUAL_QUALITY),
+            "--workspace", str(workspace),
+            "--output", str(visual_quality_path),
+        ],
+    )
+    if visual_quality_outcome.ok:
+        print(f"  [PASS] validate_visual_quality rc=0")
+    else:
+        print(
+            f"  [WARN] validate_visual_quality "
+            f"rc={visual_quality_outcome.rc} "
+            f"(truth-checker will refuse)"
+        )
+        _print_outcome_tail(visual_quality_outcome)
+    visual_quality_report = _read_visual_quality_report(visual_quality_path)
+
     summary = _build_summary(
         images=images,
         pptx_path=output,
@@ -2840,6 +2995,9 @@ def _run_happy_path(
         contract=contract,
         inventory_outcome=inventory_outcome,
         registry_outcome=registry_outcome,
+        visual_quality_outcome=visual_quality_outcome,
+        visual_quality_path=visual_quality_path,
+        visual_quality_report=visual_quality_report,
         pptx_media_shas=pptx_media_shas,
         manifest_path=manifest_path,
     )
@@ -3014,9 +3172,12 @@ def _run_template_write_mode(
     refusal (no filesystem mutation), 1 on write failure.
 
     The template writer does NOT run the pipeline, does NOT produce a
-    PPTX, does NOT touch any file under ``REPO_ROOT``, and does NOT call
-    D-One / MCP / Qoder / a public network / a model API / an image
-    search / telemetry. It composes the same image-discovery gate
+    PPTX, does NOT produce a ``visual_quality.json`` report (the
+    visual-quality validator only runs in normal operator mode against
+    a produced workspace), does NOT touch any file under ``REPO_ROOT``,
+    and does NOT call D-One / MCP / Qoder / a public network / a model
+    API / an image search / telemetry. It composes the same
+    image-discovery gate
     (IG1..IG9) the normal operator mode applies plus the
     ``--write-manifest-template`` path gate (MT1..MT6), then writes a
     deterministic JSON manifest whose ``images[]`` array carries one
@@ -3247,6 +3408,9 @@ def _run_self_tests() -> int:
                     detail = "no_external_relationships is not True"
                 else:
                     prov = summary.get("image_provenance") or []
+                    vq = summary.get("visual_quality") or {}
+                    val = summary.get("validators") or {}
+                    vq_path = out_dir / "visual_quality.json"
                     if not all(
                         p.get("embedded_media_parts")
                         for p in prov
@@ -3256,11 +3420,52 @@ def _run_self_tests() -> int:
                             f"image_provenance missing media parts: "
                             f"{prov!r}"
                         )
+                    elif not vq_path.is_file() or vq_path.is_symlink():
+                        ok = False
+                        detail = (
+                            f"visual_quality.json not written as a "
+                            f"regular non-symlink file at {vq_path}"
+                        )
+                    elif vq.get("rc") != 0:
+                        ok = False
+                        detail = (
+                            f"visual_quality.rc={vq.get('rc')!r}, "
+                            f"expected 0"
+                        )
+                    elif vq.get("report_parsed") is not True:
+                        ok = False
+                        detail = (
+                            f"visual_quality.report_parsed="
+                            f"{vq.get('report_parsed')!r}, expected True"
+                        )
+                    elif vq.get("error_count") != 0:
+                        ok = False
+                        detail = (
+                            f"visual_quality.error_count="
+                            f"{vq.get('error_count')!r}, expected 0"
+                        )
+                    elif not isinstance(vq.get("warning_count"), int):
+                        ok = False
+                        detail = (
+                            f"visual_quality.warning_count="
+                            f"{vq.get('warning_count')!r}, expected int"
+                        )
+                    elif (
+                        (val.get("validate_visual_quality") or {}).get("rc")
+                        != 0
+                    ):
+                        ok = False
+                        detail = (
+                            f"validators.validate_visual_quality.rc="
+                            f"{(val.get('validate_visual_quality') or {}).get('rc')!r}, "
+                            f"expected 0"
+                        )
         if not ok and not detail:
             detail = f"rc={rc}"
         results.append(_ProbeResult(
             "T1 happy path: synthetic PNG + JPEG into a fresh --out-dir "
-            "-> 2-slide editable PPTX with provenance",
+            "-> 2-slide editable PPTX with provenance + visual_quality "
+            "report",
             ok, detail,
         ))
 
@@ -5256,6 +5461,204 @@ def _run_self_tests() -> int:
             f"leaked={leaked}",
         ))
 
+    # T71 visual_quality.json: produced under --out-dir, parses as a JSON
+    # object, and carries integer totals.errors / totals.warnings. Spot-
+    # checks the file the helper hands to a reviewer is the same shape
+    # the truth-checker reads.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T71-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        _write_synthetic_images(images_dir)
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+        )
+        vq_path = out_dir / "visual_quality.json"
+        parsed: object = None
+        if rc == 0 and vq_path.is_file():
+            try:
+                parsed = json.loads(vq_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                parsed = None
+        ok = (
+            rc == 0
+            and vq_path.is_file()
+            and not vq_path.is_symlink()
+            and isinstance(parsed, dict)
+            and isinstance(parsed.get("totals"), dict)
+            and parsed["totals"].get("errors") == 0
+            and isinstance(parsed["totals"].get("warnings"), int)
+            and isinstance(parsed.get("slides"), list)
+            and len(parsed["slides"]) == 2
+        )
+        results.append(_ProbeResult(
+            "T71 visual_quality.json: written under --out-dir, parses, "
+            "totals.errors==0, totals.warnings is int, 2 per-slide "
+            "entries match the 2-image deck",
+            ok,
+            f"rc={rc}, vq_exists={vq_path.is_file()}, "
+            f"parsed_keys={sorted(parsed.keys()) if isinstance(parsed, dict) else parsed!r}",
+        ))
+
+    # T72 truth-check refuses a tampered summary whose
+    # visual_quality.error_count is positive — proves errors flow into the
+    # existing summary truth-check path (the goal's "fail closed through
+    # the existing summary truth-check path"). Built from a real happy-
+    # path summary so every other field stays valid; only the visual_
+    # quality block is mutated.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T72-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        _write_synthetic_images(images_dir)
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+        )
+        good_fails: list[str] = []
+        tampered_fails: list[str] = []
+        if rc == 0:
+            summary = json.loads(
+                (out_dir / "summary.json").read_text(encoding="utf-8"),
+            )
+            good_fails = _check_summary_truth(summary)
+            tampered = json.loads(json.dumps(summary))  # deep copy
+            tampered["visual_quality"]["error_count"] = 1
+            tampered_fails = _check_summary_truth(tampered)
+        ok = (
+            rc == 0
+            and good_fails == []
+            and any(
+                "visual_quality.error_count" in f
+                for f in tampered_fails
+            )
+        )
+        results.append(_ProbeResult(
+            "T72 tampered summary visual_quality.error_count>0 fails "
+            "truth-check (errors route through summary truth-check)",
+            ok,
+            f"rc={rc}, good_fails={good_fails!r}, "
+            f"tampered_fails={tampered_fails!r}",
+        ))
+
+    # T73 truth-check refuses a tampered summary whose
+    # visual_quality.report_parsed is False — proves a missing or
+    # malformed report file fails closed. The validator emits both
+    # totals.errors and totals.warnings on every run, so report_parsed
+    # being False at runtime means the JSON couldn't be read / parsed /
+    # decoded as an object — more fundamental than a per-slide finding.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T73-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        _write_synthetic_images(images_dir)
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+        )
+        tampered_fails: list[str] = []
+        if rc == 0:
+            summary = json.loads(
+                (out_dir / "summary.json").read_text(encoding="utf-8"),
+            )
+            tampered = json.loads(json.dumps(summary))
+            tampered["visual_quality"]["report_parsed"] = False
+            tampered["visual_quality"]["error_count"] = None
+            tampered["visual_quality"]["warning_count"] = None
+            tampered_fails = _check_summary_truth(tampered)
+        ok = (
+            rc == 0
+            and any(
+                "visual_quality.report_parsed" in f
+                for f in tampered_fails
+            )
+            and any(
+                "visual_quality.error_count" in f
+                for f in tampered_fails
+            )
+        )
+        results.append(_ProbeResult(
+            "T73 tampered summary visual_quality.report_parsed=False "
+            "fails truth-check (missing/malformed report fails closed)",
+            ok, f"rc={rc}, tampered_fails={tampered_fails!r}",
+        ))
+
+    # T74 truth-check refuses a tampered summary whose visual_quality.rc
+    # is non-zero AND whose validators.validate_visual_quality.rc is
+    # non-zero — locks both the per-block rc gate AND the validators-block
+    # rc gate so a regression that drops either fires this probe.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T74-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        _write_synthetic_images(images_dir)
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+        )
+        tampered_fails: list[str] = []
+        if rc == 0:
+            summary = json.loads(
+                (out_dir / "summary.json").read_text(encoding="utf-8"),
+            )
+            tampered = json.loads(json.dumps(summary))
+            tampered["visual_quality"]["rc"] = 1
+            tampered["validators"]["validate_visual_quality"]["rc"] = 1
+            tampered_fails = _check_summary_truth(tampered)
+        ok = (
+            rc == 0
+            and any(
+                "validators.validate_visual_quality.rc" in f
+                for f in tampered_fails
+            )
+            and any(
+                "visual_quality.rc=" in f
+                for f in tampered_fails
+            )
+        )
+        results.append(_ProbeResult(
+            "T74 tampered summary visual_quality.rc != 0 AND "
+            "validators.validate_visual_quality.rc != 0 fail truth-check",
+            ok, f"rc={rc}, tampered_fails={tampered_fails!r}",
+        ))
+
+    # T75 --write-manifest-template mode is manifest-only — produces no
+    # visual_quality.json / summary.json / deck.pptx / workspace under
+    # the template's parent directory. Manifest-template mode must NOT
+    # run the pipeline (and therefore not the visual-quality validator).
+    with tempfile.TemporaryDirectory(prefix="op-helper-T75-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        _write_synthetic_images(images_dir)
+        template_path = td / "template.json"
+        rc = _run_template_write_mode(
+            images_dir_str=str(images_dir),
+            template_path_str=str(template_path),
+        )
+        siblings = sorted(
+            p.name for p in td.iterdir() if p != images_dir
+        )
+        ok = (
+            rc == 0
+            and template_path.is_file()
+            and not (td / "visual_quality.json").exists()
+            and not (td / "summary.json").exists()
+            and not (td / "deck.pptx").exists()
+            and not (td / "workspace").exists()
+            and not (td / "reports").exists()
+            and not (td / "_pipeline_fixture").exists()
+            and not (td / "inventory.json").exists()
+            and siblings == ["template.json"]
+        )
+        results.append(_ProbeResult(
+            "T75 --write-manifest-template mode produces ONLY the "
+            "manifest — no visual_quality.json / summary.json / "
+            "deck.pptx / workspace / reports / _pipeline_fixture / "
+            "inventory.json under the template's parent directory",
+            ok, f"rc={rc}, siblings_of_template={siblings!r}",
+        ))
+
     # T70 — committed-tree snapshot. The whole self-test must not have
     # mutated any byte under REPO_ROOT/scripts/ or REPO_ROOT/examples/.
     # Kept as the LAST probe so every manifest scenario above runs
@@ -5311,9 +5714,10 @@ def main(argv: list[str]) -> int:
             "local image asset pipeline (run_explicit_pipeline.py + "
             "Stage-5.5 materialize) and validators "
             "(validate_source_image_assets, validate_pptx_contract, "
-            "inspect_pptx_inventory) once, and writes a compact summary "
-            "+ per-image provenance record alongside the produced "
-            "editable PPTX. Local-only — does NOT call D-One, MCP, "
+            "inspect_pptx_inventory, validate_visual_quality) once, and "
+            "writes a compact summary + per-image provenance record + a "
+            "visual_quality.json report alongside the produced editable "
+            "PPTX. Local-only — does NOT call D-One, MCP, "
             "Qoder, a public network, telemetry, a model API, an image "
             "search, or any external service. NOT a full prompt or "
             "report or Markdown-to-PPTX automation."
@@ -5375,7 +5779,8 @@ def main(argv: list[str]) -> int:
             "symlink ancestor, anchor under the repo, point at a "
             "missing or non-directory parent, or already exist. The "
             "template writer does NOT run the pipeline, does NOT "
-            "produce a PPTX, and does NOT call any external service. "
+            "produce a PPTX, does NOT produce a visual_quality.json "
+            "report, and does NOT call any external service. "
             "Mutually exclusive with --out-dir / --manifest / "
             "--self-test."
         ),
