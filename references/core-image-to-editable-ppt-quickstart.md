@@ -154,6 +154,28 @@ The writer reuses the same flat PNG / JPG / JPEG discovery the normal mode appli
 
 Contract for `--write-manifest-template PATH` mirrors the other operator paths: must not be URI-shaped, a symlink, or have a symlink ancestor, must not anchor under the repo tree, must have an existing directory parent, and must not already exist (the writer never overwrites operator files). The writer does NOT run the pipeline, does NOT produce a PPTX, does NOT produce a `visual_quality.json` report (the visual-quality validator only runs in normal operator mode against a produced workspace), and does NOT call D-One / MCP / Qoder / a public network / a model API / an image search / telemetry.
 
+### Optional `--plan-out` for a plan-only preflight
+
+Before driving the full pipeline, you can ask the helper for a plan-only preflight: it discovers the same flat PNG / JPG / JPEG folder operator mode uses (reuses the IG1..IG9 gates verbatim), validates the optional `--manifest` against MAN1..MAN12 when supplied, then writes a compact deterministic JSON plan and exits — without running `run_explicit_pipeline.py` and without producing a workspace, PPTX, inventory, visual_quality, summary, reports, or `_pipeline_fixture` artifact.
+
+```bash
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_local_images_to_editable_ppt.py \
+  --images-dir "$IMAGES_DIR" \
+  --plan-out "$RUN_DIR/plan.json"
+
+# With per-image slide intent:
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_local_images_to_editable_ppt.py \
+  --images-dir "$IMAGES_DIR" \
+  --plan-out "$RUN_DIR/plan.json" \
+  --manifest "$RUN_DIR/manifest.json"
+```
+
+The plan carries `schema_version="1"`, `helper_id="operator_local_images_to_editable_ppt"`, `mode="plan_only"`, `image_count`, `slide_count` (== `image_count`), `manifest_path` (string when `--manifest` was supplied, `null` otherwise), the locked `explicit_boundaries` tuple identical to the one the operator-mode summary echoes, and one `images[]` row per discovered image carrying `filename` / `asset_id` / `media_type` / `byte_count` / `sha256` / `intended_slide_index` (1-based) / `slide_title` / `alt_text` / `intended_use`, in manifest-array order when `--manifest` was supplied or filename-sorted order otherwise.
+
+Contract for `--plan-out PATH` mirrors `--write-manifest-template` (PO1..PO6): must not be URI-shaped, a symlink, or have a symlink ancestor, must not anchor under the repo tree, must have an existing directory parent, and must not already exist (stale bytes on a pre-existing target are preserved). `--plan-out` is mutually exclusive with `--out-dir` / `--write-manifest-template` / `--self-test`; it requires `--images-dir` and may combine with the optional `--manifest`. Plan-only mode does NOT run the pipeline and does NOT call D-One / MCP / Qoder / a public network / a model API / an image search / telemetry.
+
 Outputs (every path lives under `--out-dir`; nothing lands under the repo tree):
 
 - `deck.pptx` — native editable PPTX, one cover slide per operator image, each carrying the operator file embedded in `ppt/media/`.

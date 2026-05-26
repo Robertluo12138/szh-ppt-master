@@ -9,7 +9,7 @@ wants to prove those bytes can flow through the existing local image
 asset pipeline into a native editable PPTX with inventory + provenance
 evidence.
 
-Three modes share one helper:
+Four modes share one helper:
 
   * ``--images-dir DIR --out-dir OUT [--manifest PATH]`` — **operator
     mode**: takes a caller-supplied flat directory of PNG / JPG / JPEG
@@ -56,6 +56,27 @@ Three modes share one helper:
     the template verbatim and the produced summary echoes the
     template's slide_title / alt_text / intended_use under
     ``image_provenance[]`` exactly as for a hand-authored manifest.
+
+  * ``--images-dir DIR --plan-out PATH [--manifest PATH]`` — **plan-
+    only preflight writer mode**: discovers the same flat PNG / JPG /
+    JPEG folder operator mode uses (reuses the IG1..IG9 gate
+    verbatim), validates the optional ``--manifest`` against
+    MAN1..MAN12 when supplied, then writes a compact deterministic
+    JSON plan at PATH whose ``images[]`` rows carry per-image
+    filename / asset_id / media_type / byte_count / sha256 / intended
+    1-based slide index / slide_title / alt_text / intended_use, in
+    manifest-array order when ``--manifest`` is supplied or filename-
+    sorted order otherwise. The plan-only mode does NOT run
+    ``run_explicit_pipeline.py``, does NOT produce a PPTX, does NOT
+    produce a workspace / inventory / visual_quality / summary /
+    ``_pipeline_fixture`` artifact, does NOT write anywhere under
+    ``REPO_ROOT`` (PO4 refuses the argument outright), and does NOT
+    call D-One / MCP / Qoder / a public network / a model API / an
+    image search / telemetry. The plan path gate (PO1..PO6) mirrors
+    the manifest-template gate (MT1..MT6): URI, symlink, symlink
+    ancestor, REPO_ROOT anchor, missing / non-directory parent, and
+    pre-existing target are all refused; stale bytes on a
+    pre-existing target are preserved.
 
   * ``--self-test`` — drives the same happy paths inside per-run
     ``tempfile.TemporaryDirectory()`` instances using two tiny
@@ -273,6 +294,9 @@ Usage:
 
   python3 scripts/operator_local_images_to_editable_ppt.py \\
       --images-dir DIR --write-manifest-template PATH
+
+  python3 scripts/operator_local_images_to_editable_ppt.py \\
+      --images-dir DIR --plan-out PATH [--manifest PATH]
 
   python3 scripts/operator_local_images_to_editable_ppt.py --self-test
 
@@ -2070,6 +2094,123 @@ def _validate_manifest_template_arg(
 
 
 # ---------------------------------------------------------------------------
+# --plan-out path gate.
+# ---------------------------------------------------------------------------
+
+
+def _validate_plan_out_arg(
+    plan_out_str: str,
+) -> tuple[Path | None, list[str]]:
+    """Validate the ``--plan-out`` argument and return the resolved path.
+    The caller MUST treat the argument as refused whenever ``failures``
+    is non-empty OR ``path`` is ``None``, and MUST NOT write to the path
+    in that case (stale bytes on a pre-existing target are preserved).
+
+    Mirrors the ``--write-manifest-template`` gate (MT1..MT6) so the two
+    plan-only writers carry one consistent contract.
+
+      PO1   URI-shaped argument (``file://`` / ``http://`` / ``data:`` /
+            any RFC-3986 scheme prefix). The plan writer accepts local
+            paths only.
+      PO2   the path itself is a symlink (broken or resolvable).
+            Silently following a symlink would let an attacker who
+            controls the link target redirect operator writes.
+      PO3   any ancestor up to the filesystem root is a symlink. Same
+            attack surface one level up — closed system aliases like
+            ``/tmp -> /private/tmp`` remain accepted via
+            ``_forbidden_symlink_ancestor``.
+      PO4   the resolved path lexically anchors under ``REPO_ROOT``,
+            compared BOTH case-sensitively AND on case-folded strings so
+            a case-variant of the repo root still trips the gate on
+            case-insensitive APFS / HFS+ / NTFS volumes (matches the
+            MT4 reasoning).
+      PO5   the path's parent either does not exist or is not a
+            directory. Refusing to ``mkdir -p`` avoids masking a typo in
+            the operator's argument.
+      PO6   the path already exists (regular file, directory, or any
+            other entry). The plan writer does not overwrite operator
+            files; stale bytes on a pre-existing target are preserved.
+    """
+    if _has_uri_scheme(plan_out_str):
+        return None, [
+            f"--plan-out argument {plan_out_str!r} looks URI-shaped "
+            f"(PO1); only local file paths are accepted."
+        ]
+
+    plan_out = Path(plan_out_str)
+
+    if plan_out.is_symlink():
+        try:
+            tgt = os.readlink(plan_out)
+        except OSError:
+            tgt = "<unreadable>"
+        return None, [
+            f"--plan-out {plan_out} is a symlink (-> {tgt}) (PO2); "
+            f"refused so a symlink target cannot redirect operator "
+            f"writes."
+        ]
+
+    forbidden_ancestor = _forbidden_symlink_ancestor(plan_out)
+    if forbidden_ancestor is not None:
+        ancestor, tgt = forbidden_ancestor
+        return None, [
+            f"--plan-out {plan_out} has a symlink ancestor "
+            f"{ancestor} (-> {tgt}) (PO3); refused so a symlink in the "
+            f"operator's typed path cannot redirect operator writes."
+        ]
+
+    try:
+        resolved = plan_out.resolve(strict=False)
+    except OSError as exc:
+        return None, [
+            f"--plan-out {plan_out} could not be resolved: "
+            f"{type(exc).__name__}: {exc} (PO3)."
+        ]
+
+    repo_root = REPO_ROOT.resolve(strict=False)
+    under_root = False
+    try:
+        resolved.relative_to(repo_root)
+        under_root = True
+    except ValueError:
+        resolved_folded = str(resolved).casefold()
+        repo_root_folded = str(repo_root).casefold()
+        if (
+            resolved_folded == repo_root_folded
+            or resolved_folded.startswith(repo_root_folded + os.sep)
+        ):
+            under_root = True
+    if under_root:
+        return None, [
+            f"--plan-out {resolved} lexically anchors under "
+            f"REPO_ROOT={repo_root} (PO4); refused — plan files must "
+            f"land outside the committed repo tree."
+        ]
+
+    if not plan_out.parent.exists():
+        return None, [
+            f"--plan-out {plan_out} parent {plan_out.parent} does not "
+            f"exist (PO5); create the parent explicitly before "
+            f"re-running so a typo cannot be masked by an implicit "
+            f"mkdir -p."
+        ]
+    if not plan_out.parent.is_dir():
+        return None, [
+            f"--plan-out {plan_out} parent {plan_out.parent} is not a "
+            f"directory (PO5); refused."
+        ]
+
+    if plan_out.exists():
+        return None, [
+            f"--plan-out {plan_out} already exists (PO6); refused to "
+            f"avoid overwriting an operator file (stale bytes are "
+            f"preserved). Pass a fresh path."
+        ]
+
+    return plan_out, []
+
+
+# ---------------------------------------------------------------------------
 # Pipeline fixture composition.
 # ---------------------------------------------------------------------------
 
@@ -3423,6 +3564,176 @@ def _run_template_write_mode(
         f"--manifest <this-path>. Local-only — does NOT call D-One, "
         f"MCP, Qoder, a public network, a model API, an image search, "
         f"or telemetry."
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Plan-only preflight entrypoint.
+# ---------------------------------------------------------------------------
+
+
+# Schema version locked alongside the manifest's; bump in lockstep if the
+# plan-only output shape ever needs to evolve.
+_PLAN_SCHEMA_VERSION = "1"
+_PLAN_MODE = "plan_only"
+
+
+def _run_plan_only_mode(
+    *,
+    images_dir_str: str,
+    plan_out_str: str,
+    manifest_path_str: str | None = None,
+) -> int:
+    """Validate every operator argument, discover the images (and the
+    optional manifest), and write a compact deterministic JSON
+    preflight plan to ``--plan-out``. Returns 0 on success, 2 on
+    operator-input refusal (no filesystem mutation), 1 on write
+    failure.
+
+    The plan-only mode does NOT run the pipeline, does NOT produce a
+    PPTX, does NOT produce a workspace / inventory / visual_quality /
+    summary / _pipeline_fixture artifact, does NOT touch any file
+    under ``REPO_ROOT``, and does NOT call D-One / MCP / Qoder / a
+    public network / a model API / an image search / telemetry. It
+    composes the same image-discovery gate (IG1..IG9) the normal
+    operator mode applies plus — only when ``--manifest`` was supplied
+    — the manifest gate (MAN1..MAN12), plus the ``--plan-out`` path
+    gate (PO1..PO6). The plan it writes carries one row per
+    discovered image with filename / asset_id / media_type /
+    byte_count / sha256 / intended 1-based slide index / slide_title /
+    alt_text / intended_use, in manifest-array order when
+    ``--manifest`` is supplied or filename-sorted order otherwise.
+    """
+    images, _images_dir, image_failures = _validate_images_dir_arg(
+        images_dir_str,
+    )
+    plan_out, plan_failures = _validate_plan_out_arg(plan_out_str)
+
+    manifest_failures: list[str] = []
+    manifest_path: Path | None = None
+    if manifest_path_str is not None:
+        discovered_filenames = (
+            [img.operator_filename for img in images]
+            if images is not None
+            else None
+        )
+        ordered_entries, manifest_path, manifest_failures = (
+            _validate_manifest_arg(
+                manifest_path_str, discovered_filenames,
+            )
+        )
+        if (
+            not image_failures
+            and not manifest_failures
+            and images is not None
+            and ordered_entries is not None
+        ):
+            by_filename = {
+                img.operator_filename: img for img in images
+            }
+            images = [
+                replace(
+                    by_filename[entry["filename"]],
+                    slide_title=entry["slide_title"],
+                    alt_text=entry["alt_text"],
+                    intended_use=entry["intended_use"],
+                )
+                for entry in ordered_entries
+            ]
+
+    if (
+        image_failures
+        or plan_failures
+        or manifest_failures
+        or images is None
+        or plan_out is None
+    ):
+        for line in image_failures or []:
+            print(f"FAIL: {line}", file=sys.stderr)
+        for line in plan_failures or []:
+            print(f"FAIL: {line}", file=sys.stderr)
+        for line in manifest_failures or []:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 2
+
+    rows: list[dict] = []
+    for idx, image in enumerate(images, start=1):
+        title = image.slide_title or _default_slide_title(image)
+        alt_text = image.alt_text or _default_alt_text(image)
+        intended_use = image.intended_use or _DEFAULT_INTENDED_USE
+        rows.append({
+            "filename": image.operator_filename,
+            "asset_id": image.asset_id,
+            "media_type": image.media_type,
+            "byte_count": image.byte_count,
+            "sha256": image.sha256,
+            "intended_slide_index": idx,
+            "slide_title": title,
+            "alt_text": alt_text,
+            "intended_use": intended_use,
+        })
+
+    body = {
+        "schema_version": _PLAN_SCHEMA_VERSION,
+        "helper_id": "operator_local_images_to_editable_ppt",
+        "mode": _PLAN_MODE,
+        "image_count": len(images),
+        "slide_count": len(images),
+        "manifest_path": (
+            str(manifest_path) if manifest_path is not None else None
+        ),
+        "explicit_boundaries": list(_EXPLICIT_BOUNDARIES),
+        "images": rows,
+    }
+
+    manifest_arg_display = (
+        f", --manifest {manifest_path}"
+        if manifest_path is not None
+        else ""
+    )
+    print(
+        f"=== operator_local_images_to_editable_ppt "
+        f"(--images-dir {images_dir_str}, --plan-out {plan_out}"
+        f"{manifest_arg_display}) ==="
+    )
+    for row in rows:
+        print(
+            f"  image:     {row['filename']!r} "
+            f"(id={row['asset_id']!r}, {row['media_type']}, "
+            f"{row['byte_count']} bytes, "
+            f"sha256={row['sha256'][:12]}..., "
+            f"intended_slide={row['intended_slide_index']})"
+        )
+
+    try:
+        plan_out.write_text(
+            json.dumps(body, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(
+            f"FAIL: cannot write --plan-out {plan_out}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not plan_out.is_file() or plan_out.is_symlink():
+        print(
+            f"FAIL: expected --plan-out {plan_out} as a regular "
+            f"non-symlink file after write",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"OK (plan-only): wrote {len(rows)} image plan row"
+        f"{'' if len(rows) == 1 else 's'} to {plan_out}. Pipeline NOT "
+        f"run; no PPTX, workspace, inventory, visual_quality, summary, "
+        f"or _pipeline_fixture produced. Local-only — does NOT call "
+        f"D-One, MCP, Qoder, a public network, a model API, an image "
+        f"search, or telemetry."
     )
     return 0
 
@@ -6122,6 +6433,360 @@ def _run_self_tests() -> int:
             ok, f"rc={rc}, siblings_of_template={siblings!r}",
         ))
 
+    # T80 --plan-out happy path (no --manifest): the helper writes the
+    # plan and NOTHING else under the plan_out's parent — no
+    # _pipeline_fixture, no workspace, no PPTX, no inventory, no
+    # visual_quality.json, no summary.json. The plan carries the
+    # locked schema_version / helper_id / mode strings, image_count ==
+    # slide_count == 2, manifest_path == None, the eight EXPLICIT
+    # boundary sentences verbatim, and one row per discovered image
+    # with filename / asset_id / media_type / byte_count / sha256 /
+    # intended_slide_index / slide_title / alt_text / intended_use in
+    # filename-sorted order (alpha_marker.png -> slide 1,
+    # beta_marker.jpg -> slide 2). Locks the spec's "fixed explicit
+    # boundaries" + "intended 1-based slide index" + "preserve operator
+    # bytes" assertions for the no-manifest path.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T80-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        _write_synthetic_images(images_dir)
+        plan_out = td / "plan.json"
+        rc = _run_plan_only_mode(
+            images_dir_str=str(images_dir),
+            plan_out_str=str(plan_out),
+        )
+        ok = rc == 0 and plan_out.is_file()
+        detail = ""
+        if not ok:
+            detail = (
+                f"rc={rc}, plan_present={plan_out.is_file()}"
+            )
+        if ok:
+            try:
+                plan = json.loads(plan_out.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"cannot parse plan: {exc}"
+        siblings = sorted(
+            p.name for p in td.iterdir() if p != images_dir
+        )
+        if ok and siblings != ["plan.json"]:
+            ok = False
+            detail = (
+                f"unexpected siblings under plan_out parent: "
+                f"{siblings!r}; expected ['plan.json']"
+            )
+        if ok:
+            for forbidden in (
+                "summary.json", "deck.pptx", "inventory.json",
+                "visual_quality.json", "_pipeline_fixture",
+                "workspace", "reports",
+            ):
+                if (td / forbidden).exists():
+                    ok = False
+                    detail = (
+                        f"plan-only mode produced forbidden artifact "
+                        f"{forbidden!r}"
+                    )
+                    break
+        if ok:
+            if plan.get("schema_version") != "1":
+                ok = False
+                detail = (
+                    f"schema_version={plan.get('schema_version')!r}; "
+                    f"expected '1'"
+                )
+            elif plan.get("helper_id") != (
+                "operator_local_images_to_editable_ppt"
+            ):
+                ok = False
+                detail = (
+                    f"helper_id={plan.get('helper_id')!r}; "
+                    f"expected 'operator_local_images_to_editable_ppt'"
+                )
+            elif plan.get("mode") != "plan_only":
+                ok = False
+                detail = (
+                    f"mode={plan.get('mode')!r}; expected 'plan_only'"
+                )
+            elif plan.get("image_count") != 2:
+                ok = False
+                detail = (
+                    f"image_count={plan.get('image_count')!r}; "
+                    f"expected 2"
+                )
+            elif plan.get("slide_count") != 2:
+                ok = False
+                detail = (
+                    f"slide_count={plan.get('slide_count')!r}; "
+                    f"expected 2"
+                )
+            elif plan.get("manifest_path") is not None:
+                ok = False
+                detail = (
+                    f"manifest_path={plan.get('manifest_path')!r}; "
+                    f"expected None"
+                )
+            elif (
+                tuple(plan.get("explicit_boundaries") or ())
+                != _EXPLICIT_BOUNDARIES
+            ):
+                ok = False
+                detail = (
+                    f"explicit_boundaries={plan.get('explicit_boundaries')!r}; "
+                    f"expected {_EXPLICIT_BOUNDARIES!r}"
+                )
+            else:
+                rows = plan.get("images") or []
+                expected_filenames = [
+                    "alpha_marker.png", "beta_marker.jpg",
+                ]
+                if [r.get("filename") for r in rows] != expected_filenames:
+                    ok = False
+                    detail = (
+                        f"row filenames "
+                        f"{[r.get('filename') for r in rows]!r}; "
+                        f"expected {expected_filenames!r} (filename-"
+                        f"sorted order)"
+                    )
+                elif [
+                    r.get("intended_slide_index") for r in rows
+                ] != [1, 2]:
+                    ok = False
+                    detail = (
+                        f"intended_slide_index sequence "
+                        f"{[r.get('intended_slide_index') for r in rows]!r}; "
+                        f"expected [1, 2]"
+                    )
+                else:
+                    expected_media_types = [
+                        "image/png", "image/jpeg",
+                    ]
+                    if [
+                        r.get("media_type") for r in rows
+                    ] != expected_media_types:
+                        ok = False
+                        detail = (
+                            f"media_type sequence "
+                            f"{[r.get('media_type') for r in rows]!r}; "
+                            f"expected {expected_media_types!r}"
+                        )
+                    else:
+                        expected_payloads = (
+                            _TINY_PNG_BYTES, _TINY_JPEG_BYTES,
+                        )
+                        for i, payload in enumerate(expected_payloads):
+                            expected_sha = hashlib.sha256(
+                                payload,
+                            ).hexdigest()
+                            row = rows[i]
+                            if row.get("byte_count") != len(payload):
+                                ok = False
+                                detail = (
+                                    f"row[{i}].byte_count="
+                                    f"{row.get('byte_count')!r}; "
+                                    f"expected {len(payload)!r}"
+                                )
+                                break
+                            if row.get("sha256") != expected_sha:
+                                ok = False
+                                detail = (
+                                    f"row[{i}].sha256={row.get('sha256')!r}; "
+                                    f"expected {expected_sha!r}"
+                                )
+                                break
+                            for required_field in (
+                                "asset_id", "slide_title",
+                                "alt_text", "intended_use",
+                            ):
+                                value = row.get(required_field)
+                                if (
+                                    not isinstance(value, str)
+                                    or not value
+                                ):
+                                    ok = False
+                                    detail = (
+                                        f"row[{i}].{required_field}="
+                                        f"{value!r}; expected non-empty "
+                                        f"string"
+                                    )
+                                    break
+                            if not ok:
+                                break
+        results.append(_ProbeResult(
+            "T80 --plan-out happy path: plan written; no pipeline / "
+            "PPTX / inventory / visual_quality / summary / fixture "
+            "artifact materialised; rows carry filename / asset_id / "
+            "media_type / byte_count / sha256 / intended_slide_index / "
+            "slide_title / alt_text / intended_use in filename-sorted "
+            "order with locked schema / helper / mode / explicit "
+            "boundaries",
+            ok, detail,
+        ))
+
+    # T81 --plan-out happy path with --manifest: the manifest's
+    # images[] array order replaces the filename sort as the deck
+    # slide order, AND the operator-typed slide_title / alt_text /
+    # intended_use flow through verbatim into the plan rows, AND
+    # plan.manifest_path echoes the manifest path. Locks the spec's
+    # "preserves manifest order and operator-authored fields"
+    # assertion.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T81-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        _write_synthetic_images(images_dir)
+        manifest = td / "manifest.json"
+        plan_out = td / "plan.json"
+        manifest.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [
+                {
+                    "filename": "beta_marker.jpg",
+                    "slide_title": "Beta plan first",
+                    "alt_text": "Operator beta marker (plan order)",
+                    "intended_use": "decorative pattern",
+                },
+                {
+                    "filename": "alpha_marker.png",
+                    "slide_title": "Alpha plan second",
+                    "alt_text": "Operator alpha marker (plan order)",
+                    "intended_use": "icon",
+                },
+            ],
+        }) + "\n", encoding="utf-8")
+        rc = _run_plan_only_mode(
+            images_dir_str=str(images_dir),
+            plan_out_str=str(plan_out),
+            manifest_path_str=str(manifest),
+        )
+        ok = rc == 0 and plan_out.is_file()
+        detail = ""
+        if ok:
+            try:
+                plan = json.loads(plan_out.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"cannot parse plan: {exc}"
+        if ok:
+            if plan.get("manifest_path") != str(manifest):
+                ok = False
+                detail = (
+                    f"manifest_path={plan.get('manifest_path')!r}; "
+                    f"expected {str(manifest)!r}"
+                )
+            else:
+                rows = plan.get("images") or []
+                if [r.get("filename") for r in rows] != [
+                    "beta_marker.jpg", "alpha_marker.png",
+                ]:
+                    ok = False
+                    detail = (
+                        f"filenames {[r.get('filename') for r in rows]!r}; "
+                        f"expected manifest order "
+                        f"['beta_marker.jpg', 'alpha_marker.png']"
+                    )
+                elif [
+                    r.get("intended_slide_index") for r in rows
+                ] != [1, 2]:
+                    ok = False
+                    detail = (
+                        f"intended_slide_index sequence "
+                        f"{[r.get('intended_slide_index') for r in rows]!r}; "
+                        f"expected [1, 2] (manifest order)"
+                    )
+                else:
+                    expected_titles = [
+                        "Beta plan first", "Alpha plan second",
+                    ]
+                    expected_alts = [
+                        "Operator beta marker (plan order)",
+                        "Operator alpha marker (plan order)",
+                    ]
+                    expected_uses = [
+                        "decorative pattern", "icon",
+                    ]
+                    for i, (ttl, alt, use) in enumerate(zip(
+                        expected_titles, expected_alts, expected_uses,
+                    )):
+                        if rows[i].get("slide_title") != ttl:
+                            ok = False
+                            detail = (
+                                f"row[{i}].slide_title="
+                                f"{rows[i].get('slide_title')!r}; "
+                                f"expected {ttl!r}"
+                            )
+                            break
+                        if rows[i].get("alt_text") != alt:
+                            ok = False
+                            detail = (
+                                f"row[{i}].alt_text="
+                                f"{rows[i].get('alt_text')!r}; "
+                                f"expected {alt!r}"
+                            )
+                            break
+                        if rows[i].get("intended_use") != use:
+                            ok = False
+                            detail = (
+                                f"row[{i}].intended_use="
+                                f"{rows[i].get('intended_use')!r}; "
+                                f"expected {use!r}"
+                            )
+                            break
+        if not ok and not detail:
+            detail = f"rc={rc}"
+        results.append(_ProbeResult(
+            "T81 --plan-out with --manifest preserves manifest order "
+            "and operator-authored slide_title / alt_text / "
+            "intended_use; plan.manifest_path echoes the manifest path",
+            ok, detail,
+        ))
+
+    # T82 PO4 --plan-out inside REPO_ROOT refused with no file
+    # materialised under the committed repo tree.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T82-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        _write_synthetic_images(images_dir)
+        bad_plan = REPO_ROOT / "operator_plan_should_not_land_here.json"
+        rc = _run_plan_only_mode(
+            images_dir_str=str(images_dir),
+            plan_out_str=str(bad_plan),
+        )
+        leaked = bad_plan.exists()
+        results.append(_ProbeResult(
+            "T82 PO4: --plan-out inside REPO_ROOT refused; no file "
+            "materialises under the committed tree",
+            rc == 2 and not leaked,
+            f"rc={rc}, leaked={leaked}",
+        ))
+
+    # T83 PO6 pre-existing --plan-out refused with stale bytes
+    # preserved byte-identical. Mirrors the manifest-template MT6
+    # contract: the writer never overwrites operator files.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T83-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        _write_synthetic_images(images_dir)
+        plan_out = td / "plan.json"
+        stale_bytes = b"PRE-EXISTING-PLAN-BYTES\n"
+        plan_out.write_bytes(stale_bytes)
+        rc = _run_plan_only_mode(
+            images_dir_str=str(images_dir),
+            plan_out_str=str(plan_out),
+        )
+        ok = (
+            rc == 2
+            and plan_out.is_file()
+            and plan_out.read_bytes() == stale_bytes
+        )
+        results.append(_ProbeResult(
+            "T83 PO6: pre-existing --plan-out refused; stale bytes "
+            "preserved byte-identical",
+            ok,
+            f"rc={rc}, bytes_preserved="
+            f"{plan_out.read_bytes() == stale_bytes!r}",
+        ))
+
     # T70 — committed-tree snapshot. The whole self-test must not have
     # mutated any byte under REPO_ROOT/scripts/ or REPO_ROOT/examples/.
     # Kept as the LAST probe so every manifest scenario above runs
@@ -6245,7 +6910,31 @@ def main(argv: list[str]) -> int:
             "produce a PPTX, does NOT produce a visual_quality.json "
             "report, and does NOT call any external service. "
             "Mutually exclusive with --out-dir / --manifest / "
-            "--self-test."
+            "--self-test / --plan-out."
+        ),
+    )
+    parser.add_argument(
+        "--plan-out", type=str, default=None,
+        help=(
+            "Plan-only preflight writer mode. When supplied, the "
+            "helper discovers --images-dir using the same IG1..IG9 "
+            "gates the normal mode applies (and validates the optional "
+            "--manifest against MAN1..MAN12 when supplied), then writes "
+            "a compact deterministic JSON plan to PATH whose images[] "
+            "rows carry filename / asset_id / media_type / byte_count "
+            "/ sha256 / intended 1-based slide index / slide_title / "
+            "alt_text / intended_use in manifest-array order (when "
+            "--manifest is supplied) or filename-sorted order "
+            "otherwise. The plan path must not be URI-shaped, a "
+            "symlink, have a symlink ancestor, anchor under the repo, "
+            "point at a missing or non-directory parent, or already "
+            "exist. Plan-only mode does NOT run the pipeline, does NOT "
+            "produce a PPTX, does NOT produce a workspace, inventory, "
+            "visual_quality, summary, or _pipeline_fixture artifact, "
+            "and does NOT call any external service. Mutually "
+            "exclusive with --out-dir / --write-manifest-template / "
+            "--self-test; may combine with --images-dir (required) and "
+            "optional --manifest."
         ),
     )
     parser.add_argument(
@@ -6254,7 +6943,7 @@ def main(argv: list[str]) -> int:
             "Run the in-script tempfixture scenarios (happy path + "
             "every documented fail-closed probe). Mutually exclusive "
             "with --images-dir / --out-dir / --manifest / "
-            "--write-manifest-template."
+            "--write-manifest-template / --plan-out."
         ),
     )
     args = parser.parse_args(argv)
@@ -6265,10 +6954,12 @@ def main(argv: list[str]) -> int:
             or args.out_dir is not None
             or args.manifest is not None
             or args.write_manifest_template is not None
+            or args.plan_out is not None
         ):
             print(
                 "FAIL: --self-test does not take --images-dir / "
-                "--out-dir / --manifest / --write-manifest-template.",
+                "--out-dir / --manifest / --write-manifest-template / "
+                "--plan-out.",
                 file=sys.stderr,
             )
             return 2
@@ -6281,17 +6972,41 @@ def main(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 2
-        if args.out_dir is not None or args.manifest is not None:
+        if (
+            args.out_dir is not None
+            or args.manifest is not None
+            or args.plan_out is not None
+        ):
             print(
                 "FAIL: --write-manifest-template does not take "
-                "--out-dir / --manifest (the template writer does not "
-                "run the pipeline).",
+                "--out-dir / --manifest / --plan-out (the template "
+                "writer does not run the pipeline).",
                 file=sys.stderr,
             )
             return 2
         return _run_template_write_mode(
             images_dir_str=args.images_dir,
             template_path_str=args.write_manifest_template,
+        )
+
+    if args.plan_out is not None:
+        if args.images_dir is None:
+            print(
+                "FAIL: --plan-out requires --images-dir.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.out_dir is not None:
+            print(
+                "FAIL: --plan-out does not take --out-dir (plan-only "
+                "mode does not run the pipeline).",
+                file=sys.stderr,
+            )
+            return 2
+        return _run_plan_only_mode(
+            images_dir_str=args.images_dir,
+            plan_out_str=args.plan_out,
+            manifest_path_str=args.manifest,
         )
 
     missing = [
@@ -6304,9 +7019,11 @@ def main(argv: list[str]) -> int:
     if missing:
         print(
             f"FAIL: missing required argument(s): {', '.join(missing)} "
-            f"(use --self-test for the in-script scenarios, or "
+            f"(use --self-test for the in-script scenarios, "
             f"--write-manifest-template PATH to write a starter "
-            f"manifest without running the pipeline).",
+            f"manifest without running the pipeline, or --plan-out "
+            f"PATH to write a preflight plan without running the "
+            f"pipeline).",
             file=sys.stderr,
         )
         return 2
