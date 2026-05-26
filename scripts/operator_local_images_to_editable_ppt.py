@@ -33,8 +33,13 @@ Four modes share one helper:
     naming the operator filename, the workspace path the bytes landed
     at, the sha256, the embedded ``ppt/media/*`` part, and (when
     ``--manifest`` was supplied) the operator-typed slide_title /
-    alt_text / intended_use. Leaves every intermediate artifact on
-    disk under OUT for a reviewer to inspect.
+    alt_text / intended_use. On a truth-checked happy run the helper
+    additionally writes a concise operator-facing ``README.md`` to
+    ``<out-dir>`` that names the produced artifacts, points reviewers
+    at ``summary.image_provenance[]`` for filename -> sha256 -> ppt/media
+    part -> intended/readback slide evidence, and echoes the fixed
+    local-only boundary statement. Leaves every intermediate artifact
+    on disk under OUT for a reviewer to inspect.
 
   * ``--images-dir DIR --write-manifest-template PATH`` — **manifest-
     template writer mode**: discovers the same flat PNG / JPG / JPEG
@@ -426,6 +431,17 @@ _EXPLICIT_BOUNDARIES: tuple[str, ...] = (
     "No public network access.",
     "No telemetry emission.",
     "Raw prompt or report-to-PPT automation is NOT implemented.",
+)
+
+# Fixed single-sentence boundary statement embedded verbatim in the
+# operator-facing README written under --out-dir. Concentrates the same
+# negation-pinned wording the locked _EXPLICIT_BOUNDARIES tuple already
+# carries so a reviewer who reads only the README sees the same scope
+# the summary truth-checker enforces.
+_README_BOUNDARY_STATEMENT = (
+    "Local-only — real D-One is UNVERIFIED; this helper does NOT call "
+    "MCP, Qoder, a public network, a model API, an image search, or "
+    "telemetry, and is NOT a prompt or report-to-PPT automation."
 )
 
 _URI_SCHEME_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
@@ -3111,6 +3127,79 @@ def _check_summary_truth(summary: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Operator-facing README emission.
+# ---------------------------------------------------------------------------
+
+
+def _render_review_readme(summary: dict) -> str:
+    """Render the operator-facing review README from the truth-checked
+    summary. Concise Markdown — names the produced artifacts, the
+    editable-PPT evidence, the provenance pointer, and the fixed
+    local-only boundary statement. Derived ONLY from the summary the
+    helper just wrote; no new schema, no extra filesystem reads."""
+    slide_count = summary.get("slide_count")
+    image_count = summary.get("image_count")
+    embedded = summary.get("embedded_media_count")
+    manifest_path = summary.get("manifest_path")
+    manifest_line = (
+        f"- Authored from operator manifest: `{manifest_path}`."
+        if isinstance(manifest_path, str) and manifest_path
+        else "- No operator manifest supplied; filename-sorted order "
+             "and default per-image strings were applied."
+    )
+    lines = [
+        "# Operator local-images review package",
+        "",
+        f"{image_count} operator image(s) embedded into a "
+        f"{slide_count}-slide native editable `.pptx` from local "
+        "PNG / JPG / JPEG bytes; `embedded_media_count="
+        f"{embedded}` `ppt/media/*` part(s) carry the operator bytes "
+        "byte-for-byte.",
+        "",
+        manifest_line,
+        "",
+        "## Files in this review package",
+        "",
+        "- `deck.pptx` — native editable PPTX (one cover slide per "
+        "operator image; editable title text + image_slot accent).",
+        "- `summary.json` — truth-checked summary record (slide / "
+        "image / embedded-media counts, minimal-evidence booleans, "
+        "validator rc values, per-image provenance, visual-quality "
+        "block, locked boundary statement).",
+        "- `inventory.json` — `inspect_pptx_inventory` readback over "
+        "`deck.pptx` (internal-only relationships, every embedded "
+        "`ppt/media/*` part, per-slide media refs).",
+        "- `visual_quality.json` — `validate_visual_quality` JSON "
+        "report over the produced workspace's `render_models/` + "
+        "`svg_previews/` pair (per-slide `totals.errors` / "
+        "`totals.warnings`).",
+        "- `workspace/source_image_assets.json` — source-attached "
+        "registry the post-run `validate_source_image_assets` "
+        "(G1..G13) validator ran against.",
+        "- `reports/` — `pipeline_report.{json,txt}` and the "
+        "runner-written inventory from the underlying "
+        "`run_pipeline.py`.",
+        "",
+        "## Trace operator bytes through the deck",
+        "",
+        "See `summary.image_provenance[]` for the per-image evidence "
+        "chain: each row maps `operator_filename` -> `sha256` -> "
+        "embedded `ppt/media/*` part(s) (`embedded_media_parts`) -> "
+        "`intended_slide_index` -> readback "
+        "`embedded_referencing_slides` (the blip-confirmed slides "
+        "whose `<a:blip r:embed>` resolves to the part) -> "
+        "`placement_verified` (True iff the intended slide is in the "
+        "readback set; the truth-checker refuses on False).",
+        "",
+        "## Boundary",
+        "",
+        _README_BOUNDARY_STATEMENT,
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Happy path.
 # ---------------------------------------------------------------------------
 
@@ -3323,6 +3412,29 @@ def _run_happy_path(
         )
         return 1, summary, None
     print(f"  [PASS] summary written to {summary_path}")
+
+    # Stage G — operator-facing review README. Written AFTER the summary
+    # truth-check passes so a tampered run cannot leave a positive-
+    # looking README on disk; a write failure refuses the run rather
+    # than letting a partial review package masquerade as complete.
+    readme_path = out_dir / "README.md"
+    try:
+        readme_path.write_text(
+            _render_review_readme(summary), encoding="utf-8",
+        )
+    except OSError as exc:
+        print(
+            f"  [FAIL] cannot write README at {readme_path}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return 1, summary, None
+    if not readme_path.is_file() or readme_path.is_symlink():
+        print(
+            f"  [FAIL] expected README at {readme_path} as a regular "
+            f"non-symlink file"
+        )
+        return 1, summary, None
+    print(f"  [PASS] review README written to {readme_path}")
 
     # Echo a compact view to stdout so a reviewer sees the milestone
     # truth without opening the JSON file.
@@ -3977,12 +4089,46 @@ def _run_self_tests() -> int:
                             f"{(val.get('validate_visual_quality') or {}).get('rc')!r}, "
                             f"expected 0"
                         )
+                    else:
+                        readme_path = out_dir / "README.md"
+                        if (
+                            not readme_path.is_file()
+                            or readme_path.is_symlink()
+                        ):
+                            ok = False
+                            detail = (
+                                f"README.md not written as a regular "
+                                f"non-symlink file at {readme_path}"
+                            )
+                        else:
+                            readme_text = readme_path.read_text(
+                                encoding="utf-8",
+                            )
+                            required = (
+                                "deck.pptx", "summary.json",
+                                "inventory.json", "visual_quality.json",
+                                "workspace/source_image_assets.json",
+                                "reports/", "image_provenance",
+                                _README_BOUNDARY_STATEMENT,
+                            )
+                            missing = [
+                                m for m in required
+                                if m not in readme_text
+                            ]
+                            if missing:
+                                ok = False
+                                detail = (
+                                    f"README.md missing required "
+                                    f"reference(s) {missing!r} (path: "
+                                    f"{readme_path})"
+                                )
         if not ok and not detail:
             detail = f"rc={rc}"
         results.append(_ProbeResult(
             "T1 happy path: synthetic PNG + JPEG into a fresh --out-dir "
             "-> 2-slide editable PPTX with provenance + visual_quality "
-            "report",
+            "report + operator README naming the core artifacts and "
+            "boundary statement",
             ok, detail,
         ))
 
@@ -4448,11 +4594,48 @@ def _run_self_tests() -> int:
                                 f"reordered image"
                             )
                             break
+                    if ok:
+                        readme_path = out_dir / "README.md"
+                        if (
+                            not readme_path.is_file()
+                            or readme_path.is_symlink()
+                        ):
+                            ok = False
+                            detail = (
+                                f"README.md not written as a regular "
+                                f"non-symlink file at {readme_path} "
+                                f"on the --manifest happy path"
+                            )
+                        else:
+                            readme_text = readme_path.read_text(
+                                encoding="utf-8",
+                            )
+                            required = (
+                                "deck.pptx", "summary.json",
+                                "inventory.json", "visual_quality.json",
+                                "workspace/source_image_assets.json",
+                                "reports/", "image_provenance",
+                                _README_BOUNDARY_STATEMENT,
+                            )
+                            missing = [
+                                m for m in required
+                                if m not in readme_text
+                            ]
+                            if missing:
+                                ok = False
+                                detail = (
+                                    f"README.md missing required "
+                                    f"reference(s) {missing!r} on the "
+                                    f"--manifest happy path (path: "
+                                    f"{readme_path})"
+                                )
         if not ok and not detail:
             detail = f"rc={rc}"
         results.append(_ProbeResult(
             "T19 happy path: --manifest reorders + supplies custom "
-            "slide_title/alt_text/intended_use; provenance echoes both",
+            "slide_title/alt_text/intended_use; provenance echoes both, "
+            "operator README written naming the core artifacts and "
+            "boundary statement",
             ok, detail,
         ))
 
@@ -6423,13 +6606,15 @@ def _run_self_tests() -> int:
             and not (td / "reports").exists()
             and not (td / "_pipeline_fixture").exists()
             and not (td / "inventory.json").exists()
+            and not (td / "README.md").exists()
             and siblings == ["template.json"]
         )
         results.append(_ProbeResult(
             "T75 --write-manifest-template mode produces ONLY the "
             "manifest — no visual_quality.json / summary.json / "
             "deck.pptx / workspace / reports / _pipeline_fixture / "
-            "inventory.json under the template's parent directory",
+            "inventory.json / README.md under the template's parent "
+            "directory",
             ok, f"rc={rc}, siblings_of_template={siblings!r}",
         ))
 
@@ -6480,7 +6665,7 @@ def _run_self_tests() -> int:
             for forbidden in (
                 "summary.json", "deck.pptx", "inventory.json",
                 "visual_quality.json", "_pipeline_fixture",
-                "workspace", "reports",
+                "workspace", "reports", "README.md",
             ):
                 if (td / forbidden).exists():
                     ok = False
@@ -6667,6 +6852,19 @@ def _run_self_tests() -> int:
             except (OSError, json.JSONDecodeError) as exc:
                 ok = False
                 detail = f"cannot parse plan: {exc}"
+        if ok:
+            for forbidden in (
+                "summary.json", "deck.pptx", "inventory.json",
+                "visual_quality.json", "_pipeline_fixture",
+                "workspace", "reports", "README.md",
+            ):
+                if (td / forbidden).exists():
+                    ok = False
+                    detail = (
+                        f"plan-only mode with --manifest produced "
+                        f"forbidden artifact {forbidden!r}"
+                    )
+                    break
         if ok:
             if plan.get("manifest_path") != str(manifest):
                 ok = False
@@ -6869,7 +7067,10 @@ def main(argv: list[str]) -> int:
             "Must not be URI-shaped, a symlink, or have a symlink "
             "ancestor, must not anchor under the repo, must have an "
             "existing parent, and must either be missing or an empty "
-            "pre-existing directory."
+            "pre-existing directory. On a truth-checked happy run the "
+            "helper writes deck.pptx, summary.json, inventory.json, "
+            "visual_quality.json, workspace/, reports/, and a concise "
+            "operator-facing README.md under this directory."
         ),
     )
     parser.add_argument(
