@@ -1388,6 +1388,135 @@ def _sha256_of(path: Path) -> tuple[int, str, bytes]:
     return total, h.hexdigest(), first
 
 
+# ---------------------------------------------------------------------------
+# --bundle shortcut gate.
+# ---------------------------------------------------------------------------
+
+
+def _validate_bundle_arg(
+    bundle_str: str,
+) -> tuple[str | None, str | None, list[str]]:
+    """Validate the ``--bundle`` operator-handoff directory and resolve
+    it to ``(images_dir_str, manifest_path_str_or_None, failures)``.
+
+    A bundle is a flat operator-handoff folder with the shape::
+
+        <bundle>/
+            images/         # required, flat directory of PNG / JPG / JPEG
+            manifest.json   # optional caller-supplied manifest
+
+    On success the resolver returns the path strings the existing
+    ``--images-dir`` / ``--manifest`` gates accept, so all downstream
+    image discovery, manifest validation, plan-only, approved-plan,
+    out-dir, summary, README, visual-quality, inventory, and PPTX gates
+    keep firing unchanged. The bundle layer adds NO new content rules
+    on top — it only checks the wrapping directory's shape and refuses
+    cleanly BEFORE delegating.
+
+    Gates fire in order, BEFORE any pipeline subprocess:
+
+      BUN1   URI-shaped argument (``file://`` / ``http://`` / any
+             RFC-3986 scheme prefix). Only local directory paths are
+             accepted.
+      BUN2   ``--bundle`` is itself a symlink (broken or resolvable).
+             Silently following a symlink would let an attacker who
+             controls the link target redirect what bytes the helper
+             ingests.
+      BUN3   any ancestor up to the filesystem root is a symlink (closed
+             system aliases like ``/tmp -> /private/tmp`` remain
+             accepted via ``_forbidden_symlink_ancestor``).
+      BUN4   the bundle path exists.
+      BUN5   the bundle path is a directory.
+      BUN6   the bundle carries an ``images`` entry (the required
+             flat-image subfolder).
+      BUN7   ``<bundle>/images`` is NOT a symlink (broken or
+             resolvable) — same attack surface one level down.
+      BUN8   ``<bundle>/images`` is a directory (not a regular file,
+             device, FIFO, socket, etc.).
+
+    The optional ``<bundle>/manifest.json`` is only forwarded as a path
+    string when it exists; its content (JSON shape, schema_version,
+    every per-image field) is then validated by the existing
+    ``_validate_manifest_arg`` MAN1..MAN12 gates, which already produce
+    clean per-failure diagnostics for malformed bytes / missing fields
+    / URL / credential / public-hosting wording / fake-success claims.
+    The bundle resolver does NOT crack open ``manifest.json`` itself;
+    it only refuses obviously unsafe wrappers (BUN1..BUN8).
+    """
+    if _has_uri_scheme(bundle_str):
+        return None, None, [
+            f"--bundle argument {bundle_str!r} looks URI-shaped (BUN1); "
+            f"only local directory paths are accepted."
+        ]
+
+    bundle = Path(bundle_str)
+
+    if bundle.is_symlink():
+        try:
+            tgt = os.readlink(bundle)
+        except OSError:
+            tgt = "<unreadable>"
+        return None, None, [
+            f"--bundle {bundle} is a symlink (-> {tgt}) (BUN2); refused "
+            f"so a symlink target cannot redirect what bytes the helper "
+            f"ingests."
+        ]
+
+    forbidden_ancestor = _forbidden_symlink_ancestor(bundle)
+    if forbidden_ancestor is not None:
+        ancestor, tgt = forbidden_ancestor
+        return None, None, [
+            f"--bundle {bundle} has a symlink ancestor {ancestor} "
+            f"(-> {tgt}) (BUN3); refused so a symlink in the operator's "
+            f"typed path cannot redirect what bytes the helper ingests."
+        ]
+
+    if not bundle.exists():
+        return None, None, [
+            f"--bundle {bundle} does not exist (BUN4)."
+        ]
+    if not bundle.is_dir():
+        return None, None, [
+            f"--bundle {bundle} is not a directory (BUN5); the bundle "
+            f"shortcut expects an operator-handoff folder containing "
+            f"images/ and an optional manifest.json."
+        ]
+
+    images_dir = bundle / "images"
+    if not images_dir.exists() and not images_dir.is_symlink():
+        return None, None, [
+            f"--bundle {bundle} is missing the required images/ "
+            f"subdirectory (BUN6); create <bundle>/images/ containing "
+            f"the PNG / JPG / JPEG files for this deck."
+        ]
+    if images_dir.is_symlink():
+        try:
+            tgt = os.readlink(images_dir)
+        except OSError:
+            tgt = "<unreadable>"
+        return None, None, [
+            f"--bundle images path {images_dir} is a symlink "
+            f"(-> {tgt}) (BUN7); refused so a symlink target cannot "
+            f"redirect what bytes the helper ingests."
+        ]
+    if not images_dir.is_dir():
+        return None, None, [
+            f"--bundle images path {images_dir} exists but is not a "
+            f"directory (BUN8); refused."
+        ]
+
+    manifest_path = bundle / "manifest.json"
+    manifest_str: str | None = None
+    if manifest_path.exists() or manifest_path.is_symlink():
+        # Forward the path verbatim — the existing MAN1..MAN12 gates
+        # surface malformed JSON, missing fields, URI shapes, symlinks
+        # on the manifest itself, and every other content failure with
+        # the same diagnostics the explicit --manifest flag produces.
+        manifest_str = str(manifest_path)
+
+    return str(images_dir), manifest_str, []
+
+
 def _validate_images_dir_arg(
     images_dir_str: str,
 ) -> tuple[list[_DiscoveredImage] | None, Path | None, list[str]]:
@@ -8251,6 +8380,470 @@ def _run_self_tests() -> int:
             f"fails={fails_load!r}",
         ))
 
+    # ----- BUN1..BUN13: --bundle shortcut probes -----
+
+    # BUN-HAPPY1 --bundle resolves to <bundle>/images and produces the
+    # same 2-slide deck the explicit --images-dir flow produces from
+    # the same bytes (no manifest). Locks the no-manifest happy path
+    # through the shortcut.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN1-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 0
+        detail = f"rc={rc}"
+        if ok:
+            try:
+                summary = json.loads(
+                    (out_dir / "summary.json").read_text(),
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"summary parse failed: {exc}"
+            else:
+                if summary.get("image_count") != 2:
+                    ok = False
+                    detail = (
+                        f"image_count={summary.get('image_count')!r}, "
+                        f"expected 2"
+                    )
+                elif summary.get("manifest_path") is not None:
+                    ok = False
+                    detail = (
+                        f"manifest_path="
+                        f"{summary.get('manifest_path')!r}; expected "
+                        f"None (no manifest in bundle)"
+                    )
+                elif not (out_dir / "deck.pptx").is_file():
+                    ok = False
+                    detail = "deck.pptx missing"
+        results.append(_ProbeResult(
+            "BUN-HAPPY1 --bundle DIR --out-dir OUT (no manifest in "
+            "bundle) produces the same 2-slide editable deck the "
+            "explicit --images-dir flow produces and records "
+            "manifest_path=None",
+            ok, detail,
+        ))
+
+    # BUN-HAPPY2 --bundle resolves to <bundle>/images + forwards
+    # <bundle>/manifest.json. The manifest reorders the synthetic
+    # images so the produced summary echoes manifest order and
+    # records the resolved manifest path. Locks the manifest-present
+    # happy path through the shortcut.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN2-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        manifest = bundle / "manifest.json"
+        manifest.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [
+                {
+                    "filename": "beta_marker.jpg",
+                    "slide_title": "Beta first",
+                    "alt_text": "Beta first",
+                    "intended_use": "decorative",
+                },
+                {
+                    "filename": "alpha_marker.png",
+                    "slide_title": "Alpha second",
+                    "alt_text": "Alpha second",
+                    "intended_use": "icon",
+                },
+            ],
+        }) + "\n", encoding="utf-8")
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 0
+        detail = f"rc={rc}"
+        if ok:
+            try:
+                summary = json.loads(
+                    (out_dir / "summary.json").read_text(),
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"summary parse failed: {exc}"
+            else:
+                prov = summary.get("image_provenance") or []
+                if summary.get("manifest_path") != str(manifest):
+                    ok = False
+                    detail = (
+                        f"manifest_path="
+                        f"{summary.get('manifest_path')!r}; expected "
+                        f"{str(manifest)!r}"
+                    )
+                elif (
+                    [p.get("operator_filename") for p in prov]
+                    != ["beta_marker.jpg", "alpha_marker.png"]
+                ):
+                    ok = False
+                    detail = (
+                        f"provenance order "
+                        f"{[p.get('operator_filename') for p in prov]!r}; "
+                        f"expected manifest order [beta, alpha]"
+                    )
+        results.append(_ProbeResult(
+            "BUN-HAPPY2 --bundle DIR --out-dir OUT (bundle carries "
+            "manifest.json) forwards the manifest unchanged: "
+            "summary.manifest_path equals <bundle>/manifest.json and "
+            "provenance follows manifest order",
+            ok, detail,
+        ))
+
+    # BUN-HAPPY3 --bundle DIR --plan-out PATH writes the SAME plan
+    # bytes the explicit --images-dir / --manifest pair would have
+    # produced. Locks plan-only mode through the shortcut.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN3-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        plan_via_bundle = td / "plan_bundle.json"
+        plan_via_explicit = td / "plan_explicit.json"
+        rc_bundle = main([
+            "--bundle", str(bundle),
+            "--plan-out", str(plan_via_bundle),
+        ])
+        rc_explicit = main([
+            "--images-dir", str(bundle / "images"),
+            "--plan-out", str(plan_via_explicit),
+        ])
+        ok = rc_bundle == 0 and rc_explicit == 0
+        detail = f"rc_bundle={rc_bundle}, rc_explicit={rc_explicit}"
+        if ok:
+            bundle_bytes = plan_via_bundle.read_bytes()
+            explicit_bytes = plan_via_explicit.read_bytes()
+            if bundle_bytes != explicit_bytes:
+                ok = False
+                detail = (
+                    "plan bytes differ between --bundle and explicit "
+                    "--images-dir paths (shortcut must produce byte-"
+                    "identical plans)"
+                )
+        results.append(_ProbeResult(
+            "BUN-HAPPY3 --bundle DIR --plan-out PATH produces the "
+            "byte-identical plan an explicit --images-dir "
+            "<bundle>/images --plan-out PATH run produces",
+            ok, detail,
+        ))
+
+    # BUN-HAPPY4 --bundle DIR --out-dir OUT --approved-plan PATH
+    # accepts a plan generated by --bundle DIR --plan-out PATH on the
+    # same bytes. Locks the approved-plan lock through the shortcut.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN4-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        plan_out = td / "approved.json"
+        out_dir = td / "out"
+        rc_plan = main([
+            "--bundle", str(bundle), "--plan-out", str(plan_out),
+        ])
+        rc_run = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+            "--approved-plan", str(plan_out),
+        ])
+        ok = (
+            rc_plan == 0
+            and rc_run == 0
+            and (out_dir / "deck.pptx").is_file()
+            and (out_dir / "summary.json").is_file()
+        )
+        detail = (
+            f"rc_plan={rc_plan}, rc_run={rc_run}, "
+            f"deck={(out_dir / 'deck.pptx').is_file()}"
+        )
+        if ok:
+            try:
+                summary = json.loads(
+                    (out_dir / "summary.json").read_text(),
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"summary parse failed: {exc}"
+            else:
+                ap = summary.get("approved_plan") or {}
+                if ap.get("matched") is not True:
+                    ok = False
+                    detail = (
+                        f"approved_plan.matched={ap.get('matched')!r}; "
+                        f"expected True"
+                    )
+        results.append(_ProbeResult(
+            "BUN-HAPPY4 --bundle DIR --out-dir OUT --approved-plan "
+            "PATH (plan generated via --bundle --plan-out) accepts "
+            "the lock and records summary.approved_plan.matched=True",
+            ok, detail,
+        ))
+
+    # BUN-DRIFT --bundle approved-plan drift: --plan-out then a byte
+    # change to one image flips its sha256 + byte_count; the helper
+    # must refuse with rc 2 BEFORE deck.pptx / summary / inventory /
+    # visual_quality / README / workspace / reports materialise.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN-D-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        plan_out = td / "approved.json"
+        out_dir = td / "out"
+        rc_plan = main([
+            "--bundle", str(bundle), "--plan-out", str(plan_out),
+        ])
+        # Append a benign trailing byte to one image to force a
+        # sha256 / byte_count change while keeping the PNG signature.
+        target = bundle / "images" / "alpha_marker.png"
+        target.write_bytes(target.read_bytes() + b"\x00")
+        rc_run = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+            "--approved-plan", str(plan_out),
+        ])
+        leaked = [
+            p for p in (
+                out_dir / "deck.pptx",
+                out_dir / "summary.json",
+                out_dir / "inventory.json",
+                out_dir / "visual_quality.json",
+                out_dir / "README.md",
+                out_dir / "workspace",
+                out_dir / "reports",
+                out_dir / "_pipeline_fixture",
+            ) if p.exists()
+        ]
+        ok = rc_plan == 0 and rc_run == 2 and not leaked
+        results.append(_ProbeResult(
+            "BUN-DRIFT --bundle --approved-plan refuses a "
+            "post-approval image byte change with rc 2 and writes no "
+            "deck / summary / inventory / visual_quality / README / "
+            "workspace / reports artifact under --out-dir",
+            ok,
+            f"rc_plan={rc_plan}, rc_run={rc_run}, "
+            f"leaked={[str(p) for p in leaked]!r}",
+        ))
+
+    # BUN1 URI-shaped --bundle refused.
+    _img, _man, fails = _validate_bundle_arg("file:///tmp/bundle")
+    results.append(_ProbeResult(
+        "BUN1 URI-shaped --bundle refused with a clean diagnostic "
+        "naming BUN1",
+        any("BUN1" in f for f in fails),
+        f"fails={fails!r}",
+    ))
+
+    # BUN2 --bundle itself is a symlink — refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN-S-") as raw_td:
+        td = Path(raw_td)
+        real = td / "real"
+        real.mkdir()
+        (real / "images").mkdir()
+        link = td / "linked_bundle"
+        os.symlink(real, link)
+        _img, _man, fails = _validate_bundle_arg(str(link))
+        results.append(_ProbeResult(
+            "BUN2 symlink --bundle refused with a clean diagnostic "
+            "naming BUN2",
+            any("BUN2" in f for f in fails),
+            f"fails={fails!r}",
+        ))
+
+    # BUN3 --bundle ancestor is a symlink — refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN-A-") as raw_td:
+        td = Path(raw_td)
+        real = td / "real"
+        real.mkdir()
+        bundle = real / "bundle"
+        bundle.mkdir()
+        (bundle / "images").mkdir()
+        link = td / "linked_real"
+        os.symlink(real, link)
+        bundle_via_link = link / "bundle"
+        _img, _man, fails = _validate_bundle_arg(str(bundle_via_link))
+        results.append(_ProbeResult(
+            "BUN3 symlink ancestor of --bundle refused with a clean "
+            "diagnostic naming BUN3",
+            any("BUN3" in f for f in fails),
+            f"fails={fails!r}",
+        ))
+
+    # BUN4 missing --bundle refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN-M-") as raw_td:
+        td = Path(raw_td)
+        missing = td / "no_such_bundle"
+        _img, _man, fails = _validate_bundle_arg(str(missing))
+        results.append(_ProbeResult(
+            "BUN4 missing --bundle refused with a clean diagnostic "
+            "naming BUN4",
+            any("BUN4" in f for f in fails),
+            f"fails={fails!r}",
+        ))
+
+    # BUN5 --bundle is a regular file (not a directory) — refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN-F-") as raw_td:
+        td = Path(raw_td)
+        not_dir = td / "bundle.txt"
+        not_dir.write_text("not a bundle", encoding="utf-8")
+        _img, _man, fails = _validate_bundle_arg(str(not_dir))
+        results.append(_ProbeResult(
+            "BUN5 --bundle that points at a regular file refused with "
+            "a clean diagnostic naming BUN5",
+            any("BUN5" in f for f in fails),
+            f"fails={fails!r}",
+        ))
+
+    # BUN6 --bundle without images/ subdir — refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN-I-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        # Deliberately do NOT create bundle/images/
+        _img, _man, fails = _validate_bundle_arg(str(bundle))
+        results.append(_ProbeResult(
+            "BUN6 --bundle without an images/ subdir refused with a "
+            "clean diagnostic naming BUN6",
+            any("BUN6" in f for f in fails),
+            f"fails={fails!r}",
+        ))
+
+    # BUN7 <bundle>/images is itself a symlink — refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN-IS-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        real_images = td / "real_images"
+        real_images.mkdir()
+        os.symlink(real_images, bundle / "images")
+        _img, _man, fails = _validate_bundle_arg(str(bundle))
+        results.append(_ProbeResult(
+            "BUN7 symlinked <bundle>/images refused with a clean "
+            "diagnostic naming BUN7",
+            any("BUN7" in f for f in fails),
+            f"fails={fails!r}",
+        ))
+
+    # BUN8 <bundle>/images is a regular file — refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN-IN-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        (bundle / "images").write_text(
+            "not a directory", encoding="utf-8",
+        )
+        _img, _man, fails = _validate_bundle_arg(str(bundle))
+        results.append(_ProbeResult(
+            "BUN8 non-directory <bundle>/images refused with a clean "
+            "diagnostic naming BUN8",
+            any("BUN8" in f for f in fails),
+            f"fails={fails!r}",
+        ))
+
+    # BUN-MAN-MALFORMED bundle resolution forwards <bundle>/manifest.json
+    # verbatim; malformed JSON is caught by the existing MAN5 gate so
+    # the operator sees a clean per-failure diagnostic before any
+    # pipeline subprocess fires.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN-MM-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        # Write bytes that aren't valid JSON.
+        (bundle / "manifest.json").write_text(
+            "{not valid json}", encoding="utf-8",
+        )
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "BUN-MAN-MALFORMED malformed <bundle>/manifest.json "
+            "refused via the existing MAN5 gate (rc 2, no --out-dir "
+            "artifact materialised)",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # BUN-MIX1 --bundle + --images-dir is ambiguous and refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN-X1-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        other_images = td / "other_images"
+        _write_synthetic_images(other_images)
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle),
+            "--images-dir", str(other_images),
+            "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "BUN-MIX1 --bundle + --images-dir refused (mixed input "
+            "styles are ambiguous; the helper requires a single "
+            "source for the image directory) with rc 2 and no "
+            "--out-dir artifact materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # BUN-MIX2 --bundle + --manifest is ambiguous and refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-BUN-X2-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        external_manifest = td / "external_manifest.json"
+        external_manifest.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [
+                {
+                    "filename": "alpha_marker.png",
+                    "slide_title": "Alpha",
+                    "alt_text": "Alpha",
+                    "intended_use": "icon",
+                },
+                {
+                    "filename": "beta_marker.jpg",
+                    "slide_title": "Beta",
+                    "alt_text": "Beta",
+                    "intended_use": "icon",
+                },
+            ],
+        }) + "\n", encoding="utf-8")
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle),
+            "--manifest", str(external_manifest),
+            "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "BUN-MIX2 --bundle + --manifest refused (mixed input "
+            "styles are ambiguous; the helper requires a single "
+            "source for the manifest path) with rc 2 and no "
+            "--out-dir artifact materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # BUN-MIX3 --self-test + --bundle refused.
+    rc_st = main(["--self-test", "--bundle", "/tmp/anywhere"])
+    results.append(_ProbeResult(
+        "BUN-MIX3 --self-test + --bundle refused with rc 2",
+        rc_st == 2,
+        f"rc={rc_st}",
+    ))
+
     # T70 — committed-tree snapshot. The whole self-test must not have
     # mutated any byte under REPO_ROOT/scripts/ or REPO_ROOT/examples/.
     # Kept as the LAST probe so every manifest scenario above runs
@@ -8430,12 +9023,30 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--bundle", type=str, default=None,
+        help=(
+            "Operator-handoff folder shortcut. Resolves to "
+            "--images-dir <bundle>/images and (when present) --manifest "
+            "<bundle>/manifest.json, then delegates to the same image "
+            "discovery + manifest + plan-only + approved-plan + out-dir "
+            "+ summary + README + visual-quality + inventory + PPTX "
+            "gates the explicit-flag flow runs. Required shape: "
+            "<bundle>/images/ is a flat non-symlink directory of "
+            "PNG / JPG / JPEG files; <bundle>/manifest.json is optional. "
+            "The bundle path must not be URI-shaped, a symlink, have a "
+            "symlink ancestor, be missing, or be a regular file. "
+            "Mutually exclusive with --images-dir / --manifest / "
+            "--write-manifest-template / --self-test."
+        ),
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios (happy path + "
             "every documented fail-closed probe). Mutually exclusive "
             "with --images-dir / --out-dir / --manifest / "
-            "--write-manifest-template / --plan-out / --approved-plan."
+            "--write-manifest-template / --plan-out / --approved-plan / "
+            "--bundle."
         ),
     )
     args = parser.parse_args(argv)
@@ -8448,15 +9059,49 @@ def main(argv: list[str]) -> int:
             or args.write_manifest_template is not None
             or args.plan_out is not None
             or args.approved_plan is not None
+            or args.bundle is not None
         ):
             print(
                 "FAIL: --self-test does not take --images-dir / "
                 "--out-dir / --manifest / --write-manifest-template / "
-                "--plan-out / --approved-plan.",
+                "--plan-out / --approved-plan / --bundle.",
                 file=sys.stderr,
             )
             return 2
         return _run_self_tests()
+
+    if args.bundle is not None:
+        if args.images_dir is not None or args.manifest is not None:
+            print(
+                "FAIL: --bundle is a shortcut for --images-dir "
+                "<bundle>/images and --manifest <bundle>/manifest.json; "
+                "pass either --bundle DIR or the explicit "
+                "--images-dir/--manifest pair, not both (mixed input "
+                "styles are refused so the source of each path is "
+                "unambiguous).",
+                file=sys.stderr,
+            )
+            return 2
+        if args.write_manifest_template is not None:
+            print(
+                "FAIL: --bundle does not take "
+                "--write-manifest-template (the template writer expects "
+                "an explicit --images-dir and writes a starter "
+                "manifest, separate from the bundle handoff shape).",
+                file=sys.stderr,
+            )
+            return 2
+        resolved_images_dir, resolved_manifest, bundle_failures = (
+            _validate_bundle_arg(args.bundle)
+        )
+        if bundle_failures or resolved_images_dir is None:
+            for line in bundle_failures or []:
+                print(f"FAIL: {line}", file=sys.stderr)
+            return 2
+        # Substitute the resolved paths so the existing routing keeps
+        # firing every downstream gate unchanged.
+        args.images_dir = resolved_images_dir
+        args.manifest = resolved_manifest
 
     if args.write_manifest_template is not None:
         if args.images_dir is None:
@@ -8486,7 +9131,7 @@ def main(argv: list[str]) -> int:
     if args.plan_out is not None:
         if args.images_dir is None:
             print(
-                "FAIL: --plan-out requires --images-dir.",
+                "FAIL: --plan-out requires --images-dir (or --bundle).",
                 file=sys.stderr,
             )
             return 2
@@ -8524,9 +9169,10 @@ def main(argv: list[str]) -> int:
             f"FAIL: missing required argument(s): {', '.join(missing)} "
             f"(use --self-test for the in-script scenarios, "
             f"--write-manifest-template PATH to write a starter "
-            f"manifest without running the pipeline, or --plan-out "
+            f"manifest without running the pipeline, --plan-out "
             f"PATH to write a preflight plan without running the "
-            f"pipeline).",
+            f"pipeline, or --bundle DIR as the operator-handoff "
+            f"shortcut for --images-dir / --manifest).",
             file=sys.stderr,
         )
         return 2

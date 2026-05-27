@@ -212,6 +212,40 @@ TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
 
 Local-only — does NOT call D-One, MCP, Qoder, a public network, telemetry, a model API, an image search, or any external service. Real D-One remains UNVERIFIED.
 
+### `--bundle` operator handoff shortcut
+
+Operators who hand off a single folder to a reviewer (`bundle/images/` and an optional `bundle/manifest.json`) can use the `--bundle DIR` shortcut instead of typing `--images-dir <bundle>/images` and (when present) `--manifest <bundle>/manifest.json` explicitly. The shortcut resolves to the same two paths and then delegates to the same image discovery, manifest, plan-only, approved-plan, out-dir, summary, README, visual-quality, inventory, and PPTX gates the explicit-flag flow runs — no new content rules are added on top.
+
+```bash
+# Bundle layout (operator handoff folder outside the repo):
+#   bundle/
+#     images/         # required, flat directory of PNG / JPG / JPEG
+#     manifest.json   # optional caller-supplied manifest
+
+# Easiest real-operator command — produces deck.pptx + summary.json +
+# inventory.json + visual_quality.json + workspace/ + reports/ +
+# README.md under "$RUN_DIR/operator_out":
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_local_images_to_editable_ppt.py \
+  --bundle "$RUN_DIR/bundle" \
+  --out-dir "$RUN_DIR/operator_out"
+
+# Plan-only preflight through the bundle:
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_local_images_to_editable_ppt.py \
+  --bundle "$RUN_DIR/bundle" \
+  --plan-out "$RUN_DIR/plan.json"
+
+# Reviewer-approved run lock through the bundle:
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_local_images_to_editable_ppt.py \
+  --bundle "$RUN_DIR/bundle" \
+  --out-dir "$RUN_DIR/operator_out" \
+  --approved-plan "$RUN_DIR/approved.json"
+```
+
+Contract for `--bundle DIR` (BUN1..BUN8): must not be URI-shaped, a symlink, or have a symlink ancestor; must exist and be a directory; must contain a non-symlink `images/` subdirectory. `<bundle>/manifest.json` is optional — when present it is forwarded verbatim to the existing manifest validator (MAN1..MAN12), so malformed JSON, missing fields, URL/credential/public-hosting wording, and the rest of the manifest content gates still fire with the same diagnostics they produce under explicit `--manifest`. `--bundle` is mutually exclusive with `--images-dir` / `--manifest` (mixed input styles are ambiguous and refused) and with `--write-manifest-template` / `--self-test`; combine it with `--plan-out`, `--out-dir`, and `--approved-plan` exactly as you would the explicit flags. The explicit `--images-dir` / `--manifest` flags keep working as documented above — `--bundle` is purely a usability shortcut for the operator-handoff shape.
+
 For the broader aggregate that runs every delegated core editable-PPT smoke in order (operator local-image intake, operator local-images trial, placement readback, image-asset acceptance, taxonomy / text-policy / provenance handoff smokes, render-model roundtrip, trace acceptance, …) — `scripts/operator_local_images_to_editable_ppt.py --self-test` and `scripts/operator_local_images_trial.py --self-test` are both wired in as delegated smokes so the operator local-images route AND the one-command trial are covered by this single top-level command:
 
 ```bash
