@@ -2227,6 +2227,80 @@ def _validate_plan_out_arg(
 
 
 # ---------------------------------------------------------------------------
+# --approved-plan path gate (operator-mode reviewer-approved run lock).
+# ---------------------------------------------------------------------------
+
+
+def _validate_approved_plan_arg(
+    approved_plan_str: str,
+) -> tuple[Path | None, list[str]]:
+    """Validate the ``--approved-plan`` argument and return the path.
+
+    The argument is an OPERATOR-INPUT path (a previously-written
+    ``--plan-out`` plan a reviewer has signed off on); it is READ, never
+    written. The gate refuses every shape that would let an attacker
+    substitute the bytes the helper compares against:
+
+      AP1   URI-shaped argument (``file://`` / ``http://`` / any RFC-3986
+            scheme prefix). The compare reads local files only.
+      AP2   the path itself is a symlink (broken or resolvable). Silently
+            following a symlink would let an attacker who controls the
+            link target swap the approved bytes between approval time
+            and run time.
+      AP3   any ancestor up to the filesystem root is a symlink. Same
+            attack surface one level up — closed system aliases like
+            ``/tmp -> /private/tmp`` remain accepted via
+            ``_forbidden_symlink_ancestor``.
+      AP4   the path exists AND is a regular non-symlink file (a
+            directory, FIFO, device, socket, or missing entry is
+            refused).
+    """
+    if _has_uri_scheme(approved_plan_str):
+        return None, [
+            f"--approved-plan argument {approved_plan_str!r} looks "
+            f"URI-shaped (AP1); only local file paths are accepted."
+        ]
+
+    approved_plan = Path(approved_plan_str)
+
+    if approved_plan.is_symlink():
+        try:
+            tgt = os.readlink(approved_plan)
+        except OSError:
+            tgt = "<unreadable>"
+        return None, [
+            f"--approved-plan {approved_plan} is a symlink (-> {tgt}) "
+            f"(AP2); refused so a symlink target cannot redirect which "
+            f"bytes the helper compares against."
+        ]
+
+    forbidden_ancestor = _forbidden_symlink_ancestor(approved_plan)
+    if forbidden_ancestor is not None:
+        ancestor, tgt = forbidden_ancestor
+        return None, [
+            f"--approved-plan {approved_plan} has a symlink ancestor "
+            f"{ancestor} (-> {tgt}) (AP3); refused so a symlink in the "
+            f"operator's typed path cannot redirect which bytes the "
+            f"helper compares against."
+        ]
+
+    if not approved_plan.exists():
+        return None, [
+            f"--approved-plan {approved_plan} does not exist (AP4); "
+            f"the approved plan must be a regular local file produced "
+            f"by a prior --plan-out run."
+        ]
+    if not approved_plan.is_file():
+        return None, [
+            f"--approved-plan {approved_plan} is not a regular file "
+            f"(AP4); refused — directories, FIFOs, devices, and sockets "
+            f"cannot be compared."
+        ]
+
+    return approved_plan, []
+
+
+# ---------------------------------------------------------------------------
 # Pipeline fixture composition.
 # ---------------------------------------------------------------------------
 
@@ -3455,6 +3529,7 @@ def _run_operator_mode(
     images_dir_str: str,
     out_dir_str: str,
     manifest_path_str: str | None = None,
+    approved_plan_path_str: str | None = None,
 ) -> int:
     """Validate every operator argument, create ``--out-dir`` if
     needed, and drive the happy path. Returns 0 on success, 1 on any
@@ -3466,11 +3541,31 @@ def _run_operator_mode(
     match the manifest's array order, and each discovered image is
     enriched with its operator-supplied slide_title / alt_text /
     intended_use. When omitted, the helper preserves its deterministic
-    filename-sort behaviour and built-in default strings verbatim."""
+    filename-sort behaviour and built-in default strings verbatim.
+
+    When ``approved_plan_path_str`` is provided, the helper builds the
+    SAME in-memory plan ``--plan-out`` would have written for the
+    current ``--images-dir`` + ``--manifest`` combination, loads the
+    operator-supplied approved plan, and refuses the run with rc 2
+    BEFORE any pipeline subprocess fires or any out-dir artifact is
+    created if the approved plan is malformed, carries a wrong
+    schema_version / helper_id / mode, has boundary drift, or differs
+    from the current inputs on image_count, slide_count, manifest_path,
+    image order, or any per-image filename / asset_id / media_type /
+    byte_count / sha256 / intended_slide_index / slide_title /
+    alt_text / intended_use. On a clean match, normal mode behaves
+    exactly as it does without ``--approved-plan``."""
     images, _images_dir, image_failures = _validate_images_dir_arg(
         images_dir_str,
     )
     out_dir, out_failures = _validate_out_dir_arg(out_dir_str)
+
+    approved_plan_path: Path | None = None
+    approved_plan_failures: list[str] = []
+    if approved_plan_path_str is not None:
+        approved_plan_path, approved_plan_failures = (
+            _validate_approved_plan_arg(approved_plan_path_str)
+        )
 
     manifest_failures: list[str] = []
     manifest_path: Path | None = None
@@ -3516,6 +3611,7 @@ def _run_operator_mode(
         image_failures
         or out_failures
         or manifest_failures
+        or approved_plan_failures
         or images is None
         or out_dir is None
     ):
@@ -3525,7 +3621,46 @@ def _run_operator_mode(
             print(f"FAIL: {line}", file=sys.stderr)
         for line in manifest_failures or []:
             print(f"FAIL: {line}", file=sys.stderr)
+        for line in approved_plan_failures or []:
+            print(f"FAIL: {line}", file=sys.stderr)
         return 2
+
+    # Reviewer-approved run lock. Runs AFTER every argument-shape gate
+    # passes (so discovery + manifest semantics are already known good)
+    # but BEFORE any out-dir mkdir / pipeline subprocess / out-dir
+    # artifact write. A drift between the approved plan and the
+    # current inputs refuses the run with rc 2 and leaves the out-dir
+    # untouched (pre-existing bytes preserved; never mkdir'd if the
+    # operator passed a fresh path).
+    if approved_plan_path is not None:
+        current_plan = _build_plan_body(
+            images=images, manifest_path=manifest_path,
+        )
+        approved_plan, load_failures = _load_approved_plan(
+            approved_plan_path,
+        )
+        if load_failures or approved_plan is None:
+            for line in load_failures:
+                print(f"FAIL: {line}", file=sys.stderr)
+            return 2
+        compare_failures = _compare_to_approved_plan(
+            current=current_plan,
+            approved=approved_plan,
+            approved_plan_path=approved_plan_path,
+        )
+        if compare_failures:
+            for line in compare_failures:
+                print(f"FAIL: {line}", file=sys.stderr)
+            print(
+                "FAIL: --approved-plan does not match current inputs; "
+                "refusing the run before any pipeline subprocess fires "
+                "or any out-dir artifact is written. Re-run --plan-out "
+                "against the current --images-dir (and --manifest, if "
+                "supplied) and have a reviewer re-approve the resulting "
+                "plan.",
+                file=sys.stderr,
+            )
+            return 2
 
     if not out_dir.exists():
         try:
@@ -3543,10 +3678,15 @@ def _run_operator_mode(
         if manifest_path is not None
         else ""
     )
+    approved_plan_arg_display = (
+        f", --approved-plan {approved_plan_path}"
+        if approved_plan_path is not None
+        else ""
+    )
     print(
         f"=== operator_local_images_to_editable_ppt "
         f"(--images-dir {images_dir_str}, --out-dir {out_dir}"
-        f"{manifest_arg_display}) ==="
+        f"{manifest_arg_display}{approved_plan_arg_display}) ==="
     )
     rc, summary, summary_path = _run_happy_path(
         out_dir=out_dir, images=images, manifest_path=manifest_path,
@@ -3690,6 +3830,239 @@ def _run_template_write_mode(
 _PLAN_SCHEMA_VERSION = "1"
 _PLAN_MODE = "plan_only"
 
+# Fields the operator-mode --approved-plan compare walks per image row.
+# Drift in any of these refuses the run with rc 2 BEFORE any pipeline
+# subprocess fires or any out-dir artifact is written. Order is the
+# compare order (first-mismatch wins per row).
+_PLAN_ROW_COMPARE_FIELDS: tuple[str, ...] = (
+    "filename",
+    "asset_id",
+    "media_type",
+    "byte_count",
+    "sha256",
+    "intended_slide_index",
+    "slide_title",
+    "alt_text",
+    "intended_use",
+)
+
+
+def _build_plan_body(
+    *,
+    images: list[_DiscoveredImage],
+    manifest_path: Path | None,
+) -> dict:
+    """Build the in-memory plan body for the supplied (already
+    discovered + manifest-enriched) image list.
+
+    Shared between ``--plan-out`` (writes this body to disk) and the
+    operator-mode ``--approved-plan`` compare (builds the same body
+    in memory and compares it to the approved bytes BEFORE any pipeline
+    subprocess fires). One source of truth means a reviewer who runs
+    ``--plan-out`` and then re-runs operator mode with
+    ``--approved-plan <that plan>`` against byte-identical inputs sees
+    a clean match."""
+    rows: list[dict] = []
+    for idx, image in enumerate(images, start=1):
+        title = image.slide_title or _default_slide_title(image)
+        alt_text = image.alt_text or _default_alt_text(image)
+        intended_use = image.intended_use or _DEFAULT_INTENDED_USE
+        rows.append({
+            "filename": image.operator_filename,
+            "asset_id": image.asset_id,
+            "media_type": image.media_type,
+            "byte_count": image.byte_count,
+            "sha256": image.sha256,
+            "intended_slide_index": idx,
+            "slide_title": title,
+            "alt_text": alt_text,
+            "intended_use": intended_use,
+        })
+    return {
+        "schema_version": _PLAN_SCHEMA_VERSION,
+        "helper_id": "operator_local_images_to_editable_ppt",
+        "mode": _PLAN_MODE,
+        "image_count": len(images),
+        "slide_count": len(images),
+        "manifest_path": (
+            str(manifest_path) if manifest_path is not None else None
+        ),
+        "explicit_boundaries": list(_EXPLICIT_BOUNDARIES),
+        "images": rows,
+    }
+
+
+def _load_approved_plan(approved_plan: Path) -> tuple[dict | None, list[str]]:
+    """Read + parse the operator's ``--approved-plan`` file and validate
+    the top-level shape (schema_version, helper_id, mode, explicit_
+    boundaries, image_count, slide_count, manifest_path, images array).
+
+    Returns ``(plan_or_None, failures)``. The caller MUST treat the
+    plan as refused whenever ``failures`` is non-empty OR ``plan`` is
+    ``None`` and refuse the run with rc 2 BEFORE any pipeline
+    subprocess fires.
+
+    The structural failures surfaced here cover everything the
+    operator could trip on BEFORE the per-image compare runs: missing
+    file bytes, unparseable JSON, non-object root, wrong/missing
+    schema_version / helper_id / mode, boundary drift (the eight
+    locked sentences), non-integer counts, non-string manifest_path,
+    or a malformed images array."""
+    try:
+        raw_bytes = approved_plan.read_bytes()
+    except OSError as exc:
+        return None, [
+            f"--approved-plan {approved_plan} could not be read: "
+            f"{type(exc).__name__}: {exc}"
+        ]
+    # Decode + JSON-parse separately so non-UTF-8 bytes (e.g. a binary
+    # file the operator typed by mistake) fail closed with a clear
+    # diagnostic instead of crashing on the read_text UnicodeDecodeError
+    # path. Both failure modes return the same rc 2 contract.
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return None, [
+            f"--approved-plan {approved_plan} is not valid UTF-8: "
+            f"{type(exc).__name__}: {exc}"
+        ]
+    try:
+        plan = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return None, [
+            f"--approved-plan {approved_plan} is not valid JSON: "
+            f"{type(exc).__name__}: {exc}"
+        ]
+    if not isinstance(plan, dict):
+        return None, [
+            f"--approved-plan {approved_plan} root is not a JSON object "
+            f"(got {type(plan).__name__})."
+        ]
+
+    failures: list[str] = []
+
+    if plan.get("schema_version") != _PLAN_SCHEMA_VERSION:
+        failures.append(
+            f"--approved-plan {approved_plan} schema_version="
+            f"{plan.get('schema_version')!r}; expected "
+            f"{_PLAN_SCHEMA_VERSION!r}."
+        )
+    expected_helper = "operator_local_images_to_editable_ppt"
+    if plan.get("helper_id") != expected_helper:
+        failures.append(
+            f"--approved-plan {approved_plan} helper_id="
+            f"{plan.get('helper_id')!r}; expected {expected_helper!r}."
+        )
+    if plan.get("mode") != _PLAN_MODE:
+        failures.append(
+            f"--approved-plan {approved_plan} mode={plan.get('mode')!r}; "
+            f"expected {_PLAN_MODE!r}."
+        )
+    boundaries = plan.get("explicit_boundaries")
+    if (
+        not isinstance(boundaries, list)
+        or tuple(boundaries) != _EXPLICIT_BOUNDARIES
+    ):
+        failures.append(
+            f"--approved-plan {approved_plan} explicit_boundaries "
+            f"differs from the helper's locked boundary statement "
+            f"(boundary drift): approved={boundaries!r}, "
+            f"current={list(_EXPLICIT_BOUNDARIES)!r}."
+        )
+    if not isinstance(plan.get("image_count"), int):
+        failures.append(
+            f"--approved-plan {approved_plan} image_count="
+            f"{plan.get('image_count')!r}; expected integer."
+        )
+    if not isinstance(plan.get("slide_count"), int):
+        failures.append(
+            f"--approved-plan {approved_plan} slide_count="
+            f"{plan.get('slide_count')!r}; expected integer."
+        )
+    mp = plan.get("manifest_path", "__MISSING__")
+    if mp == "__MISSING__":
+        failures.append(
+            f"--approved-plan {approved_plan} missing manifest_path "
+            f"key (expected string or null)."
+        )
+    elif mp is not None and not isinstance(mp, str):
+        failures.append(
+            f"--approved-plan {approved_plan} manifest_path={mp!r}; "
+            f"expected string or null."
+        )
+    images = plan.get("images")
+    if not isinstance(images, list):
+        failures.append(
+            f"--approved-plan {approved_plan} images is not a JSON "
+            f"array (got {type(images).__name__})."
+        )
+    else:
+        for i, row in enumerate(images):
+            if not isinstance(row, dict):
+                failures.append(
+                    f"--approved-plan {approved_plan} images[{i}] is "
+                    f"not a JSON object (got {type(row).__name__})."
+                )
+                continue
+            for field in _PLAN_ROW_COMPARE_FIELDS:
+                if field not in row:
+                    failures.append(
+                        f"--approved-plan {approved_plan} images[{i}] "
+                        f"missing required field {field!r}."
+                    )
+
+    if failures:
+        return None, failures
+    return plan, []
+
+
+def _compare_to_approved_plan(
+    *,
+    current: dict,
+    approved: dict,
+    approved_plan_path: Path,
+) -> list[str]:
+    """Compare the in-memory ``current`` plan body to the (already
+    structurally-validated) ``approved`` plan body and return a list of
+    drift diagnostics. Empty list means a clean match.
+
+    Top-level fields compared: image_count, slide_count, manifest_path
+    (schema_version / helper_id / mode / explicit_boundaries already
+    matched by ``_load_approved_plan``). Per-image fields compared
+    (in order): filename, asset_id, media_type, byte_count, sha256,
+    intended_slide_index, slide_title, alt_text, intended_use. Image
+    array length mismatch is reported once, before per-row drift, so
+    the operator does not see N spurious row-missing diagnostics on
+    top of the real ``image_count`` mismatch."""
+    failures: list[str] = []
+    for top in ("image_count", "slide_count", "manifest_path"):
+        if approved.get(top) != current.get(top):
+            failures.append(
+                f"--approved-plan {approved_plan_path} {top}="
+                f"{approved.get(top)!r}; current inputs produce "
+                f"{current.get(top)!r}."
+            )
+    approved_rows = approved.get("images") or []
+    current_rows = current.get("images") or []
+    if len(approved_rows) != len(current_rows):
+        failures.append(
+            f"--approved-plan {approved_plan_path} images length="
+            f"{len(approved_rows)}; current inputs produce "
+            f"{len(current_rows)} image row(s)."
+        )
+        return failures
+    for i, (a_row, c_row) in enumerate(zip(approved_rows, current_rows)):
+        for field in _PLAN_ROW_COMPARE_FIELDS:
+            a_val = a_row.get(field)
+            c_val = c_row.get(field)
+            if a_val != c_val:
+                failures.append(
+                    f"--approved-plan {approved_plan_path} images[{i}]."
+                    f"{field}={a_val!r}; current inputs produce "
+                    f"{c_val!r}."
+                )
+    return failures
+
 
 def _run_plan_only_mode(
     *,
@@ -3769,35 +4142,8 @@ def _run_plan_only_mode(
             print(f"FAIL: {line}", file=sys.stderr)
         return 2
 
-    rows: list[dict] = []
-    for idx, image in enumerate(images, start=1):
-        title = image.slide_title or _default_slide_title(image)
-        alt_text = image.alt_text or _default_alt_text(image)
-        intended_use = image.intended_use or _DEFAULT_INTENDED_USE
-        rows.append({
-            "filename": image.operator_filename,
-            "asset_id": image.asset_id,
-            "media_type": image.media_type,
-            "byte_count": image.byte_count,
-            "sha256": image.sha256,
-            "intended_slide_index": idx,
-            "slide_title": title,
-            "alt_text": alt_text,
-            "intended_use": intended_use,
-        })
-
-    body = {
-        "schema_version": _PLAN_SCHEMA_VERSION,
-        "helper_id": "operator_local_images_to_editable_ppt",
-        "mode": _PLAN_MODE,
-        "image_count": len(images),
-        "slide_count": len(images),
-        "manifest_path": (
-            str(manifest_path) if manifest_path is not None else None
-        ),
-        "explicit_boundaries": list(_EXPLICIT_BOUNDARIES),
-        "images": rows,
-    }
+    body = _build_plan_body(images=images, manifest_path=manifest_path)
+    rows = body["images"]
 
     manifest_arg_display = (
         f", --manifest {manifest_path}"
@@ -6985,6 +7331,422 @@ def _run_self_tests() -> int:
             f"{plan_out.read_bytes() == stale_bytes!r}",
         ))
 
+    # T84 --approved-plan happy path: --plan-out PATH then --approved-
+    # plan PATH against byte-identical images + manifest succeeds and
+    # writes the same deck.pptx / summary.json / inventory.json /
+    # visual_quality.json / workspace / reports / README.md the
+    # bare-normal run does. Locks the spec's "match -> normal mode
+    # behaves exactly as before and still writes README" assertion.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T84-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        plan_out = td / "approved.json"
+        _write_synthetic_images(images_dir)
+        rc_plan = _run_plan_only_mode(
+            images_dir_str=str(images_dir),
+            plan_out_str=str(plan_out),
+        )
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+            approved_plan_path_str=str(plan_out),
+        )
+        readme_path = out_dir / "README.md"
+        summary_path = out_dir / "summary.json"
+        deck_path = out_dir / "deck.pptx"
+        ok = (
+            rc_plan == 0
+            and rc == 0
+            and deck_path.is_file()
+            and not deck_path.is_symlink()
+            and summary_path.is_file()
+            and not summary_path.is_symlink()
+            and readme_path.is_file()
+            and not readme_path.is_symlink()
+        )
+        results.append(_ProbeResult(
+            "T84 --approved-plan happy path: --plan-out then normal "
+            "run with --approved-plan succeeds and writes deck.pptx + "
+            "summary.json + README.md",
+            ok,
+            f"rc_plan={rc_plan}, rc={rc}, "
+            f"deck={deck_path.is_file()}, "
+            f"summary={summary_path.is_file()}, "
+            f"readme={readme_path.is_file()}",
+        ))
+
+    # T85 --approved-plan refuses on a post-approval image byte change.
+    # Changing alpha_marker.png's bytes after --plan-out flips its
+    # sha256 + byte_count; --approved-plan must catch the drift and
+    # refuse with rc 2 BEFORE deck.pptx / summary.json / inventory /
+    # visual_quality / README.md / workspace / reports materialise.
+    # Locks "changing an image byte after plan-out makes
+    # --approved-plan fail before deck/summary/README/workspace/reports
+    # artifacts are created".
+    with tempfile.TemporaryDirectory(prefix="op-helper-T85-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        plan_out = td / "approved.json"
+        _write_synthetic_images(images_dir)
+        rc_plan = _run_plan_only_mode(
+            images_dir_str=str(images_dir),
+            plan_out_str=str(plan_out),
+        )
+        # Re-author alpha_marker.png with a magic-byte-valid PNG body
+        # that has a different trailing chunk so sha256 / byte_count
+        # drift. Keeps IG8 happy so the helper reaches the
+        # --approved-plan compare step rather than refusing on
+        # magic-byte mismatch first.
+        tampered_png = bytes.fromhex(
+            "89504e470d0a1a0a"
+            "0000000d49484452"
+            "0000000100000001"
+            "08060000001f15c489"
+            "0000000d49444154"
+            "789c6300010000000500010d0a2db4"
+            "00000000"
+            "49454e44ae426082"
+            "00000000"
+        )
+        (images_dir / "alpha_marker.png").write_bytes(tampered_png)
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+            approved_plan_path_str=str(plan_out),
+        )
+        artifact_paths = [
+            out_dir / "deck.pptx",
+            out_dir / "summary.json",
+            out_dir / "inventory.json",
+            out_dir / "visual_quality.json",
+            out_dir / "README.md",
+            out_dir / "workspace",
+            out_dir / "reports",
+            out_dir / "_pipeline_fixture",
+        ]
+        leaked = [str(p) for p in artifact_paths if p.exists()]
+        ok = rc_plan == 0 and rc == 2 and not leaked
+        results.append(_ProbeResult(
+            "T85 --approved-plan refuses on a post-approval image byte "
+            "change; no deck.pptx / summary.json / inventory.json / "
+            "visual_quality.json / README.md / workspace / reports / "
+            "_pipeline_fixture artifact materialised",
+            ok,
+            f"rc_plan={rc_plan}, rc={rc}, leaked={leaked!r}",
+        ))
+
+    # T86 --approved-plan refuses on manifest order change. Original
+    # --plan-out used filename-sorted order; a re-run with a manifest
+    # that reverses the order trips the per-row filename drift on
+    # row [0] and image_count / manifest_path also drift. Locks
+    # "changing manifest order ... makes --approved-plan fail before
+    # artifacts".
+    with tempfile.TemporaryDirectory(prefix="op-helper-T86-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        plan_out = td / "approved.json"
+        manifest = td / "manifest.json"
+        _write_synthetic_images(images_dir)
+        rc_plan = _run_plan_only_mode(
+            images_dir_str=str(images_dir),
+            plan_out_str=str(plan_out),
+        )
+        manifest.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [
+                {
+                    "filename": "beta_marker.jpg",
+                    "slide_title": "Beta first",
+                    "alt_text": "Operator beta marker reordered.",
+                    "intended_use": "spot illustration",
+                },
+                {
+                    "filename": "alpha_marker.png",
+                    "slide_title": "Alpha second",
+                    "alt_text": "Operator alpha marker reordered.",
+                    "intended_use": "spot illustration",
+                },
+            ],
+        }) + "\n", encoding="utf-8")
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+            manifest_path_str=str(manifest),
+            approved_plan_path_str=str(plan_out),
+        )
+        artifact_paths = [
+            out_dir / "deck.pptx",
+            out_dir / "summary.json",
+            out_dir / "inventory.json",
+            out_dir / "visual_quality.json",
+            out_dir / "README.md",
+            out_dir / "workspace",
+            out_dir / "reports",
+            out_dir / "_pipeline_fixture",
+        ]
+        leaked = [str(p) for p in artifact_paths if p.exists()]
+        ok = rc_plan == 0 and rc == 2 and not leaked
+        results.append(_ProbeResult(
+            "T86 --approved-plan refuses on a manifest order change "
+            "(filename-sorted plan vs reverse-order manifest); no "
+            "deck / summary / inventory / visual_quality / README / "
+            "workspace / reports / _pipeline_fixture artifact "
+            "materialised",
+            ok,
+            f"rc_plan={rc_plan}, rc={rc}, leaked={leaked!r}",
+        ))
+
+    # T87 --approved-plan refuses on an operator-field change. Plan
+    # written with manifest M1 (slide_title 'Alpha first' / 'Beta
+    # second'); re-run with manifest M2 that only changes the alt_text
+    # for the first row trips per-row alt_text drift. Locks "changing
+    # ... an operator field after plan-out makes --approved-plan fail
+    # before artifacts".
+    with tempfile.TemporaryDirectory(prefix="op-helper-T87-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        plan_out = td / "approved.json"
+        manifest1 = td / "manifest1.json"
+        manifest2 = td / "manifest2.json"
+        _write_synthetic_images(images_dir)
+        manifest1.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [
+                {
+                    "filename": "alpha_marker.png",
+                    "slide_title": "Alpha first",
+                    "alt_text": "Operator alpha marker original.",
+                    "intended_use": "spot illustration",
+                },
+                {
+                    "filename": "beta_marker.jpg",
+                    "slide_title": "Beta second",
+                    "alt_text": "Operator beta marker original.",
+                    "intended_use": "spot illustration",
+                },
+            ],
+        }) + "\n", encoding="utf-8")
+        manifest2.write_text(json.dumps({
+            "schema_version": "1",
+            "images": [
+                {
+                    "filename": "alpha_marker.png",
+                    "slide_title": "Alpha first",
+                    "alt_text": "Operator alpha marker tampered.",
+                    "intended_use": "spot illustration",
+                },
+                {
+                    "filename": "beta_marker.jpg",
+                    "slide_title": "Beta second",
+                    "alt_text": "Operator beta marker original.",
+                    "intended_use": "spot illustration",
+                },
+            ],
+        }) + "\n", encoding="utf-8")
+        rc_plan = _run_plan_only_mode(
+            images_dir_str=str(images_dir),
+            plan_out_str=str(plan_out),
+            manifest_path_str=str(manifest1),
+        )
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+            manifest_path_str=str(manifest2),
+            approved_plan_path_str=str(plan_out),
+        )
+        artifact_paths = [
+            out_dir / "deck.pptx",
+            out_dir / "summary.json",
+            out_dir / "inventory.json",
+            out_dir / "visual_quality.json",
+            out_dir / "README.md",
+            out_dir / "workspace",
+            out_dir / "reports",
+            out_dir / "_pipeline_fixture",
+        ]
+        leaked = [str(p) for p in artifact_paths if p.exists()]
+        ok = rc_plan == 0 and rc == 2 and not leaked
+        results.append(_ProbeResult(
+            "T87 --approved-plan refuses on an operator-field change "
+            "(alt_text drift between approval-time manifest and run-"
+            "time manifest); no deck / summary / inventory / "
+            "visual_quality / README / workspace / reports / "
+            "_pipeline_fixture artifact materialised",
+            ok,
+            f"rc_plan={rc_plan}, rc={rc}, leaked={leaked!r}",
+        ))
+
+    # T88 malformed --approved-plan refused with rc 2 and no out-dir
+    # artifact. Covers (a) invalid-UTF-8 bytes, (b) non-JSON text,
+    # (c) JSON-but-not-an-object, (d) wrong helper_id, (e) wrong mode,
+    # (f) boundary drift. Each variant is its own out-dir so a leaked
+    # artifact on one case cannot mask another. The invalid-UTF-8
+    # case locks the regression where Path.read_text(encoding="utf-8")
+    # would raise UnicodeDecodeError (not caught by an OSError-only
+    # except) and crash the run instead of returning rc 2.
+    malformed_cases: list[tuple[str, bytes]] = [
+        ("invalid UTF-8 bytes", b"\xff\xfe\x00\x01malformed"),
+        ("non-JSON text", b"not-json"),
+        ("JSON array root", b"[1, 2, 3]"),
+        (
+            "wrong helper_id",
+            json.dumps({
+                "schema_version": "1",
+                "helper_id": "some_other_helper",
+                "mode": "plan_only",
+                "image_count": 2, "slide_count": 2,
+                "manifest_path": None,
+                "explicit_boundaries": list(_EXPLICIT_BOUNDARIES),
+                "images": [],
+            }).encode("utf-8"),
+        ),
+        (
+            "wrong mode",
+            json.dumps({
+                "schema_version": "1",
+                "helper_id": "operator_local_images_to_editable_ppt",
+                "mode": "operator_mode",
+                "image_count": 2, "slide_count": 2,
+                "manifest_path": None,
+                "explicit_boundaries": list(_EXPLICIT_BOUNDARIES),
+                "images": [],
+            }).encode("utf-8"),
+        ),
+        (
+            "boundary drift",
+            json.dumps({
+                "schema_version": "1",
+                "helper_id": "operator_local_images_to_editable_ppt",
+                "mode": "plan_only",
+                "image_count": 2, "slide_count": 2,
+                "manifest_path": None,
+                "explicit_boundaries": ["dropped boundary"],
+                "images": [],
+            }).encode("utf-8"),
+        ),
+    ]
+    t88_failures: list[str] = []
+    for label, raw_bytes in malformed_cases:
+        with tempfile.TemporaryDirectory(
+            prefix=f"op-helper-T88-{label[:8]}-",
+        ) as raw_td:
+            td = Path(raw_td)
+            images_dir = td / "images"
+            out_dir = td / "out"
+            plan_path = td / "approved.json"
+            _write_synthetic_images(images_dir)
+            plan_path.write_bytes(raw_bytes)
+            try:
+                rc = _run_operator_mode(
+                    images_dir_str=str(images_dir),
+                    out_dir_str=str(out_dir),
+                    approved_plan_path_str=str(plan_path),
+                )
+            except BaseException as exc:
+                # An uncaught exception (UnicodeDecodeError, JSONDecode
+                # crash, etc.) IS the regression we are locking — capture
+                # it as a probe failure rather than letting it abort the
+                # whole self-test run.
+                t88_failures.append(
+                    f"{label}: crashed with "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            artifact_paths = [
+                out_dir / "deck.pptx",
+                out_dir / "summary.json",
+                out_dir / "inventory.json",
+                out_dir / "visual_quality.json",
+                out_dir / "README.md",
+                out_dir / "workspace",
+                out_dir / "reports",
+                out_dir / "_pipeline_fixture",
+            ]
+            leaked = [str(p) for p in artifact_paths if p.exists()]
+            if rc != 2 or leaked:
+                t88_failures.append(
+                    f"{label}: rc={rc}, leaked={leaked!r}"
+                )
+    results.append(_ProbeResult(
+        "T88 malformed --approved-plan refused with rc 2 across the "
+        "six documented shapes (invalid UTF-8 bytes, non-JSON text, "
+        "JSON array root, wrong helper_id, wrong mode, boundary "
+        "drift); no deck / summary / inventory / visual_quality / "
+        "README / workspace / reports / _pipeline_fixture artifact "
+        "materialised",
+        not t88_failures,
+        "; ".join(t88_failures) if t88_failures else "",
+    ))
+
+    # T89 AP1..AP4 --approved-plan path gate.
+    # AP1: URI-shaped path refused.
+    path, fails = _validate_approved_plan_arg("file:///tmp/x.json")
+    ap1_ok = path is None and any("AP1" in f for f in fails)
+    # AP4 directory: directory path refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T89-dir-") as raw_td:
+        td_path = Path(raw_td)
+        path_dir, fails_dir = _validate_approved_plan_arg(str(td_path))
+        ap4_dir_ok = path_dir is None and any(
+            "AP4" in f for f in fails_dir
+        )
+    # AP4 missing: missing path refused.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T89-mis-") as raw_td:
+        missing_path = Path(raw_td) / "no-such-file.json"
+        path_missing, fails_missing = _validate_approved_plan_arg(
+            str(missing_path),
+        )
+        ap4_missing_ok = path_missing is None and any(
+            "AP4" in f for f in fails_missing
+        )
+    # AP2 symlink path refused (skipped if symlink unsupported on this
+    # OS, mirroring the IG2 / T3 self-test pattern).
+    ap2_skipped = False
+    ap2_ok = False
+    with tempfile.TemporaryDirectory(prefix="op-helper-T89-sym-") as raw_td:
+        real = Path(raw_td) / "real.json"
+        real.write_text("{}", encoding="utf-8")
+        link = Path(raw_td) / "link.json"
+        try:
+            link.symlink_to(real)
+        except (OSError, NotImplementedError):
+            ap2_skipped = True
+            ap2_ok = True
+        else:
+            path_sym, fails_sym = _validate_approved_plan_arg(str(link))
+            ap2_ok = path_sym is None and any(
+                "AP2" in f for f in fails_sym
+            )
+    # Operator-mode wiring of the AP4 gate (URI-shaped): rc must be 2
+    # and out-dir must NOT be mkdir'd by the helper. Locks "URI/symlink
+    # approved-plan paths fail closed".
+    with tempfile.TemporaryDirectory(prefix="op-helper-T89-cli-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        _write_synthetic_images(images_dir)
+        rc_cli = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+            approved_plan_path_str="file:///tmp/whatever.json",
+        )
+        cli_leaked = out_dir.exists()
+        cli_ok = rc_cli == 2 and not cli_leaked
+    results.append(_ProbeResult(
+        "T89 AP1..AP4 --approved-plan path gate: URI / symlink / "
+        "directory / missing-file paths refused"
+        + (" (AP2 symlink probe skipped)" if ap2_skipped else "")
+        + " and operator-mode CLI refuses a URI-shaped --approved-plan "
+        "without mkdir'ing --out-dir",
+        ap1_ok and ap2_ok and ap4_dir_ok and ap4_missing_ok and cli_ok,
+        f"ap1_ok={ap1_ok}, ap2_ok={ap2_ok}, ap4_dir_ok={ap4_dir_ok}, "
+        f"ap4_missing_ok={ap4_missing_ok}, rc_cli={rc_cli}, "
+        f"cli_leaked={cli_leaked}",
+    ))
+
     # T70 — committed-tree snapshot. The whole self-test must not have
     # mutated any byte under REPO_ROOT/scripts/ or REPO_ROOT/examples/.
     # Kept as the LAST probe so every manifest scenario above runs
@@ -7139,12 +7901,37 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--approved-plan", type=str, default=None,
+        help=(
+            "Optional reviewer-approved run lock. When supplied, the "
+            "helper builds the SAME in-memory plan --plan-out would "
+            "have written for the current --images-dir (and --manifest, "
+            "if supplied), loads the operator-supplied approved plan, "
+            "and refuses the run with rc 2 BEFORE any pipeline "
+            "subprocess fires or any out-dir artifact is created if "
+            "the approved plan is malformed, carries a wrong "
+            "schema_version / helper_id / mode, has boundary drift, or "
+            "differs from current inputs on image_count, slide_count, "
+            "manifest_path, image order, or any per-image filename / "
+            "asset_id / media_type / byte_count / sha256 / "
+            "intended_slide_index / slide_title / alt_text / "
+            "intended_use. The path must be a regular local "
+            "non-symlink file, not URI-shaped, with no symlink "
+            "ancestor. On a clean match, normal operator mode proceeds "
+            "exactly as it does without --approved-plan and writes "
+            "deck.pptx, summary.json, inventory.json, visual_quality."
+            "json, workspace/, reports/, and README.md under --out-dir. "
+            "Mutually exclusive with --plan-out / "
+            "--write-manifest-template / --self-test."
+        ),
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios (happy path + "
             "every documented fail-closed probe). Mutually exclusive "
             "with --images-dir / --out-dir / --manifest / "
-            "--write-manifest-template / --plan-out."
+            "--write-manifest-template / --plan-out / --approved-plan."
         ),
     )
     args = parser.parse_args(argv)
@@ -7156,11 +7943,12 @@ def main(argv: list[str]) -> int:
             or args.manifest is not None
             or args.write_manifest_template is not None
             or args.plan_out is not None
+            or args.approved_plan is not None
         ):
             print(
                 "FAIL: --self-test does not take --images-dir / "
                 "--out-dir / --manifest / --write-manifest-template / "
-                "--plan-out.",
+                "--plan-out / --approved-plan.",
                 file=sys.stderr,
             )
             return 2
@@ -7177,11 +7965,12 @@ def main(argv: list[str]) -> int:
             args.out_dir is not None
             or args.manifest is not None
             or args.plan_out is not None
+            or args.approved_plan is not None
         ):
             print(
                 "FAIL: --write-manifest-template does not take "
-                "--out-dir / --manifest / --plan-out (the template "
-                "writer does not run the pipeline).",
+                "--out-dir / --manifest / --plan-out / --approved-plan "
+                "(the template writer does not run the pipeline).",
                 file=sys.stderr,
             )
             return 2
@@ -7201,6 +7990,15 @@ def main(argv: list[str]) -> int:
             print(
                 "FAIL: --plan-out does not take --out-dir (plan-only "
                 "mode does not run the pipeline).",
+                file=sys.stderr,
+            )
+            return 2
+        if args.approved_plan is not None:
+            print(
+                "FAIL: --plan-out does not take --approved-plan "
+                "(--plan-out writes a plan; --approved-plan compares "
+                "an existing plan against current inputs in normal "
+                "operator mode).",
                 file=sys.stderr,
             )
             return 2
@@ -7233,6 +8031,7 @@ def main(argv: list[str]) -> int:
         images_dir_str=args.images_dir,
         out_dir_str=args.out_dir,
         manifest_path_str=args.manifest,
+        approved_plan_path_str=args.approved_plan,
     )
 
 
