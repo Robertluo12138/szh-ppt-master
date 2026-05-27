@@ -604,6 +604,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "operator_local_images_to_editable_ppt.py",
     SCRIPTS_DIR / "operator_local_images_trial.py",
     SCRIPTS_DIR / "validate_operator_review_package.py",
+    SCRIPTS_DIR / "mock_generated_images_to_editable_ppt_smoke.py",
     SCRIPTS_DIR / "image_placement_readback_smoke.py",
     SCRIPTS_DIR / "validate_mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
