@@ -226,6 +226,40 @@ TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
   python3 scripts/d_one_live_readiness_preflight.py --self-test
 ```
 
+## One-command operator trial
+
+For a reviewer who wants the shortest end-to-end run on synthetic inputs without hand-authoring a `--plan-out` / `--approved-plan` loop, `scripts/operator_local_images_trial.py` drives the helper twice — first with `--plan-out` to write an approved plan, then in normal mode under `--approved-plan` — into a caller-supplied directory outside the repo, and writes a concise top-level `README.md` naming what to open first.
+
+```bash
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/szh-trial-XXXX")
+echo "Trial artifacts will land under: $RUN_DIR/trial"
+
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_local_images_trial.py \
+  --out-dir "$RUN_DIR/trial"
+
+# When done inspecting, clean up:
+#   rm -rf "$RUN_DIR"
+```
+
+On a clean run the trial leaves the following layout under `--out-dir`:
+
+- `input_images/` — the synthetic flat folder the trial generated (one PNG + one JPEG, magic-byte-valid; same payloads the helper's `--self-test` uses).
+- `approved_plan.json` — the plan written by `scripts/operator_local_images_to_editable_ppt.py --plan-out` against the synthetic folder. A reviewer in a real workflow would inspect and sign off on this file before allowing the normal-mode run.
+- `review_package/` — the full helper output under the approved-plan run lock: `deck.pptx`, `summary.json` (with the `approved_plan` block carrying `matched: true`), `README.md` (helper-written review-package README), `inventory.json`, `visual_quality.json`, `workspace/source_image_assets.json`, and `reports/pipeline_report.{json,txt}`.
+- `README.md` — top-level operator README pointing reviewers at the seven files above in the order they should open them.
+
+The trial does NOT duplicate the helper's manifest / plan / approved-plan / pipeline / contract / inventory / visual-quality validation; it only verifies that the canonical produced files exist and that `summary.approved_plan.matched == true` (defense in depth — the helper's own truth-checker already gates every byte-level invariant before it returns 0). The `--out-dir` argument re-uses the same gate the sibling helpers enforce (URI / symlink / symlink-ancestor / inside-REPO_ROOT / non-empty pre-existing refusals; stale bytes on a refused path are preserved).
+
+Run `--self-test` to exercise the trial under per-run TMPDIR fixtures plus every documented `--out-dir` refusal probe and the boundary-claim scan:
+
+```bash
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+  python3 scripts/operator_local_images_trial.py --self-test
+```
+
+Local-only — the trial does NOT call D-One, MCP, Qoder, a public network, telemetry, a model API, an image search, or any external service. NOT a prompt / report / Markdown-to-PPTX automation. Real D-One remains UNVERIFIED.
+
 ## Boundary reminders
 
 - The pipeline never calls D-One, MCP, Qoder, a public network, telemetry, any model API, an image search, or any external service. Real D-One remains UNVERIFIED.
