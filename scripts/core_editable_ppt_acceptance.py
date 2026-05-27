@@ -489,20 +489,44 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     drives ``scripts/operator_local_images_to_editable_ppt.py`` twice
     — once with ``--plan-out`` to write a reviewer-approved plan,
     once in normal operator mode under ``--approved-plan`` — into a
-    caller-supplied directory outside the repo, leaves the produced
-    review package on disk for inspection, and writes a concise
-    top-level README naming the first files to open. The aggregate
-    invokes ``--self-test``, which drives the same happy path inside
-    a per-run tempdir on tiny generated PNG + JPEG fixtures (no
-    committed image bytes) and exercises the OP1..OP5 ``--out-dir``
-    argument gates (URI / symlink / symlink-ancestor / inside-
-    REPO_ROOT / non-empty pre-existing) plus a no-external-service-
-    claims scan over the trial's stdout, trial README, helper-written
-    review-package README, and helper-written ``summary.json``.
-    Reuses the helper's own ``_validate_out_dir_arg`` /
-    ``_write_synthetic_images`` / ``_EXPLICIT_BOUNDARIES`` — no new
-    schema, no new validator, no new runtime contract. LOCAL-ONLY —
-    no real D-One.
+    caller-supplied directory outside the repo, re-checks the
+    produced review package on disk via
+    ``scripts/validate_operator_review_package.py --out-dir <produced
+    review package>`` (read-only stdlib companion), leaves both on
+    disk for inspection, and writes a concise top-level README
+    naming the first files to open and recording the on-disk
+    re-validation rc + the read-only / local-only nature of that
+    re-check. The aggregate invokes ``--self-test``, which drives
+    the same happy path inside a per-run tempdir on tiny generated
+    PNG + JPEG fixtures (no committed image bytes) and exercises
+    the OP1..OP5 ``--out-dir`` argument gates (URI / symlink /
+    symlink-ancestor / inside-REPO_ROOT / non-empty pre-existing)
+    plus a no-external-service-claims scan over the trial's stdout,
+    trial README, helper-written review-package README, and
+    helper-written ``summary.json``. Reuses the helper's own
+    ``_validate_out_dir_arg`` / ``_write_synthetic_images`` /
+    ``_EXPLICIT_BOUNDARIES`` — no new schema, no new validator, no
+    new runtime contract. LOCAL-ONLY — no real D-One.
+  - ``scripts/validate_operator_review_package.py`` — read-only
+    stdlib validator for the review package produced by
+    ``scripts/operator_local_images_to_editable_ppt.py`` (the
+    ``--out-dir`` artifact set, including the ``--bundle``
+    shortcut). The aggregate invokes ``--self-test``, which drives
+    the operator helper into a per-run tempdir and re-runs every
+    documented tamper probe (missing deck, stale summary path,
+    placement_verified flipped, visual_quality errors > 0, external
+    URL, credential token, public-hosting wording, missing /
+    flipped / malformed / extra-key ``approved_plan`` shapes,
+    dangerous single-colon URI scheme in README, ``file:`` URI
+    leak in README, tampered ``summary.registry_path`` outside
+    ``--out-dir``, tampered ``summary.visual_quality.path`` outside
+    ``--out-dir``). Pairs the in-trial wiring above so the same
+    on-disk re-check the operator trial just exercised against a
+    real review package also fires here against the validator's own
+    tamper-probe matrix. LOCAL-ONLY — no real D-One; never calls
+    MCP, Qoder, a public network, a model API, an image search, or
+    telemetry; never mutates the package; never rebuilds the
+    pipeline.
   - ``scripts/render_model_roundtrip_smoke.py`` — synthetic
     render_model -> editable .pptx round-trip exercising every
     primitive kind the exporter supports today (text, line, shape,
@@ -579,6 +603,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "core_image_to_editable_ppt_demo.py",
     SCRIPTS_DIR / "operator_local_images_to_editable_ppt.py",
     SCRIPTS_DIR / "operator_local_images_trial.py",
+    SCRIPTS_DIR / "validate_operator_review_package.py",
     SCRIPTS_DIR / "image_placement_readback_smoke.py",
     SCRIPTS_DIR / "validate_mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
@@ -820,6 +845,7 @@ def main(argv: list[str]) -> int:
             "core_image_to_editable_ppt_demo + "
             "operator_local_images_to_editable_ppt + "
             "operator_local_images_trial + "
+            "validate_operator_review_package + "
             "image_placement_readback_smoke + "
             "validate_mock_image_bundle_trial_evidence + "
             "render_model_roundtrip_smoke + trace_acceptance_smoke). "

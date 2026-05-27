@@ -5,13 +5,18 @@ Drives the existing
 ``scripts/operator_local_images_to_editable_ppt.py`` helper twice — once
 in plan-only mode to write an approved plan, once in normal operator
 mode under the same approved plan — into a caller-supplied directory
-outside the repo, leaves the produced review package on disk for a
-human reviewer to inspect, and writes a concise top-level ``README.md``
-that names the first artifacts to open.
+outside the repo, then re-checks the produced review package on disk
+via ``scripts/validate_operator_review_package.py --out-dir <produced
+review package>`` (read-only stdlib companion; never writes to the
+package), leaves both on disk for a human reviewer to inspect, and
+writes a concise top-level ``README.md`` that names the first artifacts
+to open and records the validator rc + the read-only / local-only
+nature of that re-check.
 
 The helper remains the source of truth for every manifest / plan /
 approved-plan / pipeline / contract / inventory / visual-quality
-validation. This script only orchestrates the helper's real CLI path
+validation. This script only orchestrates the helper's real CLI path,
+runs the read-only review-package validator over the helper's output,
 and verifies that the key produced files exist; the helper's own
 truth-checker still gates the run.
 
@@ -74,6 +79,7 @@ from operator_local_images_to_editable_ppt import (  # noqa: E402
 )
 
 HELPER_PATH = SCRIPTS_DIR / "operator_local_images_to_editable_ppt.py"
+VALIDATOR_PATH = SCRIPTS_DIR / "validate_operator_review_package.py"
 
 # Files the helper writes under its --out-dir on a happy normal-mode
 # run. Verifying these exist after the subprocess returns 0 is the
@@ -247,7 +253,32 @@ def _run_trial(out_dir: Path) -> int:
           f"(path={ap.get('path')!r}, "
           f"sha256={ap.get('sha256', '')[:12]}...)")
 
-    # Stage F — concise top-level README pointing the operator at what
+    # Stage F — read-only stdlib re-check of the produced review
+    # package via the companion validator. The validator never writes
+    # to the package; it re-checks every locked summary field +
+    # path-resolve gate + inventory / visual-quality / approved-plan
+    # invariant the helper's own truth-checker enforced before exit,
+    # so a tampered post-helper edit (or a future helper regression
+    # that lets such an edit through) fails closed here too. Run
+    # BEFORE the trial README write so the README can carry the
+    # validator rc, and so a torn re-check cannot leave a
+    # positive-looking README behind.
+    validator_outcome = _run(
+        "validate_operator_review_package --out-dir",
+        [
+            sys.executable, str(VALIDATOR_PATH),
+            "--out-dir", str(review_package),
+        ],
+    )
+    if validator_outcome.rc != 0:
+        print(f"  [FAIL] validate_operator_review_package "
+              f"rc={validator_outcome.rc}")
+        _print_outcome_tail(validator_outcome)
+        return 1
+    print(f"  [PASS] validate_operator_review_package rc=0 "
+          f"(read-only / local-only)")
+
+    # Stage G — concise top-level README pointing the operator at what
     # to open first. Written after every verification passes so a torn
     # run cannot leave a positive-looking README behind.
     trial_readme = out_dir / "README.md"
@@ -256,6 +287,7 @@ def _run_trial(out_dir: Path) -> int:
             review_package=review_package,
             approved_plan=approved_plan,
             images_dir=images_dir,
+            validator_rc=validator_outcome.rc,
         ),
         encoding="utf-8",
     )
@@ -276,9 +308,12 @@ def _render_trial_readme(
     review_package: Path,
     approved_plan: Path,
     images_dir: Path,
+    validator_rc: int,
 ) -> str:
     """Render the trial's top-level operator-facing README. Names what
-    landed where and which files to open first."""
+    landed where, which files to open first, and the rc of the
+    read-only stdlib re-check the trial just ran over the produced
+    review package."""
     return "\n".join([
         "# operator_local_images_trial — review package",
         "",
@@ -319,6 +354,19 @@ def _render_trial_readme(
         "same helper in normal operator mode under "
         "`--approved-plan`, so the plan-out / approved-plan loop is "
         "exercised end-to-end.",
+        "",
+        "## On-disk re-validation",
+        "",
+        f"`scripts/validate_operator_review_package.py --out-dir "
+        f"{review_package.name}` rc={validator_rc}. Read-only stdlib "
+        "re-check; local-only — does not call D-One, MCP, Qoder, a "
+        "public network, a model API, an image search, or telemetry. "
+        "Re-run anytime with:",
+        "",
+        "```",
+        f"python3 scripts/validate_operator_review_package.py "
+        f"--out-dir {review_package}",
+        "```",
         "",
         "## Boundary statement",
         "",
@@ -494,6 +542,38 @@ def _run_self_tests() -> int:
                             f"'UNVERIFIED' "
                             f"(got {summary.get('real_d_one_status')!r})"
                         )
+                if ok:
+                    # The trial README must record the on-disk
+                    # re-validation rc the trial just ran via the
+                    # read-only companion validator. Re-reading the
+                    # README here locks the wiring in place — a future
+                    # regression that skips the validator stage OR
+                    # writes the README without the validator line
+                    # surfaces as a T1 FAIL rather than as silent
+                    # drift.
+                    try:
+                        readme_text = (out_dir / "README.md").read_text(
+                            encoding="utf-8",
+                        )
+                    except OSError as exc:
+                        ok = False
+                        detail = (
+                            f"trial README unreadable: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    else:
+                        if "validate_operator_review_package" not in readme_text:
+                            ok = False
+                            detail = (
+                                f"trial README does not mention "
+                                f"validate_operator_review_package"
+                            )
+                        elif "rc=0" not in readme_text:
+                            ok = False
+                            detail = (
+                                f"trial README does not record "
+                                f"on-disk re-validation rc=0"
+                            )
         else:
             detail = f"main(--out-dir) rc={rc}"
         results.append(_ProbeResult(name="T1 happy path", ok=ok, detail=detail))
