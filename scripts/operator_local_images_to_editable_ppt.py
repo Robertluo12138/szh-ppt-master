@@ -446,6 +446,17 @@ _README_BOUNDARY_STATEMENT = (
 
 _URI_SCHEME_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
 
+# Lowercase-hex 64-character sha256 pattern, used by the truth-checker
+# to validate the approved_plan evidence block so reviewers can pipe
+# the recorded digest to ``sha256sum`` without parsing variations.
+_SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+# Sentinel object distinct from ``None`` so the truth-checker can tell
+# a missing summary key (refused — a tampered summary cannot silently
+# erase the lock) from an explicit null value (accepted — the run was
+# not approved-plan-locked).
+_MISSING = object()
+
 
 # ---------------------------------------------------------------------------
 # Optional --manifest validation.
@@ -2869,6 +2880,7 @@ def _build_summary(
     visual_quality_report: dict | None,
     pptx_media_shas: dict[str, list[str]],
     manifest_path: Path | None,
+    approved_plan_evidence: dict | None,
 ) -> dict:
     contract_pass = _project_contract_gates(contract.stdout or "")
     part_to_referencing_slides = (
@@ -2943,6 +2955,16 @@ def _build_summary(
             "embed_surface": _HELPER_EMBED_SURFACE_NOTE,
         },
         "explicit_boundaries": list(_EXPLICIT_BOUNDARIES),
+        # Reviewer-approved run lock evidence. None when the operator
+        # did not pass --approved-plan; a {path, sha256, matched=True}
+        # dict when they did. The summary itself is written ONLY after
+        # the approved-plan compare passed AND the summary truth-check
+        # passed, so matched=True is the only valid value here — a
+        # tampered matched=False fails the truth-check and refuses the
+        # run. Reviewers can confirm the lock by running
+        # ``sha256sum <approved_plan.path>`` against the recorded
+        # sha256 and verifying both numbers agree.
+        "approved_plan": approved_plan_evidence,
     }
 
 
@@ -3197,6 +3219,66 @@ def _check_summary_truth(summary: dict) -> list[str]:
             f"summary.explicit_boundaries={boundaries!r}; expected "
             f"the locked tuple {list(_EXPLICIT_BOUNDARIES)!r} verbatim"
         )
+
+    # approved_plan is REQUIRED to be present: ``null`` when the run
+    # was not locked against a reviewer-approved plan, an object
+    # carrying exactly {path, sha256, matched=True} when it was. A
+    # missing key is refused so a tampered summary cannot silently
+    # erase the lock. A matched=False value is refused because the
+    # approved-plan compare refuses the run with rc 2 BEFORE summary
+    # creation on mismatch — by the time the summary exists, the only
+    # valid recorded outcome is matched=True. The sha256 must be
+    # 64-char lowercase hex so reviewers can pipe it to ``sha256sum``
+    # without parsing.
+    ap = summary.get("approved_plan", _MISSING)
+    if ap is _MISSING:
+        failures.append(
+            "summary.approved_plan missing; expected null (no "
+            "--approved-plan supplied) or {path, sha256, matched: True}"
+        )
+    elif ap is not None:
+        if not isinstance(ap, dict):
+            failures.append(
+                f"summary.approved_plan={ap!r}; expected null or an "
+                f"object"
+            )
+        else:
+            unknown = sorted(
+                set(ap.keys()) - {"path", "sha256", "matched"}
+            )
+            if unknown:
+                failures.append(
+                    f"summary.approved_plan has unknown key(s) "
+                    f"{unknown!r}; expected exactly "
+                    f"{{path, sha256, matched}}"
+                )
+            ap_path = ap.get("path")
+            if not isinstance(ap_path, str) or not ap_path:
+                failures.append(
+                    f"summary.approved_plan.path={ap_path!r}; "
+                    f"expected non-empty string (the --approved-plan "
+                    f"path as the helper resolved it)"
+                )
+            ap_sha = ap.get("sha256")
+            if (
+                not isinstance(ap_sha, str)
+                or not _SHA256_HEX_PATTERN.fullmatch(ap_sha)
+            ):
+                failures.append(
+                    f"summary.approved_plan.sha256={ap_sha!r}; "
+                    f"expected 64-character lowercase hex string "
+                    f"(reviewers must be able to confirm via "
+                    f"sha256sum on the approved-plan file)"
+                )
+            ap_matched = ap.get("matched")
+            if ap_matched is not True:
+                failures.append(
+                    f"summary.approved_plan.matched={ap_matched!r}; "
+                    f"expected True (the approved-plan compare refuses "
+                    f"with rc 2 BEFORE summary creation on mismatch; "
+                    f"only matched=True can reach the summary)"
+                )
+
     return failures
 
 
@@ -3221,6 +3303,36 @@ def _render_review_readme(summary: dict) -> str:
         else "- No operator manifest supplied; filename-sorted order "
              "and default per-image strings were applied."
     )
+    # Approved-plan lock evidence is included ONLY when the run was
+    # locked against a reviewer-approved plan. Omitted entirely on
+    # plain runs so the README does NOT imply approval that did not
+    # happen (the operator goal explicitly forbids any approval claim
+    # in the unlocked README).
+    ap = summary.get("approved_plan")
+    approved_plan_block: list[str] = []
+    if isinstance(ap, dict) and ap.get("matched") is True:
+        approved_plan_block = [
+            "## Approved-plan lock",
+            "",
+            "This run was locked against a reviewer-approved plan. "
+            "The helper built the same in-memory plan `--plan-out` "
+            "would have written for the current `--images-dir` (and "
+            "`--manifest`, when supplied) and verified — BEFORE any "
+            "pipeline subprocess fired — that every per-image "
+            "`filename` / `asset_id` / `media_type` / `byte_count` / "
+            "`sha256` / `intended_slide_index` / `slide_title` / "
+            "`alt_text` / `intended_use` matched the approved plan.",
+            "",
+            f"- approved plan path: `{ap.get('path')}`",
+            f"- approved plan sha256: `{ap.get('sha256')}`",
+            "",
+            "Reviewers can confirm the lock by running "
+            "`sha256sum <approved-plan-path>` and matching the "
+            "result against the recorded sha256, or by reading "
+            "`summary.json` field `approved_plan` (which carries the "
+            "same `path`, `sha256`, and `matched: true` evidence).",
+            "",
+        ]
     lines = [
         "# Operator local-images review package",
         "",
@@ -3232,6 +3344,7 @@ def _render_review_readme(summary: dict) -> str:
         "",
         manifest_line,
         "",
+        *approved_plan_block,
         "## Files in this review package",
         "",
         "- `deck.pptx` — native editable PPTX (one cover slide per "
@@ -3283,6 +3396,7 @@ def _run_happy_path(
     out_dir: Path,
     images: list[_DiscoveredImage],
     manifest_path: Path | None = None,
+    approved_plan_evidence: dict | None = None,
 ) -> tuple[int, dict | None, Path | None]:
     """Build the fixture under ``out_dir``, drive the pipeline, run the
     validators, and write the summary. Returns ``(rc, summary,
@@ -3293,7 +3407,13 @@ def _run_happy_path(
     ``--manifest`` JSON file, or ``None`` when the operator did not
     supply one. The path is echoed verbatim into ``summary.manifest_path``
     so a reviewer can trace which manifest authored the per-image
-    operator_* strings in the provenance block."""
+    operator_* strings in the provenance block.
+
+    ``approved_plan_evidence`` is the (already-computed) {path, sha256,
+    matched=True} dict when the operator passed ``--approved-plan`` and
+    the compare passed, or ``None`` otherwise. Echoed verbatim into
+    ``summary.approved_plan`` and rendered as the README's
+    ``Approved-plan lock`` section when non-None."""
     print(
         f"--- operator local-image intake: "
         f"{len(images)} image(s) -> editable PPTX ---"
@@ -3461,6 +3581,7 @@ def _run_happy_path(
         visual_quality_report=visual_quality_report,
         pptx_media_shas=pptx_media_shas,
         manifest_path=manifest_path,
+        approved_plan_evidence=approved_plan_evidence,
     )
 
     truth_failures = _check_summary_truth(summary)
@@ -3632,12 +3753,18 @@ def _run_operator_mode(
     # current inputs refuses the run with rc 2 and leaves the out-dir
     # untouched (pre-existing bytes preserved; never mkdir'd if the
     # operator passed a fresh path).
+    approved_plan_evidence: dict | None = None
     if approved_plan_path is not None:
         current_plan = _build_plan_body(
             images=images, manifest_path=manifest_path,
         )
-        approved_plan, load_failures = _load_approved_plan(
-            approved_plan_path,
+        # _load_approved_plan returns (plan, sha256_of_loaded_bytes,
+        # failures) — the digest is captured at read time so a later
+        # re-read cannot hash different bytes than were compared
+        # (TOCTOU race). Use the returned digest verbatim for the
+        # summary evidence; do NOT re-read approved_plan_path here.
+        approved_plan, approved_plan_sha256, load_failures = (
+            _load_approved_plan(approved_plan_path)
         )
         if load_failures or approved_plan is None:
             for line in load_failures:
@@ -3661,6 +3788,11 @@ def _run_operator_mode(
                 file=sys.stderr,
             )
             return 2
+        approved_plan_evidence = {
+            "path": str(approved_plan_path),
+            "sha256": approved_plan_sha256,
+            "matched": True,
+        }
 
     if not out_dir.exists():
         try:
@@ -3690,6 +3822,7 @@ def _run_operator_mode(
     )
     rc, summary, summary_path = _run_happy_path(
         out_dir=out_dir, images=images, manifest_path=manifest_path,
+        approved_plan_evidence=approved_plan_evidence,
     )
     if rc != 0 or summary is None or summary_path is None:
         print(
@@ -3892,15 +4025,38 @@ def _build_plan_body(
     }
 
 
-def _load_approved_plan(approved_plan: Path) -> tuple[dict | None, list[str]]:
+def _is_strict_int(value: object) -> bool:
+    """True iff ``value`` is a Python int AND NOT a bool. JSON
+    ``true`` / ``false`` deserialises to ``True`` / ``False``, which
+    ``isinstance(_, int)`` accepts (bool is an int subclass). Without
+    this guard, an approved plan with a boolean in any int field would
+    pass type validation AND compare-match the current 1 / 0 integer
+    via Python's ``True == 1`` / ``False == 0`` equality, silently
+    defeating the run lock."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _load_approved_plan(
+    approved_plan: Path,
+) -> tuple[dict | None, str | None, list[str]]:
     """Read + parse the operator's ``--approved-plan`` file and validate
     the top-level shape (schema_version, helper_id, mode, explicit_
     boundaries, image_count, slide_count, manifest_path, images array).
 
-    Returns ``(plan_or_None, failures)``. The caller MUST treat the
-    plan as refused whenever ``failures`` is non-empty OR ``plan`` is
-    ``None`` and refuse the run with rc 2 BEFORE any pipeline
-    subprocess fires.
+    Returns ``(plan_or_None, bytes_sha256_hex_or_None, failures)``.
+    The caller MUST treat the plan as refused whenever ``failures`` is
+    non-empty OR ``plan`` is ``None`` and refuse the run with rc 2
+    BEFORE any pipeline subprocess fires.
+
+    ``bytes_sha256_hex`` is the sha256 over the EXACT bytes the helper
+    just read and parsed. The caller MUST use this digest when
+    surfacing approved-plan evidence in the summary — re-reading the
+    file later opens a TOCTOU window where a concurrent process could
+    swap the bytes between compare-time and evidence-time, making the
+    recorded digest hash bytes that were never actually compared. The
+    digest is returned whenever the bytes were captured (even on
+    subsequent structural failures), and ``None`` only when the
+    initial ``read_bytes()`` call itself raised ``OSError``.
 
     The structural failures surfaced here cover everything the
     operator could trip on BEFORE the per-image compare runs: missing
@@ -3911,10 +4067,15 @@ def _load_approved_plan(approved_plan: Path) -> tuple[dict | None, list[str]]:
     try:
         raw_bytes = approved_plan.read_bytes()
     except OSError as exc:
-        return None, [
+        return None, None, [
             f"--approved-plan {approved_plan} could not be read: "
             f"{type(exc).__name__}: {exc}"
         ]
+    # Capture the digest IMMEDIATELY after the read so every later
+    # return path threads back the sha256 of exactly the bytes that
+    # produced the parsed plan. No second read_bytes() anywhere in
+    # this module — the digest is the only thing flowing forward.
+    bytes_sha256 = hashlib.sha256(raw_bytes).hexdigest()
     # Decode + JSON-parse separately so non-UTF-8 bytes (e.g. a binary
     # file the operator typed by mistake) fail closed with a clear
     # diagnostic instead of crashing on the read_text UnicodeDecodeError
@@ -3922,19 +4083,19 @@ def _load_approved_plan(approved_plan: Path) -> tuple[dict | None, list[str]]:
     try:
         raw = raw_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
-        return None, [
+        return None, bytes_sha256, [
             f"--approved-plan {approved_plan} is not valid UTF-8: "
             f"{type(exc).__name__}: {exc}"
         ]
     try:
         plan = json.loads(raw)
     except json.JSONDecodeError as exc:
-        return None, [
+        return None, bytes_sha256, [
             f"--approved-plan {approved_plan} is not valid JSON: "
             f"{type(exc).__name__}: {exc}"
         ]
     if not isinstance(plan, dict):
-        return None, [
+        return None, bytes_sha256, [
             f"--approved-plan {approved_plan} root is not a JSON object "
             f"(got {type(plan).__name__})."
         ]
@@ -3969,15 +4130,23 @@ def _load_approved_plan(approved_plan: Path) -> tuple[dict | None, list[str]]:
             f"(boundary drift): approved={boundaries!r}, "
             f"current={list(_EXPLICIT_BOUNDARIES)!r}."
         )
-    if not isinstance(plan.get("image_count"), int):
+    # Python's bool is a subclass of int (isinstance(True, int) is True
+    # AND True == 1). Without the bool guard, an approved plan with
+    # "image_count": true / "byte_count": true / "intended_slide_index":
+    # false would (a) pass the int type check AND (b) compare-match the
+    # current 1 / 0 integer value via equality, letting a tampered
+    # approval bypass the run lock. _is_strict_int closes both holes.
+    if not _is_strict_int(plan.get("image_count")):
         failures.append(
             f"--approved-plan {approved_plan} image_count="
-            f"{plan.get('image_count')!r}; expected integer."
+            f"{plan.get('image_count')!r}; expected non-boolean "
+            f"integer."
         )
-    if not isinstance(plan.get("slide_count"), int):
+    if not _is_strict_int(plan.get("slide_count")):
         failures.append(
             f"--approved-plan {approved_plan} slide_count="
-            f"{plan.get('slide_count')!r}; expected integer."
+            f"{plan.get('slide_count')!r}; expected non-boolean "
+            f"integer."
         )
     mp = plan.get("manifest_path", "__MISSING__")
     if mp == "__MISSING__":
@@ -4010,10 +4179,22 @@ def _load_approved_plan(approved_plan: Path) -> tuple[dict | None, list[str]]:
                         f"--approved-plan {approved_plan} images[{i}] "
                         f"missing required field {field!r}."
                     )
+            # Reject bool for the per-row int fields too. byte_count
+            # and intended_slide_index would otherwise compare-match
+            # the current integers 0 / 1 via True == 1 / False == 0.
+            for int_field in ("byte_count", "intended_slide_index"):
+                if int_field in row and not _is_strict_int(
+                    row.get(int_field),
+                ):
+                    failures.append(
+                        f"--approved-plan {approved_plan} images[{i}]."
+                        f"{int_field}={row.get(int_field)!r}; "
+                        f"expected non-boolean integer."
+                    )
 
     if failures:
-        return None, failures
-    return plan, []
+        return None, bytes_sha256, failures
+    return plan, bytes_sha256, []
 
 
 def _compare_to_approved_plan(
@@ -7335,8 +7516,10 @@ def _run_self_tests() -> int:
     # plan PATH against byte-identical images + manifest succeeds and
     # writes the same deck.pptx / summary.json / inventory.json /
     # visual_quality.json / workspace / reports / README.md the
-    # bare-normal run does. Locks the spec's "match -> normal mode
-    # behaves exactly as before and still writes README" assertion.
+    # bare-normal run does. ALSO locks that summary.approved_plan
+    # carries {path, sha256, matched=True} with the sha256 equal to
+    # sha256(approved-plan-bytes) and that the README's
+    # "Approved-plan lock" section names the same path + sha256.
     with tempfile.TemporaryDirectory(prefix="op-helper-T84-") as raw_td:
         td = Path(raw_td)
         images_dir = td / "images"
@@ -7365,15 +7548,80 @@ def _run_self_tests() -> int:
             and readme_path.is_file()
             and not readme_path.is_symlink()
         )
-        results.append(_ProbeResult(
-            "T84 --approved-plan happy path: --plan-out then normal "
-            "run with --approved-plan succeeds and writes deck.pptx + "
-            "summary.json + README.md",
-            ok,
+        detail = (
             f"rc_plan={rc_plan}, rc={rc}, "
             f"deck={deck_path.is_file()}, "
             f"summary={summary_path.is_file()}, "
-            f"readme={readme_path.is_file()}",
+            f"readme={readme_path.is_file()}"
+        )
+        if ok:
+            try:
+                summary = json.loads(summary_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"summary parse failed: {exc}"
+        if ok:
+            ap = summary.get("approved_plan")
+            expected_sha = hashlib.sha256(
+                plan_out.read_bytes(),
+            ).hexdigest()
+            if not isinstance(ap, dict):
+                ok = False
+                detail = (
+                    f"summary.approved_plan={ap!r}; expected dict"
+                )
+            elif sorted(ap.keys()) != ["matched", "path", "sha256"]:
+                ok = False
+                detail = (
+                    f"summary.approved_plan keys={sorted(ap.keys())!r}; "
+                    f"expected ['matched', 'path', 'sha256']"
+                )
+            elif ap.get("matched") is not True:
+                ok = False
+                detail = (
+                    f"summary.approved_plan.matched="
+                    f"{ap.get('matched')!r}; expected True"
+                )
+            elif ap.get("path") != str(plan_out):
+                ok = False
+                detail = (
+                    f"summary.approved_plan.path={ap.get('path')!r}; "
+                    f"expected {str(plan_out)!r}"
+                )
+            elif ap.get("sha256") != expected_sha:
+                ok = False
+                detail = (
+                    f"summary.approved_plan.sha256="
+                    f"{ap.get('sha256')!r}; expected "
+                    f"{expected_sha!r} (sha256sum of the approved "
+                    f"plan bytes)"
+                )
+            else:
+                readme_text = readme_path.read_text(encoding="utf-8")
+                required_in_readme = (
+                    "## Approved-plan lock",
+                    str(plan_out),
+                    expected_sha,
+                    "summary.json",
+                    "approved_plan",
+                )
+                missing = [
+                    m for m in required_in_readme
+                    if m not in readme_text
+                ]
+                if missing:
+                    ok = False
+                    detail = (
+                        f"README missing approved-plan lock "
+                        f"reference(s) {missing!r}"
+                    )
+        results.append(_ProbeResult(
+            "T84 --approved-plan happy path: summary.approved_plan "
+            "carries {path, sha256, matched=True} where sha256 equals "
+            "sha256(approved-plan-bytes), and README 'Approved-plan "
+            "lock' section names the same path + sha256 + points to "
+            "summary.json#approved_plan",
+            ok, detail,
         ))
 
     # T85 --approved-plan refuses on a post-approval image byte change.
@@ -7746,6 +7994,262 @@ def _run_self_tests() -> int:
         f"ap4_missing_ok={ap4_missing_ok}, rc_cli={rc_cli}, "
         f"cli_leaked={cli_leaked}",
     ))
+
+    # T90 normal run WITHOUT --approved-plan: summary.approved_plan
+    # is exactly null (not missing, not a dict) AND the README has
+    # no "Approved-plan lock" section / no "reviewer-approved plan"
+    # claim — so an unlocked run never falsely implies approval.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T90-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        _write_synthetic_images(images_dir)
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+        )
+        ok = rc == 0
+        detail = f"rc={rc}"
+        if ok:
+            try:
+                summary = json.loads(
+                    (out_dir / "summary.json").read_text(),
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"summary parse failed: {exc}"
+        if ok:
+            # Use the `in` test so a missing key (which would route
+            # through the same `summary.get("approved_plan")` return
+            # value of None) is caught as a separate failure mode.
+            if "approved_plan" not in summary:
+                ok = False
+                detail = (
+                    "summary missing 'approved_plan' key; expected "
+                    "the key to be present with value null"
+                )
+            elif summary.get("approved_plan") is not None:
+                ok = False
+                detail = (
+                    f"summary.approved_plan="
+                    f"{summary.get('approved_plan')!r}; expected "
+                    f"null on an unlocked run"
+                )
+        if ok:
+            readme_text = (
+                out_dir / "README.md"
+            ).read_text(encoding="utf-8")
+            forbidden_in_readme = (
+                "Approved-plan lock",
+                "reviewer-approved plan",
+                "approved_plan",
+                "approved-plan",
+            )
+            leaked = [
+                f for f in forbidden_in_readme
+                if f.lower() in readme_text.lower()
+            ]
+            if leaked:
+                ok = False
+                detail = (
+                    f"unlocked README leaked approval-related "
+                    f"reference(s) {leaked!r}"
+                )
+        results.append(_ProbeResult(
+            "T90 normal run WITHOUT --approved-plan: "
+            "summary.approved_plan is exactly null AND README has no "
+            "Approved-plan lock section or approval claim",
+            ok, detail,
+        ))
+
+    # T91 tampered summary.approved_plan.matched=False fails the
+    # truth-checker. The compare refuses with rc 2 BEFORE summary
+    # creation on a real mismatch, so only matched=True can ever
+    # legitimately reach the summary — a False value is hand-tampered
+    # and the truth-checker must catch it.
+    tampered_matched = {
+        "schema_version": "1",
+        "helper_id": "operator_local_images_to_editable_ppt",
+        "real_d_one_status": _REAL_D_ONE_STATUS,
+        "manifest_path": None,
+        "slide_count": 1, "image_count": 1, "embedded_media_count": 1,
+        "source_classes": ["local_asset"],
+        "minimal_evidence": {
+            "editable_text": True, "not_all_image_slide": True,
+            "every_slide_has_native_shape": True, "no_blank_slide": True,
+        },
+        "no_external_relationships": True,
+        "image_provenance": [{
+            "operator_filename": "x.png", "asset_id": "x",
+            "sha256": "0" * 64,
+            "workspace_local_path": "x", "workspace_destination_path": "x",
+            "media_type": "image/png", "byte_count": 1,
+            "embedded_media_parts": ["ppt/media/image1.png"],
+            "intended_slide_index": 1,
+            "embedded_referencing_slides": [1],
+            "placement_verified": True,
+        }],
+        "pptx_path": "x", "workspace_path": "x", "report_dir": "x",
+        "inventory_path": "x", "registry_path": "x",
+        "inventory": {
+            "ok": True, "findings_empty": True, "evidence_basis": "x",
+        },
+        "validators": {
+            "validate_source_image_assets": {"rc": 0},
+            "validate_pptx_contract": {"rc": 0},
+            "inspect_pptx_inventory": {"rc": 0},
+            "validate_visual_quality": {"rc": 0},
+        },
+        "visual_quality": {
+            "rc": 0, "path": "x", "report_parsed": True,
+            "error_count": 0, "warning_count": 0,
+        },
+        "notes": {"scope": "x", "embed_surface": "x"},
+        "explicit_boundaries": list(_EXPLICIT_BOUNDARIES),
+        "approved_plan": {
+            "path": "/tmp/approved.json",
+            "sha256": "a" * 64,
+            "matched": False,
+        },
+    }
+    fails = _check_summary_truth(tampered_matched)
+    results.append(_ProbeResult(
+        "T91 tampered summary.approved_plan.matched=False fails the "
+        "truth-checker (matched=True is the only value a real run "
+        "can produce)",
+        any("approved_plan.matched" in f for f in fails),
+        f"failures={fails!r}",
+    ))
+
+    # T92 tampered summary.approved_plan.sha256 with wrong shape (not
+    # 64-char lowercase hex) fails the truth-checker — a reviewer must
+    # be able to confirm the lock by piping the recorded digest to
+    # sha256sum, so an upper-cased or short value is refused.
+    tampered_sha = json.loads(json.dumps(tampered_matched))
+    tampered_sha["approved_plan"] = {
+        "path": "/tmp/approved.json",
+        "sha256": "NOTAHASH",
+        "matched": True,
+    }
+    fails_sha = _check_summary_truth(tampered_sha)
+    results.append(_ProbeResult(
+        "T92 tampered summary.approved_plan.sha256 with non-hex / "
+        "wrong-length value fails the truth-checker",
+        any("approved_plan.sha256" in f for f in fails_sha),
+        f"failures={fails_sha!r}",
+    ))
+
+    # T93 summary missing the approved_plan key entirely fails the
+    # truth-checker — a tampered summary that erases the lock must
+    # not pass.
+    tampered_missing = json.loads(json.dumps(tampered_matched))
+    del tampered_missing["approved_plan"]
+    fails_missing = _check_summary_truth(tampered_missing)
+    results.append(_ProbeResult(
+        "T93 summary missing approved_plan key fails the truth-checker",
+        any("approved_plan missing" in f for f in fails_missing),
+        f"failures={fails_missing!r}",
+    ))
+
+    # T94 boolean confusable: an approved plan with image_count=true /
+    # byte_count=true / etc. (Python True == 1) is refused at load
+    # time so it can never compare-match a single-image run via
+    # True == 1 equality. Locks the regression Codex flagged.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T94-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        out_dir = td / "out"
+        plan_out = td / "plan.json"
+        # One-image fixture so True == 1 would silently compare-match
+        # without the bool guard.
+        images_dir.mkdir()
+        (images_dir / "a.png").write_bytes(_TINY_PNG_BYTES)
+        rc_plan = _run_plan_only_mode(
+            images_dir_str=str(images_dir),
+            plan_out_str=str(plan_out),
+        )
+        tampered = json.loads(plan_out.read_text(encoding="utf-8"))
+        tampered["image_count"] = True
+        tampered["slide_count"] = True
+        tampered["images"][0]["byte_count"] = True
+        tampered["images"][0]["intended_slide_index"] = True
+        plan_out.write_text(
+            json.dumps(tampered) + "\n", encoding="utf-8",
+        )
+        rc = _run_operator_mode(
+            images_dir_str=str(images_dir),
+            out_dir_str=str(out_dir),
+            approved_plan_path_str=str(plan_out),
+        )
+        artifact_paths = [
+            out_dir / "deck.pptx",
+            out_dir / "summary.json",
+            out_dir / "inventory.json",
+            out_dir / "visual_quality.json",
+            out_dir / "README.md",
+            out_dir / "workspace",
+            out_dir / "reports",
+            out_dir / "_pipeline_fixture",
+        ]
+        leaked = [str(p) for p in artifact_paths if p.exists()]
+        ok = rc_plan == 0 and rc == 2 and not leaked
+        results.append(_ProbeResult(
+            "T94 boolean confusable in approved-plan int fields "
+            "(image_count / slide_count / byte_count / "
+            "intended_slide_index = true) refused; no deck / summary "
+            "/ inventory / visual_quality / README / workspace / "
+            "reports / _pipeline_fixture artifact materialised",
+            ok,
+            f"rc_plan={rc_plan}, rc={rc}, leaked={leaked!r}",
+        ))
+
+    # T95 _load_approved_plan returns the sha256 of the bytes it
+    # actually read, captured at read time. Locks the contract that
+    # eliminates the TOCTOU race where a second read_bytes() call
+    # for evidence could hash different bytes than the ones the
+    # helper compared against (Codex stop-time review caught this on
+    # the first iteration). The probe deliberately deletes the plan
+    # file BEFORE inspecting the returned digest: if the helper had
+    # been lazily re-reading, deletion would force a None / failure;
+    # the captured digest must survive the file going away because
+    # it was computed in memory from bytes the helper already owns.
+    with tempfile.TemporaryDirectory(prefix="op-helper-T95-") as raw_td:
+        td = Path(raw_td)
+        plan_path = td / "plan.json"
+        body = {
+            "schema_version": "1",
+            "helper_id": "operator_local_images_to_editable_ppt",
+            "mode": "plan_only",
+            "image_count": 0,
+            "slide_count": 0,
+            "manifest_path": None,
+            "explicit_boundaries": list(_EXPLICIT_BOUNDARIES),
+            "images": [],
+        }
+        raw_bytes = (
+            json.dumps(body, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        plan_path.write_bytes(raw_bytes)
+        expected_sha = hashlib.sha256(raw_bytes).hexdigest()
+        plan, sha, fails_load = _load_approved_plan(plan_path)
+        plan_path.unlink()
+        ok = (
+            plan is not None
+            and not fails_load
+            and sha == expected_sha
+            and not plan_path.exists()
+        )
+        results.append(_ProbeResult(
+            "T95 _load_approved_plan captures sha256 over the bytes "
+            "it just read; the digest survives the source file being "
+            "deleted before the caller inspects it (eliminates TOCTOU "
+            "re-read race where a second read could hash different "
+            "bytes than were compared)",
+            ok,
+            f"plan={plan!r}, sha={sha!r}, "
+            f"expected_sha={expected_sha!r}, "
+            f"fails={fails_load!r}",
+        ))
 
     # T70 — committed-tree snapshot. The whole self-test must not have
     # mutated any byte under REPO_ROOT/scripts/ or REPO_ROOT/examples/.

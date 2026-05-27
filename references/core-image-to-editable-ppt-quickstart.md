@@ -176,6 +176,22 @@ The plan carries `schema_version="1"`, `helper_id="operator_local_images_to_edit
 
 Contract for `--plan-out PATH` mirrors `--write-manifest-template` (PO1..PO6): must not be URI-shaped, a symlink, or have a symlink ancestor, must not anchor under the repo tree, must have an existing directory parent, and must not already exist (stale bytes on a pre-existing target are preserved). `--plan-out` is mutually exclusive with `--out-dir` / `--write-manifest-template` / `--self-test`; it requires `--images-dir` and may combine with the optional `--manifest`. Plan-only mode does NOT run the pipeline, does NOT produce an operator-facing `README.md` (the README is written only in normal operator mode after the summary truth-check passes), and does NOT call D-One / MCP / Qoder / a public network / a model API / an image search / telemetry.
 
+### Optional `--approved-plan` for a reviewer-approved run lock
+
+Once a reviewer has signed off on a `--plan-out` plan, a follow-up normal operator run can pass the same file as `--approved-plan PATH` to refuse the run unless the current `--images-dir` (and `--manifest`, when supplied) re-produce the byte-equivalent in-memory plan. The compare runs AFTER every argument-shape gate but BEFORE any out-dir `mkdir`, any pipeline subprocess, or any out-dir artifact write, so a drift in `schema_version` / `helper_id` / `mode` / `explicit_boundaries` (boundary drift) / `image_count` / `slide_count` / `manifest_path` / image order / per-image `filename` / `asset_id` / `media_type` / `byte_count` / `sha256` / `intended_slide_index` / `slide_title` / `alt_text` / `intended_use` refuses the run with rc 2 and leaves the out-dir untouched.
+
+```bash
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_local_images_to_editable_ppt.py \
+  --images-dir "$IMAGES_DIR" \
+  --out-dir "$RUN_DIR/out" \
+  --approved-plan "$RUN_DIR/approved.json"
+```
+
+Contract for `--approved-plan PATH`: must be a regular local non-symlink file, must not be URI-shaped, must have no symlink ancestor; refused for directories and missing paths (AP1..AP4). The bytes are decoded as UTF-8 JSON and structurally validated (schema_version / helper_id / mode / explicit_boundaries / image_count / slide_count / manifest_path / images array); integer fields reject Python booleans (an approved plan with `"image_count": true` would otherwise compare-match the current `1` via Python's `True == 1` equality). `--approved-plan` is mutually exclusive with `--plan-out` / `--write-manifest-template` / `--self-test`; it requires `--images-dir` + `--out-dir` and may combine with the optional `--manifest`.
+
+On a clean match the run proceeds exactly as the unlocked normal operator mode does, and the produced `summary.json` carries an `approved_plan` block `{ "path": "<approved plan path>", "sha256": "<64-char lowercase hex of approved-plan bytes>", "matched": true }` (the truth-checker refuses on a missing key, a non-True `matched`, or a non-hex `sha256`). On an unlocked run, `summary.approved_plan` is exactly `null` and the README has no approval claim. The produced `README.md` adds an `## Approved-plan lock` section naming the same path + sha256 and pointing reviewers at `summary.json` field `approved_plan`, so a reviewer can confirm the lock by running `sha256sum <approved-plan-path>` against the recorded sha256.
+
 Outputs (every path lives under `--out-dir`; nothing lands under the repo tree):
 
 - `deck.pptx` — native editable PPTX, one cover slide per operator image, each carrying the operator file embedded in `ppt/media/`.
