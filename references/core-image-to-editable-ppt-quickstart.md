@@ -294,6 +294,32 @@ TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
 
 Local-only — the trial does NOT call D-One, MCP, Qoder, a public network, telemetry, a model API, an image search, or any external service. NOT a prompt / report / Markdown-to-PPTX automation. Real D-One remains UNVERIFIED.
 
+## Re-validate an existing operator review package
+
+After running the helper with `--bundle ... --out-dir ...` (or `operator_local_images_trial.py --out-dir ...`), the produced review package can be re-checked on disk without re-running the pipeline:
+
+```bash
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_local_images_to_editable_ppt.py \
+  --bundle /path/to/bundle \
+  --out-dir /path/to/output
+
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/validate_operator_review_package.py \
+  --out-dir /path/to/output
+```
+
+`scripts/validate_operator_review_package.py` is a read-only stdlib gate. It confirms `--out-dir` carries the required `deck.pptx` / `summary.json` / `inventory.json` / `visual_quality.json` / `README.md` files and `workspace/` / `reports/` directories, re-checks the locked `summary.helper_id == "operator_local_images_to_editable_ppt"` / `summary.real_d_one_status == "UNVERIFIED"` / `summary.explicit_boundaries` deny-tuple (no real D-One, MCP, Qoder, public network, model API, image search, telemetry, or raw prompt / report-to-PPT automation), verifies every `summary.pptx_path` / `summary.workspace_path` / `summary.report_dir` / `summary.inventory_path` / `summary.registry_path` / `summary.visual_quality.path` string resolves under `--out-dir` to the expected existing non-symlink artifact (so a tampered summary that reroutes the workspace's `source_image_assets.json` or the nested visual-quality report outside the package is refused with a `does not resolve under` diagnostic — the every-contract-field gate, not just the flat top-level subset), cross-checks `slide_count` / `image_count` / `embedded_media_count` / `source_classes` / `no_external_relationships` / each validator's `rc` value / `inventory.ok` / `inventory.findings_empty` / `visual_quality.error_count == 0` / every `image_provenance[*].placement_verified == True`, re-runs `validate_pptx_contract.py --expected-slide-count` and `inspect_pptx_inventory.py` against `deck.pptx` to confirm the same slide / media-part counts surface from a fresh inspection, and scans every JSON file plus `README.md` for URI / URL, credential / token / API-key shapes, public-upload / share / hosting wording, confidential / raw-source / customer markers, and positive real-D-One / MCP / Qoder / model-API / image-search / public-network / telemetry success claims (the locked negation-pinned boundary wording is whitelisted so it never false-positives). The URI scan covers BOTH `<scheme>://` shapes (`http://`, `https://`, `ftp://`, ...) AND a known-dangerous single-colon-scheme set that the `://`-anchored regex would otherwise miss — `data:` (defeats the embedded-content boundary by allowing arbitrary inline bytes), `file:` (local-filesystem path leak — `file:/etc/passwd` style; an earlier `\bfile:\b` shape was a silent false-negative because `\b` between non-word `:` and non-word `/` is no boundary, so `file:/foo` and `file://x` slipped through), `javascript:` / `vbscript:` (XSS payloads in a markdown-rendered README), `mailto:` / `tel:` (contact-channel leakage), `urn:` / `gopher:` / `ssh:` / `git:` / `ftp:` / `sftp:` / `ws:` / `wss:` / `view-source:` / `chrome-extension:` / `intent:` / `jdbc:` / `dict:` / `ldap:` / `ldaps:` / `imap:` / `pop:` / `smtp:` / `telnet:` / `rsync:` / `feed:` / `afp:` / `smb:` / `nfs:`. The dangerous-scheme regex requires the scheme to be followed by a non-whitespace / non-quote / non-bracket char, so generic English prose like `Note: foo` or `Time is 10:30` does not false-positive.
+
+The validator also re-checks `summary.approved_plan` to mirror the helper's own truth-checker: the key must be present (a tampered post-helper edit that erases it is refused), the value must be either explicit JSON `null` (the run was not approved-plan-locked — accepted) or exactly `{path, sha256, matched: True}` with `path` a non-empty string, `sha256` a 64-character lowercase hex string (so a reviewer can pipe it to `sha256sum`), `matched` strictly `True` (the helper refuses with rc 2 BEFORE summary creation on a mismatch — by the time the summary exists, `matched=True` is the only valid value), and no unknown extra keys. Tampering that flips `matched` to False, drops the key, swaps in a malformed sha256, or adds an extra field is refused by the validator with a diagnostic naming the `approved_plan` sub-field.
+
+The validator does NOT mutate `--out-dir`, does NOT rebuild the pipeline, does NOT touch the committed repo tree, and does NOT call D-One, MCP, Qoder, a public network, a model API, an image search, or telemetry. `--self-test` exercises the happy path against a real review package produced by `scripts/operator_local_images_to_editable_ppt.py --bundle ... --out-dir ...` plus every documented tamper probe (missing `deck.pptx`, stale `summary.pptx_path`, positive real-D-One success claim, `placement_verified=false`, `visual_quality.totals.errors>0`, external URL, credential token, public-hosting wording, missing `summary.approved_plan` key, `approved_plan.matched=False`, malformed `approved_plan.sha256`, unknown `approved_plan` extra key, dangerous single-colon URI scheme `data:` / `mailto:` / `javascript:` in the README, `file:/etc/passwd` + `file:relative.txt` local-path shapes in the README, `summary.registry_path` rerouted outside `--out-dir`, `summary.visual_quality.path` rerouted outside `--out-dir`):
+
+```bash
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+  python3 scripts/validate_operator_review_package.py --self-test
+```
+
 ## Boundary reminders
 
 - The pipeline never calls D-One, MCP, Qoder, a public network, telemetry, any model API, an image search, or any external service. Real D-One remains UNVERIFIED.
