@@ -212,7 +212,7 @@ TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
 
 Local-only — does NOT call D-One, MCP, Qoder, a public network, telemetry, a model API, an image search, or any external service. Real D-One remains UNVERIFIED.
 
-For the broader aggregate that runs every delegated core editable-PPT smoke in order (operator local-image intake, placement readback, image-asset acceptance, taxonomy / text-policy / provenance handoff smokes, render-model roundtrip, trace acceptance, …) — `scripts/operator_local_images_to_editable_ppt.py --self-test` is wired in as one of twenty delegated smokes so the operator local-images route is covered by this single top-level command:
+For the broader aggregate that runs every delegated core editable-PPT smoke in order (operator local-image intake, operator local-images trial, placement readback, image-asset acceptance, taxonomy / text-policy / provenance handoff smokes, render-model roundtrip, trace acceptance, …) — `scripts/operator_local_images_to_editable_ppt.py --self-test` and `scripts/operator_local_images_trial.py --self-test` are both wired in as delegated smokes so the operator local-images route AND the one-command trial are covered by this single top-level command:
 
 ```bash
 TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \

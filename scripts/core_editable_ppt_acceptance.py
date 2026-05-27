@@ -483,6 +483,26 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     ``validate_pptx_contract --expected-slide-count N``,
     ``inspect_pptx_inventory``) — no new schema, no new validator, no
     new runtime contract. LOCAL-ONLY — no real D-One.
+  - ``scripts/operator_local_images_trial.py`` — operator-facing
+    **one-command trial** for the local image-to-editable-PPT lane.
+    The quickest first practical command a new operator can run: it
+    drives ``scripts/operator_local_images_to_editable_ppt.py`` twice
+    — once with ``--plan-out`` to write a reviewer-approved plan,
+    once in normal operator mode under ``--approved-plan`` — into a
+    caller-supplied directory outside the repo, leaves the produced
+    review package on disk for inspection, and writes a concise
+    top-level README naming the first files to open. The aggregate
+    invokes ``--self-test``, which drives the same happy path inside
+    a per-run tempdir on tiny generated PNG + JPEG fixtures (no
+    committed image bytes) and exercises the OP1..OP5 ``--out-dir``
+    argument gates (URI / symlink / symlink-ancestor / inside-
+    REPO_ROOT / non-empty pre-existing) plus a no-external-service-
+    claims scan over the trial's stdout, trial README, helper-written
+    review-package README, and helper-written ``summary.json``.
+    Reuses the helper's own ``_validate_out_dir_arg`` /
+    ``_write_synthetic_images`` / ``_EXPLICIT_BOUNDARIES`` — no new
+    schema, no new validator, no new runtime contract. LOCAL-ONLY —
+    no real D-One.
   - ``scripts/render_model_roundtrip_smoke.py`` — synthetic
     render_model -> editable .pptx round-trip exercising every
     primitive kind the exporter supports today (text, line, shape,
@@ -558,6 +578,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "mixed_image_asset_provenance_handoff_smoke.py",
     SCRIPTS_DIR / "core_image_to_editable_ppt_demo.py",
     SCRIPTS_DIR / "operator_local_images_to_editable_ppt.py",
+    SCRIPTS_DIR / "operator_local_images_trial.py",
     SCRIPTS_DIR / "image_placement_readback_smoke.py",
     SCRIPTS_DIR / "validate_mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
@@ -798,6 +819,7 @@ def main(argv: list[str]) -> int:
             "mixed_image_asset_provenance_handoff_smoke + "
             "core_image_to_editable_ppt_demo + "
             "operator_local_images_to_editable_ppt + "
+            "operator_local_images_trial + "
             "image_placement_readback_smoke + "
             "validate_mock_image_bundle_trial_evidence + "
             "render_model_roundtrip_smoke + trace_acceptance_smoke). "
