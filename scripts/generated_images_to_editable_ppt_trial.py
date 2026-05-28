@@ -2,16 +2,18 @@
 bundle path through the local image-to-editable-PPT lane.
 
 Sibling to ``scripts/operator_local_images_trial.py`` (which exercises
-the operator-photo ``--plan-out`` / ``--approved-plan`` loop). This
-trial exercises the OTHER operator shortcut the helper supports — a
-flat ``<bundle>/`` carrying ``images/`` + ``manifest.json`` + the
-optional ``generated_provenance.json`` sidecar — so a reviewer can see
-the generated-image sidecar surface (``summary.generated_provenance``
-+ the per-row ``generator_source`` / ``intent_summary`` /
-``placement_role`` / ``text_policy`` / ``subject_domain`` /
-``custom_descriptor`` projection + the ``## Generated image
-provenance`` README section) without having to assemble the bundle by
-hand.
+the same ``--plan-out`` / ``--approved-plan`` loop on operator-photo
+inputs). This trial exercises the OTHER operator shortcut the helper
+supports — a flat ``<bundle>/`` carrying ``images/`` +
+``manifest.json`` + the optional ``generated_provenance.json``
+sidecar — and now drives the full reviewer-approved-plan loop end to
+end so a reviewer can see the generated-image sidecar surface
+(``summary.generated_provenance`` + the per-row ``generator_source`` /
+``intent_summary`` / ``placement_role`` / ``text_policy`` /
+``subject_domain`` / ``custom_descriptor`` projection + the
+``## Generated image provenance`` README section) AND the approved-plan
+run lock (``summary.approved_plan.matched=true``) on the same run,
+without having to assemble the bundle or write the plan by hand.
 
 On a clean ``--out-dir`` run the trial:
 
@@ -33,12 +35,23 @@ On a clean ``--out-dir`` run the trial:
      prove that closure fires, but no component positively walks
      each member end-to-end today;
   2. invokes ``scripts/operator_local_images_to_editable_ppt.py
-     --bundle <out-dir>/bundle --out-dir <out-dir>/review_package``;
-  3. invokes ``scripts/validate_operator_review_package.py --out-dir
+     --bundle <out-dir>/bundle --plan-out
+     <out-dir>/approved_plan.json`` to write the reviewer-approved
+     plan (which carries the top-level ``generated_provenance``
+     block plus the per-row sidecar fields) without running the
+     pipeline;
+  3. invokes ``scripts/operator_local_images_to_editable_ppt.py
+     --bundle <out-dir>/bundle --out-dir <out-dir>/review_package
+     --approved-plan <out-dir>/approved_plan.json`` so the
+     produced review package is gated behind the approved plan and
+     the resulting ``summary.json`` carries
+     ``approved_plan.matched=true``;
+  4. invokes ``scripts/validate_operator_review_package.py --out-dir
      <out-dir>/review_package`` as a read-only on-disk re-check;
-  4. writes a concise top-level ``<out-dir>/README.md`` naming the
-     produced review package, the on-disk re-validation rc, and the
-     local-only / no-external-service boundary.
+  5. writes a concise top-level ``<out-dir>/README.md`` naming the
+     approved plan, the produced review package, the on-disk
+     re-validation rc, and the local-only / no-external-service
+     boundary.
 
 The helper remains the source of truth for every manifest / sidecar /
 pipeline / contract / inventory / visual-quality validation. This
@@ -344,22 +357,26 @@ def _print_outcome_tail(outcome: _ToolOutcome, *, tail_lines: int = 30) -> None:
 
 
 def _run_trial(out_dir: Path) -> int:
-    """Drive the helper through the ``--bundle`` shortcut into
-    ``<out_dir>/review_package`` and write the trial's top-level
-    README. Returns 0 on success, 1 on any helper / verification
-    failure. The helper itself leaves partial artifacts under
-    ``<out_dir>/review_package/`` on failure — the trial does NOT
+    """Drive the helper through the ``--bundle`` shortcut twice
+    (``--plan-out`` to write the reviewer-approved plan, then
+    ``--approved-plan`` + ``--out-dir`` to produce the review package
+    behind the plan's run lock) into ``<out_dir>/`` and write the
+    trial's top-level README. Returns 0 on success, 1 on any helper /
+    verification failure. The helper itself leaves partial artifacts
+    under ``<out_dir>/review_package/`` on failure — the trial does NOT
     delete them; an operator inspects the partial state directly.
 
     Caller MUST have already passed ``out_dir`` through
     ``_validate_out_dir_arg`` and confirmed it exists (the trial
     ``mkdir`` happens earlier in the entrypoint)."""
     bundle = out_dir / "bundle"
+    approved_plan = out_dir / "approved_plan.json"
     review_package = out_dir / "review_package"
 
     print(f"=== generated_images_to_editable_ppt_trial ===")
     print(f"  out-dir:         {out_dir}")
     print(f"  bundle:          {bundle}")
+    print(f"  approved-plan:   {approved_plan}")
     print(f"  review-package:  {review_package}")
     print()
 
@@ -372,13 +389,61 @@ def _run_trial(out_dir: Path) -> int:
     print(f"  sidecar:         "
           f"{(bundle / 'generated_provenance.json').is_file()}")
 
-    # Stage B — drive the helper through the --bundle shortcut.
+    # Stage B — drive the helper through --bundle + --plan-out to
+    # write the reviewer-approved plan. Plan-only mode does NOT touch
+    # the pipeline; it captures the deterministic plan body (image
+    # rows + manifest_path + generated_provenance) the operator-mode
+    # run will compare against. Run BEFORE any out-dir review-package
+    # mkdir so the plan is the first thing on disk.
+    plan_outcome = _run(
+        "operator_local_images_to_editable_ppt --bundle --plan-out",
+        [
+            sys.executable, str(HELPER_PATH),
+            "--bundle", str(bundle),
+            "--plan-out", str(approved_plan),
+        ],
+    )
+    if plan_outcome.rc != 0:
+        print(f"  [FAIL] plan-out helper rc={plan_outcome.rc}")
+        _print_outcome_tail(plan_outcome)
+        return 1
+    if not approved_plan.is_file() or approved_plan.is_symlink():
+        print(f"  [FAIL] expected approved plan at {approved_plan} as "
+              f"a regular non-symlink file")
+        return 1
+    try:
+        plan_body = json.loads(approved_plan.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"  [FAIL] could not parse approved plan: "
+              f"{type(exc).__name__}: {exc}")
+        return 1
+    plan_gp = plan_body.get("generated_provenance")
+    if not isinstance(plan_gp, dict):
+        print(f"  [FAIL] approved plan generated_provenance is not a "
+              f"dict (got {plan_gp!r}); expected {{path, entry_count}}")
+        return 1
+    if plan_gp.get("entry_count") != len(_BUNDLE_IMAGES):
+        print(f"  [FAIL] approved plan generated_provenance."
+              f"entry_count={plan_gp.get('entry_count')!r}; expected "
+              f"{len(_BUNDLE_IMAGES)}")
+        return 1
+    print(f"  [PASS] approved plan written to {approved_plan} "
+          f"(generated_provenance.entry_count="
+          f"{plan_gp['entry_count']})")
+
+    # Stage C — drive the helper through --bundle + --out-dir +
+    # --approved-plan so the review package is gated behind the plan
+    # the previous stage wrote. The helper refuses with rc 2 BEFORE
+    # any mkdir if the current bundle drifts from the approved plan;
+    # reaching rc==0 here means the approved-plan compare passed AND
+    # the produced summary carries the matched=True evidence block.
     helper_outcome = _run(
-        "operator_local_images_to_editable_ppt --bundle",
+        "operator_local_images_to_editable_ppt --bundle --approved-plan",
         [
             sys.executable, str(HELPER_PATH),
             "--bundle", str(bundle),
             "--out-dir", str(review_package),
+            "--approved-plan", str(approved_plan),
         ],
     )
     if helper_outcome.rc != 0:
@@ -387,7 +452,7 @@ def _run_trial(out_dir: Path) -> int:
         return 1
     print(f"  [PASS] operator helper rc=0")
 
-    # Stage C — verify the review package on disk. The helper's own
+    # Stage D — verify the review package on disk. The helper's own
     # truth-checker already gated every byte-level invariant before it
     # returned 0; the trial only spot-checks that the canonical files
     # exist so an operator does not have to chase down a torn run.
@@ -413,10 +478,12 @@ def _run_trial(out_dir: Path) -> int:
           f"(files={list(_REVIEW_PACKAGE_FILES)}, "
           f"dirs={list(_REVIEW_PACKAGE_DIRS)})")
 
-    # Stage D — confirm the sidecar surface flows through. Required so
-    # the trial directly proves what its name advertises (a regression
-    # that silently drops the sidecar block or fails to project the
-    # per-row fields surfaces here, not just in the validator stage).
+    # Stage E — confirm the sidecar surface AND the approved-plan
+    # run lock both flow through. Required so the trial directly
+    # proves what its name advertises (a regression that silently
+    # drops the sidecar block, fails to project the per-row fields,
+    # or returns 0 without recording approved_plan.matched=True
+    # surfaces here, not just in the validator stage).
     summary_path = review_package / "summary.json"
     try:
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -443,6 +510,15 @@ def _run_trial(out_dir: Path) -> int:
     print(f"  [PASS] summary.generated_provenance carries "
           f"entry_count={gp['entry_count']} == image_count={image_count}")
 
+    ap = summary.get("approved_plan")
+    if not isinstance(ap, dict) or ap.get("matched") is not True:
+        print(f"  [FAIL] summary.approved_plan.matched is not True "
+              f"(approved_plan={ap!r})")
+        return 1
+    print(f"  [PASS] summary.approved_plan.matched=True "
+          f"(path={ap.get('path')!r}, "
+          f"sha256={(ap.get('sha256') or '')[:12]}...)")
+
     prov = summary.get("image_provenance")
     if not isinstance(prov, list) or len(prov) != image_count:
         n = len(prov) if isinstance(prov, list) else "n/a"
@@ -464,7 +540,7 @@ def _run_trial(out_dir: Path) -> int:
     print(f"  [PASS] every image_provenance row carries "
           f"{list(_REQUIRED_SIDECAR_ROW_FIELDS)} from the sidecar")
 
-    # Stage E — read-only stdlib re-check of the produced review
+    # Stage F — read-only stdlib re-check of the produced review
     # package via the companion validator. The validator never writes
     # to the package; it re-checks every locked summary field + path-
     # resolve gate + inventory / visual-quality / approved-plan /
@@ -489,7 +565,7 @@ def _run_trial(out_dir: Path) -> int:
     print(f"  [PASS] validate_operator_review_package rc=0 "
           f"(read-only / local-only)")
 
-    # Stage F — concise top-level README pointing the operator at
+    # Stage G — concise top-level README pointing the operator at
     # what to open first. Rendered into memory FIRST so the overclaim
     # gate can refuse to write before any bytes land on disk: the
     # trial's sidecar covers both placement_role values (full closed
@@ -505,6 +581,7 @@ def _run_trial(out_dir: Path) -> int:
     rendered_readme = _render_trial_readme(
         review_package=review_package,
         bundle=bundle,
+        approved_plan=approved_plan,
         validator_rc=validator_outcome.rc,
         entry_count=gp["entry_count"],
     )
@@ -534,44 +611,65 @@ def _render_trial_readme(
     *,
     review_package: Path,
     bundle: Path,
+    approved_plan: Path,
     validator_rc: int,
     entry_count: int,
 ) -> str:
     """Render the trial's top-level operator-facing README. Names what
     landed where, which files to open first, the on-disk re-validation
-    rc, and the locked local-only / no-external-service boundary."""
+    rc, and the locked local-only / no-external-service boundary. The
+    approved-plan loop is now the headline path — the README points
+    the operator at ``approved_plan.json`` first so the
+    reviewer-approved plan is the entry point, not the produced
+    PPTX."""
     return "\n".join([
         "# generated_images_to_editable_ppt_trial — review package",
         "",
         "A one-command trial run of the generated-image bundle path "
-        "through the local image-to-editable-PPT lane. Exercises the "
-        "optional `<bundle>/generated_provenance.json` sidecar end to "
-        "end so a reviewer can confirm the per-image generated-image "
-        "intent flows through onto every `summary.image_provenance` "
-        "row and onto the produced review-package README.",
+        "through the local image-to-editable-PPT lane, end to end "
+        "through the reviewer-approved-plan loop. Exercises both the "
+        "approved-plan run lock (`summary.approved_plan.matched=true`) "
+        "AND the optional `<bundle>/generated_provenance.json` sidecar "
+        "(the `summary.generated_provenance` block + the per-row "
+        "`generator_source` / `intent_summary` / `placement_role` / "
+        "`text_policy` / `subject_domain` projection + the "
+        "`## Generated image provenance` README section) so a reviewer "
+        "can confirm the full operator approval surface fires on the "
+        "same run.",
         "",
         "## What to open first",
         "",
-        f"1. `{(review_package / 'README.md').relative_to(review_package.parent)}` — operator-facing review-package README "
+        f"1. `{approved_plan.relative_to(approved_plan.parent)}` — "
+        "reviewer-approved plan written by "
+        "`scripts/operator_local_images_to_editable_ppt.py --bundle "
+        "<bundle> --plan-out`. Inspect this BEFORE the review package: "
+        "the operator-mode run below was gated behind a "
+        "byte-identical match against this plan and refused to "
+        "produce any review-package artifact under a drift. Carries "
+        f"the top-level `generated_provenance` block "
+        f"(entry_count={entry_count}) AND the per-row sidecar "
+        "projection.",
+        f"2. `{(review_package / 'README.md').relative_to(review_package.parent)}` — operator-facing review-package README "
         "written by the helper. Includes a `## Generated image "
         "provenance` section listing the per-entry sidecar fields.",
-        f"2. `{(review_package / 'deck.pptx').relative_to(review_package.parent)}` — the produced editable PPTX. "
+        f"3. `{(review_package / 'deck.pptx').relative_to(review_package.parent)}` — the produced editable PPTX. "
         "One cover slide per synthetic image; titles and shapes are "
         "native PowerPoint objects.",
-        f"3. `{(review_package / 'summary.json').relative_to(review_package.parent)}` — compact summary. The "
+        f"4. `{(review_package / 'summary.json').relative_to(review_package.parent)}` — compact summary. The "
         "`generated_provenance` block confirms the sidecar fired "
-        f"(entry_count={entry_count}); each `image_provenance[]` row "
-        "carries `generator_source` / `intent_summary` / "
-        "`placement_role` / `text_policy` / `subject_domain` from the "
-        "sidecar.",
-        f"4. `{(review_package / 'inventory.json').relative_to(review_package.parent)}` — `inspect_pptx_inventory` "
+        f"(entry_count={entry_count}); the `approved_plan` block "
+        "confirms `matched=true` against the plan above; each "
+        "`image_provenance[]` row carries `generator_source` / "
+        "`intent_summary` / `placement_role` / `text_policy` / "
+        "`subject_domain` from the sidecar.",
+        f"5. `{(review_package / 'inventory.json').relative_to(review_package.parent)}` — `inspect_pptx_inventory` "
         "readback over the produced PPTX.",
-        f"5. `{(review_package / 'visual_quality.json').relative_to(review_package.parent)}` — `validate_visual_quality` "
+        f"6. `{(review_package / 'visual_quality.json').relative_to(review_package.parent)}` — `validate_visual_quality` "
         "report over the produced workspace.",
-        f"6. `{(review_package / 'workspace').relative_to(review_package.parent)}/source_image_assets.json` — "
+        f"7. `{(review_package / 'workspace').relative_to(review_package.parent)}/source_image_assets.json` — "
         "source-attached image registry the helper wrote into the "
         "production workspace.",
-        f"7. `{(review_package / 'reports').relative_to(review_package.parent)}/` — `pipeline_report.{{json,txt}}` "
+        f"8. `{(review_package / 'reports').relative_to(review_package.parent)}/` — `pipeline_report.{{json,txt}}` "
         "from the underlying `run_pipeline.py`.",
         "",
         "## How this trial was produced",
@@ -600,9 +698,19 @@ def _render_trial_readme(
         "closed sets, and the negative GP-BAD-* probes in "
         "`scripts/operator_local_images_to_editable_ppt.py "
         "--self-test` prove those refusals fire.",
+        f"- Reviewer-approved plan: `{approved_plan.name}` — written "
+        "by `scripts/operator_local_images_to_editable_ppt.py "
+        "--bundle <bundle> --plan-out` against the synthetic bundle "
+        "above. Plan-only mode does NOT run the pipeline; it captures "
+        "the deterministic plan body (image rows + manifest_path + "
+        "`generated_provenance`) that the operator-mode run compared "
+        "against.",
         f"- Review package: `{review_package.name}/` — written by "
-        "`scripts/operator_local_images_to_editable_ppt.py --bundle` "
-        "against the synthetic bundle above.",
+        "`scripts/operator_local_images_to_editable_ppt.py --bundle "
+        "<bundle> --out-dir <review_package> --approved-plan "
+        f"{approved_plan.name}`, so the plan-out / approved-plan loop "
+        "is exercised end to end and the produced summary records "
+        "`approved_plan.matched=true`.",
         "",
         "## On-disk re-validation",
         "",
@@ -775,6 +883,55 @@ def _run_self_tests() -> int:
             ).is_file():
                 ok = False
                 detail = "missing bundle/generated_provenance.json"
+            # The trial must land the reviewer-approved plan FIRST —
+            # this is the file the operator inspects before the
+            # produced review package, and the file the operator-mode
+            # run was gated behind. A missing approved_plan.json means
+            # either the plan-out subprocess regressed OR the trial
+            # skipped Stage B.
+            if ok and (
+                not (out_dir / "approved_plan.json").is_file()
+                or (out_dir / "approved_plan.json").is_symlink()
+            ):
+                ok = False
+                detail = "missing approved_plan.json"
+            if ok:
+                try:
+                    plan_body = json.loads(
+                        (out_dir / "approved_plan.json").read_text(
+                            encoding="utf-8",
+                        )
+                    )
+                except (OSError, ValueError) as exc:
+                    ok = False
+                    detail = (
+                        f"approved_plan.json unparseable: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    # generated_provenance MUST appear in the plan as a
+                    # dict — when a sidecar is supplied the plan body
+                    # carries the top-level {path, entry_count} block
+                    # that the operator-mode compare locks the run
+                    # against. A null here would prove the plan-out
+                    # path lost the sidecar projection.
+                    plan_gp = plan_body.get("generated_provenance")
+                    if not isinstance(plan_gp, dict):
+                        ok = False
+                        detail = (
+                            f"approved_plan.generated_provenance not "
+                            f"a dict: {plan_gp!r}"
+                        )
+                    elif plan_gp.get("entry_count") != len(
+                        _BUNDLE_IMAGES,
+                    ):
+                        ok = False
+                        detail = (
+                            f"approved_plan.generated_provenance."
+                            f"entry_count="
+                            f"{plan_gp.get('entry_count')!r}; "
+                            f"expected {len(_BUNDLE_IMAGES)!r}"
+                        )
             if ok:
                 try:
                     summary = json.loads(
@@ -810,6 +967,25 @@ def _run_self_tests() -> int:
                             f"summary.generated_provenance."
                             f"entry_count={gp.get('entry_count')!r}; "
                             f"expected {image_count!r}"
+                        )
+                if ok:
+                    # The approved-plan compare must have matched — a
+                    # regression that returned 0 without writing the
+                    # matched=True evidence block, or that skipped the
+                    # --approved-plan subprocess entirely, surfaces
+                    # here.
+                    ap = summary.get("approved_plan")
+                    if not isinstance(ap, dict):
+                        ok = False
+                        detail = (
+                            f"summary.approved_plan not a dict: "
+                            f"{ap!r}"
+                        )
+                    elif ap.get("matched") is not True:
+                        ok = False
+                        detail = (
+                            f"summary.approved_plan.matched is not "
+                            f"True: {ap!r}"
                         )
                 if ok:
                     prov = summary.get("image_provenance") or []
@@ -1067,6 +1243,7 @@ def _run_self_tests() -> int:
                 *,
                 review_package: Path,
                 bundle: Path,
+                approved_plan: Path,
                 validator_rc: int,
                 entry_count: int,
                 _text: str = tampered_text,
@@ -1197,6 +1374,126 @@ def _run_self_tests() -> int:
             ok=ok, detail=detail,
         ))
 
+    # T9 post-plan sidecar drift. Drives the helper through --plan-out
+    # against the canonical synthetic bundle (so an approved plan is
+    # written), then mutates the sidecar (swaps the first entry's
+    # placement_role to the OTHER valid enum value, so the sidecar
+    # itself still passes GP1..GP13 but the per-row plan comparison
+    # is guaranteed to drift), then drives the helper through
+    # --bundle + --out-dir + --approved-plan against the mutated
+    # bundle. The helper MUST refuse with rc 2 BEFORE any mkdir or
+    # pipeline subprocess fires; the trial proves this by asserting
+    # the review_package directory does NOT exist on disk after the
+    # refused run AND that the per-failure summary / deck / inventory
+    # / visual_quality / workspace / reports artifacts the operator
+    # mode normally writes are also absent. This locks the
+    # "approved-plan run lock fails BEFORE any review_package artifact
+    # is created" contract — a future helper regression that mkdir'd
+    # the out-dir before the compare or emitted a partial artifact on
+    # drift surfaces here as a per-artifact existence assertion.
+    with tempfile.TemporaryDirectory(prefix="gen-img-trial-T9-") as raw_td:
+        td = Path(raw_td)
+        out_dir = td / "trial"
+        out_dir.mkdir()
+        bundle = out_dir / "bundle"
+        approved_plan = out_dir / "approved_plan.json"
+        review_package = out_dir / "review_package"
+
+        _write_bundle(bundle)
+
+        plan_outcome = _run(
+            "T9 plan-out",
+            [
+                sys.executable, str(HELPER_PATH),
+                "--bundle", str(bundle),
+                "--plan-out", str(approved_plan),
+            ],
+        )
+        plan_ok = plan_outcome.rc == 0 and approved_plan.is_file()
+
+        # Mutate the sidecar AFTER the plan has been written so the
+        # comparison drifts. Swapping placement_role between the two
+        # valid enum values keeps the sidecar itself accepted by the
+        # GP1..GP13 gates but guarantees the per-row plan compare
+        # surfaces drift.
+        sidecar_path = bundle / "generated_provenance.json"
+        try:
+            sidecar_body = json.loads(
+                sidecar_path.read_text(encoding="utf-8"),
+            )
+            original_role = (
+                sidecar_body["entries"][0]["placement_role"]
+            )
+            sidecar_body["entries"][0]["placement_role"] = (
+                "local_region"
+                if original_role != "local_region"
+                else "hero_page"
+            )
+            sidecar_path.write_text(
+                json.dumps(
+                    sidecar_body, indent=2, sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            mutated_ok = True
+            mutate_detail = ""
+        except (OSError, ValueError, KeyError, IndexError) as exc:
+            mutated_ok = False
+            mutate_detail = (
+                f"sidecar mutation failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        drift_outcome = _run(
+            "T9 approved-plan after drift",
+            [
+                sys.executable, str(HELPER_PATH),
+                "--bundle", str(bundle),
+                "--out-dir", str(review_package),
+                "--approved-plan", str(approved_plan),
+            ],
+        )
+
+        # Every review-package artifact MUST be absent on a refused
+        # drift run — the helper refuses BEFORE mkdir, so the
+        # directory itself MUST NOT exist. Belt-and-braces: also
+        # check the canonical per-file artifacts in case a future
+        # regression that pre-created the directory still landed
+        # nothing else under it (the directory-existence check would
+        # already catch this, but the per-file list reads cleanly in
+        # the failure detail).
+        leaked_files = [
+            name for name in _REVIEW_PACKAGE_FILES
+            if (review_package / name).exists()
+        ]
+        leaked_dirs = [
+            name for name in _REVIEW_PACKAGE_DIRS
+            if (review_package / name).exists()
+        ]
+
+        ok = (
+            plan_ok
+            and mutated_ok
+            and drift_outcome.rc == 2
+            and not review_package.exists()
+            and not leaked_files
+            and not leaked_dirs
+        )
+        if ok:
+            detail = ""
+        else:
+            detail = (
+                f"plan_ok={plan_ok!r}; mutate_detail={mutate_detail!r}; "
+                f"drift_rc={drift_outcome.rc!r}; "
+                f"review_package.exists={review_package.exists()!r}; "
+                f"leaked_files={leaked_files!r}; "
+                f"leaked_dirs={leaked_dirs!r}"
+            )
+        results.append(_ProbeResult(
+            name="T9 post-plan sidecar drift refuses before review_package",
+            ok=ok, detail=detail,
+        ))
+
     repo_rc = _check_repo_unchanged(snapshot_before=snapshot_before)
 
     print()
@@ -1231,22 +1528,30 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Operator-facing one-command trial for the "
-            "generated-image bundle path through the local "
-            "image-to-editable-PPT lane. Assembles a synthetic bundle "
-            "under --out-dir carrying PNG + JPEG bytes, manifest.json, "
-            "and the optional generated_provenance.json sidecar; "
-            "invokes scripts/operator_local_images_to_editable_ppt.py "
-            "--bundle <bundle> --out-dir <out-dir>/review_package; "
-            "invokes scripts/validate_operator_review_package.py "
-            "--out-dir <out-dir>/review_package; writes a top-level "
-            "README.md naming the produced review package and the "
-            "local-only boundary. Local-only — does NOT call D-One, "
-            "MCP, Qoder, a public network, telemetry, a model API, "
-            "an image search, or any external service. The sidecar's "
-            "generator_source == \"mock_generated\" records declared "
-            "operator intent for the staged synthetic bytes; it does "
-            "NOT claim any external generator ran. NOT a full prompt "
-            "/ report / Markdown-to-PPTX automation."
+            "generated-image bundle path through the full operator "
+            "approval loop. Assembles a synthetic bundle under "
+            "--out-dir carrying PNG + JPEG bytes, manifest.json, and "
+            "the optional generated_provenance.json sidecar; invokes "
+            "scripts/operator_local_images_to_editable_ppt.py "
+            "--bundle <bundle> --plan-out <out-dir>/approved_plan.json "
+            "to write the reviewer-approved plan; invokes the same "
+            "helper with --bundle <bundle> --out-dir "
+            "<out-dir>/review_package --approved-plan "
+            "<out-dir>/approved_plan.json so the produced review "
+            "package is gated behind the plan and the resulting "
+            "summary records approved_plan.matched=true; invokes "
+            "scripts/validate_operator_review_package.py --out-dir "
+            "<out-dir>/review_package; writes a top-level README.md "
+            "telling the operator to inspect approved_plan.json "
+            "first, then review_package/README.md, then "
+            "review_package/deck.pptx, plus the local-only boundary. "
+            "Local-only — does NOT call D-One, MCP, Qoder, a public "
+            "network, telemetry, a model API, an image search, or "
+            "any external service. The sidecar's generator_source == "
+            "\"mock_generated\" records declared operator intent for "
+            "the staged synthetic bytes; it does NOT claim any "
+            "external generator ran. NOT a full prompt / report / "
+            "Markdown-to-PPTX automation."
         ),
     )
     group = parser.add_mutually_exclusive_group(required=True)
@@ -1259,8 +1564,8 @@ def main(argv: list[str]) -> int:
             "an existing parent; and must either be missing or an "
             "empty pre-existing directory (stale bytes on a refused "
             "path are preserved). On a clean run, the trial writes "
-            "bundle/, review_package/, and README.md under this "
-            "directory."
+            "bundle/, approved_plan.json, review_package/, and "
+            "README.md under this directory."
         ),
     )
     group.add_argument(
@@ -1270,8 +1575,11 @@ def main(argv: list[str]) -> int:
             "Run the trial under a per-run TMPDIR fixture plus every "
             "documented fail-closed probe (URI / symlink / "
             "symlink-ancestor / inside-REPO_ROOT / pre-existing "
-            "non-empty --out-dir). No caller-visible artifacts "
-            "retained; mutually exclusive with --out-dir."
+            "non-empty --out-dir) and the post-plan sidecar drift "
+            "probe (mutating the sidecar between --plan-out and "
+            "--approved-plan refuses with rc 2 BEFORE any "
+            "review_package artifact is created). No caller-visible "
+            "artifacts retained; mutually exclusive with --out-dir."
         ),
     )
     args = parser.parse_args(argv)
