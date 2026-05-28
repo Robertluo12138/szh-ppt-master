@@ -71,17 +71,26 @@ Four modes share one helper:
     filename / asset_id / media_type / byte_count / sha256 / intended
     1-based slide index / slide_title / alt_text / intended_use, in
     manifest-array order when ``--manifest`` is supplied or filename-
-    sorted order otherwise. The plan-only mode does NOT run
-    ``run_explicit_pipeline.py``, does NOT produce a PPTX, does NOT
-    produce a workspace / inventory / visual_quality / summary /
-    ``_pipeline_fixture`` artifact, does NOT write anywhere under
-    ``REPO_ROOT`` (PO4 refuses the argument outright), and does NOT
-    call D-One / MCP / Qoder / a public network / a model API / an
-    image search / telemetry. The plan path gate (PO1..PO6) mirrors
-    the manifest-template gate (MT1..MT6): URI, symlink, symlink
-    ancestor, REPO_ROOT anchor, missing / non-directory parent, and
-    pre-existing target are all refused; stale bytes on a
-    pre-existing target are preserved.
+    sorted order otherwise. When the source is ``--bundle DIR`` and
+    that bundle carries a ``generated_provenance.json`` sidecar, the
+    plan additionally carries a top-level
+    ``generated_provenance = {path, entry_count}`` block AND every
+    per-image row gains the sidecar's generator_source /
+    intent_summary / placement_role / text_policy / subject_domain
+    (plus optional custom_descriptor); a bundle without the sidecar
+    produces an explicit ``generated_provenance = null`` block and no
+    per-row sidecar field — the same absent-sidecar shape the produced
+    ``summary.json`` carries, so a reviewer can match plan ↔ summary
+    1:1. The plan-only mode does NOT run ``run_explicit_pipeline.py``,
+    does NOT produce a PPTX, does NOT produce a workspace / inventory
+    / visual_quality / summary / ``_pipeline_fixture`` artifact, does
+    NOT write anywhere under ``REPO_ROOT`` (PO4 refuses the argument
+    outright), and does NOT call D-One / MCP / Qoder / a public
+    network / a model API / an image search / telemetry. The plan
+    path gate (PO1..PO6) mirrors the manifest-template gate
+    (MT1..MT6): URI, symlink, symlink ancestor, REPO_ROOT anchor,
+    missing / non-directory parent, and pre-existing target are all
+    refused; stale bytes on a pre-existing target are preserved.
 
   * ``--self-test`` — drives the same happy paths inside per-run
     ``tempfile.TemporaryDirectory()`` instances using two tiny
@@ -4731,6 +4740,7 @@ def _run_operator_mode(
     if approved_plan_path is not None:
         current_plan = _build_plan_body(
             images=images, manifest_path=manifest_path,
+            sidecar_entries=sidecar_entries, sidecar_path=sidecar_path,
         )
         # _load_approved_plan returns (plan, sha256_of_loaded_bytes,
         # failures) — the digest is captured at read time so a later
@@ -4961,11 +4971,31 @@ _PLAN_ROW_COMPARE_FIELDS: tuple[str, ...] = (
     "intended_use",
 )
 
+# Sidecar-derived per-row fields that flow into the plan when the
+# bundle carried ``<bundle>/generated_provenance.json``. The compare
+# treats each field's presence-or-absence AND value as load-bearing:
+# a value mismatch, a field that appears on one side only, OR a
+# top-level sidecar block whose null-vs-dict state diverges between
+# the approved plan and the current bundle all refuse the run with
+# rc 2 BEFORE any out-dir artifact materialises. ``custom_descriptor``
+# is intentionally optional — the sidecar may omit it on any subset
+# of entries — but the compare still detects asymmetric presence.
+_PLAN_ROW_SIDECAR_FIELDS: tuple[str, ...] = (
+    "generator_source",
+    "intent_summary",
+    "placement_role",
+    "text_policy",
+    "subject_domain",
+    "custom_descriptor",
+)
+
 
 def _build_plan_body(
     *,
     images: list[_DiscoveredImage],
     manifest_path: Path | None,
+    sidecar_entries: list[dict] | None = None,
+    sidecar_path: Path | None = None,
 ) -> dict:
     """Build the in-memory plan body for the supplied (already
     discovered + manifest-enriched) image list.
@@ -4976,13 +5006,31 @@ def _build_plan_body(
     subprocess fires). One source of truth means a reviewer who runs
     ``--plan-out`` and then re-runs operator mode with
     ``--approved-plan <that plan>`` against byte-identical inputs sees
-    a clean match."""
+    a clean match.
+
+    ``sidecar_entries`` / ``sidecar_path`` are the (already-validated)
+    return values of ``_validate_generated_provenance_sidecar``. When a
+    ``<bundle>/generated_provenance.json`` sidecar was supplied, the
+    plan carries a top-level ``generated_provenance`` block
+    (``{path, entry_count}``) and each per-image row gains the
+    sidecar's generator_source / intent_summary / placement_role /
+    text_policy / subject_domain (and optional custom_descriptor). When
+    no sidecar was supplied, ``generated_provenance`` is ``null`` and no
+    per-row sidecar field is present — the same absent-sidecar shape
+    the produced ``summary.json`` carries. The approved-plan compare
+    relies on this 1:1 plan / summary shape so a sidecar drift between
+    plan time and run time refuses the run BEFORE any out-dir artifact
+    materialises."""
+    sidecar_by_filename: dict[str, dict] = {}
+    if sidecar_entries is not None:
+        for entry in sidecar_entries:
+            sidecar_by_filename[entry["filename"]] = entry
     rows: list[dict] = []
     for idx, image in enumerate(images, start=1):
         title = image.slide_title or _default_slide_title(image)
         alt_text = image.alt_text or _default_alt_text(image)
         intended_use = image.intended_use or _DEFAULT_INTENDED_USE
-        rows.append({
+        row = {
             "filename": image.operator_filename,
             "asset_id": image.asset_id,
             "media_type": image.media_type,
@@ -4992,7 +5040,17 @@ def _build_plan_body(
             "slide_title": title,
             "alt_text": alt_text,
             "intended_use": intended_use,
-        })
+        }
+        sc = sidecar_by_filename.get(image.operator_filename)
+        if sc is not None:
+            row["generator_source"] = sc["generator_source"]
+            row["intent_summary"] = sc["intent_summary"]
+            row["placement_role"] = sc["placement_role"]
+            row["text_policy"] = sc["text_policy"]
+            row["subject_domain"] = sc["subject_domain"]
+            if "custom_descriptor" in sc:
+                row["custom_descriptor"] = sc["custom_descriptor"]
+        rows.append(row)
     return {
         "schema_version": _PLAN_SCHEMA_VERSION,
         "helper_id": "operator_local_images_to_editable_ppt",
@@ -5001,6 +5059,18 @@ def _build_plan_body(
         "slide_count": len(images),
         "manifest_path": (
             str(manifest_path) if manifest_path is not None else None
+        ),
+        "generated_provenance": (
+            {
+                "path": (
+                    str(sidecar_path)
+                    if sidecar_path is not None
+                    else None
+                ),
+                "entry_count": len(sidecar_entries),
+            }
+            if sidecar_entries is not None
+            else None
         ),
         "explicit_boundaries": list(_EXPLICIT_BOUNDARIES),
         "images": rows,
@@ -5141,6 +5211,49 @@ def _load_approved_plan(
             f"--approved-plan {approved_plan} manifest_path={mp!r}; "
             f"expected string or null."
         )
+    # generated_provenance is REQUIRED to be present (mirrors the
+    # summary's REQUIRED gate): ``null`` when the approved plan was
+    # written against a bundle WITHOUT a sidecar; an object carrying
+    # exactly ``{path, entry_count}`` when one was supplied. The
+    # _compare_to_approved_plan step refuses any null-vs-dict drift
+    # between approved and current bundle BEFORE any pipeline
+    # subprocess fires or any out-dir artifact is created.
+    gp = plan.get("generated_provenance", "__MISSING__")
+    if gp == "__MISSING__":
+        failures.append(
+            f"--approved-plan {approved_plan} missing "
+            f"generated_provenance key (expected null or "
+            f"{{path, entry_count}}); re-run --plan-out against the "
+            f"current bundle and have a reviewer re-approve."
+        )
+    elif gp is None:
+        pass  # null is the absent-sidecar state.
+    elif not isinstance(gp, dict):
+        failures.append(
+            f"--approved-plan {approved_plan} generated_provenance="
+            f"{gp!r}; expected null or {{path, entry_count}}."
+        )
+    else:
+        unknown = sorted(set(gp.keys()) - {"path", "entry_count"})
+        if unknown:
+            failures.append(
+                f"--approved-plan {approved_plan} generated_provenance "
+                f"has unknown key(s) {unknown!r}; expected exactly "
+                f"{{path, entry_count}}."
+            )
+        gp_path = gp.get("path")
+        if not isinstance(gp_path, str) or not gp_path:
+            failures.append(
+                f"--approved-plan {approved_plan} generated_provenance."
+                f"path={gp_path!r}; expected non-empty string."
+            )
+        gp_count = gp.get("entry_count")
+        if not _is_strict_int(gp_count):
+            failures.append(
+                f"--approved-plan {approved_plan} generated_provenance."
+                f"entry_count={gp_count!r}; expected non-boolean "
+                f"integer."
+            )
     images = plan.get("images")
     if not isinstance(images, list):
         failures.append(
@@ -5189,16 +5302,25 @@ def _compare_to_approved_plan(
     structurally-validated) ``approved`` plan body and return a list of
     drift diagnostics. Empty list means a clean match.
 
-    Top-level fields compared: image_count, slide_count, manifest_path
-    (schema_version / helper_id / mode / explicit_boundaries already
-    matched by ``_load_approved_plan``). Per-image fields compared
-    (in order): filename, asset_id, media_type, byte_count, sha256,
-    intended_slide_index, slide_title, alt_text, intended_use. Image
-    array length mismatch is reported once, before per-row drift, so
-    the operator does not see N spurious row-missing diagnostics on
-    top of the real ``image_count`` mismatch."""
+    Top-level fields compared: image_count, slide_count, manifest_path,
+    generated_provenance (schema_version / helper_id / mode /
+    explicit_boundaries already matched by ``_load_approved_plan``).
+    Per-image fields compared (in order): filename, asset_id,
+    media_type, byte_count, sha256, intended_slide_index, slide_title,
+    alt_text, intended_use, then any sidecar-derived field
+    (generator_source, intent_summary, placement_role, text_policy,
+    subject_domain, custom_descriptor). A sidecar field that appears
+    on one side and not the other is reported as drift — a bundle that
+    gained or lost ``<bundle>/generated_provenance.json`` after the
+    plan was approved cannot silently slip through. Image array length
+    mismatch is reported once, before per-row drift, so the operator
+    does not see N spurious row-missing diagnostics on top of the real
+    ``image_count`` mismatch."""
     failures: list[str] = []
-    for top in ("image_count", "slide_count", "manifest_path"):
+    for top in (
+        "image_count", "slide_count", "manifest_path",
+        "generated_provenance",
+    ):
         if approved.get(top) != current.get(top):
             failures.append(
                 f"--approved-plan {approved_plan_path} {top}="
@@ -5224,6 +5346,32 @@ def _compare_to_approved_plan(
                     f"{field}={a_val!r}; current inputs produce "
                     f"{c_val!r}."
                 )
+        # Sidecar-derived row fields. A field that appears in one row
+        # only is drift — a bundle that gained or lost
+        # ``<bundle>/generated_provenance.json`` between plan time and
+        # run time MUST refuse. ``custom_descriptor`` is optional in the
+        # sidecar itself but the per-pair presence check still fires:
+        # presence-asymmetry between approved and current = drift.
+        for field in _PLAN_ROW_SIDECAR_FIELDS:
+            a_has = field in a_row
+            c_has = field in c_row
+            if a_has != c_has:
+                failures.append(
+                    f"--approved-plan {approved_plan_path} images[{i}]."
+                    f"{field} present={a_has}; current inputs produce "
+                    f"present={c_has} (generated-provenance drift)."
+                )
+                continue
+            if not a_has:
+                continue
+            a_val = a_row.get(field)
+            c_val = c_row.get(field)
+            if a_val != c_val:
+                failures.append(
+                    f"--approved-plan {approved_plan_path} images[{i}]."
+                    f"{field}={a_val!r}; current inputs produce "
+                    f"{c_val!r} (generated-provenance drift)."
+                )
     return failures
 
 
@@ -5232,6 +5380,7 @@ def _run_plan_only_mode(
     images_dir_str: str,
     plan_out_str: str,
     manifest_path_str: str | None = None,
+    generated_provenance_path_str: str | None = None,
 ) -> int:
     """Validate every operator argument, discover the images (and the
     optional manifest), and write a compact deterministic JSON
@@ -5252,7 +5401,15 @@ def _run_plan_only_mode(
     byte_count / sha256 / intended 1-based slide index / slide_title /
     alt_text / intended_use, in manifest-array order when
     ``--manifest`` is supplied or filename-sorted order otherwise.
-    """
+
+    When ``generated_provenance_path_str`` is provided (today only via
+    a ``<bundle>/generated_provenance.json`` sidecar — the helper does
+    not surface an explicit operator-typed flag), the sidecar is
+    validated against the discovered image filenames (GP1..GP13) and
+    each accepted per-filename entry flows through verbatim into the
+    plan's per-row sidecar fields and the top-level
+    ``generated_provenance`` block. A sidecar refusal returns rc 2
+    without touching ``--plan-out``."""
     images, _images_dir, image_failures = _validate_images_dir_arg(
         images_dir_str,
     )
@@ -5290,10 +5447,27 @@ def _run_plan_only_mode(
                 for entry in ordered_entries
             ]
 
+    sidecar_failures: list[str] = []
+    sidecar_entries: list[dict] | None = None
+    sidecar_path: Path | None = None
+    if generated_provenance_path_str is not None:
+        discovered_for_sidecar = (
+            [img.operator_filename for img in images]
+            if images is not None
+            else None
+        )
+        sidecar_entries, sidecar_path, sidecar_failures = (
+            _validate_generated_provenance_sidecar(
+                generated_provenance_path_str,
+                discovered_for_sidecar,
+            )
+        )
+
     if (
         image_failures
         or plan_failures
         or manifest_failures
+        or sidecar_failures
         or images is None
         or plan_out is None
     ):
@@ -5303,9 +5477,14 @@ def _run_plan_only_mode(
             print(f"FAIL: {line}", file=sys.stderr)
         for line in manifest_failures or []:
             print(f"FAIL: {line}", file=sys.stderr)
+        for line in sidecar_failures or []:
+            print(f"FAIL: {line}", file=sys.stderr)
         return 2
 
-    body = _build_plan_body(images=images, manifest_path=manifest_path)
+    body = _build_plan_body(
+        images=images, manifest_path=manifest_path,
+        sidecar_entries=sidecar_entries, sidecar_path=sidecar_path,
+    )
     rows = body["images"]
 
     manifest_arg_display = (
@@ -5313,10 +5492,15 @@ def _run_plan_only_mode(
         if manifest_path is not None
         else ""
     )
+    sidecar_arg_display = (
+        f", generated_provenance.json {sidecar_path}"
+        if sidecar_path is not None
+        else ""
+    )
     print(
         f"=== operator_local_images_to_editable_ppt "
         f"(--images-dir {images_dir_str}, --plan-out {plan_out}"
-        f"{manifest_arg_display}) ==="
+        f"{manifest_arg_display}{sidecar_arg_display}) ==="
     )
     for row in rows:
         print(
@@ -9286,6 +9470,7 @@ def _run_self_tests() -> int:
             "image_count": 0,
             "slide_count": 0,
             "manifest_path": None,
+            "generated_provenance": None,
             "explicit_boundaries": list(_EXPLICIT_BOUNDARIES),
             "images": [],
         }
@@ -10415,6 +10600,382 @@ def _run_self_tests() -> int:
             f"rc={rc}, out_dir_exists={out_dir.exists()}",
         ))
 
+    # GP-PLAN-HAPPY plan-out with bundle sidecar embeds the same per-row
+    # sidecar fields the summary echoes AND a top-level
+    # generated_provenance block, AND the plan re-loads cleanly through
+    # --approved-plan against the byte-identical bundle (sidecar-lock
+    # round-trip).
+    with tempfile.TemporaryDirectory(
+        prefix="op-helper-GP-PL-",
+    ) as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        sidecar_path = bundle / "generated_provenance.json"
+        sidecar_path.write_text(
+            json.dumps(_make_sidecar_body((
+                "alpha_marker.png", "beta_marker.jpg",
+            ))) + "\n",
+            encoding="utf-8",
+        )
+        plan_out = td / "plan.json"
+        rc_plan = main([
+            "--bundle", str(bundle), "--plan-out", str(plan_out),
+        ])
+        ok = rc_plan == 0
+        detail = f"rc_plan={rc_plan}"
+        if ok:
+            try:
+                plan_body = json.loads(plan_out.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"plan parse failed: {exc}"
+        if ok:
+            gp = plan_body.get("generated_provenance")
+            if (
+                not isinstance(gp, dict)
+                or gp.get("path") != str(sidecar_path)
+                or gp.get("entry_count") != 2
+            ):
+                ok = False
+                detail = (
+                    f"plan.generated_provenance={gp!r}; expected "
+                    f"{{path={str(sidecar_path)!r}, entry_count=2}}"
+                )
+            else:
+                rows = plan_body.get("images") or []
+                required = {
+                    "generator_source", "intent_summary",
+                    "placement_role", "text_policy", "subject_domain",
+                }
+                if not all(
+                    isinstance(r, dict) and required.issubset(r.keys())
+                    for r in rows
+                ):
+                    ok = False
+                    detail = (
+                        "plan image rows missing one or more sidecar "
+                        "fields"
+                    )
+                elif not all(
+                    r["generator_source"] == "mock_generated"
+                    and isinstance(r["intent_summary"], str)
+                    and r["placement_role"]
+                        in _SIDECAR_ALLOWED_PLACEMENT_ROLES
+                    and r["text_policy"]
+                        in _SIDECAR_ALLOWED_TEXT_POLICIES
+                    and r["subject_domain"]
+                        in _SIDECAR_ALLOWED_SUBJECT_DOMAINS
+                    for r in rows
+                ):
+                    ok = False
+                    detail = (
+                        "plan image rows carry sidecar fields outside "
+                        "the closed enum sets"
+                    )
+        results.append(_ProbeResult(
+            "GP-PLAN-HAPPY --bundle --plan-out PATH with a sidecar in "
+            "the bundle writes top-level generated_provenance "
+            "{path, entry_count} AND per-row generator_source / "
+            "intent_summary / placement_role / text_policy / "
+            "subject_domain fields",
+            ok, detail,
+        ))
+
+    # GP-AP-HAPPY approved-plan match path: a sidecar-bearing plan
+    # produced via --bundle --plan-out is accepted as --approved-plan
+    # against the same byte-identical bundle, and the run completes
+    # with summary.approved_plan.matched=True AND
+    # summary.generated_provenance carrying {path, entry_count=2}.
+    with tempfile.TemporaryDirectory(
+        prefix="op-helper-GP-AP-",
+    ) as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        (bundle / "generated_provenance.json").write_text(
+            json.dumps(_make_sidecar_body((
+                "alpha_marker.png", "beta_marker.jpg",
+            ))) + "\n",
+            encoding="utf-8",
+        )
+        plan_out = td / "approved.json"
+        out_dir = td / "out"
+        rc_plan = main([
+            "--bundle", str(bundle), "--plan-out", str(plan_out),
+        ])
+        rc_run = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+            "--approved-plan", str(plan_out),
+        ])
+        ok = (
+            rc_plan == 0
+            and rc_run == 0
+            and (out_dir / "summary.json").is_file()
+        )
+        detail = f"rc_plan={rc_plan}, rc_run={rc_run}"
+        if ok:
+            try:
+                summary = json.loads(
+                    (out_dir / "summary.json").read_text(),
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"summary parse failed: {exc}"
+            else:
+                ap = summary.get("approved_plan") or {}
+                gp = summary.get("generated_provenance") or {}
+                if ap.get("matched") is not True:
+                    ok = False
+                    detail = (
+                        f"approved_plan.matched={ap.get('matched')!r}; "
+                        f"expected True"
+                    )
+                elif gp.get("entry_count") != 2:
+                    ok = False
+                    detail = (
+                        f"generated_provenance.entry_count="
+                        f"{gp.get('entry_count')!r}; expected 2"
+                    )
+        results.append(_ProbeResult(
+            "GP-AP-HAPPY sidecar-bearing plan via --bundle --plan-out "
+            "is accepted as --approved-plan against the byte-identical "
+            "bundle and the run records summary.approved_plan."
+            "matched=True with summary.generated_provenance carrying "
+            "entry_count=2",
+            ok, detail,
+        ))
+
+    # GP-AP-DRIFT a sidecar field change between plan-out and the
+    # approved-plan run trips the per-row generated-provenance compare
+    # and refuses the run with rc 2 BEFORE deck.pptx / summary.json /
+    # inventory.json / visual_quality.json / README.md / workspace /
+    # reports / _pipeline_fixture materialise.
+    with tempfile.TemporaryDirectory(
+        prefix="op-helper-GP-AD-",
+    ) as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        (bundle / "generated_provenance.json").write_text(
+            json.dumps(_make_sidecar_body((
+                "alpha_marker.png", "beta_marker.jpg",
+            ))) + "\n",
+            encoding="utf-8",
+        )
+        plan_out = td / "approved.json"
+        out_dir = td / "out"
+        rc_plan = main([
+            "--bundle", str(bundle), "--plan-out", str(plan_out),
+        ])
+        # Flip alpha_marker.png's intent_summary to a different (still
+        # safe) phrase so GP10 passes but the per-row sidecar compare
+        # trips on intent_summary drift.
+        drift_body = _make_sidecar_body((
+            "alpha_marker.png", "beta_marker.jpg",
+        ))
+        drift_body["entries"][0]["intent_summary"] = (
+            "Updated synthetic accent (mock; local-only)"
+        )
+        (bundle / "generated_provenance.json").write_text(
+            json.dumps(drift_body) + "\n", encoding="utf-8",
+        )
+        rc_run = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+            "--approved-plan", str(plan_out),
+        ])
+        leaked = [
+            p for p in (
+                out_dir / "deck.pptx",
+                out_dir / "summary.json",
+                out_dir / "inventory.json",
+                out_dir / "visual_quality.json",
+                out_dir / "README.md",
+                out_dir / "workspace",
+                out_dir / "reports",
+                out_dir / "_pipeline_fixture",
+            ) if p.exists()
+        ]
+        ok = rc_plan == 0 and rc_run == 2 and not leaked
+        results.append(_ProbeResult(
+            "GP-AP-DRIFT --bundle --approved-plan refuses a "
+            "post-approval sidecar intent_summary change with rc 2 "
+            "and writes no deck / summary / inventory / visual_quality "
+            "/ README / workspace / reports / _pipeline_fixture "
+            "artifact under --out-dir",
+            ok,
+            f"rc_plan={rc_plan}, rc_run={rc_run}, "
+            f"leaked={[str(p) for p in leaked]!r}",
+        ))
+
+    # GP-AP-MISSING approved plan was written against a sidecar-bearing
+    # bundle; the current bundle has dropped the sidecar entirely. The
+    # top-level generated_provenance dict-vs-null drift refuses the run
+    # with rc 2 and no --out-dir artifact materialises.
+    with tempfile.TemporaryDirectory(
+        prefix="op-helper-GP-MIS-",
+    ) as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        (bundle / "generated_provenance.json").write_text(
+            json.dumps(_make_sidecar_body((
+                "alpha_marker.png", "beta_marker.jpg",
+            ))) + "\n",
+            encoding="utf-8",
+        )
+        plan_out = td / "approved.json"
+        out_dir = td / "out"
+        rc_plan = main([
+            "--bundle", str(bundle), "--plan-out", str(plan_out),
+        ])
+        # Drop the sidecar from the bundle after the plan was written.
+        # The approved plan still encodes generated_provenance != null
+        # so the compare must refuse the run.
+        (bundle / "generated_provenance.json").unlink()
+        rc_run = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+            "--approved-plan", str(plan_out),
+        ])
+        leaked = [
+            p for p in (
+                out_dir / "deck.pptx",
+                out_dir / "summary.json",
+                out_dir / "inventory.json",
+                out_dir / "visual_quality.json",
+                out_dir / "README.md",
+                out_dir / "workspace",
+                out_dir / "reports",
+                out_dir / "_pipeline_fixture",
+            ) if p.exists()
+        ]
+        ok = rc_plan == 0 and rc_run == 2 and not leaked
+        results.append(_ProbeResult(
+            "GP-AP-MISSING approved plan was written WITH a sidecar; "
+            "current bundle has no sidecar — refused with rc 2 and no "
+            "deck / summary / inventory / visual_quality / README / "
+            "workspace / reports / _pipeline_fixture artifact "
+            "materialised",
+            ok,
+            f"rc_plan={rc_plan}, rc_run={rc_run}, "
+            f"leaked={[str(p) for p in leaked]!r}",
+        ))
+
+    # GP-AP-EXTRA inverse drift: approved plan was written WITHOUT a
+    # sidecar (generated_provenance=null); the current bundle has
+    # gained a sidecar. The top-level null-vs-dict drift refuses the
+    # run with rc 2 and no --out-dir artifact materialises.
+    with tempfile.TemporaryDirectory(
+        prefix="op-helper-GP-EX-",
+    ) as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        plan_out = td / "approved.json"
+        out_dir = td / "out"
+        rc_plan = main([
+            "--bundle", str(bundle), "--plan-out", str(plan_out),
+        ])
+        # Add a sidecar AFTER the plan was approved so the bundle now
+        # carries generated-image metadata the approved plan never saw.
+        (bundle / "generated_provenance.json").write_text(
+            json.dumps(_make_sidecar_body((
+                "alpha_marker.png", "beta_marker.jpg",
+            ))) + "\n",
+            encoding="utf-8",
+        )
+        rc_run = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+            "--approved-plan", str(plan_out),
+        ])
+        leaked = [
+            p for p in (
+                out_dir / "deck.pptx",
+                out_dir / "summary.json",
+                out_dir / "inventory.json",
+                out_dir / "visual_quality.json",
+                out_dir / "README.md",
+                out_dir / "workspace",
+                out_dir / "reports",
+                out_dir / "_pipeline_fixture",
+            ) if p.exists()
+        ]
+        ok = rc_plan == 0 and rc_run == 2 and not leaked
+        results.append(_ProbeResult(
+            "GP-AP-EXTRA approved plan was written WITHOUT a sidecar; "
+            "current bundle has a sidecar — refused with rc 2 and no "
+            "deck / summary / inventory / visual_quality / README / "
+            "workspace / reports / _pipeline_fixture artifact "
+            "materialised",
+            ok,
+            f"rc_plan={rc_plan}, rc_run={rc_run}, "
+            f"leaked={[str(p) for p in leaked]!r}",
+        ))
+
+    # GP-PLAN-ABSENT plan-out without a sidecar in the bundle records
+    # generated_provenance=null AND no per-row sidecar field on any
+    # image — same absent-sidecar shape the produced summary.json
+    # carries. Locks the no-sidecar compatibility path.
+    with tempfile.TemporaryDirectory(
+        prefix="op-helper-GP-PA-",
+    ) as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        plan_out = td / "plan.json"
+        rc_plan = main([
+            "--bundle", str(bundle), "--plan-out", str(plan_out),
+        ])
+        ok = rc_plan == 0
+        detail = f"rc_plan={rc_plan}"
+        if ok:
+            try:
+                plan_body = json.loads(plan_out.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"plan parse failed: {exc}"
+        if ok:
+            if "generated_provenance" not in plan_body:
+                ok = False
+                detail = (
+                    "plan.generated_provenance key missing; expected "
+                    "explicit null"
+                )
+            elif plan_body["generated_provenance"] is not None:
+                ok = False
+                detail = (
+                    f"plan.generated_provenance="
+                    f"{plan_body['generated_provenance']!r}; "
+                    f"expected null"
+                )
+            else:
+                leak_fields = _ABSENT_SIDECAR_LEAK_FIELDS
+                rows = plan_body.get("images") or []
+                leaked_rows = [
+                    i for i, r in enumerate(rows)
+                    if isinstance(r, dict)
+                    and (set(r.keys()) & leak_fields)
+                ]
+                if leaked_rows:
+                    ok = False
+                    detail = (
+                        f"plan rows {leaked_rows!r} carry sidecar "
+                        f"field(s) despite generated_provenance=null"
+                    )
+        results.append(_ProbeResult(
+            "GP-PLAN-ABSENT --bundle --plan-out PATH with no sidecar "
+            "in the bundle writes generated_provenance=null AND no "
+            "per-row sidecar field on any image — preserves the "
+            "no-sidecar compatibility path",
+            ok, detail,
+        ))
+
     # T70 — committed-tree snapshot. The whole self-test must not have
     # mutated any byte under REPO_ROOT/scripts/ or REPO_ROOT/examples/.
     # Kept as the LAST probe so every manifest scenario above runs
@@ -10580,10 +11141,15 @@ def main(argv: list[str]) -> int:
             "the approved plan is malformed, carries a wrong "
             "schema_version / helper_id / mode, has boundary drift, or "
             "differs from current inputs on image_count, slide_count, "
-            "manifest_path, image order, or any per-image filename / "
-            "asset_id / media_type / byte_count / sha256 / "
+            "manifest_path, image order, the top-level "
+            "generated_provenance block (null-vs-dict drift between a "
+            "plan written WITH a sidecar and a current bundle WITHOUT "
+            "one — or vice versa — is refused), or any per-image "
+            "filename / asset_id / media_type / byte_count / sha256 / "
             "intended_slide_index / slide_title / alt_text / "
-            "intended_use. The path must be a regular local "
+            "intended_use / generator_source / intent_summary / "
+            "placement_role / text_policy / subject_domain / "
+            "custom_descriptor. The path must be a regular local "
             "non-symlink file, not URI-shaped, with no symlink "
             "ancestor. On a clean match, normal operator mode proceeds "
             "exactly as it does without --approved-plan and writes "
@@ -10734,6 +11300,9 @@ def main(argv: list[str]) -> int:
             images_dir_str=args.images_dir,
             plan_out_str=args.plan_out,
             manifest_path_str=args.manifest,
+            generated_provenance_path_str=getattr(
+                args, "_generated_provenance_path", None,
+            ),
         )
 
     missing = [
