@@ -319,6 +319,31 @@ TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
 
 Local-only — the trial does NOT call D-One, MCP, Qoder, a public network, telemetry, a model API, an image search, or any external service. NOT a prompt / report / Markdown-to-PPTX automation. Real D-One remains UNVERIFIED.
 
+### Generated-image bundle trial (sidecar end-to-end)
+
+For a reviewer who wants to see the optional `<bundle>/generated_provenance.json` sidecar surface end to end (the `summary.generated_provenance` block AND the per-row `generator_source` / `intent_summary` / `placement_role` / `text_policy` / `subject_domain` projection AND the helper-written `## Generated image provenance` README section) without assembling a bundle by hand, `scripts/generated_images_to_editable_ppt_trial.py` drives the helper through `--bundle` against a synthetic two-image bundle that exercises representative sidecar diversity (both `placement_role` values, two distinct `text_policy` / `subject_domain` values, plus both the present and absent forms of the optional `custom_descriptor` — not exhaustive enum coverage, since `text_policy` has three closed members (`caption_safe` is not positively exercised) and `subject_domain` has five (`data_visual_concept` / `icon_concept` / `process_concept` are not positively exercised); the helper's own `--self-test` sidecar fixture uses the same 2-of-3 / 2-of-5 subset, so no component positively walks every closed-enum member end-to-end today, and what IS gated is closure of the legal set via the helper's GP9 enum-membership refusal and the validator's mirror gate):
+
+```bash
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/szh-gen-img-trial-XXXX")
+echo "Trial artifacts will land under: $RUN_DIR/trial"
+
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/generated_images_to_editable_ppt_trial.py \
+  --out-dir "$RUN_DIR/trial"
+
+# When done inspecting, clean up:
+#   rm -rf "$RUN_DIR"
+```
+
+On a clean run the trial leaves `bundle/` (synthetic `images/` + `manifest.json` + `generated_provenance.json`), `review_package/` (the full helper output), and a top-level `README.md` naming what to open first plus the on-disk re-validation rc. Run `--self-test` to exercise the trial under per-run TMPDIR fixtures plus every documented `--out-dir` refusal probe:
+
+```bash
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+  python3 scripts/generated_images_to_editable_ppt_trial.py --self-test
+```
+
+The trial's `--self-test` is wired into `scripts/core_editable_ppt_acceptance.py`. Local-only — the sidecar's `generator_source == "mock_generated"` records declared operator intent for the staged synthetic bytes; the trial does NOT call D-One, MCP, Qoder, a public network, telemetry, a model API, an image search, or any external service. Real D-One remains UNVERIFIED.
+
 ## Re-validate an existing operator review package
 
 After running the helper with `--bundle ... --out-dir ...` (or `operator_local_images_trial.py --out-dir ...`), the produced review package can be re-checked on disk without re-running the pipeline:

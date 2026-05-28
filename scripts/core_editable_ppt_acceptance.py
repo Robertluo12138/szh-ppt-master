@@ -507,6 +507,43 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     ``_validate_out_dir_arg`` / ``_write_synthetic_images`` /
     ``_EXPLICIT_BOUNDARIES`` — no new schema, no new validator, no
     new runtime contract. LOCAL-ONLY — no real D-One.
+  - ``scripts/generated_images_to_editable_ppt_trial.py`` —
+    operator-facing **one-command trial** for the generated-image
+    bundle path (sibling to ``operator_local_images_trial.py``,
+    which covers the ``--plan-out`` / ``--approved-plan`` loop).
+    Assembles a synthetic ``<out-dir>/bundle/`` carrying PNG + JPEG
+    bytes, ``manifest.json``, and the optional
+    ``generated_provenance.json`` sidecar (representative diversity —
+    both ``placement_role`` values, two distinct ``text_policy`` /
+    ``subject_domain`` values, plus both the present and absent forms
+    of the optional ``custom_descriptor``; this is NOT exhaustive
+    per-member enum coverage and the helper's own ``--self-test``
+    sidecar fixture uses the same 2-of-3 / 2-of-5 subset, so neither
+    component positively walks every closed-enum member end-to-end
+    today — what IS gated is closure of the legal set via the
+    helper's GP9 enum-membership refusal and the validator's mirror
+    gate), drives
+    ``operator_local_images_to_editable_ppt --bundle`` into
+    ``<out-dir>/review_package/``, re-checks the produced package on
+    disk via ``validate_operator_review_package --out-dir``, and
+    writes a top-level README naming what to open first plus the
+    on-disk re-validation rc. The aggregate invokes ``--self-test``,
+    which drives the same happy path inside a per-run tempdir on the
+    tiny generated PNG + JPEG fixtures and exercises the
+    OP1..OP5 ``--out-dir`` argument gates (URI / symlink /
+    symlink-ancestor / inside-REPO_ROOT / non-empty pre-existing).
+    Sidecar surface is asserted directly in T1 (the
+    ``summary.generated_provenance`` ``{path, entry_count}`` block,
+    ``entry_count == image_count``, and every
+    ``image_provenance[*]`` row carrying ``generator_source`` /
+    ``intent_summary`` / ``placement_role`` / ``text_policy`` /
+    ``subject_domain`` from the sidecar). Reuses the helper's own
+    ``_validate_out_dir_arg`` / ``_TINY_PNG_BYTES`` /
+    ``_TINY_JPEG_BYTES`` / ``_EXPLICIT_BOUNDARIES`` — no new schema,
+    no new validator, no new runtime contract. LOCAL-ONLY — no real
+    D-One; the sidecar's ``generator_source == "mock_generated"``
+    records declared operator intent for the staged synthetic
+    bytes, not a claim that any external generator ran.
   - ``scripts/validate_operator_review_package.py`` — read-only
     stdlib validator for the review package produced by
     ``scripts/operator_local_images_to_editable_ppt.py`` (the
@@ -605,6 +642,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "operator_local_images_trial.py",
     SCRIPTS_DIR / "validate_operator_review_package.py",
     SCRIPTS_DIR / "mock_generated_images_to_editable_ppt_smoke.py",
+    SCRIPTS_DIR / "generated_images_to_editable_ppt_trial.py",
     SCRIPTS_DIR / "image_placement_readback_smoke.py",
     SCRIPTS_DIR / "validate_mock_image_bundle_trial_evidence.py",
     SCRIPTS_DIR / "render_model_roundtrip_smoke.py",
@@ -847,6 +885,8 @@ def main(argv: list[str]) -> int:
             "operator_local_images_to_editable_ppt + "
             "operator_local_images_trial + "
             "validate_operator_review_package + "
+            "mock_generated_images_to_editable_ppt_smoke + "
+            "generated_images_to_editable_ppt_trial + "
             "image_placement_readback_smoke + "
             "validate_mock_image_bundle_trial_evidence + "
             "render_model_roundtrip_smoke + trace_acceptance_smoke). "
