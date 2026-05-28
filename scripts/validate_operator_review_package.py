@@ -103,6 +103,7 @@ _EXPECTED_SOURCE_CLASSES = ["local_asset"]
 # bytes.
 _EXPECTED_SIDECAR_GENERATOR_SOURCES: frozenset[str] = frozenset({
     "mock_generated",
+    "operator_declared_generated",
 })
 _EXPECTED_SIDECAR_PLACEMENT_ROLES: frozenset[str] = frozenset({
     "hero_page", "local_region",
