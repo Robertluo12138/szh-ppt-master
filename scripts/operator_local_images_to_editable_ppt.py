@@ -446,6 +446,59 @@ _README_BOUNDARY_STATEMENT = (
 
 _URI_SCHEME_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
 
+# Known-dangerous single-colon URI schemes (no ``//`` required). The
+# ``://`` substring check + ``_URI_SCHEME_PREFIX`` (anchored to string
+# start) miss these when they appear mid-text — ``"generated, see
+# data:image/png;base64,..."`` / ``"contact: mailto:ops@example"`` /
+# ``"file:/etc/passwd reference"`` / ``"javascript:alert(1) payload"``
+# would all slip past the safe-string scan and only land in the
+# produced summary.json, where the review-package validator's text
+# scan would catch them belatedly. The boundary should refuse at the
+# operator entry point, not just on re-validation. Each scheme must
+# be followed by a non-whitespace / non-quote / non-bracket char so
+# ordinary prose like ``"Time is 10:30"`` / ``"Note: foo"`` does not
+# false-positive. Mirrors the validator-side
+# ``_DANGEROUS_URI_SCHEMES`` tuple verbatim so the entry-side gate
+# and the re-validation gate refuse the same shapes.
+_DANGEROUS_URI_SCHEMES: tuple[str, ...] = (
+    "data",
+    "file",
+    "javascript",
+    "vbscript",
+    "mailto",
+    "tel",
+    "urn",
+    "gopher",
+    "ssh",
+    "git",
+    "ftp",
+    "sftp",
+    "ws",
+    "wss",
+    "view-source",
+    "chrome-extension",
+    "intent",
+    "jdbc",
+    "dict",
+    "ldap",
+    "ldaps",
+    "imap",
+    "pop",
+    "smtp",
+    "telnet",
+    "rsync",
+    "feed",
+    "afp",
+    "smb",
+    "nfs",
+)
+_DANGEROUS_URI_SCHEME_REGEX = re.compile(
+    r"\b(?P<scheme>"
+    + "|".join(re.escape(s) for s in _DANGEROUS_URI_SCHEMES)
+    + r"):[^\s\"'<>)\]}]",
+    re.IGNORECASE,
+)
+
 # Lowercase-hex 64-character sha256 pattern, used by the truth-checker
 # to validate the approved_plan evidence block so reviewers can pipe
 # the recorded digest to ``sha256sum`` without parsing variations.
@@ -1395,23 +1448,25 @@ def _sha256_of(path: Path) -> tuple[int, str, bytes]:
 
 def _validate_bundle_arg(
     bundle_str: str,
-) -> tuple[str | None, str | None, list[str]]:
+) -> tuple[str | None, str | None, str | None, list[str]]:
     """Validate the ``--bundle`` operator-handoff directory and resolve
-    it to ``(images_dir_str, manifest_path_str_or_None, failures)``.
+    it to ``(images_dir_str, manifest_path_str_or_None,
+    generated_provenance_path_str_or_None, failures)``.
 
     A bundle is a flat operator-handoff folder with the shape::
 
         <bundle>/
-            images/         # required, flat directory of PNG / JPG / JPEG
-            manifest.json   # optional caller-supplied manifest
+            images/                       # required, PNG / JPG / JPEG flat
+            manifest.json                 # optional caller-supplied manifest
+            generated_provenance.json     # optional generated-image sidecar
 
     On success the resolver returns the path strings the existing
-    ``--images-dir`` / ``--manifest`` gates accept, so all downstream
-    image discovery, manifest validation, plan-only, approved-plan,
-    out-dir, summary, README, visual-quality, inventory, and PPTX gates
-    keep firing unchanged. The bundle layer adds NO new content rules
-    on top — it only checks the wrapping directory's shape and refuses
-    cleanly BEFORE delegating.
+    ``--images-dir`` / ``--manifest`` / sidecar gates accept, so all
+    downstream image discovery, manifest validation, plan-only,
+    approved-plan, out-dir, summary, README, visual-quality, inventory,
+    and PPTX gates keep firing unchanged. The bundle layer adds NO new
+    content rules on top — it only checks the wrapping directory's
+    shape and refuses cleanly BEFORE delegating.
 
     Gates fire in order, BEFORE any pipeline subprocess:
 
@@ -1440,11 +1495,16 @@ def _validate_bundle_arg(
     ``_validate_manifest_arg`` MAN1..MAN12 gates, which already produce
     clean per-failure diagnostics for malformed bytes / missing fields
     / URL / credential / public-hosting wording / fake-success claims.
-    The bundle resolver does NOT crack open ``manifest.json`` itself;
+    The same forwarding pattern applies to the optional
+    ``<bundle>/generated_provenance.json`` sidecar: present-or-absent is
+    checked here; content gates GP1..GP13 run later in
+    ``_validate_generated_provenance_sidecar`` once image discovery has
+    produced the filename set the sidecar must cover.
+    The bundle resolver does NOT crack open either optional file;
     it only refuses obviously unsafe wrappers (BUN1..BUN8).
     """
     if _has_uri_scheme(bundle_str):
-        return None, None, [
+        return None, None, None, [
             f"--bundle argument {bundle_str!r} looks URI-shaped (BUN1); "
             f"only local directory paths are accepted."
         ]
@@ -1456,7 +1516,7 @@ def _validate_bundle_arg(
             tgt = os.readlink(bundle)
         except OSError:
             tgt = "<unreadable>"
-        return None, None, [
+        return None, None, None, [
             f"--bundle {bundle} is a symlink (-> {tgt}) (BUN2); refused "
             f"so a symlink target cannot redirect what bytes the helper "
             f"ingests."
@@ -1465,18 +1525,18 @@ def _validate_bundle_arg(
     forbidden_ancestor = _forbidden_symlink_ancestor(bundle)
     if forbidden_ancestor is not None:
         ancestor, tgt = forbidden_ancestor
-        return None, None, [
+        return None, None, None, [
             f"--bundle {bundle} has a symlink ancestor {ancestor} "
             f"(-> {tgt}) (BUN3); refused so a symlink in the operator's "
             f"typed path cannot redirect what bytes the helper ingests."
         ]
 
     if not bundle.exists():
-        return None, None, [
+        return None, None, None, [
             f"--bundle {bundle} does not exist (BUN4)."
         ]
     if not bundle.is_dir():
-        return None, None, [
+        return None, None, None, [
             f"--bundle {bundle} is not a directory (BUN5); the bundle "
             f"shortcut expects an operator-handoff folder containing "
             f"images/ and an optional manifest.json."
@@ -1484,7 +1544,7 @@ def _validate_bundle_arg(
 
     images_dir = bundle / "images"
     if not images_dir.exists() and not images_dir.is_symlink():
-        return None, None, [
+        return None, None, None, [
             f"--bundle {bundle} is missing the required images/ "
             f"subdirectory (BUN6); create <bundle>/images/ containing "
             f"the PNG / JPG / JPEG files for this deck."
@@ -1494,13 +1554,13 @@ def _validate_bundle_arg(
             tgt = os.readlink(images_dir)
         except OSError:
             tgt = "<unreadable>"
-        return None, None, [
+        return None, None, None, [
             f"--bundle images path {images_dir} is a symlink "
             f"(-> {tgt}) (BUN7); refused so a symlink target cannot "
             f"redirect what bytes the helper ingests."
         ]
     if not images_dir.is_dir():
-        return None, None, [
+        return None, None, None, [
             f"--bundle images path {images_dir} exists but is not a "
             f"directory (BUN8); refused."
         ]
@@ -1514,7 +1574,17 @@ def _validate_bundle_arg(
         # the same diagnostics the explicit --manifest flag produces.
         manifest_str = str(manifest_path)
 
-    return str(images_dir), manifest_str, []
+    sidecar_path = bundle / "generated_provenance.json"
+    sidecar_str: str | None = None
+    if sidecar_path.exists() or sidecar_path.is_symlink():
+        # Same forward-the-path pattern as the manifest. The sidecar
+        # content gates GP1..GP13 run later in
+        # ``_validate_generated_provenance_sidecar`` once image
+        # discovery has produced the filename set the sidecar must
+        # cover.
+        sidecar_str = str(sidecar_path)
+
+    return str(images_dir), manifest_str, sidecar_str, []
 
 
 def _validate_images_dir_arg(
@@ -2117,6 +2187,503 @@ def _validate_manifest_arg(
             return None, None, failures
 
     return ordered_entries, manifest_path, []
+
+
+# ---------------------------------------------------------------------------
+# Optional <bundle>/generated_provenance.json sidecar validation.
+# ---------------------------------------------------------------------------
+
+# Closed enums for the optional generated-image provenance sidecar. The
+# sidecar is a synthetic / mock-safe local metadata file that describes
+# operator intent for generated image bytes already listed under
+# <bundle>/images/. It is local-only — the helper does NOT call D-One,
+# MCP, Qoder, a network, a model API, an image search, or telemetry to
+# materialise the bytes; the sidecar only records the operator's
+# declared intent for review.
+_SIDECAR_SCHEMA_VERSION = "1"
+_SIDECAR_REQUIRED_ROOT_KEYS: tuple[str, ...] = ("entries", "schema_version")
+_SIDECAR_ENTRY_REQUIRED_KEYS: tuple[str, ...] = (
+    "filename", "generator_source", "intent_summary",
+    "placement_role", "subject_domain", "text_policy",
+)
+_SIDECAR_ENTRY_OPTIONAL_KEYS: tuple[str, ...] = ("custom_descriptor",)
+# Generator source enum stays a single-value closed set today. The
+# sidecar exists to describe synthetic / mock bytes the operator
+# already staged under <bundle>/images/. Adding values later would
+# require the operator to opt in via a new enum, but the helper itself
+# does NOT call any generator — the enum names the operator's
+# declared source, not a runtime touchpoint.
+_SIDECAR_ALLOWED_GENERATOR_SOURCES: frozenset[str] = frozenset({
+    "mock_generated",
+})
+# Closed enums mirror the repo's existing taxonomy in
+# schemas/generated_image_provenance.schema.json (placement_role) and
+# the mock-image taxonomy values exercised by the sibling smokes (the
+# text_policy / subject_domain vocabularies). Kept small + closed so a
+# typo refuses with a clean diagnostic instead of slipping in
+# free-form prose.
+_SIDECAR_ALLOWED_PLACEMENT_ROLES: frozenset[str] = frozenset({
+    "hero_page", "local_region",
+})
+_SIDECAR_ALLOWED_TEXT_POLICIES: frozenset[str] = frozenset({
+    "no_text", "decorative_glyphs", "caption_safe",
+})
+_SIDECAR_ALLOWED_SUBJECT_DOMAINS: frozenset[str] = frozenset({
+    "abstract_marker", "background_pattern", "data_visual_concept",
+    "icon_concept", "process_concept",
+})
+_SIDECAR_INTENT_SUMMARY_MAX_LEN = 200
+# Pattern-locked optional descriptor. Lowercase identifier with
+# underscores / digits — same shape the repo's other taxonomy fields
+# use. Bounded length keeps a tampered sidecar from smuggling a long
+# prose paragraph into the review-package README via the descriptor.
+_SIDECAR_CUSTOM_DESCRIPTOR_REGEX = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# Sidecar-only field set that the absent-sidecar enforcement refuses
+# to find on any ``image_provenance`` row when
+# ``summary.generated_provenance`` is null. Shared by the helper
+# truth-checker, the review-package validator's mirror gate, and the
+# self-test GP-ABSENT shape gate so one source of truth covers every
+# leak surface.
+_ABSENT_SIDECAR_LEAK_FIELDS: frozenset[str] = frozenset({
+    "generator_source", "intent_summary", "placement_role",
+    "text_policy", "subject_domain", "custom_descriptor",
+})
+
+
+def _safe_sidecar_intent_summary(
+    *,
+    value: object,
+    entry_idx: int,
+) -> tuple[str | None, str | None]:
+    """Validate the sidecar ``intent_summary`` free-text field. Reuses
+    the same safe-string deny vocabularies the manifest gate applies
+    (URL/URI, path separator, credential / token / API-key shape,
+    public upload / share / hosting wording, raw-source / confidential
+    / customer marker, positive D-One / MCP / Qoder / model API /
+    image search / network / telemetry success claim). Returns
+    ``(cleaned_or_None, failure_or_None)``."""
+    if not isinstance(value, str):
+        return None, (
+            f"generated_provenance.entries[{entry_idx}].intent_summary "
+            f"is {type(value).__name__}, expected string (GP10)."
+        )
+    if not value:
+        return None, (
+            f"generated_provenance.entries[{entry_idx}].intent_summary "
+            f"is empty; expected a non-empty string (GP10)."
+        )
+    if len(value) > _SIDECAR_INTENT_SUMMARY_MAX_LEN:
+        return None, (
+            f"generated_provenance.entries[{entry_idx}].intent_summary "
+            f"is {len(value)} chars; expected <= "
+            f"{_SIDECAR_INTENT_SUMMARY_MAX_LEN} (GP10)."
+        )
+    if value != value.strip():
+        return None, (
+            f"generated_provenance.entries[{entry_idx}].intent_summary="
+            f"{value!r} has leading or trailing whitespace; trim and "
+            f"retry (GP10)."
+        )
+    if any(ord(ch) < 0x20 for ch in value):
+        return None, (
+            f"generated_provenance.entries[{entry_idx}].intent_summary "
+            f"contains a control character (GP10); refused so the "
+            f"review-package text never carries a non-printable byte."
+        )
+    if "://" in value:
+        return None, (
+            f"generated_provenance.entries[{entry_idx}].intent_summary="
+            f"{value!r} contains '://' (URL-shaped); refused — the "
+            f"sidecar is local-only metadata (GP10)."
+        )
+    if _has_uri_scheme(value):
+        return None, (
+            f"generated_provenance.entries[{entry_idx}].intent_summary="
+            f"{value!r} starts with a URI scheme; refused — the "
+            f"sidecar is local-only metadata (GP10)."
+        )
+    # Mid-text dangerous single-colon URI schemes
+    # (``data:image/png;base64,...`` / ``mailto:ops@example`` /
+    # ``javascript:alert(1)`` / ``file:/etc/passwd`` etc.) are missed
+    # by the ``://`` substring check AND by the start-anchored
+    # ``_URI_SCHEME_PREFIX``. The validator catches them on a final
+    # text scan of the produced summary.json, but the boundary
+    # should refuse at the operator entry point so a sidecar
+    # carrying an embedded ``data:`` blob is never written into the
+    # review package in the first place.
+    dangerous_hit = _DANGEROUS_URI_SCHEME_REGEX.search(value)
+    if dangerous_hit is not None:
+        return None, (
+            f"generated_provenance.entries[{entry_idx}].intent_summary="
+            f"{value!r} contains a dangerous single-colon URI scheme "
+            f"({dangerous_hit.group('scheme').lower()!r}); refused — "
+            f"data: / file: / javascript: / mailto: / etc. embedded "
+            f"in operator metadata leak local-FS / browser / contact "
+            f"shapes the lane refuses to surface (GP10)."
+        )
+    if "/" in value or "\\" in value:
+        return None, (
+            f"generated_provenance.entries[{entry_idx}].intent_summary="
+            f"{value!r} contains a path separator; refused — the field "
+            f"is a phrase, not a path (GP10)."
+        )
+    lower = value.lower()
+    for token in _DENY_CREDENTIAL:
+        if token in lower:
+            return None, (
+                f"generated_provenance.entries[{entry_idx}]."
+                f"intent_summary contains credential-shaped substring "
+                f"{token!r}; refused — the sidecar does NOT receive "
+                f"credentials (GP10)."
+            )
+    if _OPENAI_KEY_REGEX.search(value):
+        return None, (
+            f"generated_provenance.entries[{entry_idx}].intent_summary "
+            f"contains an API-key-shaped token (sk-XXXX...); refused "
+            f"(GP10)."
+        )
+    for token in _DENY_UPLOAD:
+        if token in lower:
+            return None, (
+                f"generated_provenance.entries[{entry_idx}]."
+                f"intent_summary contains upload / share / hosting "
+                f"substring {token!r}; refused — the sidecar is "
+                f"local-only and does NOT publish outputs (GP10)."
+            )
+    public_share_hit = _DENY_PUBLIC_SHARE_REGEX.search(value)
+    if public_share_hit is not None:
+        return None, (
+            f"generated_provenance.entries[{entry_idx}]."
+            f"intent_summary={value!r} matches public-share / "
+            f"public-hosting wording {public_share_hit.group(0)!r}; "
+            f"refused — the sidecar is local-only and does NOT "
+            f"publish outputs (GP10)."
+        )
+    for token in _DENY_CONFIDENTIAL:
+        if token in lower:
+            return None, (
+                f"generated_provenance.entries[{entry_idx}]."
+                f"intent_summary contains confidential / customer "
+                f"marker {token!r}; refused — the sidecar does NOT "
+                f"receive raw confidential or customer text (GP10)."
+            )
+    if _FAKE_SUCCESS_REGEX.search(value):
+        return None, (
+            f"generated_provenance.entries[{entry_idx}]."
+            f"intent_summary={value!r} mentions an upstream service "
+            f"this lane does NOT call (D-One, MCP, Qoder, model API, "
+            f"image search, network, telemetry) or claims a "
+            f"production / real / successful generation by an AI "
+            f"brand the helper has not invoked; refused (GP10)."
+        )
+    return value, None
+
+
+def _validate_generated_provenance_sidecar(
+    sidecar_path_str: str,
+    discovered_filenames: list[str] | None,
+) -> tuple[list[dict] | None, Path | None, list[str]]:
+    """Validate the optional ``<bundle>/generated_provenance.json``
+    sidecar.
+
+    Returns ``(entries_or_None, resolved_path_or_None, failures)``.
+    The caller MUST treat the sidecar as refused whenever ``failures``
+    is non-empty OR ``entries`` is ``None``. The sidecar is local-only
+    metadata describing the operator's declared intent for the
+    generated / mock image bytes already staged under
+    ``<bundle>/images/``. The helper itself does NOT call D-One, MCP,
+    Qoder, a network, a model API, an image search, or telemetry to
+    materialise those bytes.
+
+    Gates fire in order, BEFORE any pipeline subprocess:
+
+      GP1   URI-shaped argument.
+      GP2   sidecar path is itself a symlink (broken or resolvable).
+      GP3   any ancestor up to the filesystem root is a symlink
+            (closed system aliases like ``/tmp -> /private/tmp``
+            remain accepted via ``_forbidden_symlink_ancestor``).
+      GP4   path exists and is a regular non-symlink file.
+      GP5   the file parses as a single UTF-8 JSON document AND the
+            root is a JSON object (not an array / scalar / null).
+      GP6   the root carries exactly the required keys (no extras,
+            no missing — schema_version + entries).
+      GP7   ``schema_version`` equals ``_SIDECAR_SCHEMA_VERSION``
+            ("1") verbatim.
+      GP8   ``entries`` is a non-empty JSON array of objects whose
+            top-level keys are a subset of the required + optional
+            sets (no extras), with EVERY required key present.
+      GP9   per-entry enum gates: ``generator_source`` in
+            ``_SIDECAR_ALLOWED_GENERATOR_SOURCES``; ``placement_role``
+            in ``_SIDECAR_ALLOWED_PLACEMENT_ROLES``; ``text_policy``
+            in ``_SIDECAR_ALLOWED_TEXT_POLICIES``; ``subject_domain``
+            in ``_SIDECAR_ALLOWED_SUBJECT_DOMAINS``.
+      GP10  ``intent_summary`` passes the same safe-string gates
+            ``--manifest`` free-text fields apply (URL / URI, path
+            separator, credential / token / API-key shape, public
+            upload / share / hosting wording, raw-source / confidential
+            / customer marker, positive D-One / MCP / Qoder / model
+            API / image search / network / telemetry / AI-brand
+            success claim).
+      GP11  optional ``custom_descriptor``, when present, matches
+            ``^[a-z][a-z0-9_]{0,63}$``. The pattern-lock keeps a
+            tampered sidecar from smuggling free-form prose through
+            an "optional" slot.
+      GP12  ``filename`` is a string equal to one of the discovered
+            image filenames; no two sidecar entries share the same
+            filename.
+      GP13  (cross-check, only runs when image discovery succeeded)
+            the sidecar filename set equals the discovered set —
+            no orphan, no missing.
+    """
+    if _has_uri_scheme(sidecar_path_str):
+        return None, None, [
+            f"--generated-provenance argument {sidecar_path_str!r} "
+            f"looks URI-shaped (GP1); only local file paths are "
+            f"accepted."
+        ]
+
+    sidecar_path = Path(sidecar_path_str)
+
+    if sidecar_path.is_symlink():
+        try:
+            tgt = os.readlink(sidecar_path)
+        except OSError:
+            tgt = "<unreadable>"
+        return None, None, [
+            f"generated_provenance sidecar {sidecar_path} is a "
+            f"symlink (-> {tgt}) (GP2); refused so a symlink target "
+            f"cannot redirect what bytes the helper ingests."
+        ]
+
+    forbidden_ancestor = _forbidden_symlink_ancestor(sidecar_path)
+    if forbidden_ancestor is not None:
+        ancestor, tgt = forbidden_ancestor
+        return None, None, [
+            f"generated_provenance sidecar {sidecar_path} has a "
+            f"symlink ancestor {ancestor} (-> {tgt}) (GP3); refused "
+            f"so a symlink in the operator's typed path cannot "
+            f"redirect what bytes the helper ingests."
+        ]
+
+    if not sidecar_path.exists() or not sidecar_path.is_file():
+        return None, None, [
+            f"generated_provenance sidecar {sidecar_path} is not a "
+            f"regular file (GP4)."
+        ]
+
+    try:
+        raw_text = sidecar_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, None, [
+            f"generated_provenance sidecar {sidecar_path} cannot be "
+            f"read as UTF-8 (GP5): {type(exc).__name__}: {exc}."
+        ]
+    try:
+        root = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return None, None, [
+            f"generated_provenance sidecar {sidecar_path} does not "
+            f"parse as JSON (GP5): {exc}."
+        ]
+    if not isinstance(root, dict):
+        return None, None, [
+            f"generated_provenance sidecar {sidecar_path} root is "
+            f"{type(root).__name__}, expected JSON object (GP5)."
+        ]
+
+    failures: list[str] = []
+
+    root_keys = set(root.keys())
+    expected_root = set(_SIDECAR_REQUIRED_ROOT_KEYS)
+    missing_root = expected_root - root_keys
+    extra_root = root_keys - expected_root
+    if missing_root or extra_root:
+        return None, None, [
+            f"generated_provenance sidecar {sidecar_path} root keys "
+            f"{sorted(root_keys)!r} do not equal exactly "
+            f"{sorted(expected_root)!r} (GP6); missing="
+            f"{sorted(missing_root)!r}, extra={sorted(extra_root)!r}."
+        ]
+
+    schema_version = root.get("schema_version")
+    if schema_version != _SIDECAR_SCHEMA_VERSION:
+        return None, None, [
+            f"generated_provenance sidecar {sidecar_path}."
+            f"schema_version={schema_version!r}; expected "
+            f"{_SIDECAR_SCHEMA_VERSION!r} verbatim (GP7)."
+        ]
+
+    entries_raw = root.get("entries")
+    if not isinstance(entries_raw, list) or not entries_raw:
+        return None, None, [
+            f"generated_provenance sidecar {sidecar_path}.entries is "
+            f"{type(entries_raw).__name__ if not isinstance(entries_raw, list) else 'empty list'}"
+            f"; expected non-empty array (GP8)."
+        ]
+
+    required = set(_SIDECAR_ENTRY_REQUIRED_KEYS)
+    optional = set(_SIDECAR_ENTRY_OPTIONAL_KEYS)
+    ordered_entries: list[dict] = []
+    seen_filenames: dict[str, int] = {}
+    discovered_set = (
+        set(discovered_filenames)
+        if discovered_filenames is not None
+        else None
+    )
+    for idx, entry in enumerate(entries_raw):
+        if not isinstance(entry, dict):
+            failures.append(
+                f"generated_provenance sidecar entries[{idx}] is "
+                f"{type(entry).__name__}, expected object (GP8)."
+            )
+            continue
+        entry_keys = set(entry.keys())
+        missing = required - entry_keys
+        extra = entry_keys - (required | optional)
+        if missing or extra:
+            failures.append(
+                f"generated_provenance sidecar entries[{idx}] keys "
+                f"{sorted(entry_keys)!r} do not match required "
+                f"{sorted(required)!r} (optional "
+                f"{sorted(optional)!r}); missing={sorted(missing)!r}, "
+                f"extra={sorted(extra)!r} (GP8)."
+            )
+            continue
+
+        cleaned: dict = {}
+        entry_failed = False
+
+        filename = entry.get("filename")
+        if not isinstance(filename, str) or not filename:
+            failures.append(
+                f"generated_provenance sidecar entries[{idx}]."
+                f"filename={filename!r}; expected non-empty string "
+                f"(GP12)."
+            )
+            entry_failed = True
+        elif (
+            discovered_set is not None
+            and filename not in discovered_set
+        ):
+            failures.append(
+                f"generated_provenance sidecar entries[{idx}]."
+                f"filename={filename!r} is not present under "
+                f"<bundle>/images/ (GP12)."
+            )
+            entry_failed = True
+        else:
+            cleaned["filename"] = filename
+
+        generator_source = entry.get("generator_source")
+        if generator_source not in _SIDECAR_ALLOWED_GENERATOR_SOURCES:
+            failures.append(
+                f"generated_provenance sidecar entries[{idx}]."
+                f"generator_source={generator_source!r}; expected one "
+                f"of {sorted(_SIDECAR_ALLOWED_GENERATOR_SOURCES)!r} "
+                f"(GP9)."
+            )
+            entry_failed = True
+        else:
+            cleaned["generator_source"] = generator_source
+
+        placement_role = entry.get("placement_role")
+        if placement_role not in _SIDECAR_ALLOWED_PLACEMENT_ROLES:
+            failures.append(
+                f"generated_provenance sidecar entries[{idx}]."
+                f"placement_role={placement_role!r}; expected one of "
+                f"{sorted(_SIDECAR_ALLOWED_PLACEMENT_ROLES)!r} (GP9)."
+            )
+            entry_failed = True
+        else:
+            cleaned["placement_role"] = placement_role
+
+        text_policy = entry.get("text_policy")
+        if text_policy not in _SIDECAR_ALLOWED_TEXT_POLICIES:
+            failures.append(
+                f"generated_provenance sidecar entries[{idx}]."
+                f"text_policy={text_policy!r}; expected one of "
+                f"{sorted(_SIDECAR_ALLOWED_TEXT_POLICIES)!r} (GP9)."
+            )
+            entry_failed = True
+        else:
+            cleaned["text_policy"] = text_policy
+
+        subject_domain = entry.get("subject_domain")
+        if subject_domain not in _SIDECAR_ALLOWED_SUBJECT_DOMAINS:
+            failures.append(
+                f"generated_provenance sidecar entries[{idx}]."
+                f"subject_domain={subject_domain!r}; expected one of "
+                f"{sorted(_SIDECAR_ALLOWED_SUBJECT_DOMAINS)!r} (GP9)."
+            )
+            entry_failed = True
+        else:
+            cleaned["subject_domain"] = subject_domain
+
+        intent_cleaned, intent_fail = _safe_sidecar_intent_summary(
+            value=entry.get("intent_summary"),
+            entry_idx=idx,
+        )
+        if intent_fail:
+            failures.append(intent_fail)
+            entry_failed = True
+        else:
+            cleaned["intent_summary"] = intent_cleaned
+
+        if "custom_descriptor" in entry:
+            cd = entry["custom_descriptor"]
+            if (
+                not isinstance(cd, str)
+                or not _SIDECAR_CUSTOM_DESCRIPTOR_REGEX.fullmatch(cd)
+            ):
+                failures.append(
+                    f"generated_provenance sidecar entries[{idx}]."
+                    f"custom_descriptor={cd!r}; expected string "
+                    f"matching ^[a-z][a-z0-9_]{{0,63}}$ (GP11)."
+                )
+                entry_failed = True
+            else:
+                cleaned["custom_descriptor"] = cd
+
+        if entry_failed:
+            continue
+
+        fname = cleaned["filename"]
+        if fname in seen_filenames:
+            failures.append(
+                f"generated_provenance sidecar entries[{idx}]."
+                f"filename={fname!r} is a duplicate of entries["
+                f"{seen_filenames[fname]}] (GP12); each operator "
+                f"image must appear in the sidecar exactly once."
+            )
+            continue
+        seen_filenames[fname] = idx
+        ordered_entries.append(cleaned)
+
+    if failures:
+        return None, None, failures
+
+    if discovered_set is not None:
+        sidecar_set = set(seen_filenames.keys())
+        orphan = sidecar_set - discovered_set
+        missing = discovered_set - sidecar_set
+        if orphan:
+            failures.append(
+                f"generated_provenance sidecar {sidecar_path} names "
+                f"filename(s) {sorted(orphan)!r} not present under "
+                f"<bundle>/images/ (GP13); the sidecar must cover "
+                f"only discovered images."
+            )
+        if missing:
+            failures.append(
+                f"generated_provenance sidecar {sidecar_path} does "
+                f"not name discovered filename(s) "
+                f"{sorted(missing)!r} (GP13); the sidecar must cover "
+                f"every discovered image exactly once."
+            )
+        if failures:
+            return None, None, failures
+
+    return ordered_entries, sidecar_path, []
 
 
 # ---------------------------------------------------------------------------
@@ -2745,6 +3312,7 @@ def _provenance_for(
     intended_slide_index: int,
     pptx_media_shas: dict[str, list[str]],
     part_to_referencing_slides: dict[str, list[int]],
+    sidecar_entry: dict | None = None,
 ) -> dict:
     """Per-image provenance record. ``pptx_media_shas`` maps each
     operator sha256 to the sorted list of ``ppt/media/*`` parts that
@@ -2809,6 +3377,21 @@ def _provenance_for(
         entry["operator_alt_text"] = image.alt_text
     if image.intended_use is not None:
         entry["operator_intended_use"] = image.intended_use
+    if sidecar_entry is not None:
+        # The sidecar has already been validated (GP1..GP13); each
+        # field flows through verbatim so the summary reviewer can
+        # trace what intent the operator declared for the bytes that
+        # embedded on this slide. Keys are present only when the
+        # sidecar carried them — ``custom_descriptor`` stays optional.
+        entry["generator_source"] = sidecar_entry["generator_source"]
+        entry["intent_summary"] = sidecar_entry["intent_summary"]
+        entry["placement_role"] = sidecar_entry["placement_role"]
+        entry["text_policy"] = sidecar_entry["text_policy"]
+        entry["subject_domain"] = sidecar_entry["subject_domain"]
+        if "custom_descriptor" in sidecar_entry:
+            entry["custom_descriptor"] = (
+                sidecar_entry["custom_descriptor"]
+            )
     return entry
 
 
@@ -3010,11 +3593,25 @@ def _build_summary(
     pptx_media_shas: dict[str, list[str]],
     manifest_path: Path | None,
     approved_plan_evidence: dict | None,
+    sidecar_entries: list[dict] | None = None,
+    sidecar_path: Path | None = None,
 ) -> dict:
     contract_pass = _project_contract_gates(contract.stdout or "")
     part_to_referencing_slides = (
         _part_to_blip_referencing_slides_from_inventory(inventory)
     )
+    sidecar_by_filename: dict[str, dict] = {}
+    if sidecar_entries is not None:
+        for entry in sidecar_entries:
+            sidecar_by_filename[entry["filename"]] = entry
+    generated_provenance_block: dict | None = None
+    if sidecar_entries is not None:
+        generated_provenance_block = {
+            "path": (
+                str(sidecar_path) if sidecar_path is not None else None
+            ),
+            "entry_count": len(sidecar_entries),
+        }
     return {
         "schema_version": "1",
         "helper_id": "operator_local_images_to_editable_ppt",
@@ -3055,9 +3652,20 @@ def _build_summary(
                 intended_slide_index=idx,
                 pptx_media_shas=pptx_media_shas,
                 part_to_referencing_slides=part_to_referencing_slides,
+                sidecar_entry=sidecar_by_filename.get(
+                    img.operator_filename,
+                ),
             )
             for idx, img in enumerate(images, start=1)
         ],
+        # Sidecar evidence block. ``None`` when no
+        # ``<bundle>/generated_provenance.json`` was supplied so the
+        # summary's image_provenance rows carry no generator_source /
+        # intent_summary / placement_role / text_policy /
+        # subject_domain / custom_descriptor; a {path, entry_count}
+        # dict otherwise so a reviewer can trace which local file
+        # authored the per-image generated-image metadata.
+        "generated_provenance": generated_provenance_block,
         "pptx_path": str(pptx_path),
         "workspace_path": str(workspace),
         "report_dir": str(report_dir),
@@ -3408,6 +4016,141 @@ def _check_summary_truth(summary: dict) -> list[str]:
                     f"only matched=True can reach the summary)"
                 )
 
+    # generated_provenance is REQUIRED to be present: ``null`` when no
+    # ``<bundle>/generated_provenance.json`` sidecar was supplied, an
+    # object carrying exactly ``{path, entry_count}`` when one was.
+    # When non-null, every image_provenance row must additionally
+    # carry generator_source / intent_summary / placement_role /
+    # text_policy / subject_domain (optional custom_descriptor) — all
+    # already enum-validated by GP9..GP11 before reaching the summary,
+    # so the truth-checker just re-asserts the closed sets to refuse
+    # a post-helper edit that downgrades a value off the allow-list.
+    gp = summary.get("generated_provenance", _MISSING)
+    if gp is _MISSING:
+        failures.append(
+            "summary.generated_provenance missing; expected null (no "
+            "<bundle>/generated_provenance.json supplied) or "
+            "{path, entry_count}"
+        )
+    elif gp is None:
+        # Absent-sidecar enforcement. With ``generated_provenance``
+        # set to null, no image_provenance row may carry any sidecar
+        # field. Without this gate a tampered summary could set
+        # generated_provenance to null AND inject generator_source /
+        # placement_role / etc. onto rows, smuggling generated-image
+        # claims into a deck where no sidecar was supplied. The
+        # leak-field set is shared with the GP-ABSENT shape gate via
+        # ``_ABSENT_SIDECAR_LEAK_FIELDS`` so one source of truth
+        # covers both the in-helper truth-check and the self-test
+        # negative proof.
+        if isinstance(prov, list):
+            for i, entry in enumerate(prov):
+                if not isinstance(entry, dict):
+                    continue
+                leaked = sorted(
+                    _ABSENT_SIDECAR_LEAK_FIELDS & set(entry.keys())
+                )
+                if leaked:
+                    failures.append(
+                        f"summary.image_provenance[{i}] carries "
+                        f"sidecar field(s) {leaked!r} despite "
+                        f"summary.generated_provenance=null; refused "
+                        f"so a tampered summary cannot smuggle "
+                        f"generated-image claims into an "
+                        f"absent-sidecar run"
+                    )
+    elif gp is not None:
+        if not isinstance(gp, dict):
+            failures.append(
+                f"summary.generated_provenance={gp!r}; expected null "
+                f"or an object"
+            )
+        else:
+            unknown = sorted(set(gp.keys()) - {"path", "entry_count"})
+            if unknown:
+                failures.append(
+                    f"summary.generated_provenance has unknown key(s) "
+                    f"{unknown!r}; expected exactly {{path, entry_count}}"
+                )
+            gp_path = gp.get("path")
+            if not isinstance(gp_path, str) or not gp_path:
+                failures.append(
+                    f"summary.generated_provenance.path={gp_path!r}; "
+                    f"expected non-empty string (the sidecar path as "
+                    f"the helper resolved it)"
+                )
+            gp_count = gp.get("entry_count")
+            if (
+                not isinstance(gp_count, int)
+                or isinstance(gp_count, bool)
+                or gp_count != (image_count or -1)
+            ):
+                failures.append(
+                    f"summary.generated_provenance.entry_count="
+                    f"{gp_count!r}; expected {image_count!r} (one "
+                    f"sidecar entry per operator image)"
+                )
+            if isinstance(prov, list):
+                for i, entry in enumerate(prov):
+                    if not isinstance(entry, dict):
+                        continue
+                    gs = entry.get("generator_source")
+                    if gs not in _SIDECAR_ALLOWED_GENERATOR_SOURCES:
+                        failures.append(
+                            f"summary.image_provenance[{i}]."
+                            f"generator_source={gs!r}; expected one "
+                            f"of "
+                            f"{sorted(_SIDECAR_ALLOWED_GENERATOR_SOURCES)!r} "
+                            f"(sidecar supplied)"
+                        )
+                    intent = entry.get("intent_summary")
+                    if not isinstance(intent, str) or not intent:
+                        failures.append(
+                            f"summary.image_provenance[{i}]."
+                            f"intent_summary={intent!r}; expected "
+                            f"non-empty string (sidecar supplied)"
+                        )
+                    pr = entry.get("placement_role")
+                    if pr not in _SIDECAR_ALLOWED_PLACEMENT_ROLES:
+                        failures.append(
+                            f"summary.image_provenance[{i}]."
+                            f"placement_role={pr!r}; expected one of "
+                            f"{sorted(_SIDECAR_ALLOWED_PLACEMENT_ROLES)!r} "
+                            f"(sidecar supplied)"
+                        )
+                    tp = entry.get("text_policy")
+                    if tp not in _SIDECAR_ALLOWED_TEXT_POLICIES:
+                        failures.append(
+                            f"summary.image_provenance[{i}]."
+                            f"text_policy={tp!r}; expected one of "
+                            f"{sorted(_SIDECAR_ALLOWED_TEXT_POLICIES)!r} "
+                            f"(sidecar supplied)"
+                        )
+                    sd = entry.get("subject_domain")
+                    if sd not in _SIDECAR_ALLOWED_SUBJECT_DOMAINS:
+                        failures.append(
+                            f"summary.image_provenance[{i}]."
+                            f"subject_domain={sd!r}; expected one of "
+                            f"{sorted(_SIDECAR_ALLOWED_SUBJECT_DOMAINS)!r} "
+                            f"(sidecar supplied)"
+                        )
+                    if "custom_descriptor" in entry:
+                        cd = entry["custom_descriptor"]
+                        if (
+                            not isinstance(cd, str)
+                            or not
+                            _SIDECAR_CUSTOM_DESCRIPTOR_REGEX.fullmatch(
+                                cd,
+                            )
+                        ):
+                            failures.append(
+                                f"summary.image_provenance[{i}]."
+                                f"custom_descriptor={cd!r}; expected "
+                                f"string matching "
+                                f"^[a-z][a-z0-9_]{{0,63}}$ "
+                                f"(sidecar supplied)"
+                            )
+
     return failures
 
 
@@ -3432,6 +4175,59 @@ def _render_review_readme(summary: dict) -> str:
         else "- No operator manifest supplied; filename-sorted order "
              "and default per-image strings were applied."
     )
+    # Generated-image provenance sidecar block. Included ONLY when a
+    # ``<bundle>/generated_provenance.json`` was supplied AND validated
+    # cleanly. The block names the sidecar path and lists the per-image
+    # generator_source / intent_summary so a reviewer can read the
+    # declared intent without opening summary.json. Omitted entirely
+    # on absent-sidecar runs so the README does NOT imply generated-
+    # image metadata that the operator did not actually supply.
+    gp = summary.get("generated_provenance")
+    prov = summary.get("image_provenance") or []
+    generated_provenance_block: list[str] = []
+    if isinstance(gp, dict) and isinstance(gp.get("path"), str):
+        generated_provenance_block.append("## Generated image provenance")
+        generated_provenance_block.append("")
+        # The boundary sentence below is byte-identical to one of the
+        # locked phrases in the review-package validator's
+        # ``_BOUNDARY_NEGATION_PHRASES`` so the positive-claim scan
+        # whitelists it. Don't reword without paired-updating that
+        # tuple.
+        generated_provenance_block.append(
+            "This bundle included a local-only "
+            "`generated_provenance.json` sidecar describing operator-"
+            "declared intent for the embedded image bytes. "
+            + _README_BOUNDARY_STATEMENT
+        )
+        generated_provenance_block.append("")
+        generated_provenance_block.append(
+            f"- sidecar path: `{gp.get('path')}`"
+        )
+        generated_provenance_block.append(
+            f"- entry_count: `{gp.get('entry_count')}`"
+        )
+        generated_provenance_block.append("")
+        generated_provenance_block.append(
+            "Per-image rows surface under `summary.image_provenance[]` "
+            "(`generator_source` / `intent_summary` / `placement_role` "
+            "/ `text_policy` / `subject_domain` / optional "
+            "`custom_descriptor`). Concise per-entry view:"
+        )
+        generated_provenance_block.append("")
+        for entry in prov:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("generator_source") is None:
+                continue
+            generated_provenance_block.append(
+                f"- `{entry.get('operator_filename')}` — "
+                f"{entry.get('generator_source')}; "
+                f"placement_role={entry.get('placement_role')}; "
+                f"text_policy={entry.get('text_policy')}; "
+                f"subject_domain={entry.get('subject_domain')}; "
+                f"intent_summary: {entry.get('intent_summary')!r}"
+            )
+        generated_provenance_block.append("")
     # Approved-plan lock evidence is included ONLY when the run was
     # locked against a reviewer-approved plan. Omitted entirely on
     # plain runs so the README does NOT imply approval that did not
@@ -3473,6 +4269,7 @@ def _render_review_readme(summary: dict) -> str:
         "",
         manifest_line,
         "",
+        *generated_provenance_block,
         *approved_plan_block,
         "## Files in this review package",
         "",
@@ -3526,6 +4323,8 @@ def _run_happy_path(
     images: list[_DiscoveredImage],
     manifest_path: Path | None = None,
     approved_plan_evidence: dict | None = None,
+    sidecar_entries: list[dict] | None = None,
+    sidecar_path: Path | None = None,
 ) -> tuple[int, dict | None, Path | None]:
     """Build the fixture under ``out_dir``, drive the pipeline, run the
     validators, and write the summary. Returns ``(rc, summary,
@@ -3542,7 +4341,17 @@ def _run_happy_path(
     matched=True} dict when the operator passed ``--approved-plan`` and
     the compare passed, or ``None`` otherwise. Echoed verbatim into
     ``summary.approved_plan`` and rendered as the README's
-    ``Approved-plan lock`` section when non-None."""
+    ``Approved-plan lock`` section when non-None.
+
+    ``sidecar_entries`` is the (already-validated) list of per-filename
+    sidecar entries from ``<bundle>/generated_provenance.json``, or
+    ``None`` when the sidecar was absent. Each entry's
+    generator_source / intent_summary / placement_role / text_policy /
+    subject_domain / optional custom_descriptor flows verbatim into
+    the matching ``summary.image_provenance[]`` row. ``sidecar_path``
+    is the resolved path of the sidecar (echoed into
+    ``summary.generated_provenance.path`` so reviewers can trace which
+    file authored the rows)."""
     print(
         f"--- operator local-image intake: "
         f"{len(images)} image(s) -> editable PPTX ---"
@@ -3711,6 +4520,8 @@ def _run_happy_path(
         pptx_media_shas=pptx_media_shas,
         manifest_path=manifest_path,
         approved_plan_evidence=approved_plan_evidence,
+        sidecar_entries=sidecar_entries,
+        sidecar_path=sidecar_path,
     )
 
     truth_failures = _check_summary_truth(summary)
@@ -3780,6 +4591,7 @@ def _run_operator_mode(
     out_dir_str: str,
     manifest_path_str: str | None = None,
     approved_plan_path_str: str | None = None,
+    generated_provenance_path_str: str | None = None,
 ) -> int:
     """Validate every operator argument, create ``--out-dir`` if
     needed, and drive the happy path. Returns 0 on success, 1 on any
@@ -3804,7 +4616,17 @@ def _run_operator_mode(
     image order, or any per-image filename / asset_id / media_type /
     byte_count / sha256 / intended_slide_index / slide_title /
     alt_text / intended_use. On a clean match, normal mode behaves
-    exactly as it does without ``--approved-plan``."""
+    exactly as it does without ``--approved-plan``.
+
+    When ``generated_provenance_path_str`` is provided (today only via
+    a ``<bundle>/generated_provenance.json`` sidecar — the helper does
+    not surface an explicit operator-typed flag), the sidecar is
+    validated against the discovered image filenames (GP1..GP13) and
+    each accepted per-filename entry flows through verbatim into the
+    summary's ``image_provenance[]`` rows. The sidecar is local-only
+    metadata: the helper does NOT call D-One, MCP, Qoder, a network,
+    a model API, an image search, or telemetry to materialise any of
+    the bytes it describes."""
     images, _images_dir, image_failures = _validate_images_dir_arg(
         images_dir_str,
     )
@@ -3855,6 +4677,26 @@ def _run_operator_mode(
                 for entry in ordered_entries
             ]
 
+    sidecar_failures: list[str] = []
+    sidecar_entries: list[dict] | None = None
+    sidecar_path: Path | None = None
+    if generated_provenance_path_str is not None:
+        # Reuses the post-manifest image ordering when --manifest was
+        # also supplied: ``images`` already reflects manifest array
+        # order at this point. The sidecar must cover exactly the
+        # discovered filename set; it does NOT itself reorder slides.
+        discovered_for_sidecar = (
+            [img.operator_filename for img in images]
+            if images is not None
+            else None
+        )
+        sidecar_entries, sidecar_path, sidecar_failures = (
+            _validate_generated_provenance_sidecar(
+                generated_provenance_path_str,
+                discovered_for_sidecar,
+            )
+        )
+
     # Report every argument refusal so the operator does not have to
     # re-run twice to find every input problem.
     if (
@@ -3862,6 +4704,7 @@ def _run_operator_mode(
         or out_failures
         or manifest_failures
         or approved_plan_failures
+        or sidecar_failures
         or images is None
         or out_dir is None
     ):
@@ -3872,6 +4715,8 @@ def _run_operator_mode(
         for line in manifest_failures or []:
             print(f"FAIL: {line}", file=sys.stderr)
         for line in approved_plan_failures or []:
+            print(f"FAIL: {line}", file=sys.stderr)
+        for line in sidecar_failures or []:
             print(f"FAIL: {line}", file=sys.stderr)
         return 2
 
@@ -3944,14 +4789,22 @@ def _run_operator_mode(
         if approved_plan_path is not None
         else ""
     )
+    sidecar_arg_display = (
+        f", generated_provenance.json {sidecar_path}"
+        if sidecar_path is not None
+        else ""
+    )
     print(
         f"=== operator_local_images_to_editable_ppt "
         f"(--images-dir {images_dir_str}, --out-dir {out_dir}"
-        f"{manifest_arg_display}{approved_plan_arg_display}) ==="
+        f"{manifest_arg_display}{approved_plan_arg_display}"
+        f"{sidecar_arg_display}) ==="
     )
     rc, summary, summary_path = _run_happy_path(
         out_dir=out_dir, images=images, manifest_path=manifest_path,
         approved_plan_evidence=approved_plan_evidence,
+        sidecar_entries=sidecar_entries,
+        sidecar_path=sidecar_path,
     )
     if rc != 0 or summary is None or summary_path is None:
         print(
@@ -4589,6 +5442,52 @@ class _ProbeResult:
     name: str
     ok: bool
     detail: str = ""
+
+
+def _absent_sidecar_summary_gate(summary: dict) -> str | None:
+    """Gate-only helper for GP-ABSENT. Returns a failure diagnostic
+    string for a summary that should reflect an absent-sidecar run,
+    or ``None`` when the summary passes. Used inline by the GP-ABSENT
+    probe AND fed mutated synthetic inputs by GP-ABSENT-NEG so a
+    refactor that weakens the gate (e.g., reverts the key-present
+    check to ``summary.get(...) is not None``) fails the negative
+    proof at run time.
+
+    Three perturbations the gate must refuse on an absent-sidecar
+    summary:
+
+      * the ``generated_provenance`` key is missing from the dict
+        (``dict.get(...) is not None`` would false-green here —
+        ``None is not None`` evaluates False);
+      * the ``generated_provenance`` value is non-null (an absent-
+        sidecar run produces exactly ``null``);
+      * any ``image_provenance`` row carries a sidecar field
+        (``_ABSENT_SIDECAR_LEAK_FIELDS``).
+    """
+    if "generated_provenance" not in summary:
+        return (
+            "summary.generated_provenance key MISSING from the "
+            "dict; expected explicit null on an absent-sidecar run "
+            "(dict.get(...) None false-positives both missing and "
+            "explicit-null; the gate uses 'in' to catch a "
+            "forgotten-key regression)"
+        )
+    if summary["generated_provenance"] is not None:
+        return (
+            f"generated_provenance="
+            f"{summary['generated_provenance']!r}; expected "
+            f"explicit null on absent-sidecar run"
+        )
+    for i, p in enumerate(summary.get("image_provenance") or []):
+        if not isinstance(p, dict):
+            continue
+        leaked = _ABSENT_SIDECAR_LEAK_FIELDS & set(p.keys())
+        if leaked:
+            return (
+                f"image_provenance[{i}] carries sidecar fields "
+                f"{sorted(leaked)!r} despite absent sidecar"
+            )
+    return None
 
 
 def _run_self_tests() -> int:
@@ -8280,6 +9179,41 @@ def _run_self_tests() -> int:
         f"failures={fails_missing!r}",
     ))
 
+    # T93b absent-sidecar leak enforcement. With
+    # ``summary.generated_provenance`` set to null, no
+    # image_provenance row may carry any sidecar field
+    # (``_ABSENT_SIDECAR_LEAK_FIELDS``). Without this gate a
+    # tampered summary could erase the sidecar block AND inject
+    # generator_source / placement_role / etc. onto a row, smuggling
+    # generated-image claims past the truth-checker. Probe
+    # constructs a synthetic clean summary, sets a sidecar-only field
+    # on one image_provenance row, and asserts the truth-checker
+    # surfaces a "carries sidecar field(s)" diagnostic. Mirrors the
+    # validator-side T23 probe so production code and on-disk
+    # re-validation share one rule.
+    tampered_leak = json.loads(json.dumps(tampered_matched))
+    tampered_leak["approved_plan"] = {
+        "path": "/tmp/approved.json",
+        "sha256": "a" * 64,
+        "matched": True,
+    }
+    tampered_leak["generated_provenance"] = None
+    tampered_leak["image_provenance"][0]["generator_source"] = (
+        "mock_generated"
+    )
+    fails_leak = _check_summary_truth(tampered_leak)
+    results.append(_ProbeResult(
+        "T93b absent-sidecar leak: image_provenance row carrying a "
+        "sidecar field while summary.generated_provenance is null "
+        "fails the truth-checker (a tampered summary cannot erase "
+        "the sidecar block AND simultaneously inject "
+        "generator_source / placement_role / etc. onto a row)",
+        any(
+            "carries sidecar field" in f for f in fails_leak
+        ),
+        f"failures={fails_leak!r}",
+    ))
+
     # T94 boolean confusable: an approved plan with image_count=true /
     # byte_count=true / etc. (Python True == 1) is refused at load
     # time so it can never compare-match a single-image run via
@@ -8632,7 +9566,9 @@ def _run_self_tests() -> int:
         ))
 
     # BUN1 URI-shaped --bundle refused.
-    _img, _man, fails = _validate_bundle_arg("file:///tmp/bundle")
+    _img, _man, _sc, fails = _validate_bundle_arg(
+        "file:///tmp/bundle",
+    )
     results.append(_ProbeResult(
         "BUN1 URI-shaped --bundle refused with a clean diagnostic "
         "naming BUN1",
@@ -8648,7 +9584,7 @@ def _run_self_tests() -> int:
         (real / "images").mkdir()
         link = td / "linked_bundle"
         os.symlink(real, link)
-        _img, _man, fails = _validate_bundle_arg(str(link))
+        _img, _man, _sc, fails = _validate_bundle_arg(str(link))
         results.append(_ProbeResult(
             "BUN2 symlink --bundle refused with a clean diagnostic "
             "naming BUN2",
@@ -8667,7 +9603,7 @@ def _run_self_tests() -> int:
         link = td / "linked_real"
         os.symlink(real, link)
         bundle_via_link = link / "bundle"
-        _img, _man, fails = _validate_bundle_arg(str(bundle_via_link))
+        _img, _man, _sc, fails = _validate_bundle_arg(str(bundle_via_link))
         results.append(_ProbeResult(
             "BUN3 symlink ancestor of --bundle refused with a clean "
             "diagnostic naming BUN3",
@@ -8679,7 +9615,7 @@ def _run_self_tests() -> int:
     with tempfile.TemporaryDirectory(prefix="op-helper-BUN-M-") as raw_td:
         td = Path(raw_td)
         missing = td / "no_such_bundle"
-        _img, _man, fails = _validate_bundle_arg(str(missing))
+        _img, _man, _sc, fails = _validate_bundle_arg(str(missing))
         results.append(_ProbeResult(
             "BUN4 missing --bundle refused with a clean diagnostic "
             "naming BUN4",
@@ -8692,7 +9628,7 @@ def _run_self_tests() -> int:
         td = Path(raw_td)
         not_dir = td / "bundle.txt"
         not_dir.write_text("not a bundle", encoding="utf-8")
-        _img, _man, fails = _validate_bundle_arg(str(not_dir))
+        _img, _man, _sc, fails = _validate_bundle_arg(str(not_dir))
         results.append(_ProbeResult(
             "BUN5 --bundle that points at a regular file refused with "
             "a clean diagnostic naming BUN5",
@@ -8706,7 +9642,7 @@ def _run_self_tests() -> int:
         bundle = td / "bundle"
         bundle.mkdir()
         # Deliberately do NOT create bundle/images/
-        _img, _man, fails = _validate_bundle_arg(str(bundle))
+        _img, _man, _sc, fails = _validate_bundle_arg(str(bundle))
         results.append(_ProbeResult(
             "BUN6 --bundle without an images/ subdir refused with a "
             "clean diagnostic naming BUN6",
@@ -8722,7 +9658,7 @@ def _run_self_tests() -> int:
         real_images = td / "real_images"
         real_images.mkdir()
         os.symlink(real_images, bundle / "images")
-        _img, _man, fails = _validate_bundle_arg(str(bundle))
+        _img, _man, _sc, fails = _validate_bundle_arg(str(bundle))
         results.append(_ProbeResult(
             "BUN7 symlinked <bundle>/images refused with a clean "
             "diagnostic naming BUN7",
@@ -8738,7 +9674,7 @@ def _run_self_tests() -> int:
         (bundle / "images").write_text(
             "not a directory", encoding="utf-8",
         )
-        _img, _man, fails = _validate_bundle_arg(str(bundle))
+        _img, _man, _sc, fails = _validate_bundle_arg(str(bundle))
         results.append(_ProbeResult(
             "BUN8 non-directory <bundle>/images refused with a clean "
             "diagnostic naming BUN8",
@@ -8843,6 +9779,641 @@ def _run_self_tests() -> int:
         rc_st == 2,
         f"rc={rc_st}",
     ))
+
+    # ----- GP-* generated-image provenance sidecar probes -----
+
+    def _make_sidecar_body(filenames: tuple[str, ...]) -> dict:
+        """Synthesize a minimum-viable sidecar covering the two
+        synthetic operator images _write_synthetic_images produces."""
+        roles = ["hero_page", "local_region"]
+        policies = ["no_text", "decorative_glyphs"]
+        domains = ["abstract_marker", "background_pattern"]
+        return {
+            "schema_version": "1",
+            "entries": [
+                {
+                    "filename": fn,
+                    "generator_source": "mock_generated",
+                    "intent_summary": (
+                        f"Synthetic accent for {fn} (mock; "
+                        f"local-only)"
+                    ),
+                    "placement_role": roles[i % len(roles)],
+                    "text_policy": policies[i % len(policies)],
+                    "subject_domain": domains[i % len(domains)],
+                }
+                for i, fn in enumerate(filenames)
+            ],
+        }
+
+    # GP-HAPPY1 sidecar present in the bundle: the produced summary
+    # carries summary.generated_provenance.{path, entry_count} and
+    # every image_provenance row echoes the per-entry generator_source
+    # / intent_summary / placement_role / text_policy /
+    # subject_domain. README has a "Generated image provenance"
+    # section. The produced PPTX + review-package keep validating.
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-H1-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        sidecar_path = bundle / "generated_provenance.json"
+        sidecar_path.write_text(
+            json.dumps(_make_sidecar_body(
+                ("alpha_marker.png", "beta_marker.jpg"),
+            )) + "\n",
+            encoding="utf-8",
+        )
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 0
+        detail = f"rc={rc}"
+        if ok:
+            try:
+                summary = json.loads(
+                    (out_dir / "summary.json").read_text(),
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"summary parse failed: {exc}"
+            else:
+                # Key-present + non-null dict gate FIRST so a
+                # regression that omits the key entirely or sets it
+                # to null (instead of a {path, entry_count} dict)
+                # fails this probe with a precise diagnostic, not as
+                # a downstream "path mismatch" that obscures the
+                # actual regression. Mirrors the GP-ABSENT
+                # missing-key gate one branch over.
+                if "generated_provenance" not in summary:
+                    gp_block: dict = {}
+                    detail_for_gp_block = (
+                        "summary.generated_provenance key MISSING "
+                        "from the dict; expected "
+                        "{path, entry_count}"
+                    )
+                elif not isinstance(
+                    summary["generated_provenance"], dict
+                ):
+                    gp_block = {}
+                    detail_for_gp_block = (
+                        f"generated_provenance="
+                        f"{summary['generated_provenance']!r}; "
+                        f"expected dict {{path, entry_count}}"
+                    )
+                else:
+                    gp_block = summary["generated_provenance"]
+                    detail_for_gp_block = ""
+                prov = summary.get("image_provenance") or []
+                if detail_for_gp_block:
+                    ok = False
+                    detail = detail_for_gp_block
+                elif gp_block.get("path") != str(sidecar_path):
+                    ok = False
+                    detail = (
+                        f"generated_provenance.path="
+                        f"{gp_block.get('path')!r}; expected "
+                        f"{str(sidecar_path)!r}"
+                    )
+                elif gp_block.get("entry_count") != 2:
+                    ok = False
+                    detail = (
+                        f"generated_provenance.entry_count="
+                        f"{gp_block.get('entry_count')!r}; expected 2"
+                    )
+                elif not all(
+                    p.get("generator_source") == "mock_generated"
+                    and isinstance(p.get("intent_summary"), str)
+                    and p.get("placement_role")
+                        in _SIDECAR_ALLOWED_PLACEMENT_ROLES
+                    and p.get("text_policy")
+                        in _SIDECAR_ALLOWED_TEXT_POLICIES
+                    and p.get("subject_domain")
+                        in _SIDECAR_ALLOWED_SUBJECT_DOMAINS
+                    for p in prov
+                ):
+                    ok = False
+                    detail = (
+                        "image_provenance rows missing one or more "
+                        "sidecar fields"
+                    )
+                else:
+                    readme_text = (
+                        out_dir / "README.md"
+                    ).read_text(encoding="utf-8")
+                    if "Generated image provenance" not in readme_text:
+                        ok = False
+                        detail = (
+                            "README is missing the 'Generated image "
+                            "provenance' section"
+                        )
+        results.append(_ProbeResult(
+            "GP-HAPPY1 <bundle>/generated_provenance.json: summary "
+            "carries generated_provenance + every image_provenance "
+            "row echoes the sidecar enums + README names the "
+            "section",
+            ok, detail,
+        ))
+
+    # GP-ABSENT bundle without sidecar: the produced PPTX / workspace
+    # / reports / inventory / visual_quality and the README section
+    # list are unchanged versus the pre-sidecar bundle path, but
+    # summary.json always carries the new top-level
+    # ``generated_provenance`` key (``null`` here) — mirroring the
+    # ``approved_plan: null`` key every run carries when no
+    # ``--approved-plan`` is supplied. This locks the absent-sidecar
+    # compatibility invariant the goal calls out: the key addition is
+    # a forward-only summary-shape evolution, NOT a byte-for-byte
+    # equality with the pre-sidecar summary.
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-A-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        # Deliberately omit <bundle>/generated_provenance.json.
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 0
+        detail = f"rc={rc}"
+        if ok:
+            try:
+                summary = json.loads(
+                    (out_dir / "summary.json").read_text(),
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                ok = False
+                detail = f"summary parse failed: {exc}"
+            else:
+                # The summary-shape gate lives in the module-level
+                # ``_absent_sidecar_summary_gate`` helper so the
+                # GP-ABSENT-NEG negative proof below can exercise the
+                # SAME function on mutated synthetic inputs. A
+                # refactor that weakens the gate (e.g., reverts the
+                # key-present check to ``summary.get(...) is not
+                # None`` and so false-greens a forgotten-key
+                # regression) fails GP-ABSENT-NEG at run time.
+                gate_failure = _absent_sidecar_summary_gate(summary)
+                if gate_failure is not None:
+                    ok = False
+                    detail = gate_failure
+                else:
+                    readme_text = (
+                        out_dir / "README.md"
+                    ).read_text(encoding="utf-8")
+                    if "Generated image provenance" in readme_text:
+                        ok = False
+                        detail = (
+                            "README has 'Generated image provenance' "
+                            "section despite absent sidecar"
+                        )
+        results.append(_ProbeResult(
+            "GP-ABSENT bundle without "
+            "generated_provenance.json: summary.generated_provenance "
+            "is null (the only summary-shape addition versus the "
+            "pre-sidecar bundle path; parallels approved_plan=null), "
+            "no image_provenance row carries sidecar fields, README "
+            "omits the section",
+            ok, detail,
+        ))
+
+    # GP-ABSENT-NEG explicit proof that the GP-ABSENT shape gate
+    # (``_absent_sidecar_summary_gate``) fires on each of the three
+    # regressions an absent-sidecar summary must refuse: forgotten
+    # key, explicit non-null value, leaked sidecar field on any
+    # image_provenance row. Plus one positive control to confirm
+    # the gate returns None (pass) for a clean absent-sidecar
+    # summary shape, so the probe is not just asserting "the gate
+    # always fails".
+    #
+    # This calls the SAME function GP-ABSENT calls; a refactor that
+    # weakens the gate (e.g., reverts the key-present check to
+    # ``summary.get(...) is not None`` so a missing key
+    # false-greens) is caught here at run time. Earlier this probe
+    # asserted Python ``in``/``get`` semantics directly — a
+    # tautology that would still pass even if the GP-ABSENT probe
+    # itself stopped exercising the ``in`` check. The function-
+    # level call binds the proof to the production gate code.
+    _clean_summary: dict = {
+        "generated_provenance": None,
+        "image_provenance": [
+            {"operator_filename": "alpha_marker.png"},
+            {"operator_filename": "beta_marker.jpg"},
+        ],
+    }
+    _missing_key_summary = {
+        k: v for k, v in _clean_summary.items()
+        if k != "generated_provenance"
+    }
+    _non_null_value_summary = dict(_clean_summary)
+    _non_null_value_summary["generated_provenance"] = {
+        "path": "/tmp/forged.json", "entry_count": 2,
+    }
+    _leaked_field_summary: dict = {
+        "generated_provenance": None,
+        "image_provenance": [
+            {
+                "operator_filename": "alpha_marker.png",
+                # The leak — a sidecar-only field on an
+                # image_provenance row of an absent-sidecar run.
+                "generator_source": "mock_generated",
+            },
+        ],
+    }
+    _clean_diag = _absent_sidecar_summary_gate(_clean_summary)
+    _missing_diag = _absent_sidecar_summary_gate(_missing_key_summary)
+    _non_null_diag = _absent_sidecar_summary_gate(
+        _non_null_value_summary,
+    )
+    _leaked_diag = _absent_sidecar_summary_gate(_leaked_field_summary)
+    results.append(_ProbeResult(
+        "GP-ABSENT-NEG _absent_sidecar_summary_gate returns None "
+        "on a clean absent-sidecar summary, and a non-None "
+        "diagnostic on each of the three documented regressions "
+        "(missing key, non-null value, leaked sidecar field on an "
+        "image_provenance row) — locks the gate's behaviour "
+        "against a refactor that weakens it (e.g., reverts the "
+        "key-present check to ``summary.get(...) is not None`` and "
+        "false-greens a forgotten-key regression)",
+        (
+            _clean_diag is None
+            and _missing_diag is not None
+            and "MISSING" in _missing_diag
+            and _non_null_diag is not None
+            and "expected explicit null" in _non_null_diag
+            and _leaked_diag is not None
+            and "carries sidecar fields" in _leaked_diag
+        ),
+        (
+            f"clean={_clean_diag!r}; "
+            f"missing={_missing_diag!r}; "
+            f"non_null={_non_null_diag!r}; "
+            f"leaked={_leaked_diag!r}"
+        ),
+    ))
+
+    # GP-MISMATCH-MISSING sidecar omits a discovered filename. GP13
+    # refuses with rc 2 and no --out-dir artifact materialises.
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-MM-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        sidecar = bundle / "generated_provenance.json"
+        body = _make_sidecar_body(("alpha_marker.png",))
+        sidecar.write_text(
+            json.dumps(body) + "\n", encoding="utf-8",
+        )
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "GP-MISMATCH-MISSING sidecar that omits a discovered "
+            "filename is refused (GP13) with rc 2 and no --out-dir "
+            "artifact materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # GP-MISMATCH-EXTRA sidecar names an extra (unknown) filename.
+    # GP12 refuses with rc 2 and no --out-dir artifact materialises.
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-MX-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        sidecar = bundle / "generated_provenance.json"
+        body = _make_sidecar_body((
+            "alpha_marker.png", "beta_marker.jpg", "ghost.png",
+        ))
+        sidecar.write_text(
+            json.dumps(body) + "\n", encoding="utf-8",
+        )
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "GP-MISMATCH-EXTRA sidecar that names an unknown "
+            "filename is refused (GP12) with rc 2 and no --out-dir "
+            "artifact materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # GP-MISMATCH-DUPE sidecar names the same filename twice. GP12
+    # refuses with rc 2 and no --out-dir artifact materialises.
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-MD-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        sidecar = bundle / "generated_provenance.json"
+        body = _make_sidecar_body(("alpha_marker.png", "beta_marker.jpg"))
+        # Duplicate the first entry's filename onto the second slot.
+        body["entries"][1]["filename"] = "alpha_marker.png"
+        sidecar.write_text(
+            json.dumps(body) + "\n", encoding="utf-8",
+        )
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "GP-MISMATCH-DUPE sidecar that names a filename twice "
+            "is refused (GP12) with rc 2 and no --out-dir artifact "
+            "materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # GP-UNSAFE-URL sidecar carries a URL in intent_summary. The
+    # safe-string scan GP10 refuses with rc 2.
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-U-U-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        sidecar = bundle / "generated_provenance.json"
+        body = _make_sidecar_body(("alpha_marker.png", "beta_marker.jpg"))
+        body["entries"][0]["intent_summary"] = (
+            "Download from https://example.invalid/image.png"
+        )
+        sidecar.write_text(
+            json.dumps(body) + "\n", encoding="utf-8",
+        )
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "GP-UNSAFE-URL sidecar intent_summary carrying a URL is "
+            "refused (GP10) with rc 2 and no --out-dir artifact "
+            "materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # GP-UNSAFE-DATA-URI sidecar intent_summary embeds a dangerous
+    # single-colon URI scheme (data: / mailto: / javascript: /
+    # file:) mid-text. The ``://`` substring + start-anchored
+    # ``_has_uri_scheme`` checks miss these; the new
+    # ``_DANGEROUS_URI_SCHEME_REGEX`` refuses them at the operator
+    # boundary (before the validator's defense-in-depth text scan
+    # on the produced summary.json fires).
+    #
+    # Naive ``rc == 2`` + ``not out_dir.exists()`` is NOT enough:
+    # ``data:image/png;base64,...`` and ``file:/etc/passwd`` both
+    # contain ``/`` so the older path-separator gate already
+    # refuses them — the probe would false-green for those two
+    # shapes by piggybacking on a gate the new regex was supposed
+    # to replace. Call ``_safe_sidecar_intent_summary`` directly
+    # and assert the failure diagnostic mentions the new
+    # "dangerous single-colon URI scheme" wording, so the proof
+    # is bound to ``_DANGEROUS_URI_SCHEME_REGEX`` specifically.
+    # Use slash-free no-path variants for data:/file: alongside
+    # the inherently slash-free mailto:/javascript: shapes so the
+    # path-separator gate cannot fire on any payload — every
+    # refusal must come from the new gate.
+    _data_uri_shapes = (
+        # data:base64 with NO content-type slash so the
+        # path-separator gate cannot pre-empt the new gate.
+        ("data", "Accent based on data:dGVzdA=="),
+        ("mailto", "Contact ops via mailto:operator@example.invalid"),
+        ("javascript", "Trigger via javascript:alert(1) not run"),
+        # file: shape with NO slash so the path-separator gate
+        # cannot pre-empt the new gate.
+        ("file", "Reference file:passwd context"),
+    )
+    _data_uri_failures: list[str] = []
+    for scheme, payload in _data_uri_shapes:
+        # Cheap pre-flight: a payload that contains "/" or "\\"
+        # would let the path-separator gate refuse it before the
+        # new regex runs, so the probe would not be a proof about
+        # ``_DANGEROUS_URI_SCHEME_REGEX``. Refuse such shapes from
+        # the probe payload set at construction time.
+        if "/" in payload or "\\" in payload or "://" in payload:
+            _data_uri_failures.append(
+                f"{scheme}: probe payload {payload!r} contains a "
+                f"path separator / '://' — would false-green via "
+                f"the older gate; rewrite the payload so only the "
+                f"new gate can refuse it"
+            )
+            continue
+        cleaned, fail = _safe_sidecar_intent_summary(
+            value=payload, entry_idx=0,
+        )
+        if cleaned is not None or fail is None:
+            _data_uri_failures.append(
+                f"{scheme}: payload {payload!r} not refused "
+                f"(cleaned={cleaned!r}, fail={fail!r})"
+            )
+            continue
+        if "dangerous single-colon URI scheme" not in fail:
+            _data_uri_failures.append(
+                f"{scheme}: payload {payload!r} refused by a "
+                f"different gate than _DANGEROUS_URI_SCHEME_REGEX "
+                f"(diagnostic: {fail!r}); the probe must bind to "
+                f"the new gate, not piggyback on another gate"
+            )
+            continue
+        if f"{scheme!r}" not in fail and scheme not in fail:
+            _data_uri_failures.append(
+                f"{scheme}: refusal diagnostic does not name the "
+                f"matched scheme (got: {fail!r})"
+            )
+    results.append(_ProbeResult(
+        "GP-UNSAFE-DATA-URI sidecar intent_summary embedding a "
+        "dangerous single-colon URI scheme (data: / mailto: / "
+        "javascript: / file:) mid-text is refused by "
+        "_DANGEROUS_URI_SCHEME_REGEX specifically (probe calls "
+        "_safe_sidecar_intent_summary directly and asserts the "
+        "'dangerous single-colon URI scheme' wording in the "
+        "diagnostic, so a path-separator-gate piggyback cannot "
+        "false-green any shape). Uses slash-free payloads for "
+        "data: and file: alongside the inherently slash-free "
+        "mailto: and javascript: shapes",
+        not _data_uri_failures,
+        (
+            "all four dangerous schemes refused by the new gate "
+            "with the expected diagnostic"
+            if not _data_uri_failures
+            else f"failures: {_data_uri_failures!r}"
+        ),
+    ))
+
+    # GP-UNSAFE-DONE sidecar claims real D-One success. The
+    # fake-success scan GP10 refuses with rc 2.
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-U-D-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        sidecar = bundle / "generated_provenance.json"
+        body = _make_sidecar_body(("alpha_marker.png", "beta_marker.jpg"))
+        body["entries"][0]["intent_summary"] = (
+            "Real D-One generated this asset"
+        )
+        sidecar.write_text(
+            json.dumps(body) + "\n", encoding="utf-8",
+        )
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "GP-UNSAFE-DONE sidecar intent_summary that claims real "
+            "D-One success is refused (GP10) with rc 2 and no "
+            "--out-dir artifact materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # GP-UNSAFE-CRED sidecar intent_summary carries an API-key shape.
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-U-C-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        sidecar = bundle / "generated_provenance.json"
+        body = _make_sidecar_body(("alpha_marker.png", "beta_marker.jpg"))
+        body["entries"][0]["intent_summary"] = (
+            "Generated with API_KEY abc123def456"
+        )
+        sidecar.write_text(
+            json.dumps(body) + "\n", encoding="utf-8",
+        )
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "GP-UNSAFE-CRED sidecar intent_summary that carries a "
+            "credential token is refused (GP10) with rc 2 and no "
+            "--out-dir artifact materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # GP-UNSAFE-CONF sidecar intent_summary names confidential /
+    # customer markers.
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-U-F-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        sidecar = bundle / "generated_provenance.json"
+        body = _make_sidecar_body(("alpha_marker.png", "beta_marker.jpg"))
+        body["entries"][0]["intent_summary"] = (
+            "Marker referencing confidential customer data row"
+        )
+        sidecar.write_text(
+            json.dumps(body) + "\n", encoding="utf-8",
+        )
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "GP-UNSAFE-CONF sidecar intent_summary that names "
+            "confidential / customer markers is refused (GP10) with "
+            "rc 2 and no --out-dir artifact materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # GP-UNSAFE-ENUM sidecar entry carries an out-of-vocab
+    # placement_role. GP9 refuses with rc 2.
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-U-E-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        sidecar = bundle / "generated_provenance.json"
+        body = _make_sidecar_body(("alpha_marker.png", "beta_marker.jpg"))
+        body["entries"][0]["placement_role"] = "billboard"
+        sidecar.write_text(
+            json.dumps(body) + "\n", encoding="utf-8",
+        )
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "GP-UNSAFE-ENUM sidecar entry with an out-of-vocab "
+            "placement_role is refused (GP9) with rc 2 and no "
+            "--out-dir artifact materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # GP-UNSAFE-CD sidecar carries an unsafe custom_descriptor (mixed
+    # case + dash). GP11 refuses with rc 2.
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-U-D2-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        sidecar = bundle / "generated_provenance.json"
+        body = _make_sidecar_body(("alpha_marker.png", "beta_marker.jpg"))
+        body["entries"][0]["custom_descriptor"] = "Bad-Pattern!"
+        sidecar.write_text(
+            json.dumps(body) + "\n", encoding="utf-8",
+        )
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "GP-UNSAFE-CD sidecar entry with an out-of-pattern "
+            "custom_descriptor is refused (GP11) with rc 2 and no "
+            "--out-dir artifact materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
+
+    # GP-SYMLINK sidecar at <bundle>/generated_provenance.json is a
+    # symlink — refused (GP2).
+    with tempfile.TemporaryDirectory(prefix="op-helper-GP-S-") as raw_td:
+        td = Path(raw_td)
+        bundle = td / "bundle"
+        bundle.mkdir()
+        _write_synthetic_images(bundle / "images")
+        # Place a real sidecar file outside the bundle, then symlink
+        # <bundle>/generated_provenance.json at it. The symlink is
+        # what the helper sees first.
+        real_sidecar = td / "real_sidecar.json"
+        real_sidecar.write_text(
+            json.dumps(_make_sidecar_body((
+                "alpha_marker.png", "beta_marker.jpg",
+            ))) + "\n",
+            encoding="utf-8",
+        )
+        os.symlink(real_sidecar, bundle / "generated_provenance.json")
+        out_dir = td / "out"
+        rc = main([
+            "--bundle", str(bundle), "--out-dir", str(out_dir),
+        ])
+        ok = rc == 2 and not out_dir.exists()
+        results.append(_ProbeResult(
+            "GP-SYMLINK symlinked <bundle>/generated_provenance.json "
+            "is refused (GP2) with rc 2 and no --out-dir artifact "
+            "materialised",
+            ok,
+            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+        ))
 
     # T70 — committed-tree snapshot. The whole self-test must not have
     # mutated any byte under REPO_ROOT/scripts/ or REPO_ROOT/examples/.
@@ -9091,17 +10662,25 @@ def main(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 2
-        resolved_images_dir, resolved_manifest, bundle_failures = (
-            _validate_bundle_arg(args.bundle)
-        )
+        (
+            resolved_images_dir,
+            resolved_manifest,
+            resolved_sidecar,
+            bundle_failures,
+        ) = _validate_bundle_arg(args.bundle)
         if bundle_failures or resolved_images_dir is None:
             for line in bundle_failures or []:
                 print(f"FAIL: {line}", file=sys.stderr)
             return 2
         # Substitute the resolved paths so the existing routing keeps
-        # firing every downstream gate unchanged.
+        # firing every downstream gate unchanged. The sidecar path
+        # (when present) lands on a private attribute the bundle
+        # routing carries into _run_operator_mode; there is no
+        # explicit operator-typed flag for it — the sidecar is
+        # bundle-only by design.
         args.images_dir = resolved_images_dir
         args.manifest = resolved_manifest
+        args._generated_provenance_path = resolved_sidecar
 
     if args.write_manifest_template is not None:
         if args.images_dir is None:
@@ -9182,6 +10761,9 @@ def main(argv: list[str]) -> int:
         out_dir_str=args.out_dir,
         manifest_path_str=args.manifest,
         approved_plan_path_str=args.approved_plan,
+        generated_provenance_path_str=getattr(
+            args, "_generated_provenance_path", None,
+        ),
     )
 
 

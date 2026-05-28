@@ -93,6 +93,38 @@ _EXPECTED_HELPER_ID = "operator_local_images_to_editable_ppt"
 _EXPECTED_REAL_D_ONE_STATUS = "UNVERIFIED"
 _EXPECTED_SOURCE_CLASSES = ["local_asset"]
 
+# Closed enums for the optional generated-image provenance sidecar.
+# Mirror the helper-side ``_SIDECAR_ALLOWED_*`` vocabularies verbatim
+# so a tampered summary that drops to an unsupported value refuses
+# here at the post-helper boundary too. The sidecar itself is
+# bundle-only metadata describing operator intent for the embedded
+# image bytes; the helper does NOT call D-One, MCP, Qoder, a network,
+# a model API, an image search, or telemetry to materialise the
+# bytes.
+_EXPECTED_SIDECAR_GENERATOR_SOURCES: frozenset[str] = frozenset({
+    "mock_generated",
+})
+_EXPECTED_SIDECAR_PLACEMENT_ROLES: frozenset[str] = frozenset({
+    "hero_page", "local_region",
+})
+_EXPECTED_SIDECAR_TEXT_POLICIES: frozenset[str] = frozenset({
+    "no_text", "decorative_glyphs", "caption_safe",
+})
+_EXPECTED_SIDECAR_SUBJECT_DOMAINS: frozenset[str] = frozenset({
+    "abstract_marker", "background_pattern", "data_visual_concept",
+    "icon_concept", "process_concept",
+})
+_SIDECAR_CUSTOM_DESCRIPTOR_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# Mirror of the helper-side ``_ABSENT_SIDECAR_LEAK_FIELDS`` set.
+# Lifted to module scope so the validator's absent-sidecar mirror
+# gate uses the same vocabulary the helper uses, refusing any
+# ``image_provenance`` row that carries sidecar field(s) when
+# ``summary.generated_provenance`` is null.
+_ABSENT_SIDECAR_LEAK_FIELDS: frozenset[str] = frozenset({
+    "generator_source", "intent_summary", "placement_role",
+    "text_policy", "subject_domain", "custom_descriptor",
+})
+
 # Lowercase-hex 64-character sha256 pattern; reviewers can pipe the
 # recorded digest to ``sha256sum`` without parsing variations. Mirrors
 # the helper-side ``_SHA256_HEX_PATTERN``.
@@ -530,6 +562,131 @@ def _check_summary(summary: Any, out_dir: Path) -> list[str]:
                     f"the only value a clean run can produce)"
                 )
 
+    # generated_provenance: mirrors the helper-side truth-check
+    # verbatim so a tampered summary that drops the sidecar block or
+    # downgrades any per-image sidecar field off the closed enum
+    # refuses here too. Required to be present (null when no
+    # ``<bundle>/generated_provenance.json`` was supplied; a {path,
+    # entry_count} object when one was). When non-null, every
+    # image_provenance row must carry generator_source /
+    # intent_summary / placement_role / text_policy /
+    # subject_domain, all from the closed enums; optional
+    # custom_descriptor must match ``^[a-z][a-z0-9_]{0,63}$``.
+    gp = summary.get("generated_provenance", _MISSING)
+    if gp is _MISSING:
+        failures.append(
+            "summary.generated_provenance missing; expected null "
+            "(no <bundle>/generated_provenance.json supplied) or "
+            "{path, entry_count}"
+        )
+    elif gp is None:
+        # Absent-sidecar enforcement mirror. With
+        # ``generated_provenance`` set to null, no image_provenance
+        # row may carry any sidecar field. Without this gate a
+        # tampered review package could set generated_provenance to
+        # null AND inject generator_source / placement_role /
+        # etc. onto rows, slipping generated-image claims past the
+        # validator even though the bundle supplied no sidecar.
+        if isinstance(prov, list):
+            for i, entry in enumerate(prov):
+                if not isinstance(entry, dict):
+                    continue
+                leaked = sorted(
+                    _ABSENT_SIDECAR_LEAK_FIELDS & set(entry.keys())
+                )
+                if leaked:
+                    failures.append(
+                        f"summary.image_provenance[{i}] carries "
+                        f"sidecar field(s) {leaked!r} despite "
+                        f"summary.generated_provenance=null"
+                    )
+    elif gp is not None:
+        if not isinstance(gp, dict):
+            failures.append(
+                f"summary.generated_provenance={gp!r}; expected "
+                f"null or an object"
+            )
+        else:
+            unknown = sorted(
+                set(gp.keys()) - {"path", "entry_count"}
+            )
+            if unknown:
+                failures.append(
+                    f"summary.generated_provenance has unknown "
+                    f"key(s) {unknown!r}; expected exactly "
+                    f"{{path, entry_count}}"
+                )
+            gp_path = gp.get("path")
+            if not isinstance(gp_path, str) or not gp_path:
+                failures.append(
+                    f"summary.generated_provenance.path={gp_path!r}; "
+                    f"expected non-empty string"
+                )
+            gp_count = gp.get("entry_count")
+            if (
+                not isinstance(gp_count, int)
+                or isinstance(gp_count, bool)
+                or gp_count != (image_count or -1)
+            ):
+                failures.append(
+                    f"summary.generated_provenance.entry_count="
+                    f"{gp_count!r}; expected {image_count!r}"
+                )
+            if isinstance(prov, list):
+                for i, entry in enumerate(prov):
+                    if not isinstance(entry, dict):
+                        continue
+                    gs = entry.get("generator_source")
+                    if gs not in _EXPECTED_SIDECAR_GENERATOR_SOURCES:
+                        failures.append(
+                            f"summary.image_provenance[{i}]."
+                            f"generator_source={gs!r}; expected one "
+                            f"of "
+                            f"{sorted(_EXPECTED_SIDECAR_GENERATOR_SOURCES)!r}"
+                        )
+                    intent = entry.get("intent_summary")
+                    if not isinstance(intent, str) or not intent:
+                        failures.append(
+                            f"summary.image_provenance[{i}]."
+                            f"intent_summary={intent!r}; expected "
+                            f"non-empty string"
+                        )
+                    pr = entry.get("placement_role")
+                    if pr not in _EXPECTED_SIDECAR_PLACEMENT_ROLES:
+                        failures.append(
+                            f"summary.image_provenance[{i}]."
+                            f"placement_role={pr!r}; expected one of "
+                            f"{sorted(_EXPECTED_SIDECAR_PLACEMENT_ROLES)!r}"
+                        )
+                    tp = entry.get("text_policy")
+                    if tp not in _EXPECTED_SIDECAR_TEXT_POLICIES:
+                        failures.append(
+                            f"summary.image_provenance[{i}]."
+                            f"text_policy={tp!r}; expected one of "
+                            f"{sorted(_EXPECTED_SIDECAR_TEXT_POLICIES)!r}"
+                        )
+                    sd = entry.get("subject_domain")
+                    if sd not in _EXPECTED_SIDECAR_SUBJECT_DOMAINS:
+                        failures.append(
+                            f"summary.image_provenance[{i}]."
+                            f"subject_domain={sd!r}; expected one of "
+                            f"{sorted(_EXPECTED_SIDECAR_SUBJECT_DOMAINS)!r}"
+                        )
+                    if "custom_descriptor" in entry:
+                        cd = entry["custom_descriptor"]
+                        if (
+                            not isinstance(cd, str)
+                            or not _SIDECAR_CUSTOM_DESCRIPTOR_RE.fullmatch(
+                                cd,
+                            )
+                        ):
+                            failures.append(
+                                f"summary.image_provenance[{i}]."
+                                f"custom_descriptor={cd!r}; expected "
+                                f"string matching "
+                                f"^[a-z][a-z0-9_]{{0,63}}$"
+                            )
+
     # Path-field cross-checks. Every path-typed field the helper writes
     # into summary.json must resolve under --out-dir to the expected
     # artifact (regular non-symlink file/dir). ``registry_path`` lives
@@ -866,11 +1023,18 @@ class _ProbeResult:
     detail: str = ""
 
 
-def _materialize_review_package(td: Path) -> tuple[bool, str, Path]:
+def _materialize_review_package(
+    td: Path,
+    *,
+    include_generated_provenance: bool = False,
+) -> tuple[bool, str, Path]:
     """Drive the operator helper against a synthetic PNG + JPG bundle
     and return ``(ok, detail, out_dir)``. The bundle lives under
     ``td/bundle`` and the produced review package under
-    ``td/out``."""
+    ``td/out``. When ``include_generated_provenance`` is True the
+    bundle also carries a synthetic
+    ``generated_provenance.json`` sidecar so the produced review
+    package surfaces the new optional summary block."""
     bundle = td / "bundle"
     images = bundle / "images"
     images.mkdir(parents=True, exist_ok=True)
@@ -890,6 +1054,38 @@ def _materialize_review_package(td: Path) -> tuple[bool, str, Path]:
     (images / "beta_marker.jpg").write_bytes(
         b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
     )
+    if include_generated_provenance:
+        (bundle / "generated_provenance.json").write_text(
+            json.dumps({
+                "schema_version": "1",
+                "entries": [
+                    {
+                        "filename": "alpha_marker.png",
+                        "generator_source": "mock_generated",
+                        "intent_summary": (
+                            "Synthetic accent for alpha (mock; "
+                            "local-only)"
+                        ),
+                        "placement_role": "hero_page",
+                        "text_policy": "no_text",
+                        "subject_domain": "abstract_marker",
+                        "custom_descriptor": "soft_color_block_v1",
+                    },
+                    {
+                        "filename": "beta_marker.jpg",
+                        "generator_source": "mock_generated",
+                        "intent_summary": (
+                            "Synthetic accent for beta (mock; "
+                            "local-only)"
+                        ),
+                        "placement_role": "local_region",
+                        "text_policy": "decorative_glyphs",
+                        "subject_domain": "background_pattern",
+                    },
+                ],
+            }) + "\n",
+            encoding="utf-8",
+        )
     out_dir = td / "out"
     operator_helper = SCRIPTS_DIR / "operator_local_images_to_editable_ppt.py"
     env = os.environ.copy()
@@ -1310,6 +1506,216 @@ def _run_self_tests() -> int:
                     for f in result.failures
                 ),
                 f"failures={result.failures[:5]!r}",
+            ))
+
+    # T18 — sidecar happy path. A review package built from a bundle
+    # that included a synthetic ``generated_provenance.json`` carries
+    # ``summary.generated_provenance.{path, entry_count}`` AND every
+    # ``image_provenance`` row echoes the per-entry sidecar fields.
+    # Locks the absent-sidecar / present-sidecar parity invariant.
+    with tempfile.TemporaryDirectory(prefix="op-review-T18-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(
+            td, include_generated_provenance=True,
+        )
+        if not ok:
+            results.append(_ProbeResult(
+                "T18 sidecar happy setup", False, detail,
+            ))
+        else:
+            result = _validate_package(out_dir)
+            summary = json.loads(
+                (out_dir / "summary.json").read_text(),
+            )
+            gp = summary.get("generated_provenance") or {}
+            prov = summary.get("image_provenance") or []
+            ok_pkg = result.ok
+            shape_ok = (
+                gp.get("entry_count") == 2
+                and isinstance(gp.get("path"), str)
+                and all(
+                    p.get("generator_source") == "mock_generated"
+                    for p in prov
+                )
+            )
+            results.append(_ProbeResult(
+                "T18 sidecar happy path: review package built from "
+                "a bundle that included a synthetic "
+                "generated_provenance.json validates rc=0 AND the "
+                "summary carries generated_provenance + per-image "
+                "sidecar fields",
+                ok_pkg and shape_ok,
+                ("first failures: " + "; ".join(result.failures[:3]))
+                if not ok_pkg else f"shape_ok={shape_ok}",
+            ))
+
+    # T19 — summary.generated_provenance key missing — refused
+    # (parallel to the approved_plan-missing T10 gate; a tampered
+    # summary cannot silently erase the sidecar block).
+    with tempfile.TemporaryDirectory(prefix="op-review-T19-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(td)
+        if not ok:
+            results.append(_ProbeResult(
+                "T19 gp-missing setup", False, detail,
+            ))
+        else:
+            summary_path = out_dir / "summary.json"
+            data = json.loads(summary_path.read_text())
+            data.pop("generated_provenance", None)
+            summary_path.write_text(
+                json.dumps(data, indent=2, sort_keys=True) + "\n",
+            )
+            result = _validate_package(out_dir)
+            results.append(_ProbeResult(
+                "T19 summary.generated_provenance key missing "
+                "refused",
+                (not result.ok)
+                and any(
+                    "generated_provenance missing" in f
+                    for f in result.failures
+                ),
+                f"failures={result.failures[:3]!r}",
+            ))
+
+    # T20 — out-of-vocab sidecar enum — refused. Drops a per-image
+    # generator_source to a value off the closed set; the validator
+    # must refuse so a tampered post-helper edit cannot smuggle a
+    # generator name the helper does NOT support.
+    with tempfile.TemporaryDirectory(prefix="op-review-T20-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(
+            td, include_generated_provenance=True,
+        )
+        if not ok:
+            results.append(_ProbeResult(
+                "T20 gp-enum setup", False, detail,
+            ))
+        else:
+            summary_path = out_dir / "summary.json"
+            data = json.loads(summary_path.read_text())
+            data["image_provenance"][0]["generator_source"] = (
+                "real_d_one"
+            )
+            summary_path.write_text(
+                json.dumps(data, indent=2, sort_keys=True) + "\n",
+            )
+            result = _validate_package(out_dir)
+            results.append(_ProbeResult(
+                "T20 image_provenance row with out-of-vocab "
+                "generator_source refused",
+                (not result.ok)
+                and any(
+                    "generator_source=" in f
+                    and "expected one of" in f
+                    for f in result.failures
+                ),
+                f"failures={result.failures[:3]!r}",
+            ))
+
+    # T21 — out-of-pattern custom_descriptor — refused. The pattern
+    # ``^[a-z][a-z0-9_]{0,63}$`` is what the helper enforces; the
+    # validator re-asserts it to catch a tampered summary edit.
+    with tempfile.TemporaryDirectory(prefix="op-review-T21-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(
+            td, include_generated_provenance=True,
+        )
+        if not ok:
+            results.append(_ProbeResult(
+                "T21 gp-cd setup", False, detail,
+            ))
+        else:
+            summary_path = out_dir / "summary.json"
+            data = json.loads(summary_path.read_text())
+            data["image_provenance"][0]["custom_descriptor"] = (
+                "Bad-Pattern!"
+            )
+            summary_path.write_text(
+                json.dumps(data, indent=2, sort_keys=True) + "\n",
+            )
+            result = _validate_package(out_dir)
+            results.append(_ProbeResult(
+                "T21 image_provenance row with out-of-pattern "
+                "custom_descriptor refused",
+                (not result.ok)
+                and any(
+                    "custom_descriptor=" in f
+                    and "[a-z][a-z0-9_]" in f
+                    for f in result.failures
+                ),
+                f"failures={result.failures[:3]!r}",
+            ))
+
+    # T22 — generated_provenance.entry_count mismatch — refused. The
+    # entry_count must equal summary.image_count; a tampered edit
+    # that changes one but not the other must refuse.
+    with tempfile.TemporaryDirectory(prefix="op-review-T22-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(
+            td, include_generated_provenance=True,
+        )
+        if not ok:
+            results.append(_ProbeResult(
+                "T22 gp-count setup", False, detail,
+            ))
+        else:
+            summary_path = out_dir / "summary.json"
+            data = json.loads(summary_path.read_text())
+            data["generated_provenance"]["entry_count"] = 99
+            summary_path.write_text(
+                json.dumps(data, indent=2, sort_keys=True) + "\n",
+            )
+            result = _validate_package(out_dir)
+            results.append(_ProbeResult(
+                "T22 summary.generated_provenance.entry_count "
+                "mismatch refused",
+                (not result.ok)
+                and any(
+                    "entry_count=" in f
+                    for f in result.failures
+                ),
+                f"failures={result.failures[:3]!r}",
+            ))
+
+    # T23 — absent-sidecar leak enforcement. A tampered review
+    # package that sets summary.generated_provenance to null AND
+    # simultaneously injects a sidecar-only field (e.g.,
+    # generator_source) onto an image_provenance row must refuse.
+    # Mirrors the helper-side truth-check so on-disk re-validation
+    # catches the same smuggling shape.
+    with tempfile.TemporaryDirectory(prefix="op-review-T23-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(td)
+        if not ok:
+            results.append(_ProbeResult(
+                "T23 leak setup", False, detail,
+            ))
+        else:
+            summary_path = out_dir / "summary.json"
+            data = json.loads(summary_path.read_text())
+            # generated_provenance is already null on this run (no
+            # sidecar supplied). Inject a sidecar-only field on the
+            # first image_provenance row — this is the smuggling
+            # shape the new gate must refuse.
+            data["image_provenance"][0]["generator_source"] = (
+                "mock_generated"
+            )
+            summary_path.write_text(
+                json.dumps(data, indent=2, sort_keys=True) + "\n",
+            )
+            result = _validate_package(out_dir)
+            results.append(_ProbeResult(
+                "T23 absent-sidecar leak: image_provenance row "
+                "carrying sidecar field while "
+                "summary.generated_provenance=null refused",
+                (not result.ok)
+                and any(
+                    "carries sidecar field" in f
+                    and "generated_provenance=null" in f
+                    for f in result.failures
+                ),
+                f"failures={result.failures[:3]!r}",
             ))
 
     rc = 0
