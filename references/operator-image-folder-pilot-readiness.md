@@ -75,6 +75,29 @@ These do not gate a first human pilot; capture them for follow-up evidence.
   back to a native placeholder shape; PNG / JPG / JPEG are the embeddable set
   for this lane. Known scope boundary.
 
+## Human-Review Checkpoint (Two-Step Mode)
+
+The one-command entrypoint auto-approves its own plan, which is convenient but
+inserts no human review between staging and building. The lane now also offers
+a two-step reviewed mode at the wrapper level — the first practical human-review
+checkpoint for this path:
+
+- `operator_images_to_review_package.py --plan --images-dir DIR --out-dir OUT`
+  stages the bundle, writes the manifest / generated-provenance templates and
+  the reviewable `approved_plan.json`, then **stops** — no `deck.pptx` and no
+  `review_package/` are produced. The plan-step `README.md` carries the review
+  checklist and the exact resume command.
+- A human inspects `approved_plan.json` (and the templates), then runs
+  `operator_images_to_review_package.py --resume --out-dir OUT`, which builds
+  the review package with the same approved-plan run lock, validators, and
+  evidence as one-command mode. `--resume` fails closed if the bundle drifted
+  from the approved plan, and refuses path-traversal / symlink `--out-dir`
+  inputs and any `--out-dir` that is not a prior `--plan` output.
+
+This is covered by the wrapper's `--self-test` probes T15–T20 and documented in
+[`core-image-to-editable-ppt-quickstart.md`](core-image-to-editable-ppt-quickstart.md).
+One-command mode is unchanged.
+
 ## Boundary
 
 The pilot was local-only. It did not call D-One, MCP, Qoder, a public network,

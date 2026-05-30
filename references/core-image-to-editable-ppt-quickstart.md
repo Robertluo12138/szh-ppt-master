@@ -367,6 +367,66 @@ TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
 
 The trial's `--self-test` is wired into `scripts/core_editable_ppt_acceptance.py`. Local-only — the sidecar's `generator_source == "mock_generated"` records declared operator intent for the staged synthetic bytes; the trial does NOT call D-One, MCP, Qoder, a public network, telemetry, a model API, an image search, or any external service. Real D-One remains UNVERIFIED.
 
+## Operator image-folder workflow (one-command and two-step reviewed)
+
+When an operator already has a folder of generated images on disk, `scripts/operator_images_to_review_package.py` is the one-command entrypoint that sequences the existing helper end to end: it copies the images into `<out-dir>/bundle/images/` (refusing symlinks / subdirectories / non-image files before any byte is copied, so the source folder is never mutated), writes the `manifest.json` + `generated_provenance.json` templates and the reviewable `approved_plan.json`, builds the `review_package/` under the helper's approved-plan run lock, runs the read-only `scripts/validate_operator_review_package.py` re-check, and writes a top-level `README.md` carrying the exact commands it ran.
+
+### Normal (one command)
+
+```bash
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/szh-op-XXXX")
+
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_images_to_review_package.py \
+  --images-dir /path/to/images \
+  --out-dir "$RUN_DIR/out"
+
+# When done inspecting, clean up:
+#   rm -rf "$RUN_DIR"
+```
+
+One-command mode **auto-approves its own plan** to drive the build — the `--approved-plan` gate still catches drift between staging and building, but no human inspects the plan in between. For a real human-review checkpoint, use the two-step mode below.
+
+### Two-step reviewed mode (plan → review → resume)
+
+`--plan` stages the bundle and writes the reviewable `approved_plan.json`, then **stops** — no `deck.pptx` and no `review_package/` are built. A human inspects the plan (and the `manifest.json` / `generated_provenance.json` templates), and only then runs `--resume`, which builds the review package with the **same validators and evidence** as one-command mode. Running `--resume` is the operator's explicit sign-off that the plan was reviewed.
+
+```bash
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/szh-op-XXXX")
+
+# 1. Plan: stage the bundle + reviewable plan, then stop.
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_images_to_review_package.py --plan \
+  --images-dir /path/to/images \
+  --out-dir "$RUN_DIR/out"
+
+# 2. Review by hand (the plan-step README spells out this checklist):
+#      less "$RUN_DIR/out/README.md"
+#      less "$RUN_DIR/out/approved_plan.json"
+#      less "$RUN_DIR/out/bundle/generated_provenance.json"
+
+# 3. Resume: build the review package from the reviewed plan.
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_images_to_review_package.py --resume \
+  --out-dir "$RUN_DIR/out"
+
+# When done inspecting, clean up:
+#   rm -rf "$RUN_DIR"
+```
+
+`--resume` takes `--out-dir` only (the bundle + plan are already staged; passing `--images-dir` is refused). It fails closed if the bundle has drifted from the approved plan between the two steps — editing any byte under `bundle/images/`, `bundle/manifest.json`, or `bundle/generated_provenance.json` in a way that changes the plan refuses the resume before any review-package artifact is created. To approve a changed plan, discard the directory and re-run `--plan`. The resume gate also refuses a URI-shaped / symlinked / symlink-ancestor / under-repo `--out-dir`, an `--out-dir` that is not a prior `--plan` output, and an `--out-dir` whose `review_package/` was already built.
+
+```bash
+# Twenty self-test probes (one-command happy path + copy/TOCTOU gates
+# + T15–T20 for the two-step flow: plan builds nothing; resume succeeds
+# for a valid reviewed plan and refuses mutated source bytes, missing /
+# mismatched generated provenance, path traversal, and symlink inputs):
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+  python3 scripts/operator_images_to_review_package.py --self-test
+```
+
+Local-only — does NOT call D-One, MCP, Qoder, a public network, telemetry, a model API, an image search, or any external service. NOT a prompt / report / Markdown-to-PPTX automation. Real D-One remains UNVERIFIED.
+
 ## Re-validate an existing operator review package
 
 After running the helper with `--bundle ... --out-dir ...` (or `operator_local_images_trial.py --out-dir ...`), the produced review package can be re-checked on disk without re-running the pipeline:

@@ -38,12 +38,32 @@ sequences the existing helpers:
      EXACT manual commands this run executed so the workflow is
      inspectable and repeatable.
 
+The same seven stages can run as ONE command or split at a human-review
+checkpoint into a ``--plan`` step (stages 1-4: stage the bundle + write
+the templates + reviewable plan, then STOP) and a ``--resume`` step
+(stages 5-7: build the review package from the operator-reviewed plan).
+The split is the first practical human-review checkpoint in this lane —
+nothing downstream is built until a person inspects ``approved_plan
+.json`` and runs ``--resume``.
+
 CLI shape::
 
-    # Operator mode that leaves the produced review package on disk:
+    # One-command mode (auto-approves its own plan; leaves the produced
+    # review package on disk):
     python3 scripts/operator_images_to_review_package.py \
         --images-dir DIR_OF_IMAGES \
         --out-dir FRESH_OUT_DIR
+
+    # Two-step reviewed mode:
+    #   1. plan: stage the bundle + reviewable plan, then stop.
+    python3 scripts/operator_images_to_review_package.py --plan \
+        --images-dir DIR_OF_IMAGES \
+        --out-dir FRESH_OUT_DIR
+    #   2. a human inspects <out-dir>/approved_plan.json (and the
+    #      manifest / generated_provenance templates).
+    #   3. resume: build the review package from the reviewed plan.
+    python3 scripts/operator_images_to_review_package.py --resume \
+        --out-dir SAME_OUT_DIR
 
     # Self-test (every scenario under TMPDIR; no caller-visible
     # artifacts retained):
@@ -56,7 +76,12 @@ sibling helpers already enforce apply here too. ``--images-dir`` is
 gated separately for URI / symlink / symlink-ancestor / missing /
 non-directory before any copy; cross-containment between the two
 arguments is refused so the operator cannot accidentally point one
-inside the other.
+inside the other. In ``--resume`` mode ``--out-dir`` instead points at
+a directory a prior ``--plan`` run staged, so it is validated through
+``_validate_resume_out_dir_arg`` (same URI / symlink / symlink-ancestor
+/ repo-tree refusals, but it REQUIRES the pre-existing ``bundle/`` +
+``approved_plan.json`` and refuses an already-built ``review_package/``)
+and ``--images-dir`` is refused.
 
 Local-only — does NOT call D-One, MCP, Qoder, a public network,
 telemetry, a model API, an image search, or any external service. NOT
@@ -600,28 +625,48 @@ def _copy_one_image_race_safe(
 # ---------------------------------------------------------------------------
 
 
-def _run_workflow(*, images_dir: Path, out_dir: Path) -> int:
-    """Drive the full workflow into ``out_dir``. The caller MUST have
-    already passed both ``images_dir`` and ``out_dir`` through their
-    respective argument gates AND confirmed ``out_dir`` exists.
+@dataclass
+class _WorkflowPaths:
+    """The canonical on-disk layout the workflow writes under
+    ``out_dir``. Derived once so the one-command, plan-only, and resume
+    entry points all agree on the same paths."""
+    out_dir: Path
+    bundle: Path
+    bundle_images: Path
+    manifest: Path
+    gen_prov: Path
+    approved_plan: Path
+    review_package: Path
 
-    Returns 0 on success, 1 on any stage failure. A torn run leaves
-    whatever the helper / validator produced under ``out_dir``
-    untouched — an operator inspects the partial state directly."""
+
+def _workflow_paths(out_dir: Path) -> _WorkflowPaths:
     bundle = out_dir / "bundle"
-    bundle_images = bundle / "images"
-    manifest = bundle / "manifest.json"
-    gen_prov = bundle / "generated_provenance.json"
-    approved_plan = out_dir / "approved_plan.json"
-    review_package = out_dir / "review_package"
+    return _WorkflowPaths(
+        out_dir=out_dir,
+        bundle=bundle,
+        bundle_images=bundle / "images",
+        manifest=bundle / "manifest.json",
+        gen_prov=bundle / "generated_provenance.json",
+        approved_plan=out_dir / "approved_plan.json",
+        review_package=out_dir / "review_package",
+    )
 
-    print(f"=== operator_images_to_review_package ===")
-    print(f"  images-dir:         {images_dir}")
-    print(f"  out-dir:            {out_dir}")
-    print(f"  bundle:             {bundle}")
-    print(f"  approved-plan:      {approved_plan}")
-    print(f"  review-package:     {review_package}")
-    print()
+
+def _stage_bundle_and_plan(
+    *, images_dir: Path, paths: _WorkflowPaths,
+) -> int:
+    """Stages A–D: copy the operator images into the bundle, write the
+    manifest + generated-provenance templates, and write the reviewable
+    plan (``approved_plan.json``). Stops short of the review package —
+    no ``deck.pptx`` / ``review_package/`` is produced here. Returns 0
+    on success, 1 on any stage failure (leaving partial output under
+    ``out_dir`` for inspection). Shared verbatim by the one-command and
+    plan-only entry points so they stage identically."""
+    bundle = paths.bundle
+    bundle_images = paths.bundle_images
+    manifest = paths.manifest
+    gen_prov = paths.gen_prov
+    approved_plan = paths.approved_plan
 
     # Stage A — stage the bundle by copying the operator images.
     copy_failures = _copy_images_into_bundle(images_dir, bundle_images)
@@ -690,6 +735,20 @@ def _run_workflow(*, images_dir: Path, out_dir: Path) -> int:
         _print_outcome_tail(plan_outcome)
         return 1
     print(f"  [PASS] approved plan written to {approved_plan}")
+    return 0
+
+
+def _build_and_validate_review_package(*, paths: _WorkflowPaths) -> int:
+    """Stages E–F: drive the approved-plan run lock (which fails closed
+    on any drift between ``approved_plan.json`` and the current bundle
+    BEFORE producing any artifact), confirm every review-package
+    artifact landed, confirm the summary's approved-plan block, and run
+    the read-only on-disk re-check. Returns 0 on success, 1 on any
+    failure. Shared verbatim by the one-command and resume entry points
+    so the produced review package and its evidence are identical."""
+    bundle = paths.bundle
+    approved_plan = paths.approved_plan
+    review_package = paths.review_package
 
     # Stage E — approved-plan run lock. The helper rejects with rc 2
     # BEFORE any pipeline subprocess fires if the current bundle has
@@ -768,6 +827,42 @@ def _run_workflow(*, images_dir: Path, out_dir: Path) -> int:
         return 1
     print(f"  [PASS] validate_operator_review_package rc=0 "
           f"(read-only / local-only)")
+    return 0
+
+
+def _run_workflow(*, images_dir: Path, out_dir: Path) -> int:
+    """Drive the full one-command workflow into ``out_dir``. The caller
+    MUST have already passed both ``images_dir`` and ``out_dir`` through
+    their respective argument gates AND confirmed ``out_dir`` exists.
+
+    Returns 0 on success, 1 on any stage failure. A torn run leaves
+    whatever the helper / validator produced under ``out_dir``
+    untouched — an operator inspects the partial state directly."""
+    paths = _workflow_paths(out_dir)
+    bundle = paths.bundle
+    manifest = paths.manifest
+    gen_prov = paths.gen_prov
+    approved_plan = paths.approved_plan
+    review_package = paths.review_package
+
+    print(f"=== operator_images_to_review_package ===")
+    print(f"  images-dir:         {images_dir}")
+    print(f"  out-dir:            {out_dir}")
+    print(f"  bundle:             {bundle}")
+    print(f"  approved-plan:      {approved_plan}")
+    print(f"  review-package:     {review_package}")
+    print()
+
+    rc = _stage_bundle_and_plan(images_dir=images_dir, paths=paths)
+    if rc != 0:
+        return rc
+    rc = _build_and_validate_review_package(paths=paths)
+    if rc != 0:
+        return rc
+    # _build_and_validate_review_package returns 0 only when Stage F's
+    # validator returned rc 0, so the README's validator rc is
+    # definitionally 0 on the success path here.
+    validator_rc = 0
 
     # Stage G — concise top-level operator-facing README carrying the
     # EXACT manual commands run, so the workflow is inspectable and
@@ -782,7 +877,7 @@ def _run_workflow(*, images_dir: Path, out_dir: Path) -> int:
             gen_prov=gen_prov,
             approved_plan=approved_plan,
             review_package=review_package,
-            validator_rc=validator_outcome.rc,
+            validator_rc=validator_rc,
         ),
         encoding="utf-8",
     )
@@ -794,6 +889,227 @@ def _run_workflow(*, images_dir: Path, out_dir: Path) -> int:
 
     print()
     print(f"OK: review package under {review_package}. Open {readme} first.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Two-step reviewed flow: --plan stages the bundle + reviewable plan and
+# STOPS; a human inspects the plan; --resume builds the review package
+# from the reviewed plan using the same approved-plan run lock,
+# validators, and evidence as one-command mode. The split is the first
+# practical human-review checkpoint in this lane: nothing downstream is
+# built until a person runs --resume.
+# ---------------------------------------------------------------------------
+
+
+def _validate_resume_out_dir_arg(
+    out_dir_str: str,
+) -> tuple[Path | None, list[str]]:
+    """Validate ``--out-dir`` for resume mode. Unlike the fresh-out-dir
+    gate the one-command / plan steps use, resume REQUIRES a
+    pre-existing plan-mode output: the directory must already exist and
+    carry ``bundle/`` + ``approved_plan.json`` (what a ``--plan`` run
+    staged). The path-safety refusals (URI / symlink / symlink-ancestor
+    / repo-tree anchor) match the fresh gate so resume cannot be pointed
+    at a redirected or in-repo path. The deeper bundle re-validation
+    (image bytes, manifest, sidecar, drift against the approved plan)
+    is left to the helper's approved-plan run lock."""
+    if _URI_SCHEME_PREFIX.match(out_dir_str):
+        return None, [
+            f"--out-dir argument {out_dir_str!r} looks URI-shaped; "
+            f"operator mode only accepts local file paths."
+        ]
+
+    out_dir = Path(out_dir_str)
+
+    if out_dir.is_symlink():
+        try:
+            tgt = os.readlink(out_dir)
+        except OSError:
+            tgt = "<unreadable>"
+        return None, [
+            f"--out-dir {out_dir} is a symlink (-> {tgt}); refused so a "
+            f"symlink target cannot redirect where the review package "
+            f"is built."
+        ]
+
+    forbidden = _forbidden_symlink_ancestor(out_dir)
+    if forbidden is not None:
+        ancestor, tgt = forbidden
+        return None, [
+            f"--out-dir {out_dir} has a symlink ancestor {ancestor} "
+            f"(-> {tgt}); refused so a symlink in the typed path cannot "
+            f"redirect where the review package is built."
+        ]
+
+    try:
+        resolved = out_dir.resolve(strict=False)
+    except OSError as exc:
+        return None, [
+            f"--out-dir {out_dir} could not be resolved: "
+            f"{type(exc).__name__}: {exc}"
+        ]
+    repo_root = REPO_ROOT.resolve(strict=False)
+    try:
+        resolved.relative_to(repo_root)
+        return None, [
+            f"--out-dir {resolved} lexically anchors under "
+            f"REPO_ROOT={repo_root}; refused — operator output must "
+            f"land outside the committed repo tree."
+        ]
+    except ValueError:
+        pass
+
+    if not out_dir.exists():
+        return None, [
+            f"--out-dir {out_dir} does not exist; --resume rebuilds the "
+            f"review package from a plan staged by a prior --plan run. "
+            f"Run --plan against this --out-dir first."
+        ]
+    if not out_dir.is_dir():
+        return None, [
+            f"--out-dir {out_dir} exists but is not a directory."
+        ]
+
+    bundle = out_dir / "bundle"
+    approved_plan = out_dir / "approved_plan.json"
+    if bundle.is_symlink() or not bundle.is_dir():
+        return None, [
+            f"--out-dir {out_dir} has no regular bundle/ directory "
+            f"(bundle={bundle}); --resume expects the bundle a prior "
+            f"--plan run staged. Run --plan against this --out-dir "
+            f"first."
+        ]
+    if approved_plan.is_symlink() or not approved_plan.is_file():
+        return None, [
+            f"--out-dir {out_dir} has no regular approved_plan.json "
+            f"(approved_plan={approved_plan}); --resume expects the "
+            f"reviewable plan a prior --plan run wrote. Run --plan "
+            f"against this --out-dir first."
+        ]
+
+    review_package = out_dir / "review_package"
+    if review_package.exists() or review_package.is_symlink():
+        return None, [
+            f"--out-dir {out_dir} already has a review_package/ "
+            f"({review_package}); --resume refuses to overwrite a built "
+            f"review package. Inspect it, or pass a fresh --out-dir and "
+            f"re-run --plan."
+        ]
+
+    return out_dir, []
+
+
+def _run_plan_mode(*, images_dir: Path, out_dir: Path) -> int:
+    """Plan step of the two-step reviewed flow. Stages the bundle and
+    writes the manifest + generated-provenance templates + reviewable
+    plan, then STOPS before building the review package — no
+    ``deck.pptx`` / ``review_package/`` is produced. The operator
+    inspects the staged plan and, when satisfied, runs ``--resume``
+    against the same ``--out-dir``. The caller MUST have already passed
+    both args through their gates and confirmed ``out_dir`` exists.
+
+    Returns 0 on success, 1 on any stage failure."""
+    paths = _workflow_paths(out_dir)
+
+    print(f"=== operator_images_to_review_package --plan ===")
+    print(f"  images-dir:         {images_dir}")
+    print(f"  out-dir:            {out_dir}")
+    print(f"  bundle:             {paths.bundle}")
+    print(f"  reviewable-plan:    {paths.approved_plan}")
+    print()
+
+    rc = _stage_bundle_and_plan(images_dir=images_dir, paths=paths)
+    if rc != 0:
+        return rc
+
+    # Belt-and-braces: plan mode must NOT have produced any review
+    # package or deck. _stage_bundle_and_plan never builds one, but
+    # assert it here so a future change that leaks a build into the
+    # stage step is caught at run time, not just in --self-test.
+    leaked = [
+        n for n in _REVIEW_PACKAGE_FILES + _REVIEW_PACKAGE_DIRS
+        if (paths.review_package / n).exists()
+    ]
+    if paths.review_package.exists() or leaked:
+        print(f"  [FAIL] plan mode unexpectedly produced review-package "
+              f"output under {paths.review_package} (leaked={leaked!r}); "
+              f"plan mode must stop before any deck.pptx / "
+              f"review_package is built.")
+        return 1
+    print(f"  [PASS] no review_package / deck.pptx produced (plan mode "
+          f"stops at the review checkpoint)")
+
+    # Top-level README: what to review + how to resume. Written last so
+    # a torn plan run never leaves a positive-looking README behind.
+    readme = out_dir / "README.md"
+    readme.write_text(
+        _render_plan_readme(images_dir=images_dir, paths=paths),
+        encoding="utf-8",
+    )
+    if not readme.is_file() or readme.is_symlink():
+        print(f"  [FAIL] expected plan README at {readme} as a regular "
+              f"non-symlink file")
+        return 1
+    print(f"  [PASS] plan README written to {readme}")
+
+    print()
+    print(f"OK: plan staged under {out_dir}. Review {readme}, then run "
+          f"--resume --out-dir {out_dir} to build the review package.")
+    return 0
+
+
+def _run_resume_mode(*, out_dir: Path) -> int:
+    """Resume step of the two-step reviewed flow. Builds the review
+    package from the operator-reviewed plan staged by a prior ``--plan``
+    run, using the SAME approved-plan run lock, validators, and evidence
+    as one-command mode. The caller MUST have already passed ``out_dir``
+    through ``_validate_resume_out_dir_arg`` (which confirms the
+    plan-mode artifacts are present). Running ``--resume`` is the
+    operator's explicit signal that the staged plan has been reviewed
+    and approved.
+
+    Returns 0 on success, 1 on any stage failure."""
+    paths = _workflow_paths(out_dir)
+
+    print(f"=== operator_images_to_review_package --resume ===")
+    print(f"  out-dir:            {out_dir}")
+    print(f"  bundle:             {paths.bundle}")
+    print(f"  approved-plan:      {paths.approved_plan}")
+    print(f"  review-package:     {paths.review_package}")
+    print()
+
+    rc = _build_and_validate_review_package(paths=paths)
+    if rc != 0:
+        return rc
+    # _build_and_validate_review_package returns 0 only when Stage F's
+    # validator returned rc 0, so the README's validator rc is
+    # definitionally 0 on the success path here.
+    validator_rc = 0
+
+    # Final top-level README: overwrites the plan-step checkpoint guide
+    # now that the run has progressed past review. Refuse a symlink
+    # planted at the README path between the plan and resume steps so
+    # the write cannot be redirected through it.
+    readme = out_dir / "README.md"
+    if readme.is_symlink():
+        print(f"  [FAIL] {readme} is a symlink; refused so the resume "
+              f"README write cannot be redirected through a symlink "
+              f"planted after the plan step.")
+        return 1
+    readme.write_text(
+        _render_resume_readme(paths=paths, validator_rc=validator_rc),
+        encoding="utf-8",
+    )
+    if not readme.is_file() or readme.is_symlink():
+        print(f"  [FAIL] expected resume README at {readme} as a regular "
+              f"non-symlink file")
+        return 1
+    print(f"  [PASS] resume README written to {readme}")
+
+    print()
+    print(f"OK: review package under {paths.review_package}. Open "
+          f"{readme} first.")
     return 0
 
 
@@ -990,6 +1306,169 @@ def _render_workflow_readme(
         "external service. Real D-One image generation remains "
         "UNVERIFIED. NOT a prompt / report / Markdown-to-PPTX "
         "automation.",
+        "",
+        "## Cleaning up",
+        "",
+        "When done inspecting, remove the workflow output directly:",
+        "",
+        "```",
+        f"rm -rf {out_dir_q}",
+        "```",
+        "",
+    ])
+
+
+def _render_plan_readme(*, images_dir: Path, paths: _WorkflowPaths) -> str:
+    """Render the plan-step top-level README: what the operator should
+    review and the EXACT command to resume. Every path embedded in a
+    fenced shell-command block goes through ``shlex.quote`` so a folder
+    name with spaces / quotes survives copy-paste."""
+    try:
+        staged = sorted(p.name for p in paths.bundle_images.iterdir())
+    except OSError:
+        staged = []
+    out_dir_q = shlex.quote(str(paths.out_dir))
+    images_q = shlex.quote(str(images_dir))
+    return "\n".join([
+        "# operator_images_to_review_package — staged plan (review me)",
+        "",
+        "This is the **plan step** of the two-step reviewed workflow for "
+        "the local image-folder -> editable-PPT lane. The operator "
+        "images have been copied into a local bundle and a reviewable "
+        "plan has been written, but **no editable PPTX and no review "
+        "package have been built yet**. Nothing downstream runs until a "
+        "human reviews the staged plan and runs `--resume`.",
+        "",
+        "## What was staged",
+        "",
+        f"- `bundle/images/` — {len(staged)} image(s) copied "
+        f"byte-identically from `{images_dir}`: {staged}. The original "
+        "folder was not mutated.",
+        "- `bundle/manifest.json` — the default per-image slide_title / "
+        "alt_text / intended_use the plan was built from.",
+        "- `bundle/generated_provenance.json` — the default "
+        "`operator_declared_generated` provenance the plan was built "
+        "from.",
+        "- `approved_plan.json` — the **reviewable plan**: the exact "
+        "per-image filename / sha256 / intended slide / title / "
+        "alt_text / intended_use the review package would be built "
+        "from. Read this top to bottom.",
+        "",
+        "## Review is read-only — do NOT edit the staged files",
+        "",
+        "Resume locks against `approved_plan.json` exactly as staged "
+        "here: it rebuilds the plan from the current bundle and **fails "
+        "closed** if anything under `bundle/images/`, "
+        "`bundle/manifest.json`, or `bundle/generated_provenance.json` "
+        "changed. So review by READING, not editing — decide go / "
+        "no-go on the plan as it stands:",
+        "",
+        "- Do the slide titles and per-image `intended_use` reflect the "
+        "business intent?",
+        "- Does each image map to the slide you expect (the plan is in "
+        "deterministic order)?",
+        "- Does `generated_provenance.json` describe the bytes "
+        "honestly?",
+        "",
+        "If every answer is yes, resume below. If not, the plan is "
+        "wrong — **discard and re-stage** (see *Start over*); do NOT "
+        "edit the staged files, because that makes resume fail closed "
+        "rather than rebuild the plan. This wrapper plans from default "
+        "templates; to hand-author custom per-image titles / intent / "
+        "provenance, drive the lower-level "
+        "`scripts/operator_local_images_to_editable_ppt.py` helper "
+        "(its `--manifest` flag and `generated_provenance.json` sidecar "
+        "are inputs to the plan it writes) instead.",
+        "",
+        "## Resume — build the review package",
+        "",
+        "When the plan reads correctly, run the resume step. Running "
+        "`--resume` is your explicit sign-off that the plan is "
+        "approved (it re-runs the helper's approved-plan run lock "
+        "against the current bundle and fails closed on any drift — "
+        "see the read-only note above):",
+        "",
+        "```",
+        "python3 scripts/operator_images_to_review_package.py \\",
+        "    --resume \\",
+        f"    --out-dir {out_dir_q}",
+        "```",
+        "",
+        "## Start over",
+        "",
+        "To abandon this staged plan and re-stage from the source "
+        "folder:",
+        "",
+        "```",
+        f"rm -rf {out_dir_q}",
+        "python3 scripts/operator_images_to_review_package.py \\",
+        "    --plan \\",
+        f"    --images-dir {images_q} \\",
+        f"    --out-dir {out_dir_q}",
+        "```",
+        "",
+        "## Boundary statement",
+        "",
+        "Local-only. Does NOT call D-One, MCP, Qoder, a public network, "
+        "telemetry, a model API, an image search, or any external "
+        "service. Real D-One image generation remains UNVERIFIED. NOT a "
+        "prompt / report / Markdown-to-PPTX automation.",
+        "",
+    ])
+
+
+def _render_resume_readme(
+    *, paths: _WorkflowPaths, validator_rc: int,
+) -> str:
+    """Render the resume-step final top-level README. Overwrites the
+    plan-step checkpoint guide. Carries the EXACT read-only re-check
+    argv (``sys.executable`` + absolute ``VALIDATOR_PATH``), each path
+    ``shlex.quote``d so it survives copy-paste."""
+    rp = paths.review_package.name
+    python_q = shlex.quote(sys.executable)
+    validator_q = shlex.quote(str(VALIDATOR_PATH))
+    review_package_q = shlex.quote(str(paths.review_package))
+    out_dir_q = shlex.quote(str(paths.out_dir))
+    return "\n".join([
+        "# operator_images_to_review_package — review package (resumed)",
+        "",
+        "Built by the **resume step** of the two-step reviewed "
+        "workflow. A human reviewed the staged plan "
+        "(`approved_plan.json`) and ran `--resume`, which built this "
+        "review package under the helper's approved-plan run lock — the "
+        "same validators and evidence as one-command mode, with a real "
+        "human-review checkpoint in front of it.",
+        "",
+        "## What to open first",
+        "",
+        f"1. `{rp}/README.md` — helper-written review-package README. "
+        "Names every produced artifact and the approved-plan lock "
+        "evidence.",
+        f"2. `{rp}/deck.pptx` — the produced editable PPTX. Native "
+        "PowerPoint shapes; one slide per source image.",
+        f"3. `{rp}/summary.json` — compact summary. The "
+        "`approved_plan.matched=true` block confirms the run lock; the "
+        "`generated_provenance` block surfaces the reviewed sidecar.",
+        f"4. `{rp}/inventory.json` and `{rp}/visual_quality.json` — "
+        "helper-validated readbacks.",
+        "",
+        "## Re-validate on disk",
+        "",
+        "The read-only stdlib re-check that ran inside resume "
+        f"(returned rc={validator_rc}) is safe to re-run any time; it "
+        "does not mutate the package:",
+        "",
+        "```",
+        f"{python_q} {validator_q} \\",
+        f"    --out-dir {review_package_q}",
+        "```",
+        "",
+        "## Boundary statement",
+        "",
+        "Local-only. Does NOT call D-One, MCP, Qoder, a public network, "
+        "telemetry, a model API, an image search, or any external "
+        "service. Real D-One image generation remains UNVERIFIED. NOT a "
+        "prompt / report / Markdown-to-PPTX automation.",
         "",
         "## Cleaning up",
         "",
@@ -2088,6 +2567,383 @@ def _run_self_tests() -> int:
             ok=ok, detail=detail,
         ))
 
+    # ----------------------------------------------------------------
+    # Two-step reviewed flow (--plan then --resume). T15..T20 pin the
+    # human-review checkpoint: plan stages a reviewable plan and builds
+    # nothing; resume builds the same review package as one-command
+    # mode for a valid reviewed plan but fails closed on mutated source
+    # bytes, missing / mismatched generated provenance, path traversal,
+    # and symlink inputs.
+    # ----------------------------------------------------------------
+
+    # T15 — plan mode stages the bundle + manifest + generated-
+    # provenance templates + reviewable approved_plan.json + a top-level
+    # README, but STOPS before building anything: no review_package/ and
+    # no *.pptx anywhere under out_dir.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T15-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        out_dir = td / "workflow_out"
+        _write_synthetic_images(images_dir)
+        rc = main(["--plan",
+                   "--images-dir", str(images_dir),
+                   "--out-dir", str(out_dir)])
+        ok = rc == 0
+        detail = "" if ok else f"main(--plan ...) rc={rc}"
+        if ok:
+            for want in ("bundle/images", "bundle/manifest.json",
+                         "bundle/generated_provenance.json",
+                         "approved_plan.json", "README.md"):
+                if not (out_dir / want).exists():
+                    ok, detail = False, f"plan mode missing {want}"
+                    break
+        if ok:
+            rp = out_dir / "review_package"
+            if rp.exists():
+                ok, detail = False, (
+                    f"plan mode produced review_package: {rp} (it must "
+                    f"stop before the build)"
+                )
+        if ok:
+            decks = sorted(str(p) for p in out_dir.rglob("*.pptx"))
+            if decks:
+                ok, detail = False, (
+                    f"plan mode produced PPTX output: {decks!r} (it must "
+                    f"stop before the build)"
+                )
+        if ok:
+            try:
+                readme_text = (out_dir / "README.md").read_text(
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                ok, detail = False, (
+                    f"plan README unreadable: {type(exc).__name__}: {exc}"
+                )
+            else:
+                # The plan README must point the operator at the resume
+                # command so the checkpoint is actionable, AND must tell
+                # reviewers the staged files are read-only (editing them
+                # makes resume fail closed). The "do NOT edit" marker
+                # pins the fix for the Codex-caught contradiction where
+                # an earlier draft invited reviewers to hand-edit
+                # bundle/manifest.json + bundle/generated_provenance.json
+                # "before resuming" — edits resume actually rejects.
+                for marker in ("--resume", "review me", "do NOT edit"):
+                    if marker not in readme_text:
+                        ok, detail = False, (
+                            f"plan README missing marker {marker!r}"
+                        )
+                        break
+        results.append(_ProbeResult(
+            name=(
+                "T15 plan mode stages the reviewable plan and emits no "
+                "PPTX / review_package"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T16 — resume mode builds the review package from a valid reviewed
+    # plan, with the SAME canonical artifacts + approved-plan evidence
+    # one-command mode produces.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T16-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        out_dir = td / "workflow_out"
+        _write_synthetic_images(images_dir)
+        plan_rc = main(["--plan",
+                        "--images-dir", str(images_dir),
+                        "--out-dir", str(out_dir)])
+        rc = (main(["--resume", "--out-dir", str(out_dir)])
+              if plan_rc == 0 else 99)
+        ok = plan_rc == 0 and rc == 0
+        detail = "" if ok else f"plan_rc={plan_rc}; resume_rc={rc}"
+        if ok:
+            review_package = out_dir / "review_package"
+            for name in _REVIEW_PACKAGE_FILES:
+                if (not (review_package / name).is_file()
+                        or (review_package / name).is_symlink()):
+                    ok, detail = False, (
+                        f"missing review-package file: "
+                        f"{review_package / name}"
+                    )
+                    break
+            if ok:
+                for name in _REVIEW_PACKAGE_DIRS:
+                    if not (review_package / name).is_dir():
+                        ok, detail = False, (
+                            f"missing review-package dir: "
+                            f"{review_package / name}"
+                        )
+                        break
+            if ok:
+                try:
+                    summary = json.loads(
+                        (review_package / "summary.json").read_text(
+                            encoding="utf-8",
+                        )
+                    )
+                except (OSError, ValueError) as exc:
+                    ok, detail = False, (
+                        f"summary.json unparseable: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    ap = summary.get("approved_plan")
+                    if (not isinstance(ap, dict)
+                            or ap.get("matched") is not True):
+                        ok, detail = False, (
+                            f"summary.approved_plan.matched is not True "
+                            f"(approved_plan={ap!r})"
+                        )
+            if ok:
+                try:
+                    readme_text = (out_dir / "README.md").read_text(
+                        encoding="utf-8",
+                    )
+                except OSError as exc:
+                    ok, detail = False, (
+                        f"resume README unreadable: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    # The resume README must record that a human review
+                    # checkpoint preceded the build.
+                    if "resumed" not in readme_text:
+                        ok, detail = False, (
+                            "resume README missing 'resumed' marker"
+                        )
+        results.append(_ProbeResult(
+            name=(
+                "T16 resume mode builds the review package from a valid "
+                "reviewed plan"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T17 — resume refuses MUTATED SOURCE BYTES. Editing a bundle image
+    # after plan-out (PNG signature intact so the helper's IG8 gate
+    # still passes, but the sha256 changes) makes the rebuilt plan
+    # differ from approved_plan.json, so the helper's approved-plan run
+    # lock fails closed BEFORE any review-package artifact is created.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T17-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        out_dir = td / "workflow_out"
+        _write_synthetic_images(images_dir)
+        plan_rc = main(["--plan",
+                        "--images-dir", str(images_dir),
+                        "--out-dir", str(out_dir)])
+        ok, detail = True, ""
+        if plan_rc != 0:
+            ok, detail = False, f"plan setup rc={plan_rc}"
+        else:
+            pngs = sorted(
+                (out_dir / "bundle" / "images").glob("*.png")
+            )
+            if not pngs:
+                ok, detail = False, "no staged .png to mutate"
+            else:
+                # Append a byte: PNG magic-byte prefix is unchanged so
+                # IG8 still passes; the sha256 drifts from the plan.
+                pngs[0].write_bytes(pngs[0].read_bytes() + b"\x00")
+        if ok:
+            rc = main(["--resume", "--out-dir", str(out_dir)])
+            rp = out_dir / "review_package"
+            if rc == 0:
+                ok, detail = False, (
+                    f"resume did NOT refuse mutated source bytes "
+                    f"(rc=0); review_package_exists={rp.exists()}"
+                )
+            elif rp.exists():
+                ok, detail = False, (
+                    f"resume refused (rc={rc}) but review_package was "
+                    f"materialised anyway: {rp}"
+                )
+        results.append(_ProbeResult(
+            name="T17 resume refuses mutated source bytes",
+            ok=ok, detail=detail,
+        ))
+
+    # T18 — resume refuses MISSING / MISMATCHED generated provenance.
+    # Both perturbations drift the rebuilt plan from approved_plan.json,
+    # so the approved-plan run lock fails closed with no review package.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T18-") as raw_td:
+        td = Path(raw_td)
+        ok, detail = True, ""
+        for label, perturb in (
+            ("missing", "delete"),
+            ("mismatched", "edit"),
+        ):
+            case_td = td / label
+            case_td.mkdir()
+            images_dir = case_td / "operator_images"
+            out_dir = case_td / "workflow_out"
+            _write_synthetic_images(images_dir)
+            plan_rc = main(["--plan",
+                            "--images-dir", str(images_dir),
+                            "--out-dir", str(out_dir)])
+            if plan_rc != 0:
+                ok, detail = False, f"{label}: plan setup rc={plan_rc}"
+                break
+            gp = out_dir / "bundle" / "generated_provenance.json"
+            if perturb == "delete":
+                gp.unlink()
+            else:
+                try:
+                    data = json.loads(gp.read_text(encoding="utf-8"))
+                    data["entries"][0]["intent_summary"] = (
+                        "drifted-by-T18-must-fail-resume"
+                    )
+                    gp.write_text(
+                        json.dumps(data, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                except (OSError, ValueError, KeyError, IndexError) as exc:
+                    ok, detail = False, (
+                        f"{label}: could not perturb sidecar: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    break
+            rc = main(["--resume", "--out-dir", str(out_dir)])
+            rp = out_dir / "review_package"
+            if rc == 0:
+                ok, detail = False, (
+                    f"{label}: resume did NOT refuse (rc=0); "
+                    f"review_package_exists={rp.exists()}"
+                )
+                break
+            if rp.exists():
+                ok, detail = False, (
+                    f"{label}: resume refused (rc={rc}) but "
+                    f"review_package was materialised anyway: {rp}"
+                )
+                break
+        results.append(_ProbeResult(
+            name=(
+                "T18 resume refuses missing / mismatched generated "
+                "provenance"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T19 — resume refuses PATH TRAVERSAL --out-dir (URI-shaped and a
+    # path that anchors under REPO_ROOT) at the gate, returning rc 2
+    # with no filesystem mutation.
+    repo_anchored = REPO_ROOT / "o2rp_T19_leak_nonexistent"
+    ok, detail = True, ""
+    uri_rc = main(["--resume", "--out-dir", "file:///tmp/o2rp-T19"])
+    if uri_rc != 2:
+        ok, detail = False, f"URI-shaped --out-dir rc={uri_rc} (expected 2)"
+    if ok:
+        anchored_rc = main(["--resume", "--out-dir", str(repo_anchored)])
+        if anchored_rc != 2:
+            ok, detail = False, (
+                f"repo-anchored --out-dir rc={anchored_rc} (expected 2)"
+            )
+        elif repo_anchored.exists():
+            ok, detail = False, (
+                f"repo-anchored --out-dir was created under REPO_ROOT: "
+                f"{repo_anchored}"
+            )
+    results.append(_ProbeResult(
+        name=(
+            "T19 resume refuses path-traversal --out-dir (URI + "
+            "under-REPO_ROOT)"
+        ),
+        ok=ok, detail=detail,
+    ))
+
+    # T20 — resume refuses SYMLINK INPUTS: an --out-dir that is itself a
+    # symlink, an --out-dir with a symlink ancestor, and a staged plan
+    # whose approved_plan.json was swapped for a symlink. Each returns
+    # rc 2 (or fails closed with no review package) so a symlink target
+    # cannot redirect what bytes the review package is built from.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T20-") as raw_td:
+        td = Path(raw_td)
+        ok, detail = True, ""
+
+        # (a) --out-dir is itself a symlink to a valid plan dir.
+        real_a = td / "real_a"
+        images_a = td / "images_a"
+        _write_synthetic_images(images_a)
+        if main(["--plan", "--images-dir", str(images_a),
+                 "--out-dir", str(real_a)]) != 0:
+            ok, detail = False, "(a) plan setup failed"
+        if ok:
+            link_a = td / "link_a"
+            link_a.symlink_to(real_a, target_is_directory=True)
+            rc_a = main(["--resume", "--out-dir", str(link_a)])
+            if rc_a != 2:
+                ok, detail = False, (
+                    f"(a) symlink --out-dir rc={rc_a} (expected 2)"
+                )
+            elif (real_a / "review_package").exists():
+                ok, detail = False, (
+                    "(a) review_package built through symlink --out-dir"
+                )
+
+        # (b) --out-dir has a symlink ANCESTOR.
+        if ok:
+            real_parent = td / "real_parent"
+            real_parent.mkdir()
+            images_b = td / "images_b"
+            _write_synthetic_images(images_b)
+            out_b = real_parent / "out_b"
+            if main(["--plan", "--images-dir", str(images_b),
+                     "--out-dir", str(out_b)]) != 0:
+                ok, detail = False, "(b) plan setup failed"
+            if ok:
+                link_parent = td / "link_parent"
+                link_parent.symlink_to(
+                    real_parent, target_is_directory=True,
+                )
+                rc_b = main([
+                    "--resume", "--out-dir", str(link_parent / "out_b"),
+                ])
+                if rc_b != 2:
+                    ok, detail = False, (
+                        f"(b) symlink-ancestor --out-dir rc={rc_b} "
+                        f"(expected 2)"
+                    )
+                elif (out_b / "review_package").exists():
+                    ok, detail = False, (
+                        "(b) review_package built through symlink "
+                        "ancestor"
+                    )
+
+        # (c) approved_plan.json swapped for a symlink in a real plan.
+        if ok:
+            real_c = td / "real_c"
+            images_c = td / "images_c"
+            _write_synthetic_images(images_c)
+            if main(["--plan", "--images-dir", str(images_c),
+                     "--out-dir", str(real_c)]) != 0:
+                ok, detail = False, "(c) plan setup failed"
+            if ok:
+                plan_file = real_c / "approved_plan.json"
+                real_plan = real_c / "real_plan.json"
+                plan_file.replace(real_plan)
+                plan_file.symlink_to(real_plan)
+                rc_c = main(["--resume", "--out-dir", str(real_c)])
+                if rc_c != 2:
+                    ok, detail = False, (
+                        f"(c) symlinked approved_plan.json rc={rc_c} "
+                        f"(expected 2)"
+                    )
+                elif (real_c / "review_package").exists():
+                    ok, detail = False, (
+                        "(c) review_package built with symlinked "
+                        "approved_plan.json"
+                    )
+        results.append(_ProbeResult(
+            name=(
+                "T20 resume refuses symlink inputs (--out-dir symlink / "
+                "symlink ancestor / symlinked approved_plan.json)"
+            ),
+            ok=ok, detail=detail,
+        ))
+
     repo_rc = _check_repo_unchanged(
         examples_before=examples_before,
         scripts_before=scripts_before,
@@ -2130,7 +2986,12 @@ def main(argv: list[str]) -> int:
             "drives the helper through the plan-out + approved-plan + "
             "review-package + on-disk re-check loop, and writes a "
             "concise top-level README carrying the EXACT manual "
-            "commands run. Local-only — does NOT call D-One, MCP, "
+            "commands run. The same lane can split at a human-review "
+            "checkpoint: --plan stages the bundle + reviewable plan and "
+            "stops; a human inspects approved_plan.json; --resume builds "
+            "the review package from the reviewed plan with the same "
+            "validators and evidence. Local-only — does NOT call D-One, "
+            "MCP, "
             "Qoder, a public network, telemetry, a model API, an "
             "image search, or any external service. NOT a full "
             "prompt / report / Markdown-to-PPTX automation."
@@ -2161,14 +3022,44 @@ def main(argv: list[str]) -> int:
             "generated_provenance.json), approved_plan.json, "
             "review_package/ (deck.pptx, summary.json, inventory.json, "
             "visual_quality.json, workspace/, reports/, README.md), "
-            "and a top-level README.md under this directory."
+            "and a top-level README.md under this directory. In "
+            "--resume mode --out-dir instead points at a directory a "
+            "prior --plan run already staged."
+        ),
+    )
+    parser.add_argument(
+        "--plan", action="store_true",
+        help=(
+            "Plan step of the two-step reviewed flow. Stage the bundle "
+            "(copy --images-dir into <out-dir>/bundle/images/), write "
+            "the manifest + generated-provenance templates and the "
+            "reviewable approved_plan.json, then STOP — no deck.pptx / "
+            "review_package/ is built. A human reviews approved_plan."
+            "json and runs --resume to continue. Requires --images-dir "
+            "+ a fresh --out-dir; mutually exclusive with --resume / "
+            "--self-test."
+        ),
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help=(
+            "Resume step of the two-step reviewed flow. Build the "
+            "review package from the operator-reviewed approved_plan."
+            "json a prior --plan run staged under --out-dir, using the "
+            "same approved-plan run lock, validators, and evidence as "
+            "one-command mode. Running --resume is the operator's "
+            "explicit sign-off that the plan was reviewed. Takes "
+            "--out-dir only (the bundle + plan are already staged); "
+            "--images-dir is refused. Fails closed if the bundle has "
+            "drifted from the approved plan. Mutually exclusive with "
+            "--plan / --self-test."
         ),
     )
     parser.add_argument(
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios under TMPDIR "
-            "(no writes under REPO_ROOT). Fourteen probes: T1 full "
+            "(no writes under REPO_ROOT). Twenty probes: T1 full "
             "happy path from synthetic --images-dir through to a "
             "validated review package + locked README markers; T2 "
             "drift (mutating generated_provenance.json after plan-"
@@ -2218,22 +3109,97 @@ def main(argv: list[str]) -> int:
             "helper's IG8 signature check) emits a recovery NOTE "
             "naming --out-dir + an `rm -rf` retry path so the operator "
             "is not blindsided by the shared --out-dir gate's "
-            "non-empty refusal on re-run. Mutually exclusive with "
-            "--images-dir / --out-dir."
+            "non-empty refusal on re-run; T15 --plan stages the "
+            "reviewable plan + templates and emits NO PPTX / "
+            "review_package (it stops at the human-review checkpoint); "
+            "T16 --resume builds the same canonical review package + "
+            "approved-plan evidence as one-command mode from a valid "
+            "reviewed plan; T17 --resume refuses mutated source bytes "
+            "(a bundle image edited after plan-out drifts the rebuilt "
+            "plan and the approved-plan run lock fails closed before any "
+            "artifact); T18 --resume refuses missing / mismatched "
+            "generated provenance (deleting or editing "
+            "generated_provenance.json after plan-out drifts the plan); "
+            "T19 --resume refuses a path-traversal --out-dir (URI-shaped "
+            "and under-REPO_ROOT) at the gate with rc 2 and no "
+            "filesystem mutation; T20 --resume refuses symlink inputs "
+            "(an --out-dir that is a symlink, one with a symlink "
+            "ancestor, and a staged approved_plan.json swapped for a "
+            "symlink). Mutually exclusive with --images-dir / --out-dir "
+            "/ --plan / --resume."
         ),
     )
     args = parser.parse_args(argv)
 
     if args.self_test:
-        if args.images_dir is not None or args.out_dir is not None:
+        if (args.images_dir is not None or args.out_dir is not None
+                or args.plan or args.resume):
             print(
                 "FAIL: --self-test is mutually exclusive with "
-                "--images-dir / --out-dir.",
+                "--images-dir / --out-dir / --plan / --resume.",
                 file=sys.stderr,
             )
             return 2
         return _run_self_tests()
 
+    if args.plan and args.resume:
+        print(
+            "FAIL: --plan and --resume are mutually exclusive; --plan "
+            "stages the reviewable plan and stops, --resume builds the "
+            "review package from an already-reviewed plan.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Resume mode: build the review package from an already-staged,
+    # operator-reviewed plan. Takes --out-dir only — the bundle + plan
+    # were staged by a prior --plan run, and --images-dir is refused so
+    # the source of record is unambiguously the staged bundle.
+    if args.resume:
+        if args.images_dir is not None:
+            print(
+                "FAIL: --resume rebuilds from the staged bundle; do not "
+                "pass --images-dir. Pass only --out-dir pointing at a "
+                "directory a prior --plan run staged.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.out_dir is None:
+            print(
+                "FAIL: --resume requires --out-dir (the directory a "
+                "prior --plan run staged).",
+                file=sys.stderr,
+            )
+            return 2
+        out_dir, out_failures = _validate_resume_out_dir_arg(args.out_dir)
+        if out_failures or out_dir is None:
+            for line in out_failures:
+                print(f"FAIL: {line}", file=sys.stderr)
+            return 2
+        try:
+            out_dir = out_dir.resolve(strict=False)
+        except OSError as exc:
+            print(
+                f"FAIL: could not resolve --out-dir to an absolute "
+                f"path: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        # Same belt-and-braces case-fold REPO_ROOT refusal the fresh
+        # gate applies — the raw-string relative_to check in
+        # _validate_resume_out_dir_arg misses case-variant paths on a
+        # case-insensitive filesystem (macOS APFS / Windows NTFS).
+        if _resolves_under_casefold(out_dir, REPO_ROOT):
+            print(
+                f"FAIL: --out-dir {out_dir} resolves under REPO_ROOT "
+                f"{REPO_ROOT} after case-folding; refused.",
+                file=sys.stderr,
+            )
+            return 2
+        return _run_resume_mode(out_dir=out_dir)
+
+    # Plan mode and one-command mode both stage from --images-dir into a
+    # fresh --out-dir, so they share the full argument gate below.
     if args.images_dir is None or args.out_dir is None:
         print(
             "FAIL: --images-dir and --out-dir are both required "
@@ -2353,7 +3319,10 @@ def main(argv: list[str]) -> int:
             )
             return 1
 
-    rc = _run_workflow(images_dir=images_dir, out_dir=out_dir)
+    if args.plan:
+        rc = _run_plan_mode(images_dir=images_dir, out_dir=out_dir)
+    else:
+        rc = _run_workflow(images_dir=images_dir, out_dir=out_dir)
     if rc != 0:
         _print_torn_run_recovery_hint(out_dir)
     return rc
