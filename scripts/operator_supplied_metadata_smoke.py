@@ -45,6 +45,18 @@ end-to-end gate:
        ``validate_operator_review_package.py`` and asserted with the same
        keyed checks as S1.
 
+  S3 — TEMPLATES-ONLY ROUND-TRIP: run ``--templates-only`` to GENERATE
+       the two editable starter files (asserting it writes EXACTLY
+       ``manifest.json`` + ``generated_provenance.json`` and nothing
+       else), programmatically EDIT their safe custom fields in place,
+       then feed the EDITED templates through ``--plan`` (still no
+       ``review_package`` yet) and ``--resume`` (re-validated package),
+       asserting the edited values surface in ``approved_plan.json`` +
+       ``review_package/summary.json``. Unlike S1 / S2 — which hand-author
+       the reviewed metadata — S3 proves the helper's OWN
+       ``--templates-only`` output is editable and consumable end-to-end
+       (the metadata-authoring shortcut closes the loop with the build).
+
 The two custom titles / intents / provenance value sets are deliberately
 DISTINCT from the helper's generated defaults, so a green run proves the
 SUPPLIED metadata flowed end-to-end (not a default that happens to match).
@@ -218,6 +230,75 @@ def _write_reviewed_provenance(
     path.write_text(
         json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8",
     )
+
+
+def _edit_templates_in_place(
+    manifest: Path,
+    sidecar: Path,
+    titles: dict[str, str],
+    intents: dict[str, str],
+    provenance: dict[str, dict[str, str]],
+) -> list[str]:
+    """Overlay the DISTINCT custom fields onto the two ``--templates-only``
+    starter files IN PLACE, keyed by filename: ``slide_title`` in the
+    manifest; ``intent_summary`` + ``generator_source`` / ``placement_role``
+    / ``text_policy`` / ``subject_domain`` (+ optional ``custom_descriptor``)
+    in the sidecar. Only EXISTING keys are overwritten — plus the single
+    allowed optional ``custom_descriptor`` — so the edited files still
+    satisfy the helper's exact-key manifest / sidecar contracts. Returns
+    failure strings if either template's shape drifted from what
+    ``--templates-only`` emits, so a template-format change surfaces here
+    rather than as a confusing downstream validator error."""
+    fails: list[str] = []
+
+    try:
+        man = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [f"templates-only manifest unreadable: {exc}"]
+    man_rows = man.get("images") if isinstance(man, dict) else None
+    if not isinstance(man_rows, list):
+        return ["templates-only manifest missing images[] list"]
+    man_by_name = {
+        r.get("filename"): r for r in man_rows if isinstance(r, dict)
+    }
+    for name in titles:
+        row = man_by_name.get(name)
+        if row is None:
+            fails.append(f"templates-only manifest missing entry for {name!r}")
+            continue
+        row["slide_title"] = titles[name]
+    manifest.write_text(
+        json.dumps(man, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+
+    try:
+        gp = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return fails + [
+            f"templates-only generated_provenance unreadable: {exc}"
+        ]
+    gp_rows = gp.get("entries") if isinstance(gp, dict) else None
+    if not isinstance(gp_rows, list):
+        return fails + [
+            "templates-only generated_provenance missing entries[] list"
+        ]
+    gp_by_name = {
+        e.get("filename"): e for e in gp_rows if isinstance(e, dict)
+    }
+    for name in titles:
+        entry = gp_by_name.get(name)
+        if entry is None:
+            fails.append(
+                f"templates-only provenance missing entry for {name!r}"
+            )
+            continue
+        entry["intent_summary"] = intents[name]
+        for key, want in provenance[name].items():
+            entry[key] = want
+    sidecar.write_text(
+        json.dumps(gp, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    return fails
 
 
 # --------------------------------------------------------------------------
@@ -497,6 +578,140 @@ def _scenario_plan_then_resume() -> list[_ProbeResult]:
     return results
 
 
+def _scenario_templates_roundtrip() -> list[_ProbeResult]:
+    """S3 — full ``--templates-only`` round-trip: GENERATE the two starter
+    templates, EDIT their safe custom fields in place, then feed the EDITED
+    files through ``--plan`` / ``--resume`` and assert the package validates
+    and carries the edited values. This is the only scenario that proves the
+    helper's OWN ``--templates-only`` output (not hand-authored JSON) is
+    editable and consumable by the build workflow."""
+    results: list[_ProbeResult] = []
+    with tempfile.TemporaryDirectory(prefix="osm-templates-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "images"
+        images_dir.mkdir()
+        _write_synthetic_images(images_dir)
+        names = sorted(p.name for p in images_dir.iterdir() if p.is_file())
+        png_name = next(n for n in names if n.lower().endswith(".png"))
+        jpg_name = next(
+            n for n in names if n.lower().endswith((".jpg", ".jpeg"))
+        )
+        titles, intents, provenance = _expected_metadata(png_name, jpg_name)
+
+        # Step 1 — --templates-only writes EXACTLY the two editable starter
+        # files (manifest.json + generated_provenance.json) and nothing
+        # else: no bundle/, approved_plan.json, review_package/, or *.pptx.
+        templates_out = td / "templates_out"
+        tonly = _run(
+            "wrapper --templates-only",
+            [
+                sys.executable, str(WRAPPER_PATH), "--templates-only",
+                "--images-dir", str(images_dir),
+                "--out-dir", str(templates_out),
+            ],
+        )
+        tonly_fails: list[str] = []
+        if tonly.rc != 0:
+            tonly_fails.append(
+                f"--templates-only rc={tonly.rc}: {_tail(tonly)}"
+            )
+        else:
+            entries = sorted(p.name for p in templates_out.iterdir())
+            if entries != ["generated_provenance.json", "manifest.json"]:
+                tonly_fails.append(
+                    f"--templates-only --out-dir is not exactly the two "
+                    f"templates: {entries!r}"
+                )
+            decks = sorted(str(p) for p in templates_out.rglob("*.pptx"))
+            if decks:
+                tonly_fails.append(
+                    f"--templates-only produced PPTX output: {decks!r}"
+                )
+        results.append(_ProbeResult(
+            "S3 --templates-only writes exactly manifest.json + "
+            "generated_provenance.json",
+            not tonly_fails, "; ".join(tonly_fails) if tonly_fails else "ok",
+        ))
+        if tonly_fails:
+            return results
+
+        manifest = templates_out / "manifest.json"
+        sidecar = templates_out / "generated_provenance.json"
+
+        # Step 2 — programmatically edit the generated templates' safe
+        # custom fields in place (values DISTINCT from the templates-only
+        # defaults, so a green run proves the EDITED text flowed).
+        edit_fails = _edit_templates_in_place(
+            manifest, sidecar, titles, intents, provenance,
+        )
+        results.append(_ProbeResult(
+            "S3 edits safe custom fields in both --templates-only files",
+            not edit_fails, "; ".join(edit_fails) if edit_fails else "ok",
+        ))
+        if edit_fails:
+            return results
+
+        # Step 3 — --plan from the EDITED templates stages the bundle +
+        # reviewed plan and STOPS (no review_package yet); the staged
+        # approved_plan.json already carries the edited values.
+        out_dir = td / "reviewed_out"
+        plan = _run(
+            "wrapper --plan (edited --templates-only metadata)",
+            [
+                sys.executable, str(WRAPPER_PATH), "--plan",
+                "--images-dir", str(images_dir),
+                "--out-dir", str(out_dir),
+                "--manifest", str(manifest),
+                "--generated-provenance", str(sidecar),
+            ],
+        )
+        plan_fails: list[str] = []
+        if plan.rc != 0:
+            plan_fails.append(f"--plan rc={plan.rc}: {_tail(plan)}")
+        else:
+            if (out_dir / "review_package").exists():
+                plan_fails.append(
+                    "review_package/ leaked at --plan time (must not "
+                    "exist until --resume)"
+                )
+            plan_fails.extend(
+                _check_plan(
+                    out_dir / "approved_plan.json",
+                    titles, intents, provenance,
+                )
+            )
+        results.append(_ProbeResult(
+            "S3 --plan stages edited-template metadata into approved_plan",
+            not plan_fails, "; ".join(plan_fails) if plan_fails else "ok",
+        ))
+        if plan_fails:
+            return results
+
+        # Step 4 — --resume builds + internally validates the package; the
+        # produced review_package is re-validated read-only and the edited
+        # values asserted in approved_plan.json + summary.json.
+        resume = _run(
+            "wrapper --resume",
+            [
+                sys.executable, str(WRAPPER_PATH), "--resume",
+                "--out-dir", str(out_dir),
+            ],
+        )
+        resume_fails: list[str] = []
+        if resume.rc != 0:
+            resume_fails.append(f"--resume rc={resume.rc}: {_tail(resume)}")
+        else:
+            resume_fails.extend(
+                _revalidate_and_assert(out_dir, titles, intents, provenance)
+            )
+        results.append(_ProbeResult(
+            "S3 --resume builds re-validated edited-template package",
+            not resume_fails,
+            "; ".join(resume_fails) if resume_fails else "ok",
+        ))
+    return results
+
+
 # --------------------------------------------------------------------------
 # Committed-tree guard.
 # --------------------------------------------------------------------------
@@ -542,6 +757,7 @@ def _run_self_test() -> int:
     results: list[_ProbeResult] = []
     results.extend(_scenario_one_command())
     results.extend(_scenario_plan_then_resume())
+    results.extend(_scenario_templates_roundtrip())
 
     repo_fails = _diff_snapshot(
         "REPO_ROOT/examples", examples_before,
@@ -565,11 +781,13 @@ def _run_self_test() -> int:
             rc = 1
     if rc == 0:
         print(
-            "OK: supplied-operator-metadata flows end-to-end through both "
-            "one-command and --plan/--resume modes; both produced review "
-            "packages re-validate and carry the custom slide_title / "
-            "intent_summary / provenance fields; REPO_ROOT/examples and "
-            "REPO_ROOT/scripts are byte-identical before and after."
+            "OK: supplied-operator-metadata flows end-to-end through "
+            "one-command, --plan/--resume, AND the --templates-only "
+            "round-trip (generate templates -> edit -> --plan -> --resume); "
+            "every produced review package re-validates and carries the "
+            "custom slide_title / intent_summary / provenance fields; "
+            "REPO_ROOT/examples and REPO_ROOT/scripts are byte-identical "
+            "before and after."
         )
     else:
         print("FAIL: one or more supplied-metadata probes failed.")
@@ -581,12 +799,14 @@ def main(argv: list[str]) -> int:
         description=(
             "Tempdir-only supplied-operator-metadata acceptance smoke for "
             "the local image-folder -> editable-PPT review-package lane. "
-            "Drives scripts/operator_images_to_review_package.py with "
             "--manifest + --generated-provenance in one-command AND "
-            "--plan/--resume modes, re-validates both produced packages "
-            "with scripts/validate_operator_review_package.py, and asserts "
-            "the custom slide_title / intent_summary / provenance fields "
-            "surface in approved_plan.json and summary.json. Stdlib-only. "
+            "--plan/--resume modes, plus a --templates-only round-trip "
+            "(generate the two starter templates, edit them, feed them "
+            "back through --plan/--resume), re-validates every produced "
+            "package with scripts/validate_operator_review_package.py, and "
+            "asserts the custom slide_title / intent_summary / provenance "
+            "fields surface in approved_plan.json and summary.json. "
+            "Stdlib-only. "
             "TEMP-ONLY. LOCAL-ONLY — no D-One / MCP / Qoder / network / "
             "model API / image search / telemetry."
         ),
