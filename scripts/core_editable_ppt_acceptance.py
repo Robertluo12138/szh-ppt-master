@@ -544,6 +544,77 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     D-One; the sidecar's ``generator_source == "mock_generated"``
     records declared operator intent for the staged synthetic
     bytes, not a claim that any external generator ran.
+  - ``scripts/operator_images_to_review_package.py`` —
+    operator-facing **one-command workflow** that starts from a
+    caller-supplied folder of generated images (``--images-dir DIR``)
+    and ends with a validated editable-PPTX review package under a
+    fresh ``--out-dir`` outside the repo. Copies the operator images
+    into ``<out-dir>/bundle/images/`` (refusing symlinks /
+    subdirectories before any byte is copied, leaving the source
+    folder unmutated), then sequences the existing
+    ``scripts/operator_local_images_to_editable_ppt.py`` through
+    ``--write-manifest-template`` →
+    ``--write-generated-provenance-template`` → ``--plan-out`` →
+    ``--approved-plan --out-dir`` and finally
+    ``scripts/validate_operator_review_package.py --out-dir``, then
+    writes a concise top-level README carrying the EXACT manual
+    commands run so the workflow is inspectable and repeatable.
+    ``Auto-approval limit``: the wrapper drives Stage 4 with the
+    same ``approved_plan.json`` Stage 3 just wrote, so the
+    ``--approved-plan`` gate only catches drift between the two
+    stages — it is NOT a substitute for human review of the plan
+    itself. The produced ``README.md`` carries an explicit
+    ``## Auto-approval`` section spelling out the limit. The
+    aggregate invokes ``--self-test``, which runs twelve probes
+    inside per-run tempdirs (no writes under ``REPO_ROOT``): T1 the
+    full
+    happy path on the helper's own synthetic PNG + JPEG fixtures plus
+    the locked README markers; T2 the drift probe (mutating
+    ``generated_provenance.json`` AFTER ``--plan-out`` must fail the
+    ``--approved-plan`` run BEFORE any canonical review-package
+    artifact in ``_REVIEW_PACKAGE_FILES`` / ``_REVIEW_PACKAGE_DIRS``
+    is produced); T3 the copy-stage bounds (per-file
+    ``MAX_BYTES_PER_FILE`` cap + ``MAX_IMAGES`` count cap refuse
+    oversized / over-count inputs BEFORE any byte is copied); T4 the
+    shell-safe README quoting (the workflow runs under a path
+    carrying whitespace + an apostrophe, then re-parses the rendered
+    Stage-4 command via ``shlex.split`` to prove every embedded path
+    survives copy-paste as a single argv token); T5 the copy-stage
+    filesystem error path (a pre-existing ``bundle_images`` makes
+    ``_copy_images_into_bundle`` return a tagged failure list rather
+    than raising an uncaught traceback); T6 the non-image extension
+    refusal (a stray ``.txt`` file alongside valid PNG + JPEG inputs
+    refuses BEFORE any byte is copied via the wrapper's IG5-parallel
+    ``{png, jpg, jpeg}`` filter); T7 the race-safe copy
+    (``_copy_one_image_race_safe`` opens the source with
+    ``O_NOFOLLOW`` so a TOCTOU swap into a symlink between the
+    pre-flight ``is_symlink`` check and the copy still fails closed
+    at open time); T8 the regular-file fstat check
+    (``stat.S_ISREG`` on the opened fd refuses a FIFO / device /
+    socket — ``O_NOFOLLOW`` alone only blocks symlinks, so without
+    the regular-file check a FIFO at the source path would open
+    successfully and block ``copyfileobj``; ``O_NONBLOCK`` keeps the
+    open itself from hanging on the FIFO); T9 the bounded copy
+    (``_copy_bounded`` caps total bytes read INSIDE the copy loop,
+    so a concurrent appender that pushes the source past the
+    ``MAX_BYTES_PER_FILE`` cap after the fstat-at-open check still
+    fails closed); T10 the case-fold ancestor check (refuses a
+    case-variant ``--out-dir`` that resolves under REPO_ROOT on a
+    case-insensitive filesystem — macOS APFS / Windows NTFS in
+    their default modes — where the helper's raw-string
+    ``relative_to`` check would otherwise miss the bypass); T11
+    the relative-path resolution (a relative ``--images-dir`` /
+    ``--out-dir`` from a non-REPO_ROOT cwd still drives the helper
+    correctly because main() resolves both args to absolute paths
+    BEFORE any subprocess fires); T12 the cross-containment
+    case-fold gate (parallel to T10: a case-variant ``--out-dir``
+    under ``--images-dir`` is refused on case-insensitive
+    filesystems).
+    Reuses the helper's own
+    ``_validate_out_dir_arg`` / ``_write_synthetic_images`` /
+    ``_EXPLICIT_BOUNDARIES`` / ``MAX_IMAGES`` and
+    ``_forbidden_symlink_ancestor`` — no new schema, no new
+    validator, no new runtime contract. LOCAL-ONLY — no real D-One.
   - ``scripts/validate_operator_review_package.py`` — read-only
     stdlib validator for the review package produced by
     ``scripts/operator_local_images_to_editable_ppt.py`` (the
@@ -640,6 +711,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "core_image_to_editable_ppt_demo.py",
     SCRIPTS_DIR / "operator_local_images_to_editable_ppt.py",
     SCRIPTS_DIR / "operator_local_images_trial.py",
+    SCRIPTS_DIR / "operator_images_to_review_package.py",
     SCRIPTS_DIR / "validate_operator_review_package.py",
     SCRIPTS_DIR / "mock_generated_images_to_editable_ppt_smoke.py",
     SCRIPTS_DIR / "generated_images_to_editable_ppt_trial.py",
@@ -884,6 +956,7 @@ def main(argv: list[str]) -> int:
             "core_image_to_editable_ppt_demo + "
             "operator_local_images_to_editable_ppt + "
             "operator_local_images_trial + "
+            "operator_images_to_review_package + "
             "validate_operator_review_package + "
             "mock_generated_images_to_editable_ppt_smoke + "
             "generated_images_to_editable_ppt_trial + "
