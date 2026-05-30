@@ -50,7 +50,8 @@ Gates (all fail-closed; any finding makes the run exit non-zero):
     / ``.env`` / ``.env.*`` (credential file shapes); any path component
     in the generated-workspace allow-list ``dist`` / ``build`` / ``out``
     / ``output`` / ``previews`` / ``renders`` / ``exports`` / ``projects``;
-    ``.git`` / ``.claude`` (tooling / harness state).
+    ``.git`` / ``.claude`` / ``.ai`` / ``.codex`` / ``.superset``
+    (tooling / harness / local-agent metadata state).
 
   G2 ``doc_referenced_scripts_exist``:
     Every ``scripts/<name>.py`` reference appearing in ``SKILL.md`` /
@@ -158,7 +159,7 @@ FORBIDDEN_PATH_COMPONENTS: frozenset[str] = frozenset({
     "__pycache__",
     "dist", "build", "out", "output",
     "previews", "renders", "exports", "projects",
-    ".git", ".claude",
+    ".git", ".claude", ".ai", ".codex", ".superset",
 })
 
 # ----------------------------------------------------------------------

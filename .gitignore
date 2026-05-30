@@ -52,6 +52,11 @@ node_modules/
 # Claude Code worktrees and local agent metadata
 .claude/
 
+# Local AI / workspace metadata
+.ai/
+.codex/
+.superset/
+
 # Logs and temp
 *.log
 *.tmp

@@ -1,10 +1,9 @@
 # Agent Operating Context
 
-A durable orientation note for any agent — Claude Code, Codex, or a Superset
-workspace — picking up work in `szh-ppt-master`. Read it before planning or
-implementing so project direction does not depend on chat history. It
-complements, and does not replace, `CLAUDE.md` (Claude implementation rules),
-`AGENTS.md` (Codex steering), and `SECURITY.md`.
+A durable orientation note for any agent picking up work in `szh-ppt-master`.
+Read it before planning or implementing so project direction does not depend on
+chat history. It complements, and does not replace, `CLAUDE.md` (Claude
+implementation rules), `AGENTS.md` (Codex steering), and `SECURITY.md`.
 
 ## North Star
 
@@ -70,15 +69,3 @@ templates, docs, examples, or assets. Borrow at most high-level **idea
 categories**, and only ones relevant to image generation or image-asset
 handling for the current lane. See `references/upstream-ppt-master-radar.md` and
 `references/clean-room-policy.md`.
-
-## Superset Workflow
-
-- **One workspace per task.** Each task runs in its own Superset workspace so
-  diffs stay isolated.
-- **Claude implements.** Claude Code makes the change narrowly against the task
-  prompt and `CLAUDE.md`.
-- **Codex reviews the same workspace diff.** Codex reviews the exact diff
-  produced in that workspace using `AGENTS.md`.
-- **Tests before commit/push.** Run the relevant verification — the narrowest
-  real checks covering the changed surface — and confirm it is green before any
-  commit or push.
