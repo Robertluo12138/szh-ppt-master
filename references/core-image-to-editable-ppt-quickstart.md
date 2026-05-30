@@ -371,6 +371,77 @@ The trial's `--self-test` is wired into `scripts/core_editable_ppt_acceptance.py
 
 When an operator already has a folder of generated images on disk, `scripts/operator_images_to_review_package.py` is the one-command entrypoint that sequences the existing helper end to end: it copies the images into `<out-dir>/bundle/images/` (refusing symlinks / subdirectories / non-image files before any byte is copied, so the source folder is never mutated), writes the `manifest.json` + `generated_provenance.json` templates and the reviewable `approved_plan.json`, builds the `review_package/` under the helper's approved-plan run lock, runs the read-only `scripts/validate_operator_review_package.py` re-check, and writes a top-level `README.md` carrying the exact commands it ran.
 
+### Try it now (zero-substitution pilot)
+
+No images of your own? Stage a throwaway one-image folder from a committed
+synthetic PNG and run the entrypoint end to end — copy-paste, no path edits. Use
+a filename whose stem starts with a lowercase letter and uses only `[a-z0-9_]`
+(e.g. `cover.png`); a leading-digit stem like `01_cover.png` passes intake but
+fails downstream on the render-model `image_ref` pattern. Everything below writes
+only under fresh `mktemp -d` dirs outside the repo.
+
+```bash
+# Stage a throwaway image folder from a committed synthetic PNG.
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/szh-folder-pilot-XXXX")
+mkdir "$RUN_DIR/images"
+cp examples/synthetic_8_page_product_brief/assets/synthetic_marker.png \
+   "$RUN_DIR/images/cover.png"
+
+# (1) One-command mode: stage + build + re-validate.
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_images_to_review_package.py \
+  --images-dir "$RUN_DIR/images" --out-dir "$RUN_DIR/out"
+```
+
+Inspect the outputs — `approved_plan.json` sits at the top level, the rest under
+`review_package/`:
+
+- `"$RUN_DIR/out/approved_plan.json"` — the reviewable plan.
+- `"$RUN_DIR/out/review_package/deck.pptx"` — the editable deck.
+- `"$RUN_DIR/out/review_package/summary.json"` — slide / embedded-media evidence.
+- `"$RUN_DIR/out/review_package/inventory.json"` — relationship readback.
+- `"$RUN_DIR/out/review_package/visual_quality.json"` — per-slide quality report.
+
+```bash
+# (2) Two-step reviewed mode (human checkpoint) on the same staged folder.
+REV=$(mktemp -d "${TMPDIR:-/tmp}/szh-folder-review-XXXX")
+# --plan stages bundle/ + approved_plan.json, then STOPS (no deck.pptx yet).
+python3 scripts/operator_images_to_review_package.py --plan \
+  --images-dir "$RUN_DIR/images" --out-dir "$REV/out"
+# Inspect "$REV/out/approved_plan.json", then build from the reviewed plan:
+python3 scripts/operator_images_to_review_package.py --resume \
+  --out-dir "$REV/out"
+```
+
+```bash
+# (3) Optional reviewed metadata: --manifest / --generated-provenance replace
+#     the default templates (one-command or --plan; refused with --resume). The
+#     filename set must equal the staged images.
+META=$(mktemp -d "${TMPDIR:-/tmp}/szh-folder-meta-XXXX")
+cat >"$META/manifest.json" <<'JSON'
+{ "schema_version": "1",
+  "images": [ { "filename": "cover.png", "slide_title": "Cover",
+                "alt_text": "Synthetic cover marker",
+                "intended_use": "spot illustration" } ] }
+JSON
+cat >"$META/generated_provenance.json" <<'JSON'
+{ "schema_version": "1",
+  "entries": [ { "filename": "cover.png",
+                 "generator_source": "operator_declared_generated",
+                 "intent_summary": "Synthetic cover accent for the pilot deck",
+                 "placement_role": "hero_page", "text_policy": "no_text",
+                 "subject_domain": "abstract_marker" } ] }
+JSON
+python3 scripts/operator_images_to_review_package.py \
+  --images-dir "$RUN_DIR/images" --out-dir "$META/out" \
+  --manifest "$META/manifest.json" \
+  --generated-provenance "$META/generated_provenance.json"
+```
+
+The subsections below document each mode in full; the pilot above is the fastest
+way to exercise all four against a committed asset. Clean up when done:
+`rm -rf "$RUN_DIR" "$REV" "$META"`.
+
 ### Normal (one command)
 
 ```bash
