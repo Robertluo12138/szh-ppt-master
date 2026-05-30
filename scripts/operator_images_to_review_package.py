@@ -75,6 +75,13 @@ CLI shape::
         --manifest REVIEWED_MANIFEST.json \
         --generated-provenance REVIEWED_PROVENANCE.json
 
+    # Template-only convenience (write JUST the two editable starter
+    # metadata files into a fresh --out-dir; builds nothing else —
+    # no bundle/, no approved_plan.json, no review_package/, no PPTX):
+    python3 scripts/operator_images_to_review_package.py --templates-only \
+        --images-dir DIR_OF_IMAGES \
+        --out-dir FRESH_OUT_DIR
+
     # Self-test (every scenario under TMPDIR; no caller-visible
     # artifacts retained):
     python3 scripts/operator_images_to_review_package.py --self-test
@@ -107,6 +114,23 @@ the plan from the supplied metadata, so ``approved_plan.json`` and the
 review-package summary reflect it; the wrapper re-implements no contract
 logic. The flags are refused with ``--resume`` (which rebuilds from the
 already-staged bundle).
+
+``--templates-only`` is the metadata-authoring shortcut: point
+``--images-dir`` at a local PNG / JPG / JPEG folder and the wrapper writes
+JUST two editable starter files into a fresh ``--out-dir`` —
+``manifest.json`` and ``generated_provenance.json`` (the helper's safe
+default templates) — and builds NOTHING else (no ``bundle/``, no
+``approved_plan.json``, no ``review_package/``, no ``deck.pptx``, no
+``workspace`` / ``reports`` / ``inventory`` / ``visual_quality``). Each
+file is written by the helper's existing
+``--write-manifest-template`` / ``--write-generated-provenance-template``
+writers against a single stable snapshot of the images (copied once into
+a private temp dir so the two files always agree on the filename set), so
+the wrapper re-implements no contract logic. Edit the two
+files, then feed them back via ``--manifest`` / ``--generated-provenance``
+to a ``--plan`` or one-command run. ``--templates-only`` is mutually
+exclusive with ``--plan`` / ``--resume`` / ``--manifest`` /
+``--generated-provenance`` / ``--self-test``.
 
 Local-only — does NOT call D-One, MCP, Qoder, a public network,
 telemetry, a model API, an image search, or any external service. NOT
@@ -1315,6 +1339,146 @@ def _run_resume_mode(*, out_dir: Path) -> int:
     print()
     print(f"OK: review package under {paths.review_package}. Open "
           f"{readme} first.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Template-only convenience: write JUST the two editable starter metadata
+# files (manifest.json + generated_provenance.json) for the operator's
+# image folder into --out-dir, then STOP. Builds no bundle, no plan, no
+# review package, no deck — the on-disk output is exactly the two files an
+# operator hand-edits and feeds back via --manifest / --generated-provenance.
+# Both files are built from a single stable snapshot of the images (copied
+# once into a temporary directory) so they always agree on the filename
+# set. This is the metadata-authoring shortcut: it removes the manual JSON
+# authoring an operator would otherwise do by hand.
+# ---------------------------------------------------------------------------
+
+
+def _run_templates_only(*, images_dir: Path, out_dir: Path) -> int:
+    """Write the two editable starter metadata templates for ``images_dir``
+    into ``out_dir`` and STOP. The caller MUST have already passed
+    ``images_dir`` / ``out_dir`` through their gates and created
+    ``out_dir``.
+
+    Both templates are written by the existing operator helper's
+    ``--write-manifest-template`` / ``--write-generated-provenance-template``
+    writers against a SINGLE stable image snapshot — the operator images
+    are copied once into a private, auto-removed ``TemporaryDirectory`` and
+    BOTH writers enumerate that copy, so the two files can never disagree
+    on the filename set even if the operator's folder changes mid-run.
+    Each writer emits its own schema-valid file, so this wrapper
+    re-implements no contract logic.
+    Nothing else is produced — no ``bundle/``, ``approved_plan.json``,
+    ``review_package/``, or ``deck.pptx`` — and a belt-and-braces leak
+    guard asserts that. Returns 0 on success, 1 on any stage failure (a
+    torn run leaves whatever was written under ``out_dir`` for the
+    operator to inspect / remove)."""
+    manifest = out_dir / "manifest.json"
+    gen_prov = out_dir / "generated_provenance.json"
+
+    print(f"=== operator_images_to_review_package --templates-only ===")
+    print(f"  images-dir:         {images_dir}")
+    print(f"  out-dir:            {out_dir}")
+    print(f"  manifest template:  {manifest}")
+    print(f"  gen-prov template:  {gen_prov}")
+    print()
+
+    # Copy the operator images ONCE into a private, auto-removed snapshot
+    # so BOTH template writers enumerate the SAME stable set of bytes.
+    # Pointing each writer at the live --images-dir would let a
+    # concurrent change between the two subprocess calls (a file added,
+    # removed, or swapped — e.g. an image generator still writing into
+    # the folder) produce a manifest.json and a generated_provenance.json
+    # whose filename sets disagree. The snapshot lives OUTSIDE --out-dir
+    # (a TemporaryDirectory honouring TMPDIR), so --out-dir still receives
+    # ONLY the two templates, and the same race-safe copy gates the other
+    # modes apply (O_NOFOLLOW / S_ISREG / per-file + count caps /
+    # extension + .DS_Store filter) run here too.
+    with tempfile.TemporaryDirectory(
+        prefix="o2rp-templates-snapshot-",
+    ) as raw_snap:
+        snapshot_images = Path(raw_snap) / "images"
+        copy_failures = _copy_images_into_bundle(images_dir, snapshot_images)
+        if copy_failures:
+            for line in copy_failures:
+                print(f"  [FAIL] {line}")
+            return 1
+        discovered = sorted(p.name for p in snapshot_images.iterdir())
+        print(f"  [PASS] snapshotted {len(discovered)} image(s) for a "
+              f"stable template build: {discovered}")
+
+        # Stage 1 — manifest starter template (from the stable snapshot).
+        manifest_outcome = _run(
+            "operator_local_images_to_editable_ppt "
+            "--write-manifest-template",
+            [
+                sys.executable, str(HELPER_PATH),
+                "--images-dir", str(snapshot_images),
+                "--write-manifest-template", str(manifest),
+            ],
+        )
+        if (manifest_outcome.rc != 0
+                or not manifest.is_file()
+                or manifest.is_symlink()):
+            print(f"  [FAIL] manifest template helper rc="
+                  f"{manifest_outcome.rc}; "
+                  f"manifest_exists={manifest.exists()}")
+            _print_outcome_tail(manifest_outcome)
+            return 1
+        print(f"  [PASS] manifest template written to {manifest}")
+
+        # Stage 2 — generated-provenance starter template (from the SAME
+        # snapshot; generator_source defaults to
+        # operator_declared_generated).
+        gen_prov_outcome = _run(
+            "operator_local_images_to_editable_ppt "
+            "--write-generated-provenance-template",
+            [
+                sys.executable, str(HELPER_PATH),
+                "--images-dir", str(snapshot_images),
+                "--write-generated-provenance-template", str(gen_prov),
+            ],
+        )
+        if (gen_prov_outcome.rc != 0
+                or not gen_prov.is_file()
+                or gen_prov.is_symlink()):
+            print(f"  [FAIL] generated-provenance template helper rc="
+                  f"{gen_prov_outcome.rc}; "
+                  f"gen_prov_exists={gen_prov.exists()}")
+            _print_outcome_tail(gen_prov_outcome)
+            return 1
+        print(f"  [PASS] generated-provenance template written to "
+              f"{gen_prov}")
+
+    # Belt-and-braces: template-only mode must NOT have produced any of
+    # the heavier build artifacts. Mirrors _run_plan_mode's leak guard so
+    # a future change that leaks a build into this mode is caught at run
+    # time, not just in --self-test.
+    leaked = [
+        n for n in ("bundle", "approved_plan.json", "review_package",
+                    "README.md")
+        if (out_dir / n).exists()
+    ]
+    if leaked:
+        print(f"  [FAIL] template-only mode unexpectedly produced "
+              f"{leaked!r}; it must write only manifest.json + "
+              f"generated_provenance.json.")
+        return 1
+    print(f"  [PASS] no bundle / approved_plan / review_package / deck "
+          f"produced (template-only mode writes just the two templates)")
+
+    print()
+    print(f"OK: editable starter metadata under {out_dir}:")
+    print(f"  - manifest.json")
+    print(f"  - generated_provenance.json")
+    print(f"Hand-edit them, then build with --manifest / "
+          f"--generated-provenance, e.g.:")
+    print(f"  python3 scripts/operator_images_to_review_package.py \\")
+    print(f"      --images-dir {shlex.quote(str(images_dir))} \\")
+    print(f"      --out-dir <FRESH_OUT_DIR> \\")
+    print(f"      --manifest {shlex.quote(str(manifest))} \\")
+    print(f"      --generated-provenance {shlex.quote(str(gen_prov))}")
     return 0
 
 
@@ -3693,6 +3857,173 @@ def _run_self_tests() -> int:
             ok=ok, detail=detail,
         ))
 
+    # ----------------------------------------------------------------
+    # Template-only convenience (--templates-only). T27..T28 pin the
+    # metadata-authoring shortcut: it writes ONLY the two editable
+    # starter templates (which pass the helper validators) and builds
+    # nothing else, and it refuses the modes / inputs it must not
+    # combine with.
+    # ----------------------------------------------------------------
+
+    # T27 — --templates-only writes JUST manifest.json +
+    # generated_provenance.json into a fresh --out-dir and builds NOTHING
+    # else (no bundle/, approved_plan.json, review_package/, deck.pptx, or
+    # README). Both files parse as JSON and pass the helper's own manifest
+    # / sidecar contract validators against the image basenames — the same
+    # gates --manifest / --generated-provenance enforce on supplied
+    # metadata — so the operator gets schema-valid starter metadata to
+    # hand-edit and feed back.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T27-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        out_dir = td / "templates_out"
+        _write_synthetic_images(images_dir)
+        rc = main(["--templates-only",
+                   "--images-dir", str(images_dir),
+                   "--out-dir", str(out_dir)])
+        ok = rc == 0
+        detail = "" if ok else f"main(--templates-only ...) rc={rc}"
+        manifest = out_dir / "manifest.json"
+        gen_prov = out_dir / "generated_provenance.json"
+        if ok:
+            for want in (manifest, gen_prov):
+                if not want.is_file() or want.is_symlink():
+                    ok, detail = False, f"missing template file: {want}"
+                    break
+        if ok:
+            # --out-dir must contain EXACTLY the two templates: nothing
+            # heavier (bundle/, approved_plan.json, review_package/,
+            # README.md, any *.pptx) and no stray output.
+            entries = sorted(p.name for p in out_dir.iterdir())
+            decks = sorted(str(p) for p in out_dir.rglob("*.pptx"))
+            if entries != ["generated_provenance.json", "manifest.json"]:
+                ok, detail = False, (
+                    f"--out-dir is not exactly the two templates: "
+                    f"{entries!r}"
+                )
+            elif decks:
+                ok, detail = False, (
+                    f"template-only mode produced PPTX output: {decks!r}"
+                )
+        if ok:
+            try:
+                man_data = json.loads(manifest.read_text(encoding="utf-8"))
+                gp_data = json.loads(gen_prov.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                ok, detail = False, (
+                    f"template not parseable JSON: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                if not (isinstance(man_data, dict)
+                        and isinstance(man_data.get("images"), list)):
+                    ok, detail = False, (
+                        "manifest template missing images[] list"
+                    )
+                elif not (isinstance(gp_data, dict)
+                          and isinstance(gp_data.get("entries"), list)):
+                    ok, detail = False, (
+                        "generated_provenance template missing entries[] "
+                        "list"
+                    )
+        if ok:
+            discovered = sorted(
+                p.name for p in images_dir.iterdir() if p.is_file()
+            )
+            # Stable-snapshot guarantee: both templates must cover the
+            # SAME filename set (equal to the operator's images). A
+            # non-snapshotted build — each writer enumerating the live
+            # folder independently — could disagree if the folder changed
+            # between the two writer subprocesses.
+            man_files = sorted(
+                e.get("filename") for e in man_data["images"]
+                if isinstance(e, dict)
+            )
+            gp_files = sorted(
+                e.get("filename") for e in gp_data["entries"]
+                if isinstance(e, dict)
+            )
+            if man_files != discovered or gp_files != discovered:
+                ok, detail = False, (
+                    f"templates disagree on the image set "
+                    f"(manifest={man_files!r}, provenance={gp_files!r}, "
+                    f"discovered={discovered!r})"
+                )
+        if ok:
+            m_entries, _m_path, man_fails = _validate_manifest_arg(
+                str(manifest), discovered,
+            )
+            g_entries, _g_path, gp_fails = (
+                _validate_generated_provenance_sidecar(
+                    str(gen_prov), discovered,
+                )
+            )
+            if man_fails or m_entries is None:
+                ok, detail = False, (
+                    f"manifest template failed helper validator: "
+                    f"{man_fails!r}"
+                )
+            elif gp_fails or g_entries is None:
+                ok, detail = False, (
+                    f"generated_provenance template failed helper "
+                    f"validator: {gp_fails!r}"
+                )
+        results.append(_ProbeResult(
+            name=(
+                "T27 --templates-only writes only the two editable "
+                "starter templates, they agree on the snapshotted image "
+                "set, and both pass the helper validators"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T28 — --templates-only refuses the modes / inputs it must not
+    # combine with: --manifest (supplying reviewed metadata while asking
+    # to WRITE a template is contradictory) and --plan (a build mode)
+    # each fail closed at the gate with rc 2 and no --out-dir created.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T28-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        _write_synthetic_images(images_dir)
+        ok, detail = True, ""
+        # (a) --templates-only + --manifest refused.
+        real_manifest = td / "supplied_manifest.json"
+        real_manifest.write_text("{}\n", encoding="utf-8")
+        out_a = td / "out_a"
+        rc_a = main(["--templates-only",
+                     "--images-dir", str(images_dir),
+                     "--out-dir", str(out_a),
+                     "--manifest", str(real_manifest)])
+        if rc_a != 2:
+            ok, detail = False, (
+                f"(a) --templates-only + --manifest rc={rc_a} (expected 2)"
+            )
+        elif out_a.exists():
+            ok, detail = False, (
+                "(a) refused combo still created --out-dir"
+            )
+        # (b) --templates-only + --plan refused.
+        if ok:
+            out_b = td / "out_b"
+            rc_b = main(["--templates-only", "--plan",
+                         "--images-dir", str(images_dir),
+                         "--out-dir", str(out_b)])
+            if rc_b != 2:
+                ok, detail = False, (
+                    f"(b) --templates-only + --plan rc={rc_b} (expected 2)"
+                )
+            elif out_b.exists():
+                ok, detail = False, (
+                    "(b) refused combo still created --out-dir"
+                )
+        results.append(_ProbeResult(
+            name=(
+                "T28 --templates-only refuses --manifest / --plan "
+                "combinations at the gate (rc 2, no --out-dir created)"
+            ),
+            ok=ok, detail=detail,
+        ))
+
     repo_rc = _check_repo_unchanged(
         examples_before=examples_before,
         scripts_before=scripts_before,
@@ -3843,10 +4174,32 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--templates-only", action="store_true",
+        help=(
+            "Template-only convenience. Point --images-dir at a local "
+            "PNG / JPG / JPEG folder and write JUST two editable starter "
+            "metadata files into a fresh --out-dir — manifest.json and "
+            "generated_provenance.json (the helper's safe-default "
+            "templates the operator can hand-edit). Builds NOTHING else: "
+            "no bundle/, no approved_plan.json, no deck.pptx, no "
+            "review_package/, no workspace / reports / inventory / "
+            "visual_quality. Each file is written by the existing helper's "
+            "--write-manifest-template / "
+            "--write-generated-provenance-template writers against a "
+            "single stable snapshot of the images (copied once so the two "
+            "files always agree on the filename set). Edit the two "
+            "files, then feed them back via --manifest / "
+            "--generated-provenance to a --plan or one-command run. "
+            "Requires --images-dir + a fresh --out-dir; mutually "
+            "exclusive with --plan / --resume / --self-test / --manifest "
+            "/ --generated-provenance."
+        ),
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios under TMPDIR "
-            "(no writes under REPO_ROOT). Twenty-six probes: T1 full "
+            "(no writes under REPO_ROOT). Twenty-eight probes: T1 full "
             "happy path from synthetic --images-dir through to a "
             "validated review package + locked README markers; T2 "
             "drift (mutating generated_provenance.json after plan-"
@@ -3927,8 +4280,16 @@ def main(argv: list[str]) -> int:
             "then the summary); T26 the default no-metadata path is "
             "unchanged (the bundle manifest stays byte-identical to the "
             "helper template and the README shows the template-write "
-            "command). Mutually exclusive with --images-dir / --out-dir "
-            "/ --manifest / --generated-provenance / --plan / --resume."
+            "command); T27 --templates-only writes ONLY the two editable "
+            "starter metadata files (manifest.json + "
+            "generated_provenance.json) into a fresh --out-dir from a "
+            "single stable image snapshot, builds nothing else, and both "
+            "files parse as JSON, agree on the filename set, and pass the "
+            "helper's manifest / sidecar validators; T28 --templates-only "
+            "refuses --manifest / --plan combinations at the gate (rc 2, "
+            "no --out-dir created). Mutually exclusive with --images-dir "
+            "/ --out-dir / --manifest / --generated-provenance / --plan "
+            "/ --resume / --templates-only."
         ),
     )
     args = parser.parse_args(argv)
@@ -3937,11 +4298,12 @@ def main(argv: list[str]) -> int:
         if (args.images_dir is not None or args.out_dir is not None
                 or args.manifest is not None
                 or args.generated_provenance is not None
-                or args.plan or args.resume):
+                or args.plan or args.resume or args.templates_only):
             print(
                 "FAIL: --self-test is mutually exclusive with "
                 "--images-dir / --out-dir / --manifest / "
-                "--generated-provenance / --plan / --resume.",
+                "--generated-provenance / --plan / --resume / "
+                "--templates-only.",
                 file=sys.stderr,
             )
             return 2
@@ -3952,6 +4314,27 @@ def main(argv: list[str]) -> int:
             "FAIL: --plan and --resume are mutually exclusive; --plan "
             "stages the reviewable plan and stops, --resume builds the "
             "review package from an already-reviewed plan.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # --templates-only writes ONLY the two editable starter metadata
+    # files (manifest.json + generated_provenance.json) from --images-dir
+    # into a fresh --out-dir and builds nothing else. It shares the
+    # images-dir / out-dir gate below with plan / one-command mode, so
+    # refuse the modes / inputs it must not combine with here first —
+    # before the resume branch and the shared gate run.
+    if args.templates_only and (
+        args.plan or args.resume
+        or args.manifest is not None
+        or args.generated_provenance is not None
+    ):
+        print(
+            "FAIL: --templates-only only writes starter manifest / "
+            "generated_provenance templates from --images-dir into a "
+            "fresh --out-dir; it is mutually exclusive with --plan / "
+            "--resume / --manifest / --generated-provenance (those "
+            "supply reviewed metadata to, or drive, a build run).",
             file=sys.stderr,
         )
         return 2
@@ -4168,7 +4551,12 @@ def main(argv: list[str]) -> int:
             )
             return 1
 
-    if args.plan:
+    if args.templates_only:
+        # manifest_src / gen_prov_src are always None here (the guard
+        # above refuses --templates-only + --manifest / --generated-
+        # provenance), so the shared metadata gate was a no-op.
+        rc = _run_templates_only(images_dir=images_dir, out_dir=out_dir)
+    elif args.plan:
         rc = _run_plan_mode(
             images_dir=images_dir, out_dir=out_dir,
             manifest_src=manifest_src, gen_prov_src=gen_prov_src,
