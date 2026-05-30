@@ -629,6 +629,37 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     ``_EXPLICIT_BOUNDARIES`` / ``MAX_IMAGES`` and
     ``_forbidden_symlink_ancestor`` — no new schema, no new
     validator, no new runtime contract. LOCAL-ONLY — no real D-One.
+  - ``scripts/operator_supplied_metadata_smoke.py`` — tempdir-only
+    **supplied-operator-metadata acceptance smoke** for the same
+    review-package lane. Drives
+    ``operator_images_to_review_package.py`` with ``--manifest`` +
+    ``--generated-provenance`` (reviewed custom per-slide
+    ``slide_title`` / ``alt_text`` / ``intended_use`` and per-image
+    ``generator_source`` / ``intent_summary`` / ``placement_role`` /
+    ``text_policy`` / ``subject_domain`` / ``custom_descriptor``) in
+    TWO modes — S1 one-command and S2 ``--plan`` then ``--resume`` —
+    on the helper's own synthetic PNG + JPEG fixtures inside per-run
+    tempdirs. For each produced ``<out-dir>/review_package`` it
+    re-runs ``scripts/validate_operator_review_package.py --out-dir``
+    (rc=0) and asserts, KEYED BY FILENAME, that the custom
+    ``slide_title`` / ``intent_summary`` plus every supplied
+    provenance field landed in ``approved_plan.json`` (per-slide
+    ``images[]`` rows where the title is ``slide_title``, plus the
+    ``generated_provenance`` evidence block) AND in
+    ``review_package/summary.json`` (per-image ``image_provenance[]``
+    rows where the manifest title surfaces as ``operator_slide_title``,
+    plus the ``generated_provenance`` block). The custom values are
+    deliberately distinct from the helper's generated defaults so a
+    green run proves the SUPPLIED metadata flowed (not a matching
+    default). S2 also asserts ``--plan`` STOPS before any
+    ``review_package`` is built while ``approved_plan.json`` already
+    carries the custom fields. Complements the wrapper's own
+    substring-only T21 / T25 metadata probes by re-invoking the
+    read-only validator and asserting exact key paths. Reuses the
+    wrapper's ``_write_synthetic_images`` /
+    ``_REVIEW_PACKAGE_FILES`` / ``_REVIEW_PACKAGE_DIRS`` — no new
+    schema, no new validator, no new runtime contract. LOCAL-ONLY —
+    no real D-One.
   - ``scripts/validate_operator_review_package.py`` — read-only
     stdlib validator for the review package produced by
     ``scripts/operator_local_images_to_editable_ppt.py`` (the
@@ -726,6 +757,7 @@ _CORE_SMOKES: tuple[Path, ...] = (
     SCRIPTS_DIR / "operator_local_images_to_editable_ppt.py",
     SCRIPTS_DIR / "operator_local_images_trial.py",
     SCRIPTS_DIR / "operator_images_to_review_package.py",
+    SCRIPTS_DIR / "operator_supplied_metadata_smoke.py",
     SCRIPTS_DIR / "validate_operator_review_package.py",
     SCRIPTS_DIR / "mock_generated_images_to_editable_ppt_smoke.py",
     SCRIPTS_DIR / "generated_images_to_editable_ppt_trial.py",
@@ -971,6 +1003,7 @@ def main(argv: list[str]) -> int:
             "operator_local_images_to_editable_ppt + "
             "operator_local_images_trial + "
             "operator_images_to_review_package + "
+            "operator_supplied_metadata_smoke + "
             "validate_operator_review_package + "
             "mock_generated_images_to_editable_ppt_smoke + "
             "generated_images_to_editable_ppt_trial + "
