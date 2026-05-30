@@ -565,7 +565,7 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     stages — it is NOT a substitute for human review of the plan
     itself. The produced ``README.md`` carries an explicit
     ``## Auto-approval`` section spelling out the limit. The
-    aggregate invokes ``--self-test``, which runs twelve probes
+    aggregate invokes ``--self-test``, which runs fourteen probes
     inside per-run tempdirs (no writes under ``REPO_ROOT``): T1 the
     full
     happy path on the helper's own synthetic PNG + JPEG fixtures plus
@@ -609,7 +609,21 @@ Delegated smokes (each invoked as a subprocess with ``--self-test``):
     BEFORE any subprocess fires); T12 the cross-containment
     case-fold gate (parallel to T10: a case-variant ``--out-dir``
     under ``--images-dir`` is refused on case-insensitive
-    filesystems).
+    filesystems); T13 the hidden-dotfile refusal (a macOS
+    ``.DS_Store`` — Finder's invisible metadata file, the most
+    common real-world contaminant of an operator image folder —
+    refuses BEFORE any byte is copied with an operator-facing
+    macOS-aware message that names the cause and offers a
+    non-destructive ``ls -a`` reveal command, not the generic
+    ``has extension ''`` line); and T14 the torn-run recovery hint
+    (a ``.png`` that passes the wrapper's cheap extension gate but
+    fails the helper's IG8 magic-byte signature check fails AFTER
+    the bundle is staged, leaving a partial bundle under
+    ``--out-dir``; main() emits a recovery NOTE naming ``--out-dir``
+    + an ``rm -rf`` retry path so the operator is not blindsided by
+    the shared ``--out-dir`` gate's non-empty refusal on
+    fix-and-re-run, since the top-level README is only written on a
+    successful run).
     Reuses the helper's own
     ``_validate_out_dir_arg`` / ``_write_synthetic_images`` /
     ``_EXPLICIT_BOUNDARIES`` / ``MAX_IMAGES`` and

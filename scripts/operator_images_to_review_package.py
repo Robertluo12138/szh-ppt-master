@@ -75,6 +75,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse  # noqa: E402
+import contextlib  # noqa: E402
 import io  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
@@ -184,6 +185,39 @@ def _print_outcome_tail(outcome: _ToolOutcome, *, tail_lines: int = 30) -> None:
           f"{outcome.name} output ---")
     for line in lines[-tail_lines:]:
         print(f"    {line}")
+
+
+def _print_torn_run_recovery_hint(out_dir: Path) -> None:
+    """After a torn workflow run, point the operator at the recovery
+    path. A run that fails AFTER the bundle is staged (a helper-stage
+    refusal — e.g. an image whose bytes fail the deeper IG signature
+    check, or an approved-plan drift) leaves its partial output under
+    ``out_dir`` by design so the operator can inspect it. The next
+    thing a real operator does is fix the flagged input and re-run the
+    SAME command — but the shared ``--out-dir`` gate then refuses the
+    now-non-empty directory with a "pre-existing artifacts" message
+    that reads as operator error even though the artifacts are this
+    failed run's own partial output. Naming the cause + both recovery
+    paths here closes that gap: the top-level README that documents
+    the same recovery is only written on a SUCCESSFUL run, so without
+    this a torn run leaves the operator with no guidance at all.
+    Guarded on a non-empty ``out_dir`` so a copy-stage refusal — which
+    leaves ``out_dir`` empty and whose own message already names what
+    to fix — stays quiet."""
+    try:
+        torn = any(out_dir.iterdir())
+    except OSError:
+        return
+    if not torn:
+        return
+    print(
+        f"\nNOTE: this failed run left partial output under {out_dir}. "
+        f"Re-running the same command against this same --out-dir will "
+        f"be refused as non-empty. To retry after fixing the issue "
+        f"flagged above, remove the partial output and re-run "
+        f"(`rm -rf {shlex.quote(str(out_dir))}`), or pass a fresh "
+        f"--out-dir."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1107,6 +1141,16 @@ class _ProbeResult:
 #         copied with an operator-facing macOS-aware message that
 #         names the cause and offers a non-destructive ``ls -a``
 #         reveal command, NOT the generic ``has extension ''`` line.
+#   T14 — a torn run that fails AFTER the bundle is staged (a ``.png``
+#         that passes the wrapper's cheap extension gate but fails the
+#         helper's IG8 magic-byte signature check) leaves a partial
+#         bundle under out_dir; main() must emit a recovery NOTE
+#         naming out_dir + an ``rm -rf`` retry path so the operator is
+#         not blindsided by the shared --out-dir gate's "non-empty"
+#         refusal when they fix the input and re-run the same command
+#         (the top-level README that documents the same recovery is
+#         only written on a SUCCESSFUL run). Surfaced by a real local
+#         pilot.
 # Every probe runs under TemporaryDirectory; the repo snapshot
 # enforces no writes under REPO_ROOT.
 # ---------------------------------------------------------------------------
@@ -1986,6 +2030,64 @@ def _run_self_tests() -> int:
             ok=ok, detail=detail,
         ))
 
+    # T14 torn-run recovery hint. A .png that passes the wrapper's
+    # cheap extension gate but FAILS the helper's IG8 magic-byte
+    # signature check fails AFTER the bundle is staged, leaving a
+    # partial bundle under out_dir. The pilot hit the follow-on
+    # confusion: the operator fixes the flagged image and re-runs the
+    # SAME command, only to be refused by the shared --out-dir gate's
+    # "non-empty" message (the partial bundle is this failed run's own
+    # output, not something the operator placed). main() must emit a
+    # recovery NOTE naming out_dir + an `rm -rf` retry path so a torn
+    # run is not a dead end — the top-level README that documents the
+    # same recovery is only written on a SUCCESSFUL run. Captures
+    # stdout to assert the NOTE, and compares against the RESOLVED
+    # out_dir (main resolves the arg, and on macOS the tempdir
+    # resolves through /var -> /private/var) so the substring check
+    # does not false-fail on the symlink-expanded path.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T14-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        _write_synthetic_images(images_dir)
+        # One .png-named non-PNG: passes the wrapper's extension /
+        # size / regular-file gates, fails the helper's IG8 signature
+        # gate one stage later — exactly the "fails after staging"
+        # shape that leaves a partial bundle behind.
+        (images_dir / "actually_text.png").write_bytes(
+            b"this file has a .png name but is not a PNG\n"
+        )
+        out_dir = td / "workflow_out"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--images-dir", str(images_dir),
+                       "--out-dir", str(out_dir)])
+        captured = buf.getvalue()
+        resolved_out = out_dir.resolve(strict=False)
+        try:
+            torn = any(out_dir.iterdir())
+        except OSError:
+            torn = False
+        ok = (
+            rc == 1
+            and torn
+            and "left partial output" in captured
+            and "rm -rf" in captured
+            and "fresh --out-dir" in captured
+            and str(resolved_out) in captured
+        )
+        detail = "" if ok else (
+            f"rc={rc}; torn={torn}; "
+            f"note_present={'left partial output' in captured}; "
+            f"captured_tail={captured[-300:]!r}"
+        )
+        results.append(_ProbeResult(
+            name=(
+                "T14 torn post-copy run emits recovery hint naming "
+                "out_dir + rm -rf retry path"
+            ),
+            ok=ok, detail=detail,
+        ))
+
     repo_rc = _check_repo_unchanged(
         examples_before=examples_before,
         scripts_before=scripts_before,
@@ -2066,7 +2168,7 @@ def main(argv: list[str]) -> int:
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios under TMPDIR "
-            "(no writes under REPO_ROOT). Thirteen probes: T1 full "
+            "(no writes under REPO_ROOT). Fourteen probes: T1 full "
             "happy path from synthetic --images-dir through to a "
             "validated review package + locked README markers; T2 "
             "drift (mutating generated_provenance.json after plan-"
@@ -2111,7 +2213,12 @@ def main(argv: list[str]) -> int:
             "folder) is refused before any byte is copied with an "
             "operator-facing macOS-aware message and a non-"
             "destructive `ls -a` reveal command, not the generic "
-            "`has extension ''` line. Mutually exclusive with "
+            "`has extension ''` line; T14 a torn run that fails AFTER "
+            "the bundle is staged (a .png whose bytes fail the "
+            "helper's IG8 signature check) emits a recovery NOTE "
+            "naming --out-dir + an `rm -rf` retry path so the operator "
+            "is not blindsided by the shared --out-dir gate's "
+            "non-empty refusal on re-run. Mutually exclusive with "
             "--images-dir / --out-dir."
         ),
     )
@@ -2246,7 +2353,10 @@ def main(argv: list[str]) -> int:
             )
             return 1
 
-    return _run_workflow(images_dir=images_dir, out_dir=out_dir)
+    rc = _run_workflow(images_dir=images_dir, out_dir=out_dir)
+    if rc != 0:
+        _print_torn_run_recovery_hint(out_dir)
+    return rc
 
 
 if __name__ == "__main__":
