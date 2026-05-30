@@ -98,6 +98,29 @@ This is covered by the wrapper's `--self-test` probes T15–T20 and documented i
 [`core-image-to-editable-ppt-quickstart.md`](core-image-to-editable-ppt-quickstart.md).
 One-command mode is unchanged.
 
+## Operator-Supplied Metadata (Optional)
+
+By default the wrapper generates placeholder `manifest.json` /
+`generated_provenance.json` templates. An operator who has already reviewed
+per-image slide intent or generated-image provenance can supply them instead,
+in one-command **or** `--plan` mode, with the optional `--manifest FILE` and/or
+`--generated-provenance FILE` flags:
+
+- Each path is gated at the CLI for URI / symlink / symlink-ancestor / missing /
+  non-file (rc 2 before any staging); its content is then validated by the
+  helper's own manifest / sidecar contract gates against the copied image
+  basenames (JSON, schema, closed field set, no public-network / credential /
+  raw-source wording, filename set == the copied images) and copied into the
+  bundle in place of the default template.
+- The produced `approved_plan.json` and `review_package/summary.json` then
+  reflect the supplied values; the wrapper re-implements no contract logic.
+- The flags are refused with `--resume` (which rebuilds from the already-staged
+  bundle). Filename-set mismatch, symlink / URI paths, and unsafe wording all
+  fail closed.
+
+This is covered by the wrapper's `--self-test` probes T21–T26. The default
+(no-flag) behavior is unchanged.
+
 ## Boundary
 
 The pilot was local-only. It did not call D-One, MCP, Qoder, a public network,

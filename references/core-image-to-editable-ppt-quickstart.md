@@ -416,11 +416,28 @@ python3 scripts/operator_images_to_review_package.py --resume \
 
 `--resume` takes `--out-dir` only (the bundle + plan are already staged; passing `--images-dir` is refused). It fails closed if the bundle has drifted from the approved plan between the two steps — editing any byte under `bundle/images/`, `bundle/manifest.json`, or `bundle/generated_provenance.json` in a way that changes the plan refuses the resume before any review-package artifact is created. To approve a changed plan, discard the directory and re-run `--plan`. The resume gate also refuses a URI-shaped / symlinked / symlink-ancestor / under-repo `--out-dir`, an `--out-dir` that is not a prior `--plan` output, and an `--out-dir` whose `review_package/` was already built.
 
+### Optional operator-supplied metadata (`--manifest` / `--generated-provenance`)
+
+By default the wrapper writes placeholder `manifest.json` / `generated_provenance.json` templates into the bundle. An operator who has already reviewed per-image slide intent or generated-image provenance can supply them instead, in one-command **or** `--plan` mode (the flags are refused with `--resume`, which rebuilds from the already-staged bundle):
+
 ```bash
-# Twenty self-test probes (one-command happy path + copy/TOCTOU gates
-# + T15–T20 for the two-step flow: plan builds nothing; resume succeeds
-# for a valid reviewed plan and refuses mutated source bytes, missing /
-# mismatched generated provenance, path traversal, and symlink inputs):
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_images_to_review_package.py \
+  --images-dir /path/to/images \
+  --out-dir "$RUN_DIR/out" \
+  --manifest /path/to/reviewed_manifest.json \
+  --generated-provenance /path/to/reviewed_provenance.json
+```
+
+Each supplied path is gated at the CLI for URI-shape / symlink / symlink-ancestor / missing / non-file (rc 2 **before** any image is staged). Its content is then validated by the helper's own `_validate_manifest_arg` (MAN1..MAN12) / `_validate_generated_provenance_sidecar` (GP1..GP13) gates against the **copied** image basenames — JSON parse, `schema_version == "1"`, the closed field set / closed enums, the safe-string deny lists (no URL / URI / path separator / credential / public-upload / confidential / fake-success wording), and the filename-set-equals-the-copied-images cross-check — and the file is copied race-safely into the bundle in place of the default template. Either flag may be supplied alone or together; an omitted flag keeps the default template for that file. Because the downstream plan-out / approved-plan / resume drift-lock build the plan from the bundle, the produced `approved_plan.json` and `review_package/summary.json` reflect the supplied metadata with no further wiring. The wrapper re-implements no contract logic — it reuses the helper's validators verbatim. A filename-set mismatch, unsafe wording, malformed JSON, or a drift between the supplied metadata at `--plan` time and `--resume` all fail closed with no review package.
+
+```bash
+# Twenty-six self-test probes (one-command happy path + copy/TOCTOU gates
+# + T15–T20 for the two-step flow + T21–T26 for operator-supplied
+# metadata: valid custom manifest/provenance accepted and reflected in
+# plan/summary, filename-set mismatch rejected, symlink/URI metadata path
+# rejected, unsafe wording rejected, plan/resume works with supplied
+# metadata, and the default no-metadata path is unchanged):
 TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
   python3 scripts/operator_images_to_review_package.py --self-test
 ```

@@ -65,6 +65,16 @@ CLI shape::
     python3 scripts/operator_images_to_review_package.py --resume \
         --out-dir SAME_OUT_DIR
 
+    # Optional operator-supplied metadata (either / both flags; valid in
+    # one-command AND --plan mode, refused with --resume). The supplied
+    # file is staged into the bundle IN PLACE OF the default template, so
+    # the produced approved_plan.json + review_package summary reflect it:
+    python3 scripts/operator_images_to_review_package.py \
+        --images-dir DIR_OF_IMAGES \
+        --out-dir FRESH_OUT_DIR \
+        --manifest REVIEWED_MANIFEST.json \
+        --generated-provenance REVIEWED_PROVENANCE.json
+
     # Self-test (every scenario under TMPDIR; no caller-visible
     # artifacts retained):
     python3 scripts/operator_images_to_review_package.py --self-test
@@ -82,6 +92,21 @@ a directory a prior ``--plan`` run staged, so it is validated through
 / repo-tree refusals, but it REQUIRES the pre-existing ``bundle/`` +
 ``approved_plan.json`` and refuses an already-built ``review_package/``)
 and ``--images-dir`` is refused.
+
+The optional ``--manifest`` / ``--generated-provenance`` flags let the
+operator supply a reviewed ``manifest.json`` / ``generated_provenance
+.json`` instead of the default generated templates. Each path is gated
+at the CLI for URI / symlink / symlink-ancestor / missing / non-file
+(rc 2 before any staging); its CONTENT is then validated by the helper's
+own ``_validate_manifest_arg`` / ``_validate_generated_provenance_
+sidecar`` gates against the copied image basenames (JSON / schema /
+closed field set / unsafe public-network-credential-raw-source wording /
+filename-set match) and copied into the bundle in place of the template.
+The downstream plan-out / approved-plan / resume drift-lock then build
+the plan from the supplied metadata, so ``approved_plan.json`` and the
+review-package summary reflect it; the wrapper re-implements no contract
+logic. The flags are refused with ``--resume`` (which rebuilds from the
+already-staged bundle).
 
 Local-only — does NOT call D-One, MCP, Qoder, a public network,
 telemetry, a model API, an image search, or any external service. NOT
@@ -128,6 +153,8 @@ from core_image_to_editable_ppt_demo import (  # noqa: E402
 from operator_local_images_to_editable_ppt import (  # noqa: E402
     MAX_IMAGES,
     _EXPLICIT_BOUNDARIES,
+    _validate_generated_provenance_sidecar,
+    _validate_manifest_arg,
     _write_synthetic_images,
 )
 
@@ -325,6 +352,66 @@ def _validate_images_dir_arg(
     return images_dir, failures
 
 
+def _validate_metadata_arg(
+    arg_str: str, flag: str,
+) -> tuple[Path | None, list[str]]:
+    """Validate an optional caller-supplied metadata path (``--manifest``
+    or ``--generated-provenance``) at the CLI BEFORE any staging.
+
+    Refuses URI-shaped arguments, the path itself being a symlink, any
+    symlink ancestor, a missing path, and a non-regular-file path — the
+    same cheap path-safety subset ``--images-dir`` gets, so an obviously
+    unsafe metadata path fails closed with rc 2 without copying a single
+    image. The deeper CONTENT contract (UTF-8 JSON parse, schema, the
+    closed field set, unsafe public / network / credential / raw-source
+    wording, and the filename-set-equals-the-copied-images cross-check)
+    is NOT re-implemented here: it is delegated verbatim to the helper's
+    own ``_validate_manifest_arg`` / ``_validate_generated_provenance_
+    sidecar`` gates, which run in ``_stage_bundle_and_plan`` once the
+    copied image basenames are known. ``flag`` only names the offending
+    argument in the diagnostics."""
+    failures: list[str] = []
+
+    if _URI_SCHEME_PREFIX.match(arg_str):
+        return None, [
+            f"{flag} argument {arg_str!r} looks URI-shaped; operator "
+            f"mode only accepts local file paths."
+        ]
+
+    path = Path(arg_str)
+
+    if path.is_symlink():
+        try:
+            tgt = os.readlink(path)
+        except OSError:
+            tgt = "<unreadable>"
+        return None, [
+            f"{flag} {path} is a symlink (-> {tgt}); refused so a "
+            f"symlink target cannot redirect which metadata bytes get "
+            f"staged into the bundle."
+        ]
+
+    forbidden = _forbidden_symlink_ancestor(path)
+    if forbidden is not None:
+        ancestor, tgt = forbidden
+        return None, [
+            f"{flag} {path} has a symlink ancestor {ancestor} "
+            f"(-> {tgt}); refused so a symlink in the typed path cannot "
+            f"redirect which metadata file is staged."
+        ]
+
+    if not path.exists():
+        return None, [
+            f"{flag} {path} does not exist."
+        ]
+    if path.is_dir() or not path.is_file():
+        return None, [
+            f"{flag} {path} is not a regular file."
+        ]
+
+    return path, failures
+
+
 def _copy_images_into_bundle(
     images_dir: Path, bundle_images: Path,
 ) -> list[str]:
@@ -498,12 +585,22 @@ def _copy_bounded(
 
 def _copy_one_image_race_safe(
     src: Path, dest: Path, max_bytes: int,
+    label: str = "--images-dir entry",
 ) -> str | None:
     """Copy ``src`` -> ``dest`` without following symlinks on either
     end, capping at ``max_bytes`` based on the opened fd's
     ``os.fstat`` (NOT the earlier pre-flight ``Path.stat``). Returns
     ``None`` on success or a single failure-line string on any
     refused / failed copy.
+
+    ``label`` only names the source in failure diagnostics. It defaults
+    to ``--images-dir entry`` so the image-copy loop's messages are
+    unchanged; the operator-supplied metadata copy passes ``--manifest``
+    / ``--generated-provenance`` so a refused metadata copy reads as
+    such. The race-free O_NOFOLLOW / S_ISREG / bounded-read gates are
+    identical regardless of label — a metadata file swapped for a
+    symlink / FIFO / oversized file after the pre-flight still fails
+    closed here.
 
     The pre-flight ``Path.is_symlink`` / ``Path.is_file`` / ``Path.
     stat`` checks earlier in ``_copy_images_into_bundle`` are racy by
@@ -541,7 +638,7 @@ def _copy_one_image_race_safe(
         src_fd = os.open(src, open_flags)
     except OSError as exc:
         return (
-            f"--images-dir entry {src} could not be opened without "
+            f"{label} {src} could not be opened without "
             f"following symlinks: {type(exc).__name__}: {exc} "
             f"(O_NOFOLLOW gate fires on a mid-call swap into a "
             f"symlink even if the pre-flight is_symlink check passed)."
@@ -551,7 +648,7 @@ def _copy_one_image_race_safe(
             st = os.fstat(src_fd)
         except OSError as exc:
             return (
-                f"--images-dir entry {src} could not be fstat'd: "
+                f"{label} {src} could not be fstat'd: "
                 f"{type(exc).__name__}: {exc}"
             )
         # ``O_NOFOLLOW`` refuses symlinks but NOT FIFOs, device
@@ -566,14 +663,14 @@ def _copy_one_image_race_safe(
         # and the open still surfaces here.
         if not stat.S_ISREG(st.st_mode):
             return (
-                f"--images-dir entry {src} opened to mode "
+                f"{label} {src} opened to mode "
                 f"{stat.filemode(st.st_mode)} (not a regular file); "
-                f"refused — only regular PNG / JPG / JPEG files are "
-                f"accepted, FIFOs / device files / sockets are not."
+                f"refused — only regular files are accepted, FIFOs / "
+                f"device files / sockets are not."
             )
         if st.st_size > max_bytes:
             return (
-                f"--images-dir entry {src} is {st.st_size} bytes (via "
+                f"{label} {src} is {st.st_size} bytes (via "
                 f"fstat on the opened fd); refused — over the "
                 f"{max_bytes}-byte per-file cap."
             )
@@ -652,16 +749,64 @@ def _workflow_paths(out_dir: Path) -> _WorkflowPaths:
     )
 
 
+def _stage_supplied_metadata(
+    *, src: Path, dest: Path, discovered: list[str], validator, flag: str,
+) -> list[str]:
+    """Validate an operator-supplied metadata file against the copied
+    image basenames, then copy it race-safely into the bundle at
+    ``dest``. Returns ``[]`` on success or a list of failure lines.
+
+    ``validator`` is the helper's own ``_validate_manifest_arg`` /
+    ``_validate_generated_provenance_sidecar``; both share the
+    ``(path_str, discovered_filenames) -> (entries, resolved_path,
+    failures)`` signature and OWN the full content contract — UTF-8 JSON
+    parse, schema / closed field set, unsafe public / network /
+    credential / raw-source wording, and the filename-set-equals-the-
+    discovered-images cross-check (MAN12 / GP13). Reusing them here means
+    the wrapper re-implements no contract logic: a metadata file whose
+    filenames do not match the copied images, or that carries unsafe
+    wording, is refused BEFORE it is copied into the bundle. The
+    subsequent plan-out stage re-validates the bundle copy as belt and
+    braces."""
+    entries, _resolved, failures = validator(str(src), discovered)
+    if failures or entries is None:
+        return failures or [
+            f"{flag} {src} was refused by the metadata contract gates."
+        ]
+    copy_err = _copy_one_image_race_safe(
+        src, dest, MAX_BYTES_PER_FILE, label=flag,
+    )
+    if copy_err is not None:
+        return [copy_err]
+    if not dest.is_file() or dest.is_symlink():
+        return [
+            f"expected staged {flag} at {dest} as a regular non-symlink "
+            f"file after copy"
+        ]
+    return []
+
+
 def _stage_bundle_and_plan(
     *, images_dir: Path, paths: _WorkflowPaths,
+    manifest_src: Path | None = None,
+    gen_prov_src: Path | None = None,
 ) -> int:
-    """Stages A–D: copy the operator images into the bundle, write the
-    manifest + generated-provenance templates, and write the reviewable
-    plan (``approved_plan.json``). Stops short of the review package —
-    no ``deck.pptx`` / ``review_package/`` is produced here. Returns 0
-    on success, 1 on any stage failure (leaving partial output under
+    """Stages A–D: copy the operator images into the bundle, stage the
+    manifest + generated-provenance metadata (operator-supplied when
+    ``manifest_src`` / ``gen_prov_src`` is given, else the helper's
+    starter templates), and write the reviewable plan
+    (``approved_plan.json``). Stops short of the review package — no
+    ``deck.pptx`` / ``review_package/`` is produced here. Returns 0 on
+    success, 1 on any stage failure (leaving partial output under
     ``out_dir`` for inspection). Shared verbatim by the one-command and
-    plan-only entry points so they stage identically."""
+    plan-only entry points so they stage identically.
+
+    When the operator supplies a metadata file, it is validated against
+    the copied image basenames with the helper's own contract gates and
+    copied into the bundle in place of the default template; the
+    downstream plan-out / approved-plan / resume drift-lock then build
+    the plan from it, so ``approved_plan.json`` and the review-package
+    summary reflect the supplied values without any further wiring."""
     bundle = paths.bundle
     bundle_images = paths.bundle_images
     manifest = paths.manifest
@@ -678,44 +823,74 @@ def _stage_bundle_and_plan(
     print(f"  [PASS] copied {len(discovered)} image(s) into "
           f"{bundle_images}: {discovered}")
 
-    # Stage B — manifest template via the helper.
-    manifest_outcome = _run(
-        "operator_local_images_to_editable_ppt --write-manifest-template",
-        [
-            sys.executable, str(HELPER_PATH),
-            "--images-dir", str(bundle_images),
-            "--write-manifest-template", str(manifest),
-        ],
-    )
-    if (manifest_outcome.rc != 0
-            or not manifest.is_file()
-            or manifest.is_symlink()):
-        print(f"  [FAIL] manifest template helper rc="
-              f"{manifest_outcome.rc}; manifest_exists="
-              f"{manifest.exists()}")
-        _print_outcome_tail(manifest_outcome)
-        return 1
-    print(f"  [PASS] manifest template written to {manifest}")
+    # Stage B — manifest: stage the operator-supplied file (validated
+    # against the copied basenames by the helper's MAN gates) or, by
+    # default, write the helper's starter template.
+    if manifest_src is not None:
+        man_failures = _stage_supplied_metadata(
+            src=manifest_src, dest=manifest, discovered=discovered,
+            validator=_validate_manifest_arg, flag="--manifest",
+        )
+        if man_failures:
+            for line in man_failures:
+                print(f"  [FAIL] {line}")
+            return 1
+        print(f"  [PASS] operator-supplied manifest staged to {manifest}")
+    else:
+        manifest_outcome = _run(
+            "operator_local_images_to_editable_ppt "
+            "--write-manifest-template",
+            [
+                sys.executable, str(HELPER_PATH),
+                "--images-dir", str(bundle_images),
+                "--write-manifest-template", str(manifest),
+            ],
+        )
+        if (manifest_outcome.rc != 0
+                or not manifest.is_file()
+                or manifest.is_symlink()):
+            print(f"  [FAIL] manifest template helper rc="
+                  f"{manifest_outcome.rc}; manifest_exists="
+                  f"{manifest.exists()}")
+            _print_outcome_tail(manifest_outcome)
+            return 1
+        print(f"  [PASS] manifest template written to {manifest}")
 
-    # Stage C — generated-provenance sidecar template via the helper.
-    gen_prov_outcome = _run(
-        "operator_local_images_to_editable_ppt "
-        "--write-generated-provenance-template",
-        [
-            sys.executable, str(HELPER_PATH),
-            "--bundle", str(bundle),
-            "--write-generated-provenance-template", str(gen_prov),
-        ],
-    )
-    if (gen_prov_outcome.rc != 0
-            or not gen_prov.is_file()
-            or gen_prov.is_symlink()):
-        print(f"  [FAIL] generated-provenance template helper rc="
-              f"{gen_prov_outcome.rc}; gen_prov_exists="
-              f"{gen_prov.exists()}")
-        _print_outcome_tail(gen_prov_outcome)
-        return 1
-    print(f"  [PASS] generated-provenance template written to {gen_prov}")
+    # Stage C — generated-provenance: stage the operator-supplied sidecar
+    # (validated against the copied basenames by the helper's GP gates)
+    # or, by default, write the helper's starter template.
+    if gen_prov_src is not None:
+        gp_failures = _stage_supplied_metadata(
+            src=gen_prov_src, dest=gen_prov, discovered=discovered,
+            validator=_validate_generated_provenance_sidecar,
+            flag="--generated-provenance",
+        )
+        if gp_failures:
+            for line in gp_failures:
+                print(f"  [FAIL] {line}")
+            return 1
+        print(f"  [PASS] operator-supplied generated-provenance staged to "
+              f"{gen_prov}")
+    else:
+        gen_prov_outcome = _run(
+            "operator_local_images_to_editable_ppt "
+            "--write-generated-provenance-template",
+            [
+                sys.executable, str(HELPER_PATH),
+                "--bundle", str(bundle),
+                "--write-generated-provenance-template", str(gen_prov),
+            ],
+        )
+        if (gen_prov_outcome.rc != 0
+                or not gen_prov.is_file()
+                or gen_prov.is_symlink()):
+            print(f"  [FAIL] generated-provenance template helper rc="
+                  f"{gen_prov_outcome.rc}; gen_prov_exists="
+                  f"{gen_prov.exists()}")
+            _print_outcome_tail(gen_prov_outcome)
+            return 1
+        print(f"  [PASS] generated-provenance template written to "
+              f"{gen_prov}")
 
     # Stage D — plan-out preflight. Writes the approved plan that
     # Stage E will lock against.
@@ -830,10 +1005,15 @@ def _build_and_validate_review_package(*, paths: _WorkflowPaths) -> int:
     return 0
 
 
-def _run_workflow(*, images_dir: Path, out_dir: Path) -> int:
+def _run_workflow(
+    *, images_dir: Path, out_dir: Path,
+    manifest_src: Path | None = None,
+    gen_prov_src: Path | None = None,
+) -> int:
     """Drive the full one-command workflow into ``out_dir``. The caller
-    MUST have already passed both ``images_dir`` and ``out_dir`` through
-    their respective argument gates AND confirmed ``out_dir`` exists.
+    MUST have already passed ``images_dir`` / ``out_dir`` / any supplied
+    metadata path through their respective argument gates AND confirmed
+    ``out_dir`` exists.
 
     Returns 0 on success, 1 on any stage failure. A torn run leaves
     whatever the helper / validator produced under ``out_dir``
@@ -851,9 +1031,16 @@ def _run_workflow(*, images_dir: Path, out_dir: Path) -> int:
     print(f"  bundle:             {bundle}")
     print(f"  approved-plan:      {approved_plan}")
     print(f"  review-package:     {review_package}")
+    if manifest_src is not None:
+        print(f"  manifest (custom):  {manifest_src}")
+    if gen_prov_src is not None:
+        print(f"  gen-prov (custom):  {gen_prov_src}")
     print()
 
-    rc = _stage_bundle_and_plan(images_dir=images_dir, paths=paths)
+    rc = _stage_bundle_and_plan(
+        images_dir=images_dir, paths=paths,
+        manifest_src=manifest_src, gen_prov_src=gen_prov_src,
+    )
     if rc != 0:
         return rc
     rc = _build_and_validate_review_package(paths=paths)
@@ -878,6 +1065,8 @@ def _run_workflow(*, images_dir: Path, out_dir: Path) -> int:
             approved_plan=approved_plan,
             review_package=review_package,
             validator_rc=validator_rc,
+            manifest_supplied=manifest_src is not None,
+            gen_prov_supplied=gen_prov_src is not None,
         ),
         encoding="utf-8",
     )
@@ -1000,14 +1189,19 @@ def _validate_resume_out_dir_arg(
     return out_dir, []
 
 
-def _run_plan_mode(*, images_dir: Path, out_dir: Path) -> int:
+def _run_plan_mode(
+    *, images_dir: Path, out_dir: Path,
+    manifest_src: Path | None = None,
+    gen_prov_src: Path | None = None,
+) -> int:
     """Plan step of the two-step reviewed flow. Stages the bundle and
-    writes the manifest + generated-provenance templates + reviewable
-    plan, then STOPS before building the review package — no
-    ``deck.pptx`` / ``review_package/`` is produced. The operator
-    inspects the staged plan and, when satisfied, runs ``--resume``
-    against the same ``--out-dir``. The caller MUST have already passed
-    both args through their gates and confirmed ``out_dir`` exists.
+    the manifest + generated-provenance metadata (operator-supplied when
+    given, else the helper's starter templates) + reviewable plan, then
+    STOPS before building the review package — no ``deck.pptx`` /
+    ``review_package/`` is produced. The operator inspects the staged
+    plan and, when satisfied, runs ``--resume`` against the same
+    ``--out-dir``. The caller MUST have already passed every arg through
+    its gate and confirmed ``out_dir`` exists.
 
     Returns 0 on success, 1 on any stage failure."""
     paths = _workflow_paths(out_dir)
@@ -1017,9 +1211,16 @@ def _run_plan_mode(*, images_dir: Path, out_dir: Path) -> int:
     print(f"  out-dir:            {out_dir}")
     print(f"  bundle:             {paths.bundle}")
     print(f"  reviewable-plan:    {paths.approved_plan}")
+    if manifest_src is not None:
+        print(f"  manifest (custom):  {manifest_src}")
+    if gen_prov_src is not None:
+        print(f"  gen-prov (custom):  {gen_prov_src}")
     print()
 
-    rc = _stage_bundle_and_plan(images_dir=images_dir, paths=paths)
+    rc = _stage_bundle_and_plan(
+        images_dir=images_dir, paths=paths,
+        manifest_src=manifest_src, gen_prov_src=gen_prov_src,
+    )
     if rc != 0:
         return rc
 
@@ -1044,7 +1245,11 @@ def _run_plan_mode(*, images_dir: Path, out_dir: Path) -> int:
     # a torn plan run never leaves a positive-looking README behind.
     readme = out_dir / "README.md"
     readme.write_text(
-        _render_plan_readme(images_dir=images_dir, paths=paths),
+        _render_plan_readme(
+            images_dir=images_dir, paths=paths,
+            manifest_supplied=manifest_src is not None,
+            gen_prov_supplied=gen_prov_src is not None,
+        ),
         encoding="utf-8",
     )
     if not readme.is_file() or readme.is_symlink():
@@ -1122,6 +1327,8 @@ def _render_workflow_readme(
     approved_plan: Path,
     review_package: Path,
     validator_rc: int,
+    manifest_supplied: bool = False,
+    gen_prov_supplied: bool = False,
 ) -> str:
     """Render the workflow's top-level operator-facing README. Carries
     the EXACT argv this run executed (``sys.executable`` +
@@ -1132,7 +1339,14 @@ def _render_workflow_readme(
     fenced shell-command block goes through ``shlex.quote`` so
     paths containing spaces / quotes / shell metacharacters
     (e.g. ``~/Pictures/Screen Shots/``) survive copy-paste without
-    breaking the command or executing injected shell fragments."""
+    breaking the command or executing injected shell fragments.
+
+    ``manifest_supplied`` / ``gen_prov_supplied`` keep the audit trail
+    honest: when the operator passed ``--manifest`` /
+    ``--generated-provenance``, that metadata was VALIDATED-AND-COPIED
+    into the bundle, not template-generated, so the corresponding step
+    is rendered as a staging note rather than a helper subprocess
+    command that never ran."""
     bundle_images = bundle / "images"
     rp = review_package.name  # "review_package", relative to <out-dir>.
     # Pre-quote every path that lands inside a fenced command block.
@@ -1152,6 +1366,70 @@ def _render_workflow_readme(
     approved_plan_q = shlex.quote(str(approved_plan))
     review_package_q = shlex.quote(str(review_package))
     out_dir_q = shlex.quote(str(review_package.parent))
+
+    # Steps 1 and 2 are rendered to match what actually ran. With no
+    # custom metadata, they show the helper template-write subprocesses
+    # verbatim (the default audit trail). When the operator passed
+    # --manifest / --generated-provenance, no template subprocess ran —
+    # the supplied file was validated against the copied image basenames
+    # and copied into the bundle — so the step is a staging note, never a
+    # command that did not execute.
+    if manifest_supplied:
+        step1 = [
+            "# 1. Operator-supplied manifest staged into the bundle. No "
+            "template was generated: the --manifest file you passed was "
+            "validated against the manifest contract gates (schema, "
+            "closed field set, local-only / no-network / no-credential / "
+            "no-raw-source wording, filename set == the copied images) "
+            "and copied verbatim to bundle/manifest.json.",
+            f"#    staged to: {manifest_q}",
+        ]
+    else:
+        step1 = [
+            "# 1. Manifest template (defaults the operator can hand-edit "
+            "before plan-out):",
+            f"{python_q} {helper_q} \\",
+            f"    --images-dir {bundle_images_q} \\",
+            f"    --write-manifest-template {manifest_q}",
+        ]
+    if gen_prov_supplied:
+        step2 = [
+            "# 2. Operator-supplied generated-provenance staged into the "
+            "bundle. No template was generated: the "
+            "--generated-provenance file you passed was validated "
+            "against the sidecar contract gates (schema, closed enums, "
+            "local-only / no-network / no-credential / no-raw-source "
+            "wording, filename set == the copied images) and copied "
+            "verbatim to bundle/generated_provenance.json.",
+            f"#    staged to: {gen_prov_q}",
+        ]
+    else:
+        step2 = [
+            "# 2. Generated-provenance sidecar template "
+            "(operator_declared_generated placeholders):",
+            f"{python_q} {helper_q} \\",
+            f"    --bundle {bundle_q} \\",
+            f"    --write-generated-provenance-template {gen_prov_q}",
+        ]
+
+    metadata_note: list[str] = []
+    if manifest_supplied or gen_prov_supplied:
+        which = []
+        if manifest_supplied:
+            which.append("manifest.json")
+        if gen_prov_supplied:
+            which.append("generated_provenance.json")
+        metadata_note = [
+            f"**This run used operator-supplied metadata** "
+            f"({' and '.join(which)}): the file(s) you passed were "
+            f"validated and copied into the bundle in place of the "
+            f"default template(s), so `approved_plan.json` and the "
+            f"review-package `summary.json` reflect your supplied "
+            f"values. Steps 1-2 below record that staging instead of a "
+            f"template-write command.",
+            "",
+        ]
+
     return "\n".join([
         "# operator_images_to_review_package — review package",
         "",
@@ -1180,6 +1458,7 @@ def _render_workflow_readme(
         "",
         "## Manual commands this run executed",
         "",
+        *metadata_note,
         "This workflow script only sequences the existing helpers; "
         "every line below ran verbatim against your `--out-dir` so the "
         "run is inspectable. **Steps 1-4 fail closed on re-run** "
@@ -1191,17 +1470,9 @@ def _render_workflow_readme(
         "see the *Re-running this workflow* section below.",
         "",
         "```",
-        "# 1. Manifest template (defaults the operator can hand-edit "
-        "before plan-out):",
-        f"{python_q} {helper_q} \\",
-        f"    --images-dir {bundle_images_q} \\",
-        f"    --write-manifest-template {manifest_q}",
+        *step1,
         "",
-        "# 2. Generated-provenance sidecar template "
-        "(operator_declared_generated placeholders):",
-        f"{python_q} {helper_q} \\",
-        f"    --bundle {bundle_q} \\",
-        f"    --write-generated-provenance-template {gen_prov_q}",
+        *step2,
         "",
         "# 3. Plan-out (writes the reviewer-approved plan without "
         "running the pipeline):",
@@ -1318,7 +1589,11 @@ def _render_workflow_readme(
     ])
 
 
-def _render_plan_readme(*, images_dir: Path, paths: _WorkflowPaths) -> str:
+def _render_plan_readme(
+    *, images_dir: Path, paths: _WorkflowPaths,
+    manifest_supplied: bool = False,
+    gen_prov_supplied: bool = False,
+) -> str:
     """Render the plan-step top-level README: what the operator should
     review and the EXACT command to resume. Every path embedded in a
     fenced shell-command block goes through ``shlex.quote`` so a folder
@@ -1329,6 +1604,25 @@ def _render_plan_readme(*, images_dir: Path, paths: _WorkflowPaths) -> str:
         staged = []
     out_dir_q = shlex.quote(str(paths.out_dir))
     images_q = shlex.quote(str(images_dir))
+
+    manifest_bullet = (
+        "- `bundle/manifest.json` — the **operator-supplied** manifest "
+        "(copied from your `--manifest` file after passing the contract "
+        "gates) the plan was built from."
+        if manifest_supplied else
+        "- `bundle/manifest.json` — the default per-image slide_title / "
+        "alt_text / intended_use the plan was built from."
+    )
+    gen_prov_bullet = (
+        "- `bundle/generated_provenance.json` — the **operator-supplied** "
+        "provenance (copied from your `--generated-provenance` file after "
+        "passing the contract gates) the plan was built from."
+        if gen_prov_supplied else
+        "- `bundle/generated_provenance.json` — the default "
+        "`operator_declared_generated` provenance the plan was built "
+        "from."
+    )
+
     return "\n".join([
         "# operator_images_to_review_package — staged plan (review me)",
         "",
@@ -1344,11 +1638,8 @@ def _render_plan_readme(*, images_dir: Path, paths: _WorkflowPaths) -> str:
         f"- `bundle/images/` — {len(staged)} image(s) copied "
         f"byte-identically from `{images_dir}`: {staged}. The original "
         "folder was not mutated.",
-        "- `bundle/manifest.json` — the default per-image slide_title / "
-        "alt_text / intended_use the plan was built from.",
-        "- `bundle/generated_provenance.json` — the default "
-        "`operator_declared_generated` provenance the plan was built "
-        "from.",
+        manifest_bullet,
+        gen_prov_bullet,
         "- `approved_plan.json` — the **reviewable plan**: the exact "
         "per-image filename / sha256 / intended slide / title / "
         "alt_text / intended_use the review package would be built "
@@ -1373,12 +1664,15 @@ def _render_plan_readme(*, images_dir: Path, paths: _WorkflowPaths) -> str:
         "If every answer is yes, resume below. If not, the plan is "
         "wrong — **discard and re-stage** (see *Start over*); do NOT "
         "edit the staged files, because that makes resume fail closed "
-        "rather than rebuild the plan. This wrapper plans from default "
-        "templates; to hand-author custom per-image titles / intent / "
-        "provenance, drive the lower-level "
+        "rather than rebuild the plan. To hand-author custom per-image "
+        "titles / intent / provenance, re-run `--plan` with the "
+        "wrapper's `--manifest <file>` and/or `--generated-provenance "
+        "<file>` flags (a local reviewed `manifest.json` / "
+        "`generated_provenance.json`), which are validated against the "
+        "copied images and staged into the bundle in place of the "
+        "default templates; or drive the lower-level "
         "`scripts/operator_local_images_to_editable_ppt.py` helper "
-        "(its `--manifest` flag and `generated_provenance.json` sidecar "
-        "are inputs to the plan it writes) instead.",
+        "directly.",
         "",
         "## Resume — build the review package",
         "",
@@ -1539,6 +1833,69 @@ class _ProbeResult:
     name: str
     ok: bool
     detail: str = ""
+
+
+def _selftest_write_custom_manifest(
+    images_dir: Path, dest: Path, *, title: str,
+) -> str | None:
+    """Self-test only: write a VALID default manifest template for
+    ``images_dir`` via the helper, then overwrite the first image's
+    ``slide_title`` with ``title`` so the customisation is traceable
+    through the produced plan + summary. Generating from the helper's
+    own writer (rather than hand-building JSON) guarantees the rest of
+    the manifest passes MAN1..MAN12 unchanged. Returns ``None`` on
+    success or a short error string."""
+    outcome = _run(
+        "write-manifest-template (fixture)",
+        [sys.executable, str(HELPER_PATH),
+         "--images-dir", str(images_dir),
+         "--write-manifest-template", str(dest)],
+    )
+    if outcome.rc != 0 or not dest.is_file():
+        return (
+            f"manifest template rc={outcome.rc}: "
+            f"{(outcome.stderr or outcome.stdout)[-200:]!r}"
+        )
+    try:
+        data = json.loads(dest.read_text(encoding="utf-8"))
+        data["images"][0]["slide_title"] = title
+        dest.write_text(
+            json.dumps(data, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, ValueError, KeyError, IndexError) as exc:
+        return f"could not customise manifest: {type(exc).__name__}: {exc}"
+    return None
+
+
+def _selftest_write_custom_sidecar(
+    images_dir: Path, dest: Path, *, intent: str,
+) -> str | None:
+    """Self-test only: write a VALID default generated-provenance sidecar
+    template for ``images_dir`` via the helper, then overwrite the first
+    entry's ``intent_summary`` with ``intent``. Returns ``None`` on
+    success or a short error string."""
+    outcome = _run(
+        "write-generated-provenance-template (fixture)",
+        [sys.executable, str(HELPER_PATH),
+         "--images-dir", str(images_dir),
+         "--write-generated-provenance-template", str(dest)],
+    )
+    if outcome.rc != 0 or not dest.is_file():
+        return (
+            f"sidecar template rc={outcome.rc}: "
+            f"{(outcome.stderr or outcome.stdout)[-200:]!r}"
+        )
+    try:
+        data = json.loads(dest.read_text(encoding="utf-8"))
+        data["entries"][0]["intent_summary"] = intent
+        dest.write_text(
+            json.dumps(data, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, ValueError, KeyError, IndexError) as exc:
+        return f"could not customise sidecar: {type(exc).__name__}: {exc}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2944,6 +3301,398 @@ def _run_self_tests() -> int:
             ok=ok, detail=detail,
         ))
 
+    # ----------------------------------------------------------------
+    # Operator-supplied metadata (--manifest / --generated-provenance).
+    # T21..T26 pin the optional wrapper-level metadata lane: a valid
+    # reviewed manifest + sidecar are staged into the bundle in place of
+    # the default templates and flow through to approved_plan.json +
+    # summary.json; filename-set mismatch, symlink / URI paths, and
+    # unsafe wording fail closed; plan/resume works with supplied
+    # metadata; and the default (no-metadata) path is unchanged.
+    # ----------------------------------------------------------------
+    _MAN_MARKER = "Custom Operator Title Probe"
+    _SIDE_MARKER = "Custom operator intent probe local only"
+
+    # T21 — a valid custom manifest + sidecar are accepted in one-command
+    # mode, the review package builds, and the custom slide_title /
+    # intent_summary flow into BOTH approved_plan.json and the
+    # review-package summary.json. The workflow README records the
+    # staging honestly (an operator-supplied note, no template-write
+    # command for the supplied files).
+    with tempfile.TemporaryDirectory(prefix="o2rp-T21-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        out_dir = td / "workflow_out"
+        _write_synthetic_images(images_dir)
+        man = td / "custom_manifest.json"
+        side = td / "custom_sidecar.json"
+        ok, detail = True, ""
+        err = _selftest_write_custom_manifest(
+            images_dir, man, title=_MAN_MARKER,
+        )
+        if err:
+            ok, detail = False, f"manifest fixture: {err}"
+        if ok:
+            err = _selftest_write_custom_sidecar(
+                images_dir, side, intent=_SIDE_MARKER,
+            )
+            if err:
+                ok, detail = False, f"sidecar fixture: {err}"
+        if ok:
+            rc = main(["--images-dir", str(images_dir),
+                       "--out-dir", str(out_dir),
+                       "--manifest", str(man),
+                       "--generated-provenance", str(side)])
+            if rc != 0:
+                ok, detail = False, f"main rc={rc} for valid custom metadata"
+        rp = out_dir / "review_package"
+        if ok and not (rp / "deck.pptx").is_file():
+            ok, detail = False, "review package not built with custom metadata"
+        if ok:
+            try:
+                plan_text = (out_dir / "approved_plan.json").read_text(
+                    encoding="utf-8")
+                summary_text = (rp / "summary.json").read_text(
+                    encoding="utf-8")
+            except OSError as exc:
+                ok, detail = False, (
+                    f"could not read plan/summary: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                for label, text in (
+                    ("approved_plan.json", plan_text),
+                    ("summary.json", summary_text),
+                ):
+                    if _MAN_MARKER not in text:
+                        ok, detail = False, (
+                            f"{label} missing custom manifest title marker"
+                        )
+                        break
+                    if _SIDE_MARKER not in text:
+                        ok, detail = False, (
+                            f"{label} missing custom sidecar intent marker"
+                        )
+                        break
+        if ok:
+            try:
+                readme_text = (out_dir / "README.md").read_text(
+                    encoding="utf-8")
+            except OSError as exc:
+                ok, detail = False, (
+                    f"workflow README unreadable: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                if "operator-supplied metadata" not in readme_text:
+                    ok, detail = False, (
+                        "workflow README missing operator-supplied-"
+                        "metadata note"
+                    )
+                elif ("--write-manifest-template" in readme_text
+                      or "--write-generated-provenance-template"
+                      in readme_text):
+                    ok, detail = False, (
+                        "workflow README still shows template-write "
+                        "commands despite supplied metadata"
+                    )
+        results.append(_ProbeResult(
+            name=(
+                "T21 valid custom manifest + provenance accepted and "
+                "reflected in plan / summary / README"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T22 — a supplied manifest whose filename set does NOT equal the
+    # copied images is rejected (the helper's MAN12 cross-check runs over
+    # the copied basenames before the file is staged), and no review
+    # package is built.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T22-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        out_dir = td / "workflow_out"
+        _write_synthetic_images(images_dir)
+        man = td / "mismatch_manifest.json"
+        ok, detail = True, ""
+        err = _selftest_write_custom_manifest(images_dir, man, title="ok")
+        if err:
+            ok, detail = False, f"fixture: {err}"
+        if ok:
+            try:
+                data = json.loads(man.read_text(encoding="utf-8"))
+                data["images"][0]["filename"] = "nonexistent_marker.png"
+                man.write_text(
+                    json.dumps(data, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8")
+            except (OSError, ValueError, KeyError, IndexError) as exc:
+                ok, detail = False, (
+                    f"could not perturb manifest: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        if ok:
+            rc = main(["--images-dir", str(images_dir),
+                       "--out-dir", str(out_dir),
+                       "--manifest", str(man)])
+            rp = out_dir / "review_package"
+            if rc == 0:
+                ok, detail = False, "filename mismatch NOT rejected (rc=0)"
+            elif rp.exists():
+                ok, detail = False, (
+                    f"refused (rc={rc}) but review_package built anyway"
+                )
+        results.append(_ProbeResult(
+            name=(
+                "T22 supplied manifest whose filename set != copied "
+                "images is rejected"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T23 — a URI-shaped metadata path and a symlinked metadata path are
+    # both refused at the CLI gate (rc 2) BEFORE --out-dir is even
+    # created, so a redirected metadata path cannot stage anything.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T23-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        _write_synthetic_images(images_dir)
+        ok, detail = True, ""
+        out_a = td / "out_a"
+        rc_a = main(["--images-dir", str(images_dir),
+                     "--out-dir", str(out_a),
+                     "--manifest", "file:///tmp/o2rp-T23-manifest.json"])
+        if rc_a != 2:
+            ok, detail = False, f"(a) URI --manifest rc={rc_a} (expected 2)"
+        elif out_a.exists():
+            ok, detail = False, "(a) URI --manifest created --out-dir"
+        if ok:
+            real_side = td / "real_sidecar.json"
+            real_side.write_text("{}\n", encoding="utf-8")
+            link_side = td / "link_sidecar.json"
+            link_side.symlink_to(real_side)
+            out_b = td / "out_b"
+            rc_b = main(["--images-dir", str(images_dir),
+                         "--out-dir", str(out_b),
+                         "--generated-provenance", str(link_side)])
+            if rc_b != 2:
+                ok, detail = False, (
+                    f"(b) symlink --generated-provenance rc={rc_b} "
+                    f"(expected 2)"
+                )
+            elif out_b.exists():
+                ok, detail = False, (
+                    "(b) symlink --generated-provenance created --out-dir"
+                )
+        results.append(_ProbeResult(
+            name=(
+                "T23 URI-shaped / symlinked metadata path refused at the "
+                "gate (rc 2, no staging)"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T24 — unsafe public / network / credential / raw-source wording in
+    # a supplied manifest field OR sidecar field is rejected (the helper's
+    # MAN10 / GP10 safe-string gates run over the staged metadata), and no
+    # review package is built.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T24-") as raw_td:
+        td = Path(raw_td)
+        ok, detail = True, ""
+        for label in ("manifest", "sidecar"):
+            case_td = td / label
+            case_td.mkdir()
+            images_dir = case_td / "operator_images"
+            out_dir = case_td / "workflow_out"
+            _write_synthetic_images(images_dir)
+            if label == "manifest":
+                meta = case_td / "unsafe_manifest.json"
+                err = _selftest_write_custom_manifest(
+                    images_dir, meta, title="posted on twitter",
+                )
+                argv = ["--images-dir", str(images_dir),
+                        "--out-dir", str(out_dir),
+                        "--manifest", str(meta)]
+            else:
+                meta = case_td / "unsafe_sidecar.json"
+                err = _selftest_write_custom_sidecar(
+                    images_dir, meta, intent="shared on linkedin",
+                )
+                argv = ["--images-dir", str(images_dir),
+                        "--out-dir", str(out_dir),
+                        "--generated-provenance", str(meta)]
+            if err:
+                ok, detail = False, f"{label} fixture: {err}"
+                break
+            rc = main(argv)
+            rp = out_dir / "review_package"
+            if rc == 0:
+                ok, detail = False, (
+                    f"{label}: unsafe wording NOT rejected (rc=0)"
+                )
+                break
+            if rp.exists():
+                ok, detail = False, (
+                    f"{label}: refused (rc={rc}) but review_package built"
+                )
+                break
+        results.append(_ProbeResult(
+            name=(
+                "T24 unsafe wording in a supplied manifest / sidecar "
+                "field is rejected"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T25 — the two-step reviewed flow works WITH supplied metadata:
+    # --plan stages the custom manifest + sidecar (approved_plan.json
+    # already carries the custom values; the plan README records the
+    # operator-supplied staging), and --resume builds the review package
+    # whose summary.json carries the same custom values.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T25-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        out_dir = td / "workflow_out"
+        _write_synthetic_images(images_dir)
+        man = td / "custom_manifest.json"
+        side = td / "custom_sidecar.json"
+        ok, detail = True, ""
+        err = _selftest_write_custom_manifest(
+            images_dir, man, title=_MAN_MARKER,
+        )
+        if err:
+            ok, detail = False, f"manifest fixture: {err}"
+        if ok:
+            err = _selftest_write_custom_sidecar(
+                images_dir, side, intent=_SIDE_MARKER,
+            )
+            if err:
+                ok, detail = False, f"sidecar fixture: {err}"
+        if ok:
+            plan_rc = main(["--plan",
+                            "--images-dir", str(images_dir),
+                            "--out-dir", str(out_dir),
+                            "--manifest", str(man),
+                            "--generated-provenance", str(side)])
+            if plan_rc != 0:
+                ok, detail = False, f"plan rc={plan_rc} with custom metadata"
+        if ok:
+            try:
+                plan_readme = (out_dir / "README.md").read_text(
+                    encoding="utf-8")
+                plan_text = (out_dir / "approved_plan.json").read_text(
+                    encoding="utf-8")
+            except OSError as exc:
+                ok, detail = False, (
+                    f"plan read: {type(exc).__name__}: {exc}"
+                )
+            else:
+                if "operator-supplied" not in plan_readme:
+                    ok, detail = False, (
+                        "plan README missing operator-supplied marker"
+                    )
+                elif (_MAN_MARKER not in plan_text
+                      or _SIDE_MARKER not in plan_text):
+                    ok, detail = False, (
+                        "approved_plan.json missing custom markers at "
+                        "plan time"
+                    )
+        if ok:
+            resume_rc = main(["--resume", "--out-dir", str(out_dir)])
+            rp = out_dir / "review_package"
+            if resume_rc != 0:
+                ok, detail = False, (
+                    f"resume rc={resume_rc} with custom metadata"
+                )
+            elif not (rp / "deck.pptx").is_file():
+                ok, detail = False, "resume did not build review package"
+            else:
+                try:
+                    summary_text = (rp / "summary.json").read_text(
+                        encoding="utf-8")
+                except OSError as exc:
+                    ok, detail = False, (
+                        f"summary read: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    if (_MAN_MARKER not in summary_text
+                            or _SIDE_MARKER not in summary_text):
+                        ok, detail = False, (
+                            "summary.json missing custom markers after "
+                            "resume"
+                        )
+        results.append(_ProbeResult(
+            name=(
+                "T25 plan/resume works with supplied metadata "
+                "(custom values flow into plan then summary)"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T26 — the default (no-metadata) path is UNCHANGED: the bundle
+    # manifest is byte-identical to the helper's default template, and
+    # the workflow README still shows the template-write command and does
+    # NOT falsely claim operator-supplied metadata.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T26-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        out_dir = td / "workflow_out"
+        _write_synthetic_images(images_dir)
+        rc = main(["--images-dir", str(images_dir),
+                   "--out-dir", str(out_dir)])
+        ok = rc == 0
+        detail = "" if ok else f"default-path main rc={rc}"
+        if ok:
+            ref = td / "ref_manifest.json"
+            ref_outcome = _run(
+                "ref manifest template",
+                [sys.executable, str(HELPER_PATH),
+                 "--images-dir", str(out_dir / "bundle" / "images"),
+                 "--write-manifest-template", str(ref)],
+            )
+            if ref_outcome.rc != 0:
+                ok, detail = False, (
+                    f"ref manifest template rc={ref_outcome.rc}"
+                )
+            else:
+                try:
+                    staged = (out_dir / "bundle" / "manifest.json"
+                              ).read_text(encoding="utf-8")
+                    reference = ref.read_text(encoding="utf-8")
+                except OSError as exc:
+                    ok, detail = False, (
+                        f"read: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    if staged != reference:
+                        ok, detail = False, (
+                            "default bundle manifest drifted from the "
+                            "helper template (default path changed)"
+                        )
+        if ok:
+            try:
+                readme_text = (out_dir / "README.md").read_text(
+                    encoding="utf-8")
+            except OSError as exc:
+                ok, detail = False, f"README: {type(exc).__name__}: {exc}"
+            else:
+                if "operator-supplied metadata" in readme_text:
+                    ok, detail = False, (
+                        "default-path README falsely claims operator-"
+                        "supplied metadata"
+                    )
+                elif "--write-manifest-template" not in readme_text:
+                    ok, detail = False, (
+                        "default-path README missing template-write "
+                        "command"
+                    )
+        results.append(_ProbeResult(
+            name=(
+                "T26 default (no-metadata) path unchanged: bundle "
+                "manifest == helper template, README shows template write"
+            ),
+            ok=ok, detail=detail,
+        ))
+
     repo_rc = _check_repo_unchanged(
         examples_before=examples_before,
         scripts_before=scripts_before,
@@ -3028,6 +3777,44 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--manifest", type=str, default=None,
+        help=(
+            "Optional caller-supplied reviewed manifest JSON for the "
+            "image-folder lane. When supplied, it is staged into the "
+            "bundle as bundle/manifest.json IN PLACE OF the default "
+            "template, so the produced approved_plan.json and "
+            "review_package summary reflect your per-image slide_title / "
+            "alt_text / intended_use (and slide order). The path must be "
+            "a local, non-URI, non-symlink regular file with no symlink "
+            "ancestor; its content is validated by the helper's manifest "
+            "contract gates (schema_version='1', the closed four-field "
+            "shape, no URL / credential / public-upload / raw-source / "
+            "fake-success wording) and its filename set must equal the "
+            "copied images exactly. Refused with --resume (the staged "
+            "bundle is the source of record). Local file only — no "
+            "network / model API / image search."
+        ),
+    )
+    parser.add_argument(
+        "--generated-provenance", type=str, default=None,
+        help=(
+            "Optional caller-supplied reviewed generated-provenance "
+            "sidecar JSON for the image-folder lane. When supplied, it "
+            "is staged into the bundle as bundle/generated_provenance."
+            "json IN PLACE OF the default template, so the produced "
+            "approved_plan.json and review_package summary reflect your "
+            "per-image generator_source / intent_summary / "
+            "placement_role / text_policy / subject_domain. The path "
+            "must be a local, non-URI, non-symlink regular file with no "
+            "symlink ancestor; its content is validated by the helper's "
+            "sidecar contract gates (schema_version='1', the closed "
+            "enums, no URL / credential / public-upload / raw-source / "
+            "fake-success wording) and its filename set must equal the "
+            "copied images exactly. Refused with --resume. Local file "
+            "only — no network / model API / image search."
+        ),
+    )
+    parser.add_argument(
         "--plan", action="store_true",
         help=(
             "Plan step of the two-step reviewed flow. Stage the bundle "
@@ -3059,7 +3846,7 @@ def main(argv: list[str]) -> int:
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios under TMPDIR "
-            "(no writes under REPO_ROOT). Twenty probes: T1 full "
+            "(no writes under REPO_ROOT). Twenty-six probes: T1 full "
             "happy path from synthetic --images-dir through to a "
             "validated review package + locked README markers; T2 "
             "drift (mutating generated_provenance.json after plan-"
@@ -3125,18 +3912,36 @@ def main(argv: list[str]) -> int:
             "filesystem mutation; T20 --resume refuses symlink inputs "
             "(an --out-dir that is a symlink, one with a symlink "
             "ancestor, and a staged approved_plan.json swapped for a "
-            "symlink). Mutually exclusive with --images-dir / --out-dir "
-            "/ --plan / --resume."
+            "symlink); T21 a valid operator-supplied --manifest + "
+            "--generated-provenance are accepted and the custom "
+            "slide_title / intent_summary flow into approved_plan.json + "
+            "summary.json (and the workflow README records the staging "
+            "instead of a template-write command); T22 a supplied "
+            "manifest whose filename set != the copied images is rejected "
+            "with no review package; T23 a URI-shaped / symlinked "
+            "metadata path is refused at the CLI gate (rc 2) before any "
+            "staging; T24 unsafe public / network / credential / "
+            "raw-source wording in a supplied manifest OR sidecar field "
+            "is rejected; T25 the two-step --plan/--resume flow works "
+            "with supplied metadata (custom values flow into the plan "
+            "then the summary); T26 the default no-metadata path is "
+            "unchanged (the bundle manifest stays byte-identical to the "
+            "helper template and the README shows the template-write "
+            "command). Mutually exclusive with --images-dir / --out-dir "
+            "/ --manifest / --generated-provenance / --plan / --resume."
         ),
     )
     args = parser.parse_args(argv)
 
     if args.self_test:
         if (args.images_dir is not None or args.out_dir is not None
+                or args.manifest is not None
+                or args.generated_provenance is not None
                 or args.plan or args.resume):
             print(
                 "FAIL: --self-test is mutually exclusive with "
-                "--images-dir / --out-dir / --plan / --resume.",
+                "--images-dir / --out-dir / --manifest / "
+                "--generated-provenance / --plan / --resume.",
                 file=sys.stderr,
             )
             return 2
@@ -3161,6 +3966,17 @@ def main(argv: list[str]) -> int:
                 "FAIL: --resume rebuilds from the staged bundle; do not "
                 "pass --images-dir. Pass only --out-dir pointing at a "
                 "directory a prior --plan run staged.",
+                file=sys.stderr,
+            )
+            return 2
+        if (args.manifest is not None
+                or args.generated_provenance is not None):
+            print(
+                "FAIL: --resume rebuilds from the already-staged bundle "
+                "metadata; do not pass --manifest / "
+                "--generated-provenance. Supply custom metadata at "
+                "--plan time (it is staged into the bundle then); "
+                "--resume only consumes what --plan staged.",
                 file=sys.stderr,
             )
             return 2
@@ -3308,6 +4124,39 @@ def main(argv: list[str]) -> int:
         )
         return 2
 
+    # Gate any operator-supplied metadata path BEFORE creating --out-dir,
+    # so an obviously unsafe --manifest / --generated-provenance fails
+    # closed with rc 2 without staging a single byte. Only the cheap
+    # path-safety subset runs here; the full content contract (JSON /
+    # schema / unsafe-wording / filename-set match) is enforced by the
+    # helper's own validators once the copied image basenames are known.
+    manifest_src: Path | None = None
+    gen_prov_src: Path | None = None
+    for raw, flag in (
+        (args.manifest, "--manifest"),
+        (args.generated_provenance, "--generated-provenance"),
+    ):
+        if raw is None:
+            continue
+        meta, meta_failures = _validate_metadata_arg(raw, flag)
+        if meta_failures or meta is None:
+            for line in meta_failures:
+                print(f"FAIL: {line}", file=sys.stderr)
+            return 2
+        try:
+            meta = meta.resolve(strict=False)
+        except OSError as exc:
+            print(
+                f"FAIL: could not resolve {flag} to an absolute path: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        if flag == "--manifest":
+            manifest_src = meta
+        else:
+            gen_prov_src = meta
+
     if not out_dir.exists():
         try:
             out_dir.mkdir(parents=False, exist_ok=False)
@@ -3320,9 +4169,15 @@ def main(argv: list[str]) -> int:
             return 1
 
     if args.plan:
-        rc = _run_plan_mode(images_dir=images_dir, out_dir=out_dir)
+        rc = _run_plan_mode(
+            images_dir=images_dir, out_dir=out_dir,
+            manifest_src=manifest_src, gen_prov_src=gen_prov_src,
+        )
     else:
-        rc = _run_workflow(images_dir=images_dir, out_dir=out_dir)
+        rc = _run_workflow(
+            images_dir=images_dir, out_dir=out_dir,
+            manifest_src=manifest_src, gen_prov_src=gen_prov_src,
+        )
     if rc != 0:
         _print_torn_run_recovery_hint(out_dir)
     return rc
