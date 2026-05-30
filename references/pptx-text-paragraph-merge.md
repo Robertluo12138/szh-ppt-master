@@ -4,7 +4,7 @@ This document defines the **opt-in** text-paragraph-merge contract for
 `scripts/export_pptx.py` in szh-ppt-master. It is **clean-room** — no
 file, schema, flag, validator, example, or wording from
 `hugohe3/ppt-master`, a local `ppt-master` checkout, or any other
-external project was opened, copied, paraphrased, or summarised while
+external project was copied, paraphrased, or summarised while
 preparing it. The opt-in path is local-only, fail-closed, and does NOT
 call D-One, MCP, model APIs, image generation, image search, telemetry,
 the Qoder runtime, or any other external service.

@@ -4,7 +4,7 @@ This document defines the SHAPE contract for the per-primitive PPTX
 **conversion trace report** in szh-ppt-master. It is **clean-room** — no
 file, schema, prompt, validator, example, or wording from
 `hugohe3/ppt-master`, a local `ppt-master` checkout, or any other
-external project was opened, copied, paraphrased, or summarised while
+external project was copied, paraphrased, or summarised while
 preparing it.
 
 ## 1. Status

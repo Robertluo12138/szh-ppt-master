@@ -4,13 +4,15 @@ This file records HIGH-LEVEL idea **categories** that an unrelated
 upstream PowerPoint project appears to be exploring. It is a **radar
 note**, not a design import.
 
-Nothing in this file copies code, prompts, templates, examples, images,
-assets, or wording from `hugohe3/ppt-master`, a local `ppt-master`
-checkout, or any other external project. No upstream commit, source
-file, schema, prompt, template, image, or asset was opened while
-preparing this note — the categories below are described in this
-repo's own vocabulary so szh-ppt-master can decide, **on its own
-contract surface**, whether and how to address them independently.
+Nothing in this file copies or paraphrases code, prompts, templates,
+examples, images, assets, or wording from `hugohe3/ppt-master`, a
+local `ppt-master` checkout, or any other external project. Upstream
+may be inspected only at the level of commit summaries and high-level
+behavior, for direction; no upstream source file, schema, prompt,
+template, image, or asset was copied or paraphrased into this note —
+the categories below are described in this repo's own vocabulary so
+szh-ppt-master can decide, **on its own contract surface**, whether
+and how to address them independently.
 
 ## 1. Status
 
@@ -23,8 +25,9 @@ contract surface**, whether and how to address them independently.
   `references/d-one-live-trial-packet.md` §3). This document does
   **not** change that status.
 - No upstream code, prompts, templates, examples, images, or assets
-  have been copied into this repo. No upstream file was read while
-  writing this note.
+  have been copied or paraphrased into this repo; upstream is treated
+  as a direction radar (commit summaries and high-level behavior)
+  only.
 
 ## 2. Scope
 
@@ -199,9 +202,11 @@ deferred until the first three land.
 
 - **No copying.** No code, prompts, templates, examples, images,
   assets, or wording from `hugohe3/ppt-master`, a local `ppt-master`
-  checkout, or any other external project may be read, paraphrased,
-  or imported. Every contract is re-derived from this repo's
-  `references/` and `schemas/`.
+  checkout, or any other external project may be copied, paraphrased,
+  ported, or imported. Upstream may be inspected only at the level of
+  commit summaries and high-level behavior, for direction. Every
+  contract is re-derived from this repo's `references/` and
+  `schemas/`.
 - **No D-One live calls.** Real D-One integration remains
   **UNVERIFIED**. Nothing here flips that status. See
   `references/d-one-live-prerequisites.md` §1.

@@ -4,7 +4,7 @@ This document defines a SHAPE contract for an internal brand / design preset
 in szh-ppt-master. It is **clean-room** — nothing here is copied, paraphrased,
 or summarised from `hugohe3/ppt-master`, a local `ppt-master` checkout, or
 any other external project. No upstream commit, source file, schema, prompt,
-template, image, or asset was opened while preparing this contract.
+template, image, or asset was copied or paraphrased while preparing this contract.
 
 ## 1. Status
 

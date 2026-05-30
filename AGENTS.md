@@ -4,6 +4,8 @@
 
 This file is for Codex only. Use it to steer direction, write Claude Code prompts, and review implementation work. Claude Code should use `CLAUDE.md`.
 
+Before planning or reviewing repo work, read `references/agent-operating-context.md` for the durable project direction and current-phase scope.
+
 Keep current tasks, milestone status, and one-off implementation instructions out of this file. Put immediate work in the Codex or Claude Code prompt.
 
 ## Project North Star

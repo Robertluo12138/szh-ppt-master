@@ -268,7 +268,7 @@ Agent-managed (machine cannot check):
 16. No raw source paragraphs are copied into any artifact — only short paraphrased summaries.
 17. `alt_text`, `intended_use`, and any sidecar image prompts are abstracted; they carry no raw source text.
 18. No slide is a full-slide raster or all-image slide. Every slide carries editable native shapes (the PPTX exporter's `minimal_evidence.every_slide_has_native_shape` gate enforces this on the output, but the agent should not even author such a slide).
-19. The agent did **not** read, copy, paraphrase, or summarize anything from `/Users/robert/ppt-master` (or any similarly named prior implementation). See `references/clean-room-policy.md`.
+19. The agent did **not** copy, paraphrase, or summarize anything from `ppt-master` (or any similarly named prior implementation). See `references/clean-room-policy.md`.
 
 If any check fails, the agent fixes the spec and re-runs the loop. Only when every check passes does the agent invoke the deterministic pipeline.
 

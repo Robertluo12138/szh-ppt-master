@@ -4,7 +4,8 @@ This skill must be implemented independently of any pre-existing reference imple
 
 ## Rules
 
-- Do **not** read, copy, paraphrase, or summarize code or documentation from `ppt-master` (or any similarly named prior implementation) into this repo.
+- Upstream `ppt-master` (or any similarly named prior implementation) is a **direction radar only**: you may inspect its commit summaries and high-level behavior for direction, but stay clean-room.
+- Do **not** copy, paraphrase, port, or summarize its code, prompts, templates, documentation, examples, or assets into this repo.
 - Do not import its modules, schemas, templates, or example artifacts.
 - Design decisions here must be re-derived from the contracts in `references/` and `schemas/`, not inherited.
 - File names and directory shapes here may overlap with conventional industry names (e.g. `deck_plan.json`), but the **content** of each file is original to this repo.

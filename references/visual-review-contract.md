@@ -4,7 +4,7 @@ This document defines the SHAPE contract for a **per-slide visual
 review rubric report** in szh-ppt-master. It is **clean-room** — no
 file, schema, prompt, rubric, validator, example, or wording from
 `hugohe3/ppt-master`, a local `ppt-master` checkout, or any other
-external project was opened, copied, paraphrased, or summarised while
+external project was copied, paraphrased, or summarised while
 preparing it. The only signal taken from upstream work is the
 high-level radar idea that a per-slide rubric-based review is useful;
 every field name, value enum, validator gate, and example fixture was
