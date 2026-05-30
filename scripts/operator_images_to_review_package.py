@@ -327,14 +327,34 @@ def _copy_images_into_bundle(
         # precise IG6 diagnostic.
         ext = child.suffix.lstrip(".").lower()
         if ext not in _ACCEPTED_EXTENSIONS:
-            failures.append(
-                f"--images-dir entry {child} has extension "
-                f"{child.suffix!r}; refused — only PNG / JPG / JPEG "
-                f"files are accepted (the helper's IG5 gate would "
-                f"reject this extension anyway; the wrapper refuses "
-                f"before copy so a non-image file is not duplicated "
-                f"into <out-dir>/bundle/images/)."
-            )
+            if child.name.startswith("."):
+                # Hidden dotfiles carry an empty extension, so the
+                # generic "has extension ''" line below reads as a
+                # mystery — most operators never see the file in
+                # Finder. The overwhelmingly common case is macOS
+                # Finder's invisible ``.DS_Store`` metadata file
+                # landing in an otherwise-clean image folder. Name the
+                # likely cause and give a non-destructive reveal
+                # command so the operator can clean the folder and
+                # re-run instead of decoding ``extension ''``.
+                failures.append(
+                    f"--images-dir entry {child} is a hidden file "
+                    f"(its name begins with '.', most often macOS "
+                    f"Finder's invisible .DS_Store metadata file); "
+                    f"refused — only PNG / JPG / JPEG image files are "
+                    f"accepted. Reveal hidden entries with "
+                    f"`ls -a {shlex.quote(str(images_dir))}`, remove "
+                    f"the non-image ones, and re-run."
+                )
+            else:
+                failures.append(
+                    f"--images-dir entry {child} has extension "
+                    f"{child.suffix!r}; refused — only PNG / JPG / JPEG "
+                    f"files are accepted (the helper's IG5 gate would "
+                    f"reject this extension anyway; the wrapper refuses "
+                    f"before copy so a non-image file is not duplicated "
+                    f"into <out-dir>/bundle/images/)."
+                )
             continue
         # Per-file byte cap. Stat'd BEFORE any byte is copied so a
         # multi-GB file in --images-dir is refused without ever being
@@ -1081,6 +1101,12 @@ class _ProbeResult:
 #         case-variant ``--out-dir /TMP/IMGS/output`` against
 #         ``--images-dir /tmp/imgs`` is refused on case-insensitive
 #         filesystems (parallel to T10's REPO_ROOT-ancestor gate).
+#   T13 — a hidden ``.DS_Store`` dotfile (macOS Finder's invisible
+#         metadata file — the most common real-world contaminant of
+#         an operator image folder) is refused BEFORE any byte is
+#         copied with an operator-facing macOS-aware message that
+#         names the cause and offers a non-destructive ``ls -a``
+#         reveal command, NOT the generic ``has extension ''`` line.
 # Every probe runs under TemporaryDirectory; the repo snapshot
 # enforces no writes under REPO_ROOT.
 # ---------------------------------------------------------------------------
@@ -1915,6 +1941,51 @@ def _run_self_tests() -> int:
         ok=ok, detail=detail,
     ))
 
+    # T13 hidden-dotfile refusal carries the operator-facing
+    # macOS-aware message, not the generic "has extension ''" line. A
+    # ``.DS_Store`` dropped into the folder by Finder is the single
+    # most common real-world contaminant; the pilot hit it, so the
+    # branch is pinned here. Mirrors T6's direct
+    # ``_copy_images_into_bundle`` call: the bad file is named, the
+    # hidden-file wording is present, and ``bundle_images`` is never
+    # created.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T13-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        _write_synthetic_images(images_dir)
+        # Plant the canonical macOS Finder metadata file alongside the
+        # valid PNG + JPEG.
+        (images_dir / ".DS_Store").write_bytes(b"\x00\x00\x00\x01")
+        bundle_images = td / "bundle_images"
+        try:
+            failures = _copy_images_into_bundle(images_dir, bundle_images)
+        except OSError as exc:
+            ok, detail = False, (
+                f"_copy_images_into_bundle raised "
+                f"{type(exc).__name__}: {exc} instead of returning a "
+                f"clean failure list"
+            )
+        else:
+            ok = (
+                len(failures) == 1
+                and ".DS_Store" in failures[0]
+                and "hidden file" in failures[0]
+                and "ls -a" in failures[0]
+                and "has extension ''" not in failures[0]
+                and not bundle_images.exists()
+            )
+            detail = "" if ok else (
+                f"failures={failures!r}; "
+                f"bundle_images_exists={bundle_images.exists()}"
+            )
+        results.append(_ProbeResult(
+            name=(
+                "T13 hidden .DS_Store refused with operator-facing "
+                "macOS-aware message before any byte is copied"
+            ),
+            ok=ok, detail=detail,
+        ))
+
     repo_rc = _check_repo_unchanged(
         examples_before=examples_before,
         scripts_before=scripts_before,
@@ -1995,7 +2066,7 @@ def main(argv: list[str]) -> int:
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios under TMPDIR "
-            "(no writes under REPO_ROOT). Twelve probes: T1 full "
+            "(no writes under REPO_ROOT). Thirteen probes: T1 full "
             "happy path from synthetic --images-dir through to a "
             "validated review package + locked README markers; T2 "
             "drift (mutating generated_provenance.json after plan-"
@@ -2034,7 +2105,13 @@ def main(argv: list[str]) -> int:
             "between --images-dir and --out-dir uses the case-fold "
             "ancestor check (parallel to T10) so a case-variant "
             "out-dir under images-dir is refused on case-"
-            "insensitive filesystems. Mutually exclusive with "
+            "insensitive filesystems; T13 a hidden .DS_Store dotfile "
+            "(macOS Finder's invisible metadata file, the most "
+            "common real-world contaminant of an operator image "
+            "folder) is refused before any byte is copied with an "
+            "operator-facing macOS-aware message and a non-"
+            "destructive `ls -a` reveal command, not the generic "
+            "`has extension ''` line. Mutually exclusive with "
             "--images-dir / --out-dir."
         ),
     )
