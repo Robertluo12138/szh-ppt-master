@@ -82,6 +82,15 @@ CLI shape::
         --images-dir DIR_OF_IMAGES \
         --out-dir FRESH_OUT_DIR
 
+    # Prepare-images convenience (copy a folder whose filenames carry
+    # spaces / uppercase / parentheses / CJK characters into
+    # <out-dir>/images/ under stable safe names + write
+    # filename_mapping.json; builds nothing heavier). Feed the prepared
+    # images/ into a --templates-only / --plan / one-command run:
+    python3 scripts/operator_images_to_review_package.py --prepare-images-only \
+        --images-dir DIR_OF_MESSY_IMAGES \
+        --out-dir FRESH_OUT_DIR
+
     # Self-test (every scenario under TMPDIR; no caller-visible
     # artifacts retained):
     python3 scripts/operator_images_to_review_package.py --self-test
@@ -132,6 +141,33 @@ to a ``--plan`` or one-command run. ``--templates-only`` is mutually
 exclusive with ``--plan`` / ``--resume`` / ``--manifest`` /
 ``--generated-provenance`` / ``--self-test``.
 
+``--prepare-images-only`` is the messy-filename prepare shortcut: real
+generated-image folders routinely carry names with spaces, uppercase
+letters, parentheses, dots, hyphens, or CJK characters. The operator lane
+uses each filename stem VERBATIM as the asset_id that becomes a slide's
+render_model ``image_ref`` (constrained to ``^[a-z][a-z0-9_]*$``), so such
+names build a broken deck even though they pass the looser IG6
+``--images-dir`` gate — and an operator should not have to hand-rename
+every file first. Point ``--images-dir`` at such a folder and the wrapper
+copies each PNG / JPG / JPEG into ``<out-dir>/images/`` under a stable
+safe filename (lowercased, every character outside ``[a-z0-9_]`` mapped to
+``_`` and collapsed, prefixed ``img_`` when it would not start with a
+lowercase letter, truncated to the byte cap — so the stem matches the
+``image_ref`` contract, which implies IG6)
+and writes ``filename_mapping.json`` (one record per image carrying
+``original_filename`` / ``safe_filename`` / ``byte_count`` / ``sha256`` /
+``media_type`` / ``extension``) plus a short ``README.md``. It builds
+NOTHING heavier — no ``bundle/``, ``approved_plan.json``,
+``review_package/``, ``deck.pptx``, ``workspace`` / ``reports``. The same
+``_preflight_image_entries`` gate the bundle-staging path uses still fires
+(symlink / subdirectory / non-image / hidden-dotfile / size + count caps),
+and a filename collision after normalisation is refused on the safe STEM
+(matching IG7) BEFORE any byte is copied, so a refused run leaves no
+half-written ``images/``. Feed the prepared ``images/`` into a
+``--templates-only`` / ``--plan`` / one-command run. ``--prepare-images-only``
+is mutually exclusive with ``--plan`` / ``--resume`` / ``--templates-only``
+/ ``--manifest`` / ``--generated-provenance`` / ``--self-test``.
+
 Local-only — does NOT call D-One, MCP, Qoder, a public network,
 telemetry, a model API, an image search, or any external service. NOT
 a full prompt / report / Markdown-to-PPTX automation. Real D-One
@@ -150,9 +186,11 @@ sys.dont_write_bytecode = True
 
 import argparse  # noqa: E402
 import contextlib  # noqa: E402
+import hashlib  # noqa: E402
 import io  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
+import re  # noqa: E402
 import shlex  # noqa: E402
 import shutil  # noqa: E402
 import stat  # noqa: E402
@@ -177,6 +215,9 @@ from core_image_to_editable_ppt_demo import (  # noqa: E402
 from operator_local_images_to_editable_ppt import (  # noqa: E402
     MAX_IMAGES,
     _EXPLICIT_BOUNDARIES,
+    _ID_MAX_LEN,
+    _TINY_JPEG_BYTES,
+    _TINY_PNG_BYTES,
     _validate_generated_provenance_sidecar,
     _validate_manifest_arg,
     _write_synthetic_images,
@@ -209,6 +250,29 @@ MAX_BYTES_PER_FILE = 64 * 1024 * 1024
 # malformed stem surfaces with the helper's precise per-file
 # diagnostic.
 _ACCEPTED_EXTENSIONS: frozenset[str] = frozenset({"png", "jpg", "jpeg"})
+
+# Media type recorded per prepared image in --prepare-images-only's
+# filename_mapping.json. Keyed by the lowercased extension (parallel to
+# _ACCEPTED_EXTENSIONS); jpg / jpeg both map to image/jpeg, matching the
+# PPTX exporter's content-type handling for embedded raster media.
+_MEDIA_TYPE_BY_EXT: dict[str, str] = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+}
+
+# The STRICT downstream image-reference contract that --prepare-images-only
+# must normalise filenames to. The operator lane uses an image's filename
+# stem VERBATIM as its asset_id (operator_local_images_to_editable_ppt.py:
+# ``asset_id=stem``), and that asset_id becomes the slide's render_model
+# ``image_ref`` / image_manifest ``id``, which schemas/render_model.schema
+# .json constrains to ``^[a-z][a-z0-9_]*$``. That pattern is STRICTER than
+# the helper's IG6 ``--images-dir`` basename gate (``_ID_PATTERN`` =
+# ``^[A-Za-z0-9][A-Za-z0-9_.\-]*$``): it forbids a leading digit, dots,
+# hyphens, and uppercase. A stem that passes IG6 (so the bundle / manifest
+# stage accepts it) can still fail this gate downstream when the deck is
+# built, so the prepare step normalises to THIS pattern — which implies IG6.
+_IMAGE_REF_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # Files / dirs the helper writes under --out-dir on a happy
 # normal-mode run. Verifying these exist after the helper subprocess
@@ -436,25 +500,35 @@ def _validate_metadata_arg(
     return path, failures
 
 
-def _copy_images_into_bundle(
-    images_dir: Path, bundle_images: Path,
-) -> list[str]:
-    """Pre-flight every direct child of ``images_dir`` and only then
-    copy the regular non-symlink files into ``bundle_images``. Any
-    symlink, sub-directory, or non-regular entry refuses the run
-    BEFORE ``bundle_images`` is created, so a refused workflow leaves
-    no half-staged bundle behind. The helper's IG1..IG9 gates then
-    re-validate extension / signature / stem on every copied byte."""
+def _preflight_image_entries(
+    images_dir: Path,
+) -> tuple[list[Path] | None, list[str]]:
+    """Validate every direct child of ``images_dir`` against the cheap
+    safety gates shared by every mode that reads an operator image folder
+    (count cap parallel to the helper's IG9, per-entry symlink /
+    regular-file / extension + hidden-dotfile / size-cap refusals) WITHOUT
+    copying a byte or creating any output.
+
+    Returns ``(entries, failures)``: ``entries`` is the sorted direct-child
+    list when the directory could be listed (``None`` only when ``iterdir``
+    itself failed), and ``failures`` is non-empty iff the folder is
+    unusable. When ``failures`` is empty the returned ``entries`` is a real
+    list a caller may safely iterate.
+
+    Single-sourced so ``_copy_images_into_bundle`` (bundle staging) and
+    ``_run_prepare_images_only`` (safe-filename prepare step) apply the
+    identical safety contract — the prepare step must not drift from the
+    staging path's gates."""
     failures: list[str] = []
     try:
         entries = sorted(images_dir.iterdir())
     except OSError as exc:
-        return [
+        return None, [
             f"--images-dir {images_dir} could not be listed: "
             f"{type(exc).__name__}: {exc}"
         ]
     if not entries:
-        return [
+        return entries, [
             f"--images-dir {images_dir} is empty; the helper requires "
             f"at least one PNG / JPG / JPEG file."
         ]
@@ -462,7 +536,7 @@ def _copy_images_into_bundle(
     # BEFORE the per-entry walk so a folder with thousands of
     # entries does not even reach the size / symlink probe loop.
     if len(entries) > MAX_IMAGES:
-        return [
+        return entries, [
             f"--images-dir {images_dir} contains {len(entries)} "
             f"entries; refused — the helper caps the deck at "
             f"{MAX_IMAGES} images (IG9). Pre-filter the folder and "
@@ -547,6 +621,23 @@ def _copy_images_into_bundle(
                 f"single oversized file cannot exhaust the operator's "
                 f"--out-dir disk before any helper gate can fire."
             )
+    return entries, failures
+
+
+def _copy_images_into_bundle(
+    images_dir: Path, bundle_images: Path,
+) -> list[str]:
+    """Pre-flight every direct child of ``images_dir`` (via
+    ``_preflight_image_entries``) and only then copy the regular
+    non-symlink files into ``bundle_images`` under their ORIGINAL names.
+    Any symlink, sub-directory, or non-regular entry refuses the run
+    BEFORE ``bundle_images`` is created, so a refused workflow leaves no
+    half-staged bundle behind. The helper's IG1..IG9 gates then
+    re-validate extension / signature / stem on every copied byte — this
+    path requires the operator's filenames to ALREADY satisfy the IG6 /
+    IG7 basename contract (the safe-filename prepare step that normalises
+    messy names is ``_run_prepare_images_only``)."""
+    entries, failures = _preflight_image_entries(images_dir)
     if failures:
         return failures
     try:
@@ -1343,6 +1434,267 @@ def _run_resume_mode(*, out_dir: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Prepare-images convenience: copy a flat PNG / JPG / JPEG folder into
+# <out-dir>/images/ under STABLE SAFE filenames and write an inspectable
+# filename_mapping.json (+ short README.md), then STOP. Real generated-image
+# folders routinely carry names with spaces, uppercase, parentheses, or CJK
+# characters that fail the downstream IG6 / IG7 basename contract; this step
+# lets an operator feed such a folder into the existing --templates-only /
+# --plan / --resume workflow WITHOUT hand-renaming every file. Builds nothing
+# heavier — no bundle/, approved_plan.json, review_package/, deck.pptx,
+# workspace/, or reports/.
+# ---------------------------------------------------------------------------
+
+
+def _safe_image_stem(stem: str) -> str:
+    """Normalise an operator image filename STEM (basename minus extension)
+    into a stable, downstream-safe stem.
+
+    The result is guaranteed BY CONSTRUCTION to satisfy the STRICT
+    downstream image-reference contract ``_IMAGE_REF_PATTERN``
+    (``^[a-z][a-z0-9_]*$``) — the pattern the render_model ``image_ref`` /
+    image_manifest ``id`` must match, since the operator lane uses the
+    filename stem verbatim as the asset_id and that asset_id becomes the
+    slide's image_ref. Because that pattern is stricter than (and implies)
+    the helper's IG6 ``--images-dir`` basename gate, a prepared name that
+    satisfies it is accepted at BOTH the bundle/manifest stage AND when the
+    deck is built.
+
+    Every character outside ``[a-z0-9_]`` — spaces, parentheses, dots,
+    hyphens, CJK glyphs, uppercase letters, and any other shape a real
+    generated-image folder produces — is mapped to ``_`` (after lowercasing,
+    so uppercase survives as its lowercase form) and runs of ``_`` are
+    collapsed; a stem that would not start with a lowercase letter (a
+    leading digit / ``_``, or one that normalised to empty) is prefixed
+    ``img_``; and the result is truncated to the byte cap.
+
+    Pure + deterministic: the same input always yields the same output, so
+    two operator files collide on the safe stem iff they genuinely normalise
+    to the same name — the caller refuses such collisions rather than
+    silently overwriting."""
+    safe = re.sub(r"[^a-z0-9_]", "_", stem.lower())
+    safe = re.sub(r"_+", "_", safe)
+    if not re.match(r"[a-z]", safe):
+        # Leading char is a digit / '_' (or the stem normalised to empty);
+        # the image_ref contract requires a leading lowercase LETTER, so
+        # prefix a literal and re-collapse the doubled separator.
+        safe = re.sub(r"_+", "_", "img_" + safe)
+    return safe[:_ID_MAX_LEN]
+
+
+def _render_prepare_readme(*, images_dir: Path, out_images: Path) -> str:
+    """Render the short README written into a --prepare-images-only
+    --out-dir. Names the three outputs and carries the shell-safe next-step
+    command (feed the prepared ``images/`` into --templates-only). Every path
+    that lands in a fenced command block goes through ``shlex.quote`` so a
+    folder containing spaces / quotes survives copy-paste — mirrors
+    ``_render_workflow_readme``'s quoting discipline."""
+    images_q = shlex.quote(str(images_dir))
+    out_dir_q = shlex.quote(str(out_images.parent))
+    out_images_q = shlex.quote(str(out_images))
+    return "\n".join([
+        "# operator_images_to_review_package — prepared image folder",
+        "",
+        "This folder was produced by `--prepare-images-only`. It copied a "
+        "flat PNG / JPG / JPEG folder into `images/` under stable, "
+        "downstream-safe filenames and recorded the original -> safe "
+        "mapping. The operator's source folder was NOT modified, and "
+        "NOTHING heavier was built (no `bundle/`, `approved_plan.json`, "
+        "`review_package/`, `deck.pptx`, `workspace/`, or `reports/`).",
+        "",
+        "## Contents",
+        "",
+        "- `images/` — the copied images, renamed to safe filenames whose "
+        "stems satisfy the downstream image_ref contract "
+        "(`^[a-z][a-z0-9_]*$`, lowercased, unique).",
+        "- `filename_mapping.json` — one record per image: "
+        "`original_filename`, `safe_filename`, `byte_count`, `sha256`, "
+        "`media_type`, and `extension`.",
+        "- `README.md` — this file.",
+        "",
+        "## Producing command",
+        "",
+        "```",
+        "python3 scripts/operator_images_to_review_package.py "
+        "--prepare-images-only \\",
+        f"    --images-dir {images_q} \\",
+        f"    --out-dir {out_dir_q}",
+        "```",
+        "",
+        "## Next step",
+        "",
+        "Author starter metadata (or run the full review-package workflow) "
+        "from the prepared `images/`:",
+        "",
+        "```",
+        "python3 scripts/operator_images_to_review_package.py "
+        "--templates-only \\",
+        f"    --images-dir {out_images_q} \\",
+        "    --out-dir <FRESH_OUT_DIR>",
+        "```",
+        "",
+        "Local-only: no network, no D-One, no model API, no image search.",
+        "",
+    ])
+
+
+def _run_prepare_images_only(*, images_dir: Path, out_dir: Path) -> int:
+    """Copy a flat PNG / JPG / JPEG folder into ``<out-dir>/images/`` under
+    stable, downstream-safe filenames and write an inspectable
+    ``filename_mapping.json`` + short ``README.md``, then STOP. Builds
+    NOTHING heavier — no bundle/, approved_plan.json, review_package/,
+    deck.pptx, workspace/, or reports/. The caller MUST have already passed
+    ``images_dir`` / ``out_dir`` through their gates and created ``out_dir``.
+
+    Every entry is first run through ``_preflight_image_entries`` (the SAME
+    safety gates the bundle-staging path applies — symlink / subdirectory /
+    non-image / hidden-dotfile / size + count caps), then each surviving
+    name is normalised with ``_safe_image_stem`` and a collision on the safe
+    STEM (matching the helper's IG7 "no two filenames share a stem" rule) is
+    refused BEFORE any byte is copied, so a refused run leaves no half-written
+    ``images/`` behind. Surviving files are copied under their safe names with
+    the same race-safe O_NOFOLLOW / S_ISREG / bounded-read gate the other
+    modes use. Returns 0 on success, 1 on any refusal or copy failure."""
+    out_images = out_dir / "images"
+    mapping_path = out_dir / "filename_mapping.json"
+    readme_path = out_dir / "README.md"
+
+    print("=== operator_images_to_review_package --prepare-images-only ===")
+    print(f"  images-dir:    {images_dir}")
+    print(f"  out-dir:       {out_dir}")
+    print(f"  images out:    {out_images}")
+    print(f"  mapping:       {mapping_path}")
+    print()
+
+    # Shared safety pre-flight (identical to the bundle-staging path). No
+    # output is created until every entry passes.
+    entries, failures = _preflight_image_entries(images_dir)
+    if failures:
+        for line in failures:
+            print(f"  [FAIL] {line}")
+        return 1
+
+    # Compute the safe filename for every entry and refuse a collision
+    # BEFORE creating images/, so a refused run leaves no half-written
+    # output. Collisions are detected on the safe STEM (not the full
+    # filename) to match the helper's IG7 rule — ``a.png`` and ``a.jpg``
+    # share the stem ``a`` and would collide downstream even though their
+    # full names differ.
+    plan: list[tuple[Path, str]] = []   # (source entry, safe filename)
+    claimed: dict[str, str] = {}        # safe stem -> original name
+    for child in entries:
+        ext = child.suffix.lstrip(".").lower()
+        safe_stem = _safe_image_stem(child.stem)
+        # Belt-and-braces: the normalisation is built to satisfy the strict
+        # image_ref contract, but tie the guarantee to that real downstream
+        # pattern so a future normalisation bug fails closed instead of
+        # emitting a stem that would only break when the deck is built.
+        if (not _IMAGE_REF_PATTERN.match(safe_stem)
+                or len(safe_stem) > _ID_MAX_LEN):
+            failures.append(
+                f"--images-dir entry {child.name!r} normalised to stem "
+                f"{safe_stem!r}, which does not satisfy the downstream "
+                f"image_ref contract {_IMAGE_REF_PATTERN.pattern!r} "
+                f"(<= {_ID_MAX_LEN} bytes); refused."
+            )
+            continue
+        if safe_stem in claimed:
+            failures.append(
+                f"--images-dir entries {claimed[safe_stem]!r} and "
+                f"{child.name!r} both normalise to the safe stem "
+                f"{safe_stem!r}; refused — two prepared files cannot share "
+                f"a stem (the downstream IG7 gate would reject them and "
+                f"they would collide in images/). Rename one and re-run."
+            )
+            continue
+        claimed[safe_stem] = child.name
+        plan.append((child, f"{safe_stem}.{ext}"))
+    if failures:
+        for line in failures:
+            print(f"  [FAIL] {line}")
+        return 1
+
+    # All names are safe + unique. Materialise images/ and copy each entry
+    # under its safe name.
+    try:
+        out_images.mkdir(parents=False, exist_ok=False)
+    except OSError as exc:
+        print(f"  [FAIL] could not create {out_images}: "
+              f"{type(exc).__name__}: {exc}")
+        return 1
+
+    mapping_images: list[dict] = []
+    for child, safe_name in plan:
+        dest = out_images / safe_name
+        err = _copy_one_image_race_safe(child, dest, MAX_BYTES_PER_FILE)
+        if err is not None:
+            print(f"  [FAIL] {err}")
+            return 1
+        try:
+            data = dest.read_bytes()
+        except OSError as exc:
+            print(f"  [FAIL] copied file {dest} could not be read back: "
+                  f"{type(exc).__name__}: {exc}")
+            return 1
+        ext = safe_name.rsplit(".", 1)[1]
+        mapping_images.append({
+            "original_filename": child.name,
+            "safe_filename": safe_name,
+            "byte_count": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "media_type": _MEDIA_TYPE_BY_EXT[ext],
+            "extension": ext,
+        })
+        print(f"  [PASS] {child.name!r} -> images/{safe_name}")
+
+    mapping_images.sort(key=lambda e: e["safe_filename"])
+    mapping = {
+        "schema_version": "1",
+        "prepared_image_count": len(mapping_images),
+        "images": mapping_images,
+    }
+    try:
+        mapping_path.write_text(
+            json.dumps(mapping, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        readme_path.write_text(
+            _render_prepare_readme(
+                images_dir=images_dir, out_images=out_images,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"  [FAIL] could not write mapping / README: "
+              f"{type(exc).__name__}: {exc}")
+        return 1
+
+    # Belt-and-braces leak guard: prepare mode must produce ONLY images/,
+    # filename_mapping.json, and README.md — never a bundle / plan / review
+    # package / deck. Mirrors _run_templates_only's leak guard.
+    produced = sorted(p.name for p in out_dir.iterdir())
+    if produced != ["README.md", "filename_mapping.json", "images"]:
+        print(f"  [FAIL] prepare mode produced unexpected entries "
+              f"{produced!r}; it must write only images/, "
+              f"filename_mapping.json, and README.md.")
+        return 1
+
+    print()
+    print(f"OK: prepared {len(mapping_images)} image(s) under {out_dir}:")
+    print(f"  - images/                ({len(mapping_images)} "
+          f"safe-named file(s))")
+    print(f"  - filename_mapping.json  (original -> safe + byte_count / "
+          f"sha256 / media_type)")
+    print(f"  - README.md")
+    print(f"Feed the prepared images into the existing workflow, e.g.:")
+    print(f"  python3 scripts/operator_images_to_review_package.py "
+          f"--templates-only \\")
+    print(f"      --images-dir {shlex.quote(str(out_images))} \\")
+    print(f"      --out-dir <FRESH_OUT_DIR>")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Template-only convenience: write JUST the two editable starter metadata
 # files (manifest.json + generated_provenance.json) for the operator's
 # image folder into --out-dir, then STOP. Builds no bundle, no plan, no
@@ -2063,7 +2415,11 @@ def _selftest_write_custom_sidecar(
 
 
 # ---------------------------------------------------------------------------
-# Self-test entrypoint. Covers exactly:
+# Self-test entrypoint. T1–T14 are detailed below; later probes (T15
+# onward, including the --templates-only T27–T28 and --prepare-images-only
+# T29–T33 groups) are documented at each probe's own inline comment, and
+# the complete, current probe list + count live in the --self-test
+# argument help. T1–T14:
 #   T1 — full happy path from operator --images-dir to validated review
 #        package + workflow README (including the locked README markers
 #        for every stage + the validator rc + the "fail closed on
@@ -4024,6 +4380,319 @@ def _run_self_tests() -> int:
             ok=ok, detail=detail,
         ))
 
+    # ----------------------------------------------------------------
+    # Prepare-images convenience (--prepare-images-only). T29..T32 pin
+    # the messy-filename prepare step: it normalises real-world image
+    # filenames into stable safe names usable by the existing
+    # --templates-only / --plan / --resume flow, refuses collisions and
+    # unsafe entries before any byte is copied, and refuses the modes /
+    # inputs it must not combine with.
+    # ----------------------------------------------------------------
+
+    # T29 — happy path: a folder of messy real-world filenames (spaces +
+    # parentheses + uppercase extension, an uppercase stem, CJK glyphs, and
+    # an already-safe control) is copied into <out-dir>/images/ under stable
+    # safe names; filename_mapping.json records original -> safe plus
+    # byte_count / sha256 / media_type / extension for every image; only the
+    # three prepare outputs are produced; and the prepared images/ feeds the
+    # existing --templates-only mode (rc 0, manifest covers exactly the safe
+    # names).
+    with tempfile.TemporaryDirectory(prefix="o2rp-T29-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator images"   # source dir name has a space
+        images_dir.mkdir()
+        # Spaces / parens / uppercase -> lowercased _; interior dots and
+        # hyphens (allowed by IG6 but NOT by the stricter image_ref
+        # contract) -> _; a leading digit and a CJK-led run -> the img_
+        # fallback (image_ref requires a leading lowercase letter); an
+        # already-safe name unchanged.
+        expected = {
+            "My Photo (1).PNG": "my_photo_1_.png",
+            "UPPER.JPEG": "upper.jpeg",
+            "图1_report.png": "img_1_report.png",
+            "report-v2.png": "report_v2.png",
+            "photo.final.png": "photo_final.png",
+            "2024shots.png": "img_2024shots.png",
+            "plain.jpg": "plain.jpg",
+        }
+        for orig in expected:
+            ext0 = orig.rsplit(".", 1)[1].lower()
+            (images_dir / orig).write_bytes(
+                _TINY_PNG_BYTES if ext0 == "png" else _TINY_JPEG_BYTES
+            )
+        out_dir = td / "prepared"
+        rc = main(["--prepare-images-only",
+                   "--images-dir", str(images_dir),
+                   "--out-dir", str(out_dir)])
+        ok = rc == 0
+        detail = "" if ok else f"main(--prepare-images-only ...) rc={rc}"
+        out_images = out_dir / "images"
+        mapping_path = out_dir / "filename_mapping.json"
+        if ok:
+            produced = sorted(p.name for p in out_dir.iterdir())
+            if produced != ["README.md", "filename_mapping.json", "images"]:
+                ok, detail = False, (
+                    f"--out-dir is not exactly the three prepare outputs: "
+                    f"{produced!r}"
+                )
+        if ok:
+            try:
+                mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                ok, detail = False, (
+                    f"filename_mapping.json not parseable: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        if ok:
+            rows = mapping.get("images")
+            if not isinstance(rows, list) or len(rows) != len(expected):
+                ok, detail = False, f"mapping images[] wrong shape: {rows!r}"
+        if ok:
+            by_orig = {
+                r.get("original_filename"): r for r in rows
+                if isinstance(r, dict)
+            }
+            for orig, want_safe in expected.items():
+                row = by_orig.get(orig)
+                if row is None:
+                    ok, detail = False, f"mapping missing original {orig!r}"
+                    break
+                if row.get("safe_filename") != want_safe:
+                    ok, detail = False, (
+                        f"{orig!r} -> {row.get('safe_filename')!r} "
+                        f"(expected {want_safe!r})"
+                    )
+                    break
+                stem = want_safe.rsplit(".", 1)[0]
+                if (not _IMAGE_REF_PATTERN.match(stem)
+                        or len(stem) > _ID_MAX_LEN):
+                    ok, detail = False, (
+                        f"safe stem {stem!r} does not match the downstream "
+                        f"image_ref contract {_IMAGE_REF_PATTERN.pattern!r}"
+                    )
+                    break
+                ext = want_safe.rsplit(".", 1)[1]
+                raw = _TINY_PNG_BYTES if ext == "png" else _TINY_JPEG_BYTES
+                want_media = "image/png" if ext == "png" else "image/jpeg"
+                if (row.get("byte_count") != len(raw)
+                        or row.get("sha256")
+                        != hashlib.sha256(raw).hexdigest()
+                        or row.get("media_type") != want_media
+                        or row.get("extension") != ext):
+                    ok, detail = False, (
+                        f"mapping fields wrong for {orig!r}: {row!r}"
+                    )
+                    break
+                if not (out_images / want_safe).is_file():
+                    ok, detail = False, (
+                        f"safe file images/{want_safe} not on disk"
+                    )
+                    break
+        if ok:
+            # The prepared images/ must be directly usable by the existing
+            # --templates-only mode (the whole point of the prepare step).
+            out2 = td / "templates_from_prepared"
+            rc2 = main(["--templates-only",
+                        "--images-dir", str(out_images),
+                        "--out-dir", str(out2)])
+            if rc2 != 0:
+                ok, detail = False, (
+                    f"prepared images/ not usable by --templates-only "
+                    f"(rc={rc2})"
+                )
+            else:
+                try:
+                    man = json.loads(
+                        (out2 / "manifest.json").read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError) as exc:
+                    ok, detail = False, (
+                        f"templates-only manifest unreadable: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    got = sorted(
+                        e.get("filename") for e in man.get("images", [])
+                        if isinstance(e, dict)
+                    )
+                    if got != sorted(expected.values()):
+                        ok, detail = False, (
+                            f"templates-only manifest set {got!r} != the "
+                            f"prepared safe names"
+                        )
+        results.append(_ProbeResult(
+            name=(
+                "T29 --prepare-images-only normalises messy filenames "
+                "(spaces / parens / uppercase / dots / hyphens / leading "
+                "digit / CJK) into image_ref-safe names, records a complete "
+                "mapping, and the prepared images/ feeds --templates-only"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T30 — a filename collision after normalisation fails closed. Two
+    # DISTINCT source names ("My File.png" and "my_file.png") normalise to
+    # the same safe stem 'my_file'; the run must refuse with rc 1 BEFORE
+    # creating images/ (no overwrite, no partial mapping). The two names
+    # differ by more than case, so the probe is valid on a
+    # case-insensitive filesystem too.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T30-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        images_dir.mkdir()
+        (images_dir / "My File.png").write_bytes(_TINY_PNG_BYTES)
+        (images_dir / "my_file.png").write_bytes(_TINY_PNG_BYTES)
+        out_dir = td / "prepared"
+        rc = main(["--prepare-images-only",
+                   "--images-dir", str(images_dir),
+                   "--out-dir", str(out_dir)])
+        ok = rc == 1
+        detail = "" if ok else f"collision did not fail closed (rc={rc})"
+        if ok and (out_dir / "images").exists():
+            ok, detail = False, "collision-refused run still created images/"
+        if ok and (out_dir / "filename_mapping.json").exists():
+            ok, detail = False, (
+                "collision-refused run still wrote filename_mapping.json"
+            )
+        results.append(_ProbeResult(
+            name=(
+                "T30 --prepare-images-only refuses a post-normalisation "
+                "filename collision (rc 1, no images/ or mapping written)"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T31 — unsafe entries still fail closed in prepare mode (the same
+    # _preflight_image_entries gate the bundle-staging path uses): (a) a
+    # per-file symlink is refused at the gate, and (b) a non-image .txt is
+    # refused before any byte is copied. Neither leaves an images/ folder.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T31-") as raw_td:
+        td = Path(raw_td)
+        ok, detail = True, ""
+        # (a) symlink entry.
+        src_a = td / "imgs_a"
+        src_a.mkdir()
+        (src_a / "real.png").write_bytes(_TINY_PNG_BYTES)
+        target = td / "target.png"
+        target.write_bytes(_TINY_PNG_BYTES)
+        (src_a / "link.png").symlink_to(target)
+        out_a = td / "out_a"
+        rc_a = main(["--prepare-images-only",
+                     "--images-dir", str(src_a), "--out-dir", str(out_a)])
+        if rc_a != 1:
+            ok, detail = False, f"(a) symlink entry rc={rc_a} (expected 1)"
+        elif (out_a / "images").exists():
+            ok, detail = False, "(a) symlink-refused run still created images/"
+        # (b) non-image .txt alongside a valid PNG.
+        if ok:
+            src_b = td / "imgs_b"
+            src_b.mkdir()
+            (src_b / "ok.png").write_bytes(_TINY_PNG_BYTES)
+            (src_b / "notes.txt").write_text("x", encoding="utf-8")
+            out_b = td / "out_b"
+            rc_b = main(["--prepare-images-only",
+                         "--images-dir", str(src_b), "--out-dir", str(out_b)])
+            if rc_b != 1:
+                ok, detail = False, f"(b) non-image .txt rc={rc_b} (expected 1)"
+            elif (out_b / "images").exists():
+                ok, detail = False, (
+                    "(b) non-image-refused run still created images/"
+                )
+        results.append(_ProbeResult(
+            name=(
+                "T31 --prepare-images-only refuses unsafe entries (per-file "
+                "symlink, non-image file) before any byte is copied"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T32 — --prepare-images-only refuses the modes / inputs it must not
+    # combine with: --plan and --templates-only (build / write modes) and
+    # --manifest (reviewed metadata for a build) each fail closed at the
+    # gate with rc 2 and no --out-dir created.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T32-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "operator_images"
+        images_dir.mkdir()
+        (images_dir / "ok.png").write_bytes(_TINY_PNG_BYTES)
+        real_manifest = td / "supplied_manifest.json"
+        real_manifest.write_text("{}\n", encoding="utf-8")
+        ok, detail = True, ""
+        combos = [
+            ("--plan", ["--plan"]),
+            ("--templates-only", ["--templates-only"]),
+            ("--manifest", ["--manifest", str(real_manifest)]),
+        ]
+        for label, extra in combos:
+            out = td / ("out_" + label.strip("-"))
+            rc = main(["--prepare-images-only", *extra,
+                       "--images-dir", str(images_dir), "--out-dir", str(out)])
+            if rc != 2:
+                ok, detail = False, (
+                    f"--prepare-images-only + {label} rc={rc} (expected 2)"
+                )
+                break
+            if out.exists():
+                ok, detail = False, (
+                    f"--prepare-images-only + {label} still created --out-dir"
+                )
+                break
+        results.append(_ProbeResult(
+            name=(
+                "T32 --prepare-images-only refuses --plan / --templates-only "
+                "/ --manifest combinations at the gate (rc 2, no --out-dir "
+                "created)"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T33 — END-TO-END downstream proof: the prepared images/ (safe names
+    # derived from messy originals carrying dots / hyphens / a leading
+    # digit — the exact shapes that pass the looser IG6 --images-dir gate
+    # but break the render_model image_ref contract) builds a FULL review
+    # package via the one-command workflow. The operator lane uses each stem
+    # verbatim as the asset_id that becomes the slide's image_ref, so a name
+    # normalised only to IG6 would fail render_model validation during the
+    # build; a green deck.pptx is the authoritative proof that the prepare
+    # step normalises to the real downstream contract, not just IG6.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T33-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "messy images"
+        images_dir.mkdir()
+        (images_dir / "report-v2.png").write_bytes(_TINY_PNG_BYTES)
+        (images_dir / "photo.final.png").write_bytes(_TINY_PNG_BYTES)
+        (images_dir / "2024 Shots.JPG").write_bytes(_TINY_JPEG_BYTES)
+        prepared = td / "prepared"
+        rc = main(["--prepare-images-only",
+                   "--images-dir", str(images_dir),
+                   "--out-dir", str(prepared)])
+        ok = rc == 0
+        detail = "" if ok else f"prepare step rc={rc}"
+        if ok:
+            built = td / "built"
+            rc_b = main(["--images-dir", str(prepared / "images"),
+                         "--out-dir", str(built)])
+            if rc_b != 0:
+                ok, detail = False, (
+                    f"prepared images/ failed the full one-command build "
+                    f"(rc={rc_b}) — a safe name did not satisfy the "
+                    f"downstream image_ref contract"
+                )
+            elif not (built / "review_package" / "deck.pptx").is_file():
+                ok, detail = False, (
+                    "one-command build on prepared images/ produced no "
+                    "deck.pptx"
+                )
+        results.append(_ProbeResult(
+            name=(
+                "T33 prepared images/ (safe names from messy originals with "
+                "dots / hyphens / leading digit) build a full review package "
+                "end-to-end (proves the image_ref contract ^[a-z][a-z0-9_]*$, "
+                "not just IG6)"
+            ),
+            ok=ok, detail=detail,
+        ))
+
     repo_rc = _check_repo_unchanged(
         examples_before=examples_before,
         scripts_before=scripts_before,
@@ -4196,10 +4865,37 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--prepare-images-only", action="store_true",
+        help=(
+            "Prepare convenience for messy real-world image filenames. "
+            "Point --images-dir at a local PNG / JPG / JPEG folder whose "
+            "names carry spaces / uppercase / parentheses / dots / hyphens "
+            "/ CJK characters and copy them into <out-dir>/images/ under "
+            "stable, downstream-safe filenames whose stems match the "
+            "render_model image_ref contract ^[a-z][a-z0-9_]*$ (lowercased, "
+            "unique) — the pattern the operator lane's asset_id (= filename "
+            "stem) must satisfy when the deck is built, stricter than the "
+            "IG6 --images-dir gate. Then write an inspectable "
+            "filename_mapping.json "
+            "(original -> safe filename + byte_count / sha256 / media_type "
+            "/ extension) and a short README.md. Builds NOTHING heavier: no "
+            "bundle/, no approved_plan.json, no review_package/, no "
+            "deck.pptx, no workspace / reports. The operator's source "
+            "folder is never mutated. A filename collision after "
+            "normalisation, a symlink / subdirectory / non-image / hidden "
+            "entry, or an oversized / over-count folder all fail closed "
+            "before any byte is copied. Feed the prepared images/ into a "
+            "--templates-only / --plan / one-command run. Requires "
+            "--images-dir + a fresh --out-dir; mutually exclusive with "
+            "--plan / --resume / --templates-only / --self-test / "
+            "--manifest / --generated-provenance."
+        ),
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios under TMPDIR "
-            "(no writes under REPO_ROOT). Twenty-eight probes: T1 full "
+            "(no writes under REPO_ROOT). Thirty-three probes: T1 full "
             "happy path from synthetic --images-dir through to a "
             "validated review package + locked README markers; T2 "
             "drift (mutating generated_provenance.json after plan-"
@@ -4287,9 +4983,26 @@ def main(argv: list[str]) -> int:
             "files parse as JSON, agree on the filename set, and pass the "
             "helper's manifest / sidecar validators; T28 --templates-only "
             "refuses --manifest / --plan combinations at the gate (rc 2, "
-            "no --out-dir created). Mutually exclusive with --images-dir "
-            "/ --out-dir / --manifest / --generated-provenance / --plan "
-            "/ --resume / --templates-only."
+            "no --out-dir created); T29 --prepare-images-only normalises a "
+            "folder of messy filenames (spaces / parentheses / uppercase / "
+            "CJK) into stable safe names, writes a complete "
+            "filename_mapping.json (original -> safe + byte_count / sha256 / "
+            "media_type / extension), produces only images/ + mapping + "
+            "README, and the prepared images/ feeds --templates-only; T30 "
+            "--prepare-images-only refuses a post-normalisation filename "
+            "collision (two distinct names sharing a safe stem) with rc 1 "
+            "and no images/ or mapping written; T31 --prepare-images-only "
+            "refuses unsafe entries (per-file symlink, non-image file) "
+            "before any byte is copied; T32 --prepare-images-only refuses "
+            "--plan / --templates-only / --manifest combinations at the "
+            "gate (rc 2, no --out-dir created); T33 the prepared images/ "
+            "(safe names from messy originals with dots / hyphens / a "
+            "leading digit) build a full review package end-to-end via the "
+            "one-command workflow, proving the safe stems satisfy the "
+            "render_model image_ref contract ^[a-z][a-z0-9_]*$ (not just "
+            "the looser IG6 gate). Mutually exclusive with "
+            "--images-dir / --out-dir / --manifest / --generated-provenance "
+            "/ --plan / --resume / --templates-only / --prepare-images-only."
         ),
     )
     args = parser.parse_args(argv)
@@ -4298,12 +5011,13 @@ def main(argv: list[str]) -> int:
         if (args.images_dir is not None or args.out_dir is not None
                 or args.manifest is not None
                 or args.generated_provenance is not None
-                or args.plan or args.resume or args.templates_only):
+                or args.plan or args.resume or args.templates_only
+                or args.prepare_images_only):
             print(
                 "FAIL: --self-test is mutually exclusive with "
                 "--images-dir / --out-dir / --manifest / "
                 "--generated-provenance / --plan / --resume / "
-                "--templates-only.",
+                "--templates-only / --prepare-images-only.",
                 file=sys.stderr,
             )
             return 2
@@ -4335,6 +5049,28 @@ def main(argv: list[str]) -> int:
             "fresh --out-dir; it is mutually exclusive with --plan / "
             "--resume / --manifest / --generated-provenance (those "
             "supply reviewed metadata to, or drive, a build run).",
+            file=sys.stderr,
+        )
+        return 2
+
+    # --prepare-images-only copies --images-dir into <out-dir>/images/ under
+    # safe filenames + writes filename_mapping.json / README.md and builds
+    # nothing else. Like --templates-only it shares the images-dir / out-dir
+    # gate below, so refuse the modes / inputs it must not combine with here
+    # first — before the resume branch and the shared gate run.
+    if args.prepare_images_only and (
+        args.plan or args.resume or args.templates_only
+        or args.manifest is not None
+        or args.generated_provenance is not None
+    ):
+        print(
+            "FAIL: --prepare-images-only only copies --images-dir into "
+            "<out-dir>/images/ under safe filenames and writes "
+            "filename_mapping.json + README.md; it is mutually exclusive "
+            "with --plan / --resume / --templates-only / --manifest / "
+            "--generated-provenance (those drive, or supply metadata to, a "
+            "later build run). Prepare first, then feed the prepared "
+            "images/ into one of those modes.",
             file=sys.stderr,
         )
         return 2
@@ -4556,6 +5292,11 @@ def main(argv: list[str]) -> int:
         # above refuses --templates-only + --manifest / --generated-
         # provenance), so the shared metadata gate was a no-op.
         rc = _run_templates_only(images_dir=images_dir, out_dir=out_dir)
+    elif args.prepare_images_only:
+        # manifest_src / gen_prov_src are always None here (the guard above
+        # refuses --prepare-images-only + --manifest / --generated-
+        # provenance), so the shared metadata gate was a no-op.
+        rc = _run_prepare_images_only(images_dir=images_dir, out_dir=out_dir)
     elif args.plan:
         rc = _run_plan_mode(
             images_dir=images_dir, out_dir=out_dir,

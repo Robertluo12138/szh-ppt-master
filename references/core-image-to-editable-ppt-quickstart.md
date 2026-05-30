@@ -487,6 +487,19 @@ python3 scripts/operator_images_to_review_package.py --resume \
 
 `--resume` takes `--out-dir` only (the bundle + plan are already staged; passing `--images-dir` is refused). It fails closed if the bundle has drifted from the approved plan between the two steps — editing any byte under `bundle/images/`, `bundle/manifest.json`, or `bundle/generated_provenance.json` in a way that changes the plan refuses the resume before any review-package artifact is created. To approve a changed plan, discard the directory and re-run `--plan`. The resume gate also refuses a URI-shaped / symlinked / symlink-ancestor / under-repo `--out-dir`, an `--out-dir` that is not a prior `--plan` output, and an `--out-dir` whose `review_package/` was already built.
 
+### Have messy generated filenames? (`--prepare-images-only`)
+
+Real generated-image folders routinely carry filenames with spaces, uppercase letters, parentheses, dots, hyphens, or CJK characters. The operator lane uses each filename stem **verbatim** as the asset_id that becomes a slide's render_model `image_ref`, which `schemas/render_model.schema.json` constrains to `^[a-z][a-z0-9_]*$` — stricter than the IG6 `--images-dir` gate (it forbids a leading digit, dots, hyphens, and uppercase), so such names pass staging but build a broken deck. Rather than hand-rename every file, point `--prepare-images-only` at the folder: it copies each PNG / JPG / JPEG into `<out-dir>/images/` under a stable, safe filename (lowercased, every character outside `[a-z0-9_]` mapped to `_` and collapsed, prefixed `img_` when it would not start with a lowercase letter, truncated to the byte cap — so the stem matches the `image_ref` contract, which implies IG6) and writes an inspectable `filename_mapping.json` (one record per image: `original_filename`, `safe_filename`, `byte_count`, `sha256`, `media_type`, `extension`) plus a short `README.md`. It builds **nothing heavier** — no `bundle/`, `approved_plan.json`, `review_package/`, `deck.pptx`, `workspace/`, or `reports/` — and never mutates your source folder:
+
+```bash
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_images_to_review_package.py --prepare-images-only \
+  --images-dir "/path/to/messy images" \
+  --out-dir "$RUN_DIR/prepared"
+```
+
+Every entry passes the same safety gate the bundle-staging path uses (symlink / subdirectory / non-image / hidden-dotfile / size + count caps), and a filename collision after normalisation is refused on the safe stem (matching IG7) **before any byte is copied**, so a refused run leaves no half-written `images/`. Feed the prepared `<out-dir>/images/` into a `--templates-only` / `--plan` / one-command run. `--prepare-images-only` is mutually exclusive with `--plan` / `--resume` / `--templates-only` / `--manifest` / `--generated-provenance` and is refused (rc 2, no `--out-dir` created) if combined with them.
+
 ### Just want editable starter metadata? (`--templates-only`)
 
 To author reviewed metadata without writing JSON by hand, point `--templates-only` at your image folder: it writes JUST `manifest.json` and `generated_provenance.json` (the helper's safe-default templates) into a fresh `--out-dir` and builds **nothing else** — no `bundle/`, no `approved_plan.json`, no `review_package/`, no `deck.pptx`:
@@ -516,14 +529,20 @@ python3 scripts/operator_images_to_review_package.py \
 Each supplied path is gated at the CLI for URI-shape / symlink / symlink-ancestor / missing / non-file (rc 2 **before** any image is staged). Its content is then validated by the helper's own `_validate_manifest_arg` (MAN1..MAN12) / `_validate_generated_provenance_sidecar` (GP1..GP13) gates against the **copied** image basenames — JSON parse, `schema_version == "1"`, the closed field set / closed enums, the safe-string deny lists (no URL / URI / path separator / credential / public-upload / confidential / fake-success wording), and the filename-set-equals-the-copied-images cross-check — and the file is copied race-safely into the bundle in place of the default template. Either flag may be supplied alone or together; an omitted flag keeps the default template for that file. Because the downstream plan-out / approved-plan / resume drift-lock build the plan from the bundle, the produced `approved_plan.json` and `review_package/summary.json` reflect the supplied metadata with no further wiring. The wrapper re-implements no contract logic — it reuses the helper's validators verbatim. A filename-set mismatch, unsafe wording, malformed JSON, or a drift between the supplied metadata at `--plan` time and `--resume` all fail closed with no review package.
 
 ```bash
-# Twenty-eight self-test probes (one-command happy path + copy/TOCTOU gates
+# Thirty-three self-test probes (one-command happy path + copy/TOCTOU gates
 # + T15–T20 for the two-step flow + T21–T26 for operator-supplied
 # metadata: valid custom manifest/provenance accepted and reflected in
 # plan/summary, filename-set mismatch rejected, symlink/URI metadata path
 # rejected, unsafe wording rejected, plan/resume works with supplied
 # metadata, and the default no-metadata path is unchanged + T27–T28 for
 # the --templates-only shortcut: template-only output that passes the
-# helper validators, plus mutual-exclusion refusal):
+# helper validators, plus mutual-exclusion refusal + T29–T33 for the
+# --prepare-images-only step: messy filenames (incl. dots / hyphens / a
+# leading digit) normalised into image_ref-valid safe names, a
+# post-normalisation collision failing closed, unsafe entries failing
+# closed, mutual-exclusion refusal, and an end-to-end one-command build
+# on the prepared images proving the safe stems satisfy the downstream
+# image_ref contract ^[a-z][a-z0-9_]*$):
 TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
   python3 scripts/operator_images_to_review_package.py --self-test
 ```

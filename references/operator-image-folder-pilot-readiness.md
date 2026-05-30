@@ -49,8 +49,14 @@ inputs):
 The spaces-in-filenames folder failed closed at the manifest helper's IG6 stem
 gate with a per-file, actionable rename message and an explicit recovery NOTE
 (remove the partial out-dir or pass a fresh one). The original image folder was
-never mutated, and the repo tree (`examples/`, `scripts/`) stayed byte-identical
-across every run.
+never mutated, and the repo tree (`examples/`, `scripts/`) stayed
+byte-identical across every run. Operators whose folders carry such names
+(spaces, uppercase, parentheses, dots, hyphens, or CJK) can now normalise them
+up front with `scripts/operator_images_to_review_package.py
+--prepare-images-only`, which copies them into a fresh `images/` under stable
+`image_ref`-valid filenames (`^[a-z][a-z0-9_]*$`) plus an inspectable
+`filename_mapping.json`, then feed the prepared folder into the one-command /
+`--plan` / `--templates-only` flow.
 
 ## Non-Blocking TODOs
 
@@ -61,7 +67,11 @@ These do not gate a first human pilot; capture them for follow-up evidence.
   an invalid-stem folder (e.g. names with spaces) leaves a partial
   `bundle/images/` copy before failing. The error and recovery NOTE are clear,
   so this is ordering polish, not a correctness gate; a future change could
-  pre-screen stems in the wrapper before any byte is copied.
+  pre-screen stems in the wrapper before any byte is copied. The new
+  `--prepare-images-only` mode now does exactly this normalising pre-screen in
+  a separate opt-in path — copying into a fresh `images/` under
+  `image_ref`-valid names, refusing unsafe entries before any byte is copied —
+  though the one-command path's copy-then-check ordering is itself unchanged.
 - **Absolute interpreter path in the README commands.** The top-level README
   records the exact commands run using the resolved interpreter path
   (`sys.executable`). Accurate and copy-paste-safe locally; a human moving the
