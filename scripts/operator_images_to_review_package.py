@@ -91,6 +91,15 @@ CLI shape::
         --images-dir DIR_OF_MESSY_IMAGES \
         --out-dir FRESH_OUT_DIR
 
+    # Templates-only seeded from the prepared images' ORIGINAL filenames
+    # (pass the prepare step's filename_mapping.json so the manifest's
+    # slide_title / alt_text keep the human-readable original names that
+    # were normalized away for safe local storage):
+    python3 scripts/operator_images_to_review_package.py --templates-only \
+        --images-dir PREPARED_OUT_DIR/images \
+        --filename-mapping PREPARED_OUT_DIR/filename_mapping.json \
+        --out-dir FRESH_OUT_DIR
+
     # Self-test (every scenario under TMPDIR; no caller-visible
     # artifacts retained):
     python3 scripts/operator_images_to_review_package.py --self-test
@@ -141,6 +150,29 @@ to a ``--plan`` or one-command run. ``--templates-only`` is mutually
 exclusive with ``--plan`` / ``--resume`` / ``--manifest`` /
 ``--generated-provenance`` / ``--self-test``.
 
+The optional ``--filename-mapping`` flag (valid ONLY with
+``--templates-only``) points at the ``filename_mapping.json`` a prior
+``--prepare-images-only`` run wrote next to the prepared ``images/``. When
+supplied, the manifest's per-image ``slide_title`` / ``alt_text`` are
+seeded from each image's ORIGINAL filename — preserving the spaces /
+punctuation / CJK characters ``--prepare-images-only`` normalized away for
+safe local storage — instead of the normalized safe basename, so a deck
+prepared from messy real-world names keeps human-readable titles. The path
+is gated for URI / symlink / symlink-ancestor / missing / non-file (rc 2)
+at the CLI; the mapping is then bound to the prepared image BYTES — its
+``safe_filename`` set must equal the prepared images exactly AND each
+record's recorded ``sha256`` / ``byte_count`` must match the prepared
+bytes (else the run fails closed, so a stale mapping that reuses the same
+safe names for different images is refused rather than mislabelling the
+deck) — and the re-seeded manifest is re-validated through the helper's
+``_validate_manifest_arg`` gate so an over-long / unsafe seeded title fails
+closed rather than producing a manifest that only breaks at build time. Only the manifest is seeded — the
+generated-provenance sidecar carries no filename-derived title. With no
+``--filename-mapping`` the manifest is exactly the helper's default
+template (prior behavior). The flag is refused outside ``--templates-only``
+(build modes consume a reviewed manifest via ``--manifest``;
+``--prepare-images-only`` produces the mapping rather than consuming it).
+
 ``--prepare-images-only`` is the messy-filename prepare shortcut: real
 generated-image folders routinely carry names with spaces, uppercase
 letters, parentheses, dots, hyphens, or CJK characters. The operator lane
@@ -158,7 +190,9 @@ result is truncated to the byte cap — so the stem matches the
 ``image_ref`` contract, which implies IG6)
 and writes ``filename_mapping.json`` (one record per image carrying
 ``original_filename`` / ``safe_filename`` / ``byte_count`` / ``sha256`` /
-``media_type`` / ``extension``) plus a short ``README.md``. It builds
+``media_type`` / ``extension``; the recorded ``original_filename`` is what
+``--templates-only --filename-mapping`` later seeds slide titles from) plus
+a short ``README.md``. It builds
 NOTHING heavier — no ``bundle/``, ``approved_plan.json``,
 ``review_package/``, ``deck.pptx``, ``workspace`` / ``reports``. The same
 ``_preflight_image_entries`` gate the bundle-staging path uses still fires
@@ -223,6 +257,8 @@ from operator_local_images_to_editable_ppt import (  # noqa: E402
     _ID_MAX_LEN,
     _TINY_JPEG_BYTES,
     _TINY_PNG_BYTES,
+    _alt_text_for_name,
+    _slide_title_for_name,
     _validate_generated_provenance_sidecar,
     _validate_manifest_arg,
     _write_synthetic_images,
@@ -1536,6 +1572,7 @@ def _render_prepare_readme(*, images_dir: Path, out_images: Path) -> str:
     images_q = shlex.quote(str(images_dir))
     out_dir_q = shlex.quote(str(out_images.parent))
     out_images_q = shlex.quote(str(out_images))
+    mapping_q = shlex.quote(str(out_images.parent / "filename_mapping.json"))
     return "\n".join([
         "# operator_images_to_review_package — prepared image folder",
         "",
@@ -1568,12 +1605,16 @@ def _render_prepare_readme(*, images_dir: Path, out_images: Path) -> str:
         "## Next step",
         "",
         "Author starter metadata (or run the full review-package workflow) "
-        "from the prepared `images/`:",
+        "from the prepared `images/`. Pass `--filename-mapping "
+        "filename_mapping.json` so the manifest's `slide_title` / `alt_text` "
+        "keep the human-readable ORIGINAL filenames instead of the "
+        "normalized safe names:",
         "",
         "```",
         "python3 scripts/operator_images_to_review_package.py "
         "--templates-only \\",
         f"    --images-dir {out_images_q} \\",
+        f"    --filename-mapping {mapping_q} \\",
         "    --out-dir <FRESH_OUT_DIR>",
         "```",
         "",
@@ -1733,10 +1774,14 @@ def _run_prepare_images_only(*, images_dir: Path, out_dir: Path) -> int:
     print(f"  - filename_mapping.json  (original -> safe + byte_count / "
           f"sha256 / media_type)")
     print(f"  - README.md")
-    print(f"Feed the prepared images into the existing workflow, e.g.:")
+    print(f"Feed the prepared images into the existing workflow, e.g. "
+          f"(--filename-mapping keeps the original filenames in the "
+          f"manifest titles):")
     print(f"  python3 scripts/operator_images_to_review_package.py "
           f"--templates-only \\")
     print(f"      --images-dir {shlex.quote(str(out_images))} \\")
+    print(f"      --filename-mapping "
+          f"{shlex.quote(str(mapping_path))} \\")
     print(f"      --out-dir <FRESH_OUT_DIR>")
     return 0
 
@@ -1754,11 +1799,256 @@ def _run_prepare_images_only(*, images_dir: Path, out_dir: Path) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _run_templates_only(*, images_dir: Path, out_dir: Path) -> int:
+def _prepared_image_digests(
+    images_dir: Path,
+) -> tuple[dict[str, dict] | None, list[str]]:
+    """Return ``{basename: {"sha256": <hex>, "byte_count": <int>}}`` for every
+    regular non-symlink file directly under ``images_dir`` — the snapshot the
+    manifest was built from — so a supplied ``--filename-mapping`` can be
+    bound to the ACTUAL prepared image bytes (not merely to the filename
+    set). Returns ``(None, failures)`` on any read error."""
+    digests: dict[str, dict] = {}
+    try:
+        entries = sorted(images_dir.iterdir())
+    except OSError as exc:
+        return None, [
+            f"could not list prepared images {images_dir} for mapping "
+            f"binding: {type(exc).__name__}: {exc}"
+        ]
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            continue
+        try:
+            data = entry.read_bytes()
+        except OSError as exc:
+            return None, [
+                f"could not read prepared image {entry} for mapping "
+                f"binding: {type(exc).__name__}: {exc}"
+            ]
+        digests[entry.name] = {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "byte_count": len(data),
+        }
+    return digests, []
+
+
+def _load_filename_mapping(
+    mapping_path: Path, prepared_digests: dict[str, dict],
+) -> tuple[dict[str, str] | None, list[str]]:
+    """Parse ``--prepare-images-only``'s ``filename_mapping.json`` and
+    return a ``{safe_filename: original_filename}`` dict, or
+    ``(None, failures)``.
+
+    ``prepared_digests`` maps each PREPARED image basename to the
+    ``{"sha256", "byte_count"}`` of its actual bytes (computed by the caller
+    from the snapshot the manifest was built from). The mapping is bound to
+    those BYTES, not merely to the filename set: it fails closed unless
+
+      * the mapping's ``safe_filename`` set EXACTLY equals the prepared image
+        basenames, AND
+      * every record's recorded ``sha256`` / ``byte_count`` matches the
+        prepared bytes of that safe name.
+
+    So a stale or unrelated mapping that happens to reuse the same safe
+    filenames but describes DIFFERENT image bytes (and therefore different
+    original filenames) is refused rather than mislabelling the deck.
+    Structural problems (non-object root, missing / empty ``images[]``, a
+    record missing a non-empty string ``original_filename`` / ``safe_filename``
+    / ``sha256`` or a non-negative integer ``byte_count``, or a duplicate
+    ``safe_filename``) also fail closed so a hand-edited or unrelated JSON
+    file is refused rather than half-applied."""
+    try:
+        raw = mapping_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, [
+            f"--filename-mapping {mapping_path} could not be read: "
+            f"{type(exc).__name__}: {exc}"
+        ]
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        return None, [
+            f"--filename-mapping {mapping_path} is not valid JSON: {exc}"
+        ]
+    if not isinstance(data, dict):
+        return None, [
+            f"--filename-mapping {mapping_path} top-level is "
+            f"{type(data).__name__}; expected a JSON object (the shape "
+            f"--prepare-images-only writes)."
+        ]
+    rows = data.get("images")
+    if not isinstance(rows, list) or not rows:
+        return None, [
+            f"--filename-mapping {mapping_path} has no non-empty images[] "
+            f"list; expected the --prepare-images-only mapping shape."
+        ]
+    mapping: dict[str, str] = {}
+    recorded: dict[str, tuple[str, int]] = {}
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            return None, [
+                f"--filename-mapping {mapping_path} images[{idx}] is "
+                f"{type(row).__name__}; expected a JSON object."
+            ]
+        original = row.get("original_filename")
+        safe = row.get("safe_filename")
+        sha = row.get("sha256")
+        byte_count = row.get("byte_count")
+        if not isinstance(original, str) or not original:
+            return None, [
+                f"--filename-mapping {mapping_path} images[{idx}] has no "
+                f"non-empty string original_filename."
+            ]
+        if not isinstance(safe, str) or not safe:
+            return None, [
+                f"--filename-mapping {mapping_path} images[{idx}] has no "
+                f"non-empty string safe_filename."
+            ]
+        if not isinstance(sha, str) or not sha:
+            return None, [
+                f"--filename-mapping {mapping_path} images[{idx}] has no "
+                f"non-empty string sha256; the mapping must carry the "
+                f"prepared-byte digest to bind to the images. Pass the "
+                f"filename_mapping.json --prepare-images-only wrote."
+            ]
+        # Reject bool explicitly: ``isinstance(True, int)`` is True, so a
+        # JSON ``true`` byte_count would otherwise slip past the int check.
+        if (not isinstance(byte_count, int) or isinstance(byte_count, bool)
+                or byte_count < 0):
+            return None, [
+                f"--filename-mapping {mapping_path} images[{idx}] has no "
+                f"non-negative integer byte_count; the mapping must carry "
+                f"the prepared byte_count to bind to the images."
+            ]
+        if safe in mapping:
+            return None, [
+                f"--filename-mapping {mapping_path} images[{idx}] repeats "
+                f"safe_filename {safe!r}; refused."
+            ]
+        mapping[safe] = original
+        recorded[safe] = (sha, byte_count)
+    mapping_set = set(mapping)
+    prepared_set = set(prepared_digests)
+    if mapping_set != prepared_set:
+        orphan = sorted(mapping_set - prepared_set)
+        missing = sorted(prepared_set - mapping_set)
+        return None, [
+            f"--filename-mapping {mapping_path} does not correspond to the "
+            f"prepared image set: safe_filename(s) {orphan!r} are not among "
+            f"the images, and image(s) {missing!r} are not in the mapping. "
+            f"Pass the filename_mapping.json that --prepare-images-only "
+            f"wrote next to the prepared images/."
+        ]
+    # Byte binding — every recorded digest must match the ACTUAL prepared
+    # bytes, so a mapping that reuses the same safe names but describes a
+    # different image set (and so different original filenames) is refused
+    # rather than silently mislabelling the deck. Walk in sorted order for a
+    # deterministic first-mismatch diagnostic.
+    for safe in sorted(mapping_set):
+        want_sha, want_bytes = recorded[safe]
+        got = prepared_digests[safe]
+        if got["sha256"] != want_sha or got["byte_count"] != want_bytes:
+            return None, [
+                f"--filename-mapping {mapping_path} does not match the "
+                f"prepared bytes for {safe!r}: the mapping records "
+                f"sha256={want_sha[:12]}... / {want_bytes} bytes but the "
+                f"prepared image is sha256={got['sha256'][:12]}... / "
+                f"{got['byte_count']} bytes. The mapping describes a "
+                f"different image set; pass the filename_mapping.json "
+                f"--prepare-images-only wrote for THESE images."
+            ]
+    return mapping, []
+
+
+def _seed_manifest_titles_from_mapping(
+    *, manifest: Path, mapping_path: Path, prepared_images: Path,
+) -> list[str]:
+    """Rewrite each manifest entry's ``slide_title`` / ``alt_text`` from the
+    operator's ORIGINAL filename (recovered from the prepare step's
+    ``filename_mapping.json``) instead of the normalized safe basename, then
+    re-validate the rewritten manifest with the helper's own
+    ``_validate_manifest_arg``. Returns ``[]`` on success or a list of
+    failure lines.
+
+    The mapping is bound to the ACTUAL bytes of ``prepared_images`` (the
+    snapshot the manifest was built from): each image's sha256 / byte_count
+    is computed and the mapping's recorded digest must match, so a stale or
+    unrelated mapping that reuses the same safe filenames but describes
+    different image bytes is refused rather than mislabelling the deck.
+
+    Only the two human-readable title fields are touched — the per-entry
+    ``filename`` stays the prepared safe name — so the manifest still covers
+    exactly the prepared image set. The seeded titles use the SAME format
+    functions the helper applies to a safe name (``_slide_title_for_name`` /
+    ``_alt_text_for_name``), so the only difference from the default
+    template is the display name. Re-validation through the helper gate
+    means a seeded title that exceeds the length cap or trips the
+    safe-string scan (an unusual original filename) fails closed here rather
+    than producing a manifest that only breaks when fed to a later build."""
+    digests, digest_fails = _prepared_image_digests(prepared_images)
+    if digest_fails or digests is None:
+        return digest_fails or [
+            f"could not digest prepared images {prepared_images} for "
+            f"mapping binding."
+        ]
+    mapping, fails = _load_filename_mapping(mapping_path, digests)
+    if fails or mapping is None:
+        return fails or [
+            f"--filename-mapping {mapping_path} was refused."
+        ]
+    try:
+        body = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [
+            f"could not read back manifest {manifest} for title seeding: "
+            f"{type(exc).__name__}: {exc}"
+        ]
+    images = body.get("images") if isinstance(body, dict) else None
+    if not isinstance(images, list):
+        return [f"manifest {manifest} has no images[] list to seed."]
+    for entry in images:
+        if not isinstance(entry, dict):
+            return [
+                f"manifest {manifest} has a non-object images[] entry; "
+                f"refused."
+            ]
+        safe = entry.get("filename")
+        original = mapping.get(safe)
+        if original is None:
+            return [
+                f"manifest {manifest} names safe filename {safe!r} that is "
+                f"absent from --filename-mapping; refused."
+            ]
+        entry["slide_title"] = _slide_title_for_name(original)
+        entry["alt_text"] = _alt_text_for_name(original)
+    try:
+        manifest.write_text(
+            json.dumps(body, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return [
+            f"could not rewrite manifest {manifest} with seeded titles: "
+            f"{type(exc).__name__}: {exc}"
+        ]
+    entries, _resolved, man_fails = _validate_manifest_arg(
+        str(manifest), sorted(digests),
+    )
+    if man_fails or entries is None:
+        return man_fails or [
+            f"seeded manifest {manifest} failed the helper manifest "
+            f"validator after title seeding."
+        ]
+    return []
+
+
+def _run_templates_only(
+    *, images_dir: Path, out_dir: Path, mapping_src: Path | None = None,
+) -> int:
     """Write the two editable starter metadata templates for ``images_dir``
     into ``out_dir`` and STOP. The caller MUST have already passed
-    ``images_dir`` / ``out_dir`` through their gates and created
-    ``out_dir``.
+    ``images_dir`` / ``out_dir`` (and any ``mapping_src``) through their
+    gates and created ``out_dir``.
 
     Both templates are written by the existing operator helper's
     ``--write-manifest-template`` / ``--write-generated-provenance-template``
@@ -1768,6 +2058,21 @@ def _run_templates_only(*, images_dir: Path, out_dir: Path) -> int:
     on the filename set even if the operator's folder changes mid-run.
     Each writer emits its own schema-valid file, so this wrapper
     re-implements no contract logic.
+
+    When ``mapping_src`` is given (the optional ``--filename-mapping``
+    pointing at a ``--prepare-images-only`` ``filename_mapping.json``), the
+    manifest's per-image ``slide_title`` / ``alt_text`` are re-seeded from
+    each image's ORIGINAL filename instead of the normalized safe basename
+    the snapshot carries, so a deck prepared from messy real-world names
+    keeps human-readable titles. The mapping is bound to the snapshot BYTES
+    (each record's recorded sha256 / byte_count must match the prepared
+    image), so the seeding fails closed if the mapping does not correspond
+    to the prepared image set OR describes different bytes, and the
+    rewritten manifest is re-validated through the helper's own contract
+    gate (see ``_seed_manifest_titles_from_mapping``). With no
+    ``mapping_src`` the manifest is exactly the helper's default template
+    (prior behavior).
+
     Nothing else is produced — no ``bundle/``, ``approved_plan.json``,
     ``review_package/``, or ``deck.pptx`` — and a belt-and-braces leak
     guard asserts that. Returns 0 on success, 1 on any stage failure (a
@@ -1850,6 +2155,28 @@ def _run_templates_only(*, images_dir: Path, out_dir: Path) -> int:
         print(f"  [PASS] generated-provenance template written to "
               f"{gen_prov}")
 
+        # Stage 3 (optional) — re-seed the manifest's slide_title /
+        # alt_text from each image's ORIGINAL filename when the operator
+        # passed --filename-mapping. Runs against the SAME snapshot the
+        # writers used: the mapping's safe_filename set must match the
+        # snapshot basenames AND each record's recorded sha256 / byte_count
+        # must match the snapshot bytes, so a stale / unrelated mapping is
+        # refused rather than mislabelling the deck. The rewritten manifest
+        # is re-validated through the helper gate so an unsafe / over-long
+        # seeded title fails closed. Only the manifest is touched — the
+        # generated-provenance sidecar carries no filename-derived title.
+        if mapping_src is not None:
+            seed_failures = _seed_manifest_titles_from_mapping(
+                manifest=manifest, mapping_path=mapping_src,
+                prepared_images=snapshot_images,
+            )
+            if seed_failures:
+                for line in seed_failures:
+                    print(f"  [FAIL] {line}")
+                return 1
+            print(f"  [PASS] manifest slide_title / alt_text seeded from "
+                  f"original filenames in {mapping_src}")
+
     # Belt-and-braces: template-only mode must NOT have produced any of
     # the heavier build artifacts. Mirrors _run_plan_mode's leak guard so
     # a future change that leaks a build into this mode is caught at run
@@ -1869,7 +2196,11 @@ def _run_templates_only(*, images_dir: Path, out_dir: Path) -> int:
 
     print()
     print(f"OK: editable starter metadata under {out_dir}:")
-    print(f"  - manifest.json")
+    if mapping_src is not None:
+        print(f"  - manifest.json  (slide_title / alt_text seeded from "
+              f"original filenames)")
+    else:
+        print(f"  - manifest.json")
     print(f"  - generated_provenance.json")
     print(f"Hand-edit them, then build with --manifest / "
           f"--generated-provenance, e.g.:")
@@ -4931,6 +5262,427 @@ def _run_self_tests() -> int:
             ok=ok, detail=detail,
         ))
 
+    # ----------------------------------------------------------------
+    # Filename-mapping title seeding (--templates-only --filename-mapping).
+    # T36..T40 pin the operator-facing improvement: when a deck is prepared
+    # from messy real-world filenames, --templates-only can seed the
+    # manifest's slide_title / alt_text from each image's ORIGINAL filename
+    # (recovered from --prepare-images-only's filename_mapping.json) instead
+    # of the normalized safe basename, so human-readable titles survive
+    # normalization. Without a mapping the prior safe-name behavior is kept;
+    # a mapping that does not correspond to the prepared image set, a wrong
+    # mode, or an unsafe path all fail closed.
+    # ----------------------------------------------------------------
+
+    # T36 — original filenames with spaces + punctuation seed readable
+    # titles. Prepare a messy folder, then --templates-only
+    # --filename-mapping, and assert each manifest slide_title / alt_text is
+    # rebuilt from the ORIGINAL filename (so the spaces / parentheses /
+    # commas survive) and differs from the safe-basename default.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T36-") as raw_td:
+        td = Path(raw_td)
+        src = td / "operator images"
+        src.mkdir()
+        originals = {
+            "Q3 Revenue (Final).png": _TINY_PNG_BYTES,
+            "Plan B, v2.jpg": _TINY_JPEG_BYTES,
+        }
+        for name, data in originals.items():
+            (src / name).write_bytes(data)
+        prepared = td / "prepared"
+        rc = main(["--prepare-images-only", "--images-dir", str(src),
+                   "--out-dir", str(prepared)])
+        ok = rc == 0
+        detail = "" if ok else f"--prepare-images-only rc={rc}"
+        out_dir = td / "templates_out"
+        if ok:
+            rc = main(["--templates-only",
+                       "--images-dir", str(prepared / "images"),
+                       "--filename-mapping",
+                       str(prepared / "filename_mapping.json"),
+                       "--out-dir", str(out_dir)])
+            if rc != 0:
+                ok, detail = False, (
+                    f"--templates-only --filename-mapping rc={rc}"
+                )
+        if ok:
+            mapping = json.loads(
+                (prepared / "filename_mapping.json").read_text(
+                    encoding="utf-8")
+            )
+            safe_to_orig = {
+                r["safe_filename"]: r["original_filename"]
+                for r in mapping["images"]
+            }
+            man = json.loads(
+                (out_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            for entry in man["images"]:
+                safe = entry["filename"]
+                original = safe_to_orig[safe]
+                if entry["slide_title"] != _slide_title_for_name(original):
+                    ok, detail = False, (
+                        f"{safe} slide_title={entry['slide_title']!r} != "
+                        f"seeded-from-original "
+                        f"{_slide_title_for_name(original)!r}"
+                    )
+                    break
+                if entry["alt_text"] != _alt_text_for_name(original):
+                    ok, detail = False, (
+                        f"{safe} alt_text not seeded from original "
+                        f"{original!r}"
+                    )
+                    break
+                # These originals normalize, so the seed must have moved the
+                # title off the safe-basename default.
+                if entry["slide_title"] == _slide_title_for_name(safe):
+                    ok, detail = False, (
+                        f"{safe} slide_title still uses the safe basename "
+                        f"(seeding did not take effect)"
+                    )
+                    break
+        results.append(_ProbeResult(
+            name=(
+                "T36 --templates-only --filename-mapping seeds slide_title / "
+                "alt_text from original filenames with spaces + punctuation "
+                "(not the normalized safe basename)"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T37 — CJK / non-ASCII original filenames seed readable titles when the
+    # mapping exists. --prepare-images-only normalizes a CJK-only name to a
+    # bland ASCII safe stem (img / img_2), which is unreadable; with the
+    # mapping the original CJK characters are restored in the seeded title.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T37-") as raw_td:
+        td = Path(raw_td)
+        src = td / "cjk images"
+        src.mkdir()
+        originals = {
+            "季度营收.png": _TINY_PNG_BYTES,
+            "报告 2024.jpg": _TINY_JPEG_BYTES,
+        }
+        for name, data in originals.items():
+            (src / name).write_bytes(data)
+        prepared = td / "prepared"
+        rc = main(["--prepare-images-only", "--images-dir", str(src),
+                   "--out-dir", str(prepared)])
+        ok = rc == 0
+        detail = "" if ok else f"--prepare-images-only rc={rc}"
+        out_dir = td / "templates_out"
+        if ok:
+            rc = main(["--templates-only",
+                       "--images-dir", str(prepared / "images"),
+                       "--filename-mapping",
+                       str(prepared / "filename_mapping.json"),
+                       "--out-dir", str(out_dir)])
+            if rc != 0:
+                ok, detail = False, (
+                    f"--templates-only --filename-mapping rc={rc}"
+                )
+        if ok:
+            mapping = json.loads(
+                (prepared / "filename_mapping.json").read_text(
+                    encoding="utf-8")
+            )
+            safe_to_orig = {
+                r["safe_filename"]: r["original_filename"]
+                for r in mapping["images"]
+            }
+            man = json.loads(
+                (out_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            saw_non_ascii = False
+            for entry in man["images"]:
+                safe = entry["filename"]
+                original = safe_to_orig[safe]
+                if entry["slide_title"] != _slide_title_for_name(original):
+                    ok, detail = False, (
+                        f"{safe} slide_title not seeded from CJK original "
+                        f"{original!r}"
+                    )
+                    break
+                # The safe basename is pure ASCII; a seeded title carrying a
+                # non-ASCII codepoint proves the CJK original survived.
+                if any(ord(ch) > 127 for ch in entry["slide_title"]):
+                    saw_non_ascii = True
+                if entry["slide_title"] == _slide_title_for_name(safe):
+                    ok, detail = False, (
+                        f"{safe} slide_title still the ASCII safe basename"
+                    )
+                    break
+            if ok and not saw_non_ascii:
+                ok, detail = False, (
+                    "no seeded slide_title carried a non-ASCII (CJK) "
+                    "codepoint"
+                )
+        results.append(_ProbeResult(
+            name=(
+                "T37 --templates-only --filename-mapping seeds readable "
+                "titles from CJK / non-ASCII original filenames (safe "
+                "basename is bland ASCII; the mapping restores the original)"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T38 — without --filename-mapping the prior behavior is preserved: the
+    # manifest slide_title / alt_text derive from the safe basename, NOT any
+    # original filename. Guards that the new option is purely additive.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T38-") as raw_td:
+        td = Path(raw_td)
+        src = td / "operator images"
+        src.mkdir()
+        (src / "Q3 Revenue (Final).png").write_bytes(_TINY_PNG_BYTES)
+        prepared = td / "prepared"
+        rc = main(["--prepare-images-only", "--images-dir", str(src),
+                   "--out-dir", str(prepared)])
+        ok = rc == 0
+        detail = "" if ok else f"--prepare-images-only rc={rc}"
+        out_dir = td / "templates_out"
+        if ok:
+            rc = main(["--templates-only",
+                       "--images-dir", str(prepared / "images"),
+                       "--out-dir", str(out_dir)])
+            if rc != 0:
+                ok, detail = False, f"--templates-only rc={rc}"
+        if ok:
+            man = json.loads(
+                (out_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            for entry in man["images"]:
+                safe = entry["filename"]
+                if entry["slide_title"] != _slide_title_for_name(safe):
+                    ok, detail = False, (
+                        f"{safe} slide_title={entry['slide_title']!r} is not "
+                        f"the safe-basename default "
+                        f"{_slide_title_for_name(safe)!r}"
+                    )
+                    break
+                if entry["alt_text"] != _alt_text_for_name(safe):
+                    ok, detail = False, (
+                        f"{safe} alt_text is not the safe-basename default"
+                    )
+                    break
+        results.append(_ProbeResult(
+            name=(
+                "T38 --templates-only WITHOUT --filename-mapping keeps the "
+                "prior behavior: slide_title / alt_text derive from the safe "
+                "basename, not the original filename"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T39 — fail-closed paths for --filename-mapping: (a) a mapping whose
+    # safe_filename set does not correspond to the prepared images is refused
+    # mid-run (rc 1, no seeded title leaks); (b) --filename-mapping outside
+    # --templates-only is refused at the gate (rc 2, no --out-dir); (c) a
+    # URI-shaped --filename-mapping is refused at the gate (rc 2, no
+    # --out-dir); (d) a mapping whose safe names MATCH but whose recorded
+    # sha256 / byte_count describe DIFFERENT bytes (a stale / unrelated
+    # mapping) is refused mid-run (rc 1) — the mapping is bound to the
+    # prepared bytes, not just the filename set.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T39-") as raw_td:
+        td = Path(raw_td)
+        src = td / "operator images"
+        src.mkdir()
+        (src / "My Photo (1).png").write_bytes(_TINY_PNG_BYTES)
+        prepared = td / "prepared"
+        ok = main(["--prepare-images-only", "--images-dir", str(src),
+                   "--out-dir", str(prepared)]) == 0
+        detail = "" if ok else "prepare failed"
+        # (a) mismatched safe-name set -> rc 1. Carries valid-looking
+        # sha256 / byte_count so the SET check fires (not the field check).
+        if ok:
+            bad = td / "bad_mapping.json"
+            bad.write_text(
+                json.dumps({
+                    "schema_version": "1",
+                    "images": [{
+                        "original_filename": "Something Else.png",
+                        "safe_filename": "not_a_prepared_name.png",
+                        "sha256": "0" * 64,
+                        "byte_count": 1,
+                    }],
+                }) + "\n",
+                encoding="utf-8",
+            )
+            out_a = td / "out_a"
+            rc_a = main(["--templates-only",
+                         "--images-dir", str(prepared / "images"),
+                         "--filename-mapping", str(bad),
+                         "--out-dir", str(out_a)])
+            if rc_a != 1:
+                ok, detail = False, (
+                    f"(a) mismatched mapping rc={rc_a} (expected 1)"
+                )
+            else:
+                # The torn run left the un-seeded templates; no seeded title
+                # from the bogus mapping may have leaked into the manifest.
+                man_path = out_a / "manifest.json"
+                if man_path.is_file():
+                    man = json.loads(man_path.read_text(encoding="utf-8"))
+                    if any("Something Else" in e.get("slide_title", "")
+                           for e in man.get("images", [])):
+                        ok, detail = False, (
+                            "(a) bogus mapping leaked into a seeded title"
+                        )
+        # (b) --filename-mapping without --templates-only -> rc 2, no out.
+        if ok:
+            out_b = td / "out_b"
+            rc_b = main(["--images-dir", str(prepared / "images"),
+                         "--filename-mapping",
+                         str(prepared / "filename_mapping.json"),
+                         "--out-dir", str(out_b)])
+            if rc_b != 2:
+                ok, detail = False, (
+                    f"(b) mapping without --templates-only rc={rc_b} "
+                    f"(expected 2)"
+                )
+            elif out_b.exists():
+                ok, detail = False, (
+                    "(b) refused combo still created --out-dir"
+                )
+        # (c) URI-shaped --filename-mapping -> rc 2, no out.
+        if ok:
+            out_c = td / "out_c"
+            rc_c = main(["--templates-only",
+                         "--images-dir", str(prepared / "images"),
+                         "--filename-mapping", "http://example.com/m.json",
+                         "--out-dir", str(out_c)])
+            if rc_c != 2:
+                ok, detail = False, (
+                    f"(c) URI-shaped mapping rc={rc_c} (expected 2)"
+                )
+            elif out_c.exists():
+                ok, detail = False, (
+                    "(c) refused URI path still created --out-dir"
+                )
+        # (d) matching safe names but WRONG bytes -> rc 1. Tamper the real
+        # mapping's recorded sha256 so the safe-name set still matches but the
+        # byte binding fails — proves the mapping is bound to the prepared
+        # bytes, not just the filename set.
+        if ok:
+            real = json.loads(
+                (prepared / "filename_mapping.json").read_text(
+                    encoding="utf-8")
+            )
+            for row in real["images"]:
+                row["sha256"] = "0" * 64
+            tampered = td / "tampered_mapping.json"
+            tampered.write_text(
+                json.dumps(real, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            out_d = td / "out_d"
+            rc_d = main(["--templates-only",
+                         "--images-dir", str(prepared / "images"),
+                         "--filename-mapping", str(tampered),
+                         "--out-dir", str(out_d)])
+            if rc_d != 1:
+                ok, detail = False, (
+                    f"(d) byte-mismatch mapping rc={rc_d} (expected 1)"
+                )
+        results.append(_ProbeResult(
+            name=(
+                "T39 --filename-mapping fails closed: mismatched safe-name "
+                "set (rc 1, no seeded title), wrong mode (rc 2), URI-shaped "
+                "path (rc 2), and a mapping bound to different bytes "
+                "(matching names, wrong sha256 -> rc 1) are all refused"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T40 — end-to-end: mapped starter metadata flows through the build.
+    # Prepare a messy folder, seed titles via --templates-only
+    # --filename-mapping, then feed the seeded manifest (+ the generated
+    # provenance template) through --plan and --resume. The resumed review
+    # package is built AND internally re-validated (resume rc 0 implies the
+    # read-only validator passed), and the seeded title surfaces in
+    # summary.json's image_provenance as operator_slide_title.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T40-") as raw_td:
+        td = Path(raw_td)
+        src = td / "operator images"
+        src.mkdir()
+        (src / "Cover Slide A.png").write_bytes(_TINY_PNG_BYTES)
+        (src / "Divider-B v2.jpg").write_bytes(_TINY_JPEG_BYTES)
+        prepared = td / "prepared"
+        ok = main(["--prepare-images-only", "--images-dir", str(src),
+                   "--out-dir", str(prepared)]) == 0
+        detail = "" if ok else "prepare failed"
+        tpl = td / "templates_out"
+        if ok:
+            rc = main(["--templates-only",
+                       "--images-dir", str(prepared / "images"),
+                       "--filename-mapping",
+                       str(prepared / "filename_mapping.json"),
+                       "--out-dir", str(tpl)])
+            if rc != 0:
+                ok, detail = False, (
+                    f"--templates-only --filename-mapping rc={rc}"
+                )
+        out_dir = td / "build"
+        if ok:
+            rc = main(["--plan",
+                       "--images-dir", str(prepared / "images"),
+                       "--out-dir", str(out_dir),
+                       "--manifest", str(tpl / "manifest.json"),
+                       "--generated-provenance",
+                       str(tpl / "generated_provenance.json")])
+            if rc != 0:
+                ok, detail = False, f"--plan rc={rc}"
+        if ok:
+            rc = main(["--resume", "--out-dir", str(out_dir)])
+            if rc != 0:
+                ok, detail = False, f"--resume rc={rc}"
+        review_package = out_dir / "review_package"
+        if ok:
+            for name in _REVIEW_PACKAGE_FILES:
+                if (not (review_package / name).is_file()
+                        or (review_package / name).is_symlink()):
+                    ok, detail = False, (
+                        f"missing review-package file: {name}"
+                    )
+                    break
+        if ok:
+            mapping = json.loads(
+                (prepared / "filename_mapping.json").read_text(
+                    encoding="utf-8")
+            )
+            safe_to_orig = {
+                r["safe_filename"]: r["original_filename"]
+                for r in mapping["images"]
+            }
+            summary = json.loads(
+                (review_package / "summary.json").read_text(encoding="utf-8")
+            )
+            rows = {
+                r.get("operator_filename"): r
+                for r in summary.get("image_provenance", [])
+                if isinstance(r, dict)
+            }
+            for safe, original in safe_to_orig.items():
+                row = rows.get(safe)
+                if row is None:
+                    ok, detail = False, f"summary missing row for {safe}"
+                    break
+                want_title = _slide_title_for_name(original)
+                if row.get("operator_slide_title") != want_title:
+                    ok, detail = False, (
+                        f"{safe} operator_slide_title="
+                        f"{row.get('operator_slide_title')!r} != seeded "
+                        f"{want_title!r}"
+                    )
+                    break
+        results.append(_ProbeResult(
+            name=(
+                "T40 mapped starter metadata flows end-to-end: "
+                "--templates-only --filename-mapping -> --plan -> --resume "
+                "builds + re-validates a review package whose summary carries "
+                "the original-filename slide_title"
+            ),
+            ok=ok, detail=detail,
+        ))
+
     repo_rc = _check_repo_unchanged(
         examples_before=examples_before,
         scripts_before=scripts_before,
@@ -5097,9 +5849,13 @@ def main(argv: list[str]) -> int:
             "files always agree on the filename set). Edit the two "
             "files, then feed them back via --manifest / "
             "--generated-provenance to a --plan or one-command run. "
-            "Requires --images-dir + a fresh --out-dir; mutually "
-            "exclusive with --plan / --resume / --self-test / --manifest "
-            "/ --generated-provenance."
+            "Optionally pass --filename-mapping (a --prepare-images-only "
+            "filename_mapping.json) to seed the manifest's slide_title / "
+            "alt_text from each image's ORIGINAL filename instead of the "
+            "normalized safe basename. Requires --images-dir + a fresh "
+            "--out-dir; mutually exclusive with --plan / --resume / "
+            "--self-test / --manifest / --generated-provenance "
+            "(--filename-mapping is the only optional companion)."
         ),
     )
     parser.add_argument(
@@ -5136,10 +5892,35 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--filename-mapping", type=str, default=None,
+        help=(
+            "Optional, ONLY with --templates-only. Path to the "
+            "filename_mapping.json a prior --prepare-images-only run wrote "
+            "next to the prepared images/. When supplied, the generated "
+            "manifest.json's per-image slide_title / alt_text are seeded "
+            "from each image's ORIGINAL filename (preserving the spaces / "
+            "punctuation / CJK characters that --prepare-images-only "
+            "normalized away for safe local storage) instead of the "
+            "normalized safe basename, so a deck prepared from messy "
+            "real-world filenames keeps human-readable titles. The path "
+            "must be a local, non-URI, non-symlink regular file with no "
+            "symlink ancestor; the mapping is bound to the prepared image "
+            "BYTES (its safe_filename set must equal the prepared images "
+            "exactly AND each record's recorded sha256 / byte_count must "
+            "match the prepared bytes, else the run fails closed — so a "
+            "stale mapping that reuses the same names for different images "
+            "is refused), and the re-seeded manifest is re-validated through "
+            "the helper's manifest contract gates so an over-long / unsafe "
+            "seeded title fails closed. Omit it to keep the prior behavior "
+            "(titles derived from the safe basename). Local file only — no "
+            "network / model API / image search."
+        ),
+    )
+    parser.add_argument(
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios under TMPDIR "
-            "(no writes under REPO_ROOT). Thirty-five probes: T1 full "
+            "(no writes under REPO_ROOT). Forty probes: T1 full "
             "happy path from synthetic --images-dir through to a "
             "validated review package + locked README markers; T2 "
             "drift (mutating generated_provenance.json after plan-"
@@ -5249,9 +6030,24 @@ def main(argv: list[str]) -> int:
             "(not just the looser IG6 gate); T34 multiple CJK-only filenames "
             "map to distinct image_ref-valid names (img / img_2 / img_3) "
             "deterministically; T35 mixed CJK + ASCII filenames keep their "
-            "ASCII run in the safe stem. Mutually exclusive with "
+            "ASCII run in the safe stem; T36 --templates-only "
+            "--filename-mapping seeds slide_title / alt_text from original "
+            "filenames carrying spaces + punctuation (not the safe basename); "
+            "T37 the same seeding restores CJK / non-ASCII original filenames "
+            "(the safe basename is bland ASCII); T38 WITHOUT --filename-mapping "
+            "the prior safe-basename titles are preserved (the option is "
+            "additive); T39 --filename-mapping fails closed on a mismatched "
+            "safe-name set (rc 1, no seeded title), outside --templates-only "
+            "(rc 2), on a URI-shaped path (rc 2), and on a mapping bound to "
+            "different bytes (matching names but wrong sha256, rc 1 — the "
+            "mapping is bound to the prepared bytes, not just the names); T40 "
+            "mapped starter metadata flows end-to-end "
+            "(--templates-only --filename-mapping -> --plan -> --resume) into "
+            "a re-validated review package whose summary carries the "
+            "original-filename slide_title. Mutually exclusive with "
             "--images-dir / --out-dir / --manifest / --generated-provenance "
-            "/ --plan / --resume / --templates-only / --prepare-images-only."
+            "/ --plan / --resume / --templates-only / --prepare-images-only / "
+            "--filename-mapping."
         ),
     )
     args = parser.parse_args(argv)
@@ -5261,12 +6057,14 @@ def main(argv: list[str]) -> int:
                 or args.manifest is not None
                 or args.generated_provenance is not None
                 or args.plan or args.resume or args.templates_only
-                or args.prepare_images_only):
+                or args.prepare_images_only
+                or args.filename_mapping is not None):
             print(
                 "FAIL: --self-test is mutually exclusive with "
                 "--images-dir / --out-dir / --manifest / "
                 "--generated-provenance / --plan / --resume / "
-                "--templates-only / --prepare-images-only.",
+                "--templates-only / --prepare-images-only / "
+                "--filename-mapping.",
                 file=sys.stderr,
             )
             return 2
@@ -5320,6 +6118,24 @@ def main(argv: list[str]) -> int:
             "--generated-provenance (those drive, or supply metadata to, a "
             "later build run). Prepare first, then feed the prepared "
             "images/ into one of those modes.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # --filename-mapping only makes sense for --templates-only: it re-seeds
+    # the generated manifest's slide_title / alt_text from each prepared
+    # image's ORIGINAL filename. The build modes (one-command / --plan /
+    # --resume) consume a reviewed manifest via --manifest, not a starter
+    # template, so a mapping there has nothing to seed; --prepare-images-only
+    # produces the mapping rather than consuming it. Refuse the combination
+    # at the gate (before the resume branch and the shared gate run).
+    if args.filename_mapping is not None and not args.templates_only:
+        print(
+            "FAIL: --filename-mapping is only valid with --templates-only "
+            "(it seeds the generated manifest's slide_title / alt_text from "
+            "the prepared images' original filenames). Run --prepare-images-"
+            "only to write the mapping, then pass it to a --templates-only "
+            "run; build modes consume a reviewed manifest via --manifest.",
             file=sys.stderr,
         )
         return 2
@@ -5525,6 +6341,34 @@ def main(argv: list[str]) -> int:
         else:
             gen_prov_src = meta
 
+    # Gate the optional --filename-mapping path with the same cheap
+    # path-safety subset (URI / symlink / symlink-ancestor / missing /
+    # non-file). It is only reachable with --templates-only (the guard
+    # above refuses every other mode), so a bad mapping path fails closed
+    # with rc 2 before --out-dir is created. The deeper content contract
+    # (JSON parse, the prepare-mapping shape, and the safe_filename-set ==
+    # prepared-images cross-check) is enforced by
+    # _seed_manifest_titles_from_mapping once the snapshot basenames are
+    # known.
+    mapping_src: Path | None = None
+    if args.filename_mapping is not None:
+        mapping_meta, mapping_failures = _validate_metadata_arg(
+            args.filename_mapping, "--filename-mapping",
+        )
+        if mapping_failures or mapping_meta is None:
+            for line in mapping_failures:
+                print(f"FAIL: {line}", file=sys.stderr)
+            return 2
+        try:
+            mapping_src = mapping_meta.resolve(strict=False)
+        except OSError as exc:
+            print(
+                f"FAIL: could not resolve --filename-mapping to an "
+                f"absolute path: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+
     if not out_dir.exists():
         try:
             out_dir.mkdir(parents=False, exist_ok=False)
@@ -5540,7 +6384,10 @@ def main(argv: list[str]) -> int:
         # manifest_src / gen_prov_src are always None here (the guard
         # above refuses --templates-only + --manifest / --generated-
         # provenance), so the shared metadata gate was a no-op.
-        rc = _run_templates_only(images_dir=images_dir, out_dir=out_dir)
+        # mapping_src is the only optional input templates-only accepts.
+        rc = _run_templates_only(
+            images_dir=images_dir, out_dir=out_dir, mapping_src=mapping_src,
+        )
     elif args.prepare_images_only:
         # manifest_src / gen_prov_src are always None here (the guard above
         # refuses --prepare-images-only + --manifest / --generated-

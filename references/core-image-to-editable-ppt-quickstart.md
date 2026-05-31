@@ -485,11 +485,15 @@ forward.
 
 ```bash
 # 2. METADATA/TEMPLATES -> editable starter manifest.json +
-#    generated_provenance.json for the prepared images (hand-edit before a real
-#    review; used as-is here).
+#    generated_provenance.json for the prepared images. --filename-mapping
+#    seeds the manifest slide_title / alt_text from the ORIGINAL filenames so
+#    the normalised safe names don't bury the human-readable titles (hand-edit
+#    before a real review; used as-is here).
 TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
 python3 scripts/operator_images_to_review_package.py --templates-only \
-  --images-dir "$PILOT/prepared/images" --out-dir "$PILOT/templates"
+  --images-dir "$PILOT/prepared/images" \
+  --filename-mapping "$PILOT/prepared/filename_mapping.json" \
+  --out-dir "$PILOT/templates"
 
 # 3. PLAN -> stage the bundle from the prepared images + reviewed metadata and
 #    write the reviewable plan, then STOP (no deck.pptx yet).
@@ -499,6 +503,12 @@ python3 scripts/operator_images_to_review_package.py --plan \
   --manifest "$PILOT/templates/manifest.json" \
   --generated-provenance "$PILOT/templates/generated_provenance.json"
 ```
+
+Because `--filename-mapping` was supplied, `$PILOT/templates/manifest.json`
+carries human-readable titles — e.g. `Operator image: Hero Cover (v2).png` and
+`Operator image: 季度总结.png` — rather than the normalised `hero_cover_v2_` /
+`img` stems, and those titles flow through `--plan` / `--resume` into the
+deck and `summary.json`. Omit the flag to keep the safe-basename titles.
 
 `--plan` writes **`$PILOT/out/approved_plan.json`** (plus `$PILOT/out/bundle/`)
 and stops — a human inspects the plan here; no review package exists yet. To
@@ -592,7 +602,7 @@ python3 scripts/operator_images_to_review_package.py --prepare-images-only \
   --out-dir "$RUN_DIR/prepared"
 ```
 
-Every entry passes the same safety gate the bundle-staging path uses (symlink / subdirectory / non-image / hidden-dotfile / size + count caps), and two names that normalise to the same base stem are given distinct names with a deterministic numeric suffix (`img` / `img_2` …, `my_file` / `my_file_2`) — so a CJK-heavy folder prepares without hand-renaming — while only a stem that still violates the `image_ref` contract is refused **before any byte is copied**, so a refused run leaves no half-written `images/`. Feed the prepared `<out-dir>/images/` into a `--templates-only` / `--plan` / one-command run. `--prepare-images-only` is mutually exclusive with `--plan` / `--resume` / `--templates-only` / `--manifest` / `--generated-provenance` and is refused (rc 2, no `--out-dir` created) if combined with them.
+Every entry passes the same safety gate the bundle-staging path uses (symlink / subdirectory / non-image / hidden-dotfile / size + count caps), and two names that normalise to the same base stem are given distinct names with a deterministic numeric suffix (`img` / `img_2` …, `my_file` / `my_file_2`) — so a CJK-heavy folder prepares without hand-renaming — while only a stem that still violates the `image_ref` contract is refused **before any byte is copied**, so a refused run leaves no half-written `images/`. Feed the prepared `<out-dir>/images/` into a `--templates-only` / `--plan` / one-command run; pass the `filename_mapping.json` written here to `--templates-only --filename-mapping` so the manifest's slide titles keep the original filenames (see below). `--prepare-images-only` is mutually exclusive with `--plan` / `--resume` / `--templates-only` / `--manifest` / `--generated-provenance` and is refused (rc 2, no `--out-dir` created) if combined with them.
 
 ### Just want editable starter metadata? (`--templates-only`)
 
@@ -606,6 +616,8 @@ python3 scripts/operator_images_to_review_package.py --templates-only \
 ```
 
 Both files are written by the helper's own `--write-manifest-template` / `--write-generated-provenance-template` writers against a single stable snapshot of the images (copied once into a private temp dir), so they always agree on the filename set and pass the helper's `_validate_manifest_arg` (MAN1..MAN12) / `_validate_generated_provenance_sidecar` (GP1..GP13) gates verbatim. Hand-edit the two files, then feed them back via `--manifest` / `--generated-provenance` (below). `--templates-only` is mutually exclusive with `--plan` / `--resume` / `--manifest` / `--generated-provenance` and is refused (rc 2, no `--out-dir` created) if combined with them.
+
+If the images came from `--prepare-images-only`, add `--filename-mapping <prepared>/filename_mapping.json` (the one optional companion to `--templates-only`): the manifest's per-image `slide_title` / `alt_text` are then seeded from each image's **original** filename instead of the normalized safe basename, so a deck prepared from messy real-world names keeps human-readable titles (e.g. `Operator image: Hero Cover (v2).png` rather than `Operator image: hero_cover_v2_.png`). The mapping is bound to the prepared image **bytes**: its `safe_filename` set must equal the prepared images exactly **and** each record's recorded `sha256` / `byte_count` must match the prepared bytes (else the run fails closed), so a stale mapping that reuses the same safe names for a different image set is refused rather than mislabelling the deck. The re-seeded manifest is re-validated through the same MAN gates so an over-long / unsafe seeded title is refused rather than carried forward. Omit the flag to keep the safe-basename titles. The generated-provenance sidecar is unaffected (it carries no filename-derived title).
 
 ### Optional operator-supplied metadata (`--manifest` / `--generated-provenance`)
 
@@ -623,7 +635,7 @@ python3 scripts/operator_images_to_review_package.py \
 Each supplied path is gated at the CLI for URI-shape / symlink / symlink-ancestor / missing / non-file (rc 2 **before** any image is staged). Its content is then validated by the helper's own `_validate_manifest_arg` (MAN1..MAN12) / `_validate_generated_provenance_sidecar` (GP1..GP13) gates against the **copied** image basenames — JSON parse, `schema_version == "1"`, the closed field set / closed enums, the safe-string deny lists (no URL / URI / path separator / credential / public-upload / confidential / fake-success wording), and the filename-set-equals-the-copied-images cross-check — and the file is copied race-safely into the bundle in place of the default template. Either flag may be supplied alone or together; an omitted flag keeps the default template for that file. Because the downstream plan-out / approved-plan / resume drift-lock build the plan from the bundle, the produced `approved_plan.json` and `review_package/summary.json` reflect the supplied metadata with no further wiring. The wrapper re-implements no contract logic — it reuses the helper's validators verbatim. A filename-set mismatch, unsafe wording, malformed JSON, or a drift between the supplied metadata at `--plan` time and `--resume` all fail closed with no review package.
 
 ```bash
-# Thirty-five self-test probes (one-command happy path + copy/TOCTOU gates
+# Forty self-test probes (one-command happy path + copy/TOCTOU gates
 # + T15–T20 for the two-step flow + T21–T26 for operator-supplied
 # metadata: valid custom manifest/provenance accepted and reflected in
 # plan/summary, filename-set mismatch rejected, symlink/URI metadata path
@@ -637,7 +649,13 @@ Each supplied path is gated at the CLI for URI-shape / symlink / symlink-ancesto
 # deterministic numeric suffix, unsafe entries failing closed,
 # mutual-exclusion refusal, and an end-to-end one-command build on the
 # prepared images proving the safe stems satisfy the downstream
-# image_ref contract ^[a-z][a-z0-9_]*$):
+# image_ref contract ^[a-z][a-z0-9_]*$ + T36–T40 for --filename-mapping
+# title seeding: readable slide_title / alt_text from original filenames
+# with spaces / punctuation / CJK, the safe-basename fallback when the
+# flag is omitted, fail-closed on a mismatched safe-name set / wrong mode /
+# unsafe path / a mapping bound to different bytes (matching names but wrong
+# sha256), and an end-to-end plan/resume build whose summary carries
+# the original-filename title):
 TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
   python3 scripts/operator_images_to_review_package.py --self-test
 ```

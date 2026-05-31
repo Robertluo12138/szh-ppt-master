@@ -3210,12 +3210,32 @@ def _write_json(path: Path, body: dict) -> None:
     )
 
 
+def _slide_title_for_name(display_name: str) -> str:
+    """Format the native editable slide title for an operator-facing
+    image DISPLAY NAME (an image basename). Single source of truth for
+    the title text so the templates-only path can seed the SAME title
+    from a prepared image's ORIGINAL filename — recovered from
+    ``--prepare-images-only``'s ``filename_mapping.json`` — instead of the
+    normalized safe basename, without restating the format string and
+    risking drift. The seeded title is re-validated by the manifest
+    contract gates, so an over-long / unsafe display name fails closed."""
+    return f"Operator image: {display_name}"
+
+
+def _alt_text_for_name(display_name: str) -> str:
+    """Format the image_manifest ``alt_text`` for an operator-facing image
+    DISPLAY NAME. Shared with the templates-only mapping-seed path so the
+    seeded ``alt_text`` matches the helper's default format byte-for-byte
+    (see ``_slide_title_for_name``)."""
+    return f"Operator-supplied local image {display_name!r}."
+
+
 def _cover_title_for(image: _DiscoveredImage) -> str:
     """Slide title naming the operator filename so a reviewer can match
     each embedded ppt/media part back to its source byte just by
     opening the deck. Title length is bounded by the operator filename
     + a fixed prefix (no derived content from the image bytes)."""
-    return f"Operator image: {image.operator_filename}"
+    return _slide_title_for_name(image.operator_filename)
 
 
 # Built-in default per-image manifest field values. Centralised so the
@@ -3245,10 +3265,7 @@ def _default_slide_title(image: _DiscoveredImage) -> str:
 
 
 def _default_alt_text(image: _DiscoveredImage) -> str:
-    return (
-        f"Operator-supplied local image "
-        f"{image.operator_filename!r}."
-    )
+    return _alt_text_for_name(image.operator_filename)
 
 
 def _default_sidecar_intent_summary(image: _DiscoveredImage) -> str:
