@@ -262,6 +262,26 @@ def _readme_overclaim_offenders(readme_text: str) -> list[str]:
     return [phrase for phrase in _FORBIDDEN_OVERCLAIMS if phrase in lowered]
 
 
+def _rects_overlap(a: dict, b: dict) -> bool:
+    """True iff two axis-aligned {x,y,w,h} pixel rects overlap (touching
+    edges do NOT count as overlap). Used by the role-aware layout probe
+    to prove the section_divider accent image does not cover slide text.
+    Returns False if either rect is missing a numeric x/y/w/h key rather
+    than raising, so a malformed render_model surfaces via its own
+    upstream validator, not here."""
+    keys = ("x", "y", "w", "h")
+    if any(not isinstance(a.get(k), int) for k in keys):
+        return False
+    if any(not isinstance(b.get(k), int) for k in keys):
+        return False
+    return (
+        a["x"] < b["x"] + b["w"]
+        and b["x"] < a["x"] + a["w"]
+        and a["y"] < b["y"] + b["h"]
+        and b["y"] < a["y"] + a["h"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bundle assembly.
 # ---------------------------------------------------------------------------
@@ -540,6 +560,113 @@ def _run_trial(out_dir: Path) -> int:
     print(f"  [PASS] every image_provenance row carries "
           f"{list(_REQUIRED_SIDECAR_ROW_FIELDS)} from the sidecar")
 
+    # Stage E2 — role-aware layout. The sidecar's placement_role now
+    # drives the slide layout: a hero_page image keeps the original
+    # cover slide; a local_region image routes to the section_divider
+    # layout, which carries the image in its optional accent slot beside
+    # an editable section_title. Read the produced deck_plan +
+    # render_models and prove BOTH expected layouts landed (so the mixed
+    # sidecar yields two image-bearing editable layouts) AND that the
+    # section_divider slide actually embeds its image rather than
+    # silently dropping it. The layout is a deterministic function of the
+    # placement_role the approved-plan drift lock already pins, so a
+    # regression that mis-routed a role surfaces here.
+    workspace = review_package / "workspace"
+    try:
+        deck_plan = json.loads(
+            (workspace / "deck_plan.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        print(f"  [FAIL] could not parse deck_plan.json: "
+              f"{type(exc).__name__}: {exc}")
+        return 1
+    manifest_title_by_filename = {
+        m["filename"]: m["slide_title"] for m in _MANIFEST_ENTRIES
+    }
+    expected_layout_by_title = {
+        manifest_title_by_filename[sc["filename"]]: (
+            "section_divider"
+            if sc["placement_role"] == "local_region"
+            else "cover"
+        )
+        for sc in _SIDECAR_ENTRIES
+    }
+    slides = deck_plan.get("slides")
+    if not isinstance(slides, list):
+        print(f"  [FAIL] deck_plan.slides is not a list (got {slides!r})")
+        return 1
+    actual_layout_by_title = {
+        s.get("title"): s.get("layout")
+        for s in slides if isinstance(s, dict)
+    }
+    for title, expected in expected_layout_by_title.items():
+        actual = actual_layout_by_title.get(title)
+        if actual != expected:
+            print(f"  [FAIL] slide {title!r}: placement_role expected "
+                  f"layout {expected!r}, deck_plan has {actual!r}")
+            return 1
+    distinct_layouts = {
+        s.get("layout") for s in slides if isinstance(s, dict)
+    }
+    if not {"cover", "section_divider"} <= distinct_layouts:
+        print(f"  [FAIL] mixed sidecar did not yield BOTH cover AND "
+              f"section_divider; deck_plan layouts="
+              f"{sorted(distinct_layouts)}")
+        return 1
+    # The section_divider slide(s) must each embed an image_slot — the
+    # local_region image is not dropped when the layout changes.
+    sd_indices = [
+        s.get("index") for s in slides
+        if isinstance(s, dict) and s.get("layout") == "section_divider"
+    ]
+    for idx in sd_indices:
+        rm_path = (
+            workspace / "render_models" / f"{idx:02d}_section_divider.json"
+        )
+        try:
+            rm = json.loads(rm_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"  [FAIL] could not parse {rm_path.name}: "
+                  f"{type(exc).__name__}: {exc}")
+            return 1
+        prims = rm.get("primitives") or []
+        image_bounds = [
+            p["bounds"] for p in prims
+            if isinstance(p, dict)
+            and p.get("kind") == "image_slot"
+            and isinstance(p.get("image_slot"), dict)
+            and p["image_slot"].get("image_ref")
+            and isinstance(p.get("bounds"), dict)
+        ]
+        if not image_bounds:
+            print(f"  [FAIL] section_divider render_model {rm_path.name} "
+                  f"embeds no image_slot; the local_region image was "
+                  f"dropped")
+            return 1
+        # The accent image must NOT overlap any text primitive. The
+        # section_title slot is full-width, so a long title would be
+        # hidden under an image placed in its band — the image is laid
+        # out above the title band precisely to prevent that. This guard
+        # fails closed if a future bounds change re-introduces the
+        # overlap (Codex stop-review finding).
+        text_bounds = [
+            p["bounds"] for p in prims
+            if isinstance(p, dict)
+            and p.get("kind") == "text"
+            and isinstance(p.get("bounds"), dict)
+        ]
+        for ib in image_bounds:
+            for tb in text_bounds:
+                if _rects_overlap(ib, tb):
+                    print(f"  [FAIL] section_divider {rm_path.name}: image "
+                          f"bounds {ib} overlap text bounds {tb}; the image "
+                          f"would cover slide text")
+                    return 1
+    print(f"  [PASS] role-aware layout: hero_page->cover, "
+          f"local_region->section_divider (image embedded, no text "
+          f"overlap); deck shows two image-bearing editable layouts "
+          f"{sorted(distinct_layouts)}")
+
     # Stage F — read-only stdlib re-check of the produced review
     # package via the companion validator. The validator never writes
     # to the package; it re-checks every locked summary field + path-
@@ -653,8 +780,10 @@ def _render_trial_readme(
         "written by the helper. Includes a `## Generated image "
         "provenance` section listing the per-entry sidecar fields.",
         f"3. `{(review_package / 'deck.pptx').relative_to(review_package.parent)}` — the produced editable PPTX. "
-        "One cover slide per synthetic image; titles and shapes are "
-        "native PowerPoint objects.",
+        "One slide per synthetic image; the placement_role picks the "
+        "layout (hero_page -> cover, local_region -> section_divider). "
+        "Titles, shapes, and the embedded image are native PowerPoint "
+        "objects.",
         f"4. `{(review_package / 'summary.json').relative_to(review_package.parent)}` — compact summary. The "
         "`generated_provenance` block confirms the sidecar fired "
         f"(entry_count={entry_count}); the `approved_plan` block "
@@ -1494,6 +1623,107 @@ def _run_self_tests() -> int:
             ok=ok, detail=detail,
         ))
 
+    # T10 no-sidecar default unchanged. A bundle WITHOUT a
+    # generated_provenance.json sidecar must keep the original cover
+    # slide for every image — the section_divider routing is opt-in via
+    # placement_role and must not change the no-sidecar path.
+    with tempfile.TemporaryDirectory(prefix="gen-img-trial-T10-") as raw_td:
+        td = Path(raw_td)
+        out_dir = td / "trial"
+        out_dir.mkdir()
+        bundle = out_dir / "bundle"
+        review_package = out_dir / "review_package"
+        _write_bundle(bundle)
+        # Drop the sidecar so this is a genuine no-sidecar run.
+        (bundle / "generated_provenance.json").unlink()
+        build = _run(
+            "T10 no-sidecar build",
+            [
+                sys.executable, str(HELPER_PATH),
+                "--bundle", str(bundle),
+                "--out-dir", str(review_package),
+            ],
+        )
+        layouts: list = []
+        deck_plan_ok = False
+        if build.rc == 0:
+            try:
+                dp = json.loads(
+                    (review_package / "workspace" / "deck_plan.json")
+                    .read_text(encoding="utf-8")
+                )
+                layouts = [
+                    s.get("layout") for s in dp.get("slides", [])
+                    if isinstance(s, dict)
+                ]
+                deck_plan_ok = True
+            except (OSError, ValueError):
+                deck_plan_ok = False
+        ok = (
+            build.rc == 0
+            and deck_plan_ok
+            and len(layouts) == len(_BUNDLE_IMAGES)
+            and all(lay == "cover" for lay in layouts)
+        )
+        detail = "" if ok else (
+            f"rc={build.rc}; deck_plan_ok={deck_plan_ok}; "
+            f"layouts={layouts!r} (expected all 'cover')"
+        )
+        results.append(_ProbeResult(
+            name="T10 no-sidecar keeps cover (default unchanged)",
+            ok=ok, detail=detail,
+        ))
+
+    # T11 invalid placement_role fails closed. A sidecar carrying a
+    # placement_role outside the closed {hero_page, local_region} set
+    # must be refused by the existing GP9 enum gate BEFORE any out-dir
+    # mkdir or pipeline subprocess — the layout routing never sees an
+    # out-of-vocab value. Proves the new feature inherits the existing
+    # fail-closed gate rather than widening it.
+    with tempfile.TemporaryDirectory(prefix="gen-img-trial-T11-") as raw_td:
+        td = Path(raw_td)
+        out_dir = td / "trial"
+        out_dir.mkdir()
+        bundle = out_dir / "bundle"
+        review_package = out_dir / "review_package"
+        _write_bundle(bundle)
+        sidecar_path = bundle / "generated_provenance.json"
+        mutated_ok = False
+        try:
+            body = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            body["entries"][0]["placement_role"] = "banner"
+            sidecar_path.write_text(
+                json.dumps(body, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            mutated_ok = True
+        except (OSError, ValueError, KeyError, IndexError):
+            mutated_ok = False
+        refused = _run(
+            "T11 invalid placement_role",
+            [
+                sys.executable, str(HELPER_PATH),
+                "--bundle", str(bundle),
+                "--out-dir", str(review_package),
+            ],
+        )
+        combined = (refused.stdout or "") + (refused.stderr or "")
+        ok = (
+            mutated_ok
+            and refused.rc == 2
+            and "placement_role" in combined
+            and not review_package.exists()
+        )
+        detail = "" if ok else (
+            f"mutated_ok={mutated_ok}; rc={refused.rc}; "
+            f"placement_role_in_output={'placement_role' in combined}; "
+            f"review_package.exists={review_package.exists()}"
+        )
+        results.append(_ProbeResult(
+            name="T11 invalid placement_role fails closed",
+            ok=ok, detail=detail,
+        ))
+
     repo_rc = _check_repo_unchanged(snapshot_before=snapshot_before)
 
     print()
@@ -1575,11 +1805,18 @@ def main(argv: list[str]) -> int:
             "Run the trial under a per-run TMPDIR fixture plus every "
             "documented fail-closed probe (URI / symlink / "
             "symlink-ancestor / inside-REPO_ROOT / pre-existing "
-            "non-empty --out-dir) and the post-plan sidecar drift "
-            "probe (mutating the sidecar between --plan-out and "
+            "non-empty --out-dir), the post-plan sidecar drift probe "
+            "(mutating placement_role between --plan-out and "
             "--approved-plan refuses with rc 2 BEFORE any "
-            "review_package artifact is created). No caller-visible "
-            "artifacts retained; mutually exclusive with --out-dir."
+            "review_package artifact is created), the no-sidecar probe "
+            "(a bundle without generated_provenance.json keeps the "
+            "cover layout for every image), and the invalid-placement_"
+            "role probe (an out-of-vocab placement_role fails closed at "
+            "the GP9 gate). The happy path additionally asserts the "
+            "role-aware layout (hero_page -> cover, local_region -> "
+            "section_divider with its image embedded). No caller-"
+            "visible artifacts retained; mutually exclusive with "
+            "--out-dir."
         ),
     )
     args = parser.parse_args(argv)

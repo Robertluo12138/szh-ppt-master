@@ -18,8 +18,10 @@ Five modes share one helper:
     naming per-image slide intent. Discovers the image files
     deterministically (filename-sorted when ``--manifest`` is omitted;
     reordered to manifest array order when supplied), generates the
-    smallest viable pipeline fixture (one cover slide per image, native
-    title + image_slot accent — with the operator-typed slide_title /
+    smallest viable pipeline fixture (one slide per image — a cover
+    slide by default, or a section_divider when a generated-provenance
+    sidecar marks that image local_region — each carrying a native
+    title + image_slot accent, with the operator-typed slide_title /
     alt_text / intended_use flowing through verbatim when
     ``--manifest`` is supplied), invokes
     ``scripts/run_explicit_pipeline.py`` with ``--theme-from-template``
@@ -436,15 +438,20 @@ _DECK_OBJECTIVE = (
 )
 _DECK_SECTION_TITLE = "Operator Image Accents"
 _DECK_SECTION_SUMMARY = (
-    "One cover slide per operator-supplied local image; each cover "
-    "carries the operator file as a native ppt/media accent and a "
-    "native editable title text run."
+    "One slide per operator-supplied local image; each carries the "
+    "operator file as a native ppt/media accent and a native editable "
+    "title text run. The generated-provenance placement_role picks the "
+    "layout: hero_page (and the no-sidecar default) uses a cover slide, "
+    "local_region uses a section_divider."
 )
 _DECK_PLAN_RATIONALE = (
-    "One cover slide per operator-supplied local image. Two-line title "
-    "names the operator filename so a reviewer can match each "
-    "embedded ppt/media part back to its source byte. Local-only; no "
-    "D-One, MCP, Qoder, public network, telemetry, or model API."
+    "One slide per operator-supplied local image. The title names the "
+    "operator filename so a reviewer can match each embedded ppt/media "
+    "part back to its source byte. The generated-provenance "
+    "placement_role picks the layout: hero_page (and the no-sidecar "
+    "default) uses a cover slide, local_region uses a section_divider. "
+    "Local-only; no D-One, MCP, Qoder, public network, telemetry, or "
+    "model API."
 )
 _SOURCE_BODY = (
     "# Operator Local-Image Intake\n\n"
@@ -3305,17 +3312,29 @@ def _build_pipeline_fixture(
     *,
     fixture_root: Path,
     images: list[_DiscoveredImage],
+    sidecar_entries: list[dict] | None = None,
 ) -> dict:
     """Author the smallest viable explicit-input fixture.
 
     Layout (all under ``fixture_root``):
 
-      source.md                  caller-supplied placeholder body.
-      plan_spec.json             N-cover deck plan.
-      specs/<idx:02d>_cover.json one per cover.
-      image_manifest_spec.json   one images[] entry per operator image.
-      assets/<id>.<ext>          operator bytes copied here for the
-                                 Stage-5.5 materialize step to ingest.
+      source.md                    caller-supplied placeholder body.
+      plan_spec.json               role-aware deck plan (one slide per
+                                   operator image).
+      specs/<idx:02d>_<layout>.json one per slide.
+      image_manifest_spec.json     one images[] entry per operator image.
+      assets/<id>.<ext>            operator bytes copied here for the
+                                   Stage-5.5 materialize step to ingest.
+
+    Each operator image becomes exactly one slide. The slide LAYOUT is
+    chosen from the generated-provenance sidecar's ``placement_role``:
+    ``local_region`` routes to the ``section_divider`` layout (the image
+    lands in that layout's optional accent slot beside a title);
+    ``hero_page`` — and the no-sidecar / no-matching-entry default —
+    keeps the original ``cover`` slide. ``sidecar_entries`` is the same
+    already-validated list ``_build_plan_body`` consumes, so the layout
+    a run produces is a deterministic function of the placement_role the
+    approved-plan drift lock already pins.
 
     Returns a dict naming the source / plan_spec / specs_dir /
     image_manifest_spec / assets_dir paths run_explicit_pipeline.py
@@ -3324,6 +3343,14 @@ def _build_pipeline_fixture(
 
     source = fixture_root / "source.md"
     source.write_text(_SOURCE_BODY, encoding="utf-8")
+
+    # Per-filename placement_role from the (already-validated) sidecar.
+    # Absent a sidecar the map is empty and every image keeps the cover
+    # layout, so the no-sidecar path is byte-identical to prior behaviour.
+    placement_by_filename: dict[str, str] = {}
+    if sidecar_entries is not None:
+        for entry in sidecar_entries:
+            placement_by_filename[entry["filename"]] = entry["placement_role"]
 
     slides_block: list[dict] = []
     sections_indices: list[int] = []
@@ -3347,13 +3374,27 @@ def _build_pipeline_fixture(
         title = image.slide_title or _default_slide_title(image)
         alt_text = image.alt_text or _default_alt_text(image)
         intended_use = image.intended_use or _DEFAULT_INTENDED_USE
+        # Role-aware layout choice. local_region -> section_divider (image
+        # in that layout's optional accent slot, required text slot is
+        # section_title); everything else (hero_page, no sidecar, no
+        # matching entry) -> the original cover slide (required text slot
+        # is title). Both layouts carry the image in their "accent" slot.
+        role = placement_by_filename.get(image.operator_filename)
+        if role == "local_region":
+            layout = "section_divider"
+            title_slot_id = "section_title"
+            layout_label = "Section-divider"
+        else:
+            layout = "cover"
+            title_slot_id = "title"
+            layout_label = "Cover"
         slides_block.append({
             "index": idx,
-            "layout": "cover",
+            "layout": layout,
             "title": title,
             "section_id": "operator_images",
             "summary": (
-                f"Cover slide for operator image "
+                f"{layout_label} slide for operator image "
                 f"{image.operator_filename!r} (id={image.asset_id!r})."
             ),
             "density": "low",
@@ -3361,14 +3402,14 @@ def _build_pipeline_fixture(
         })
         sections_indices.append(idx)
         _write_json(
-            specs_dir / f"{idx:02d}_cover.json",
+            specs_dir / f"{idx:02d}_{layout}.json",
             {
                 "index": idx,
-                "layout": "cover",
+                "layout": layout,
                 "title": title,
                 "blocks": [
                     {
-                        "id": "title",
+                        "id": title_slot_id,
                         "kind": "text",
                         "content": title,
                     },
@@ -3990,7 +4031,7 @@ def _check_summary_truth(summary: dict) -> list[str]:
     ):
         failures.append(
             f"summary.slide_count={slide_count!r}; expected "
-            f"{image_count!r} (one cover slide per operator image)"
+            f"{image_count!r} (one slide per operator image)"
         )
     if (
         isinstance(image_count, int)
@@ -4523,8 +4564,10 @@ def _render_review_readme(summary: dict) -> str:
         *approved_plan_block,
         "## Files in this review package",
         "",
-        "- `deck.pptx` — native editable PPTX (one cover slide per "
-        "operator image; editable title text + image_slot accent).",
+        "- `deck.pptx` — native editable PPTX (one slide per operator "
+        "image; editable title text + image_slot accent. hero_page and "
+        "the no-sidecar default use a cover slide; local_region uses a "
+        "section_divider).",
         "- `summary.json` — truth-checked summary record (slide / "
         "image / embedded-media counts, minimal-evidence booleans, "
         "validator rc values, per-image provenance, visual-quality "
@@ -4624,6 +4667,7 @@ def _run_happy_path(
 
     fixture = _build_pipeline_fixture(
         fixture_root=fixture_root, images=images,
+        sidecar_entries=sidecar_entries,
     )
 
     print(f"  fixture:   {fixture_root}")

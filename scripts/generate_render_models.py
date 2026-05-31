@@ -9,6 +9,7 @@ SUPPORTED LAYOUTS
     cover              text + structural line (title divider)
                        + (optional) image_slot
     section_divider    text + structural line (rule under the title)
+                       + (optional) image_slot
     executive_summary  text + bulleted text list (key_points)
     key_message        text + decorative rounded shape (callout
                        background, sized to message slot bounds)
@@ -244,6 +245,11 @@ LAYOUT_FALLBACK_BOUNDS = {
         "section_number": (64, 360, 400, 80),
         "section_title":  (64, 460, 1792, 220),
         "subtitle":       (64, 720, 1792, 140),
+        # Accent image sits in the top band ABOVE section_title (y < 460)
+        # and right of section_number (x > 464), so it never overlaps the
+        # full-width title/subtitle text — a long title cannot be hidden
+        # under the image. Keep it clear of those bands if these change.
+        "accent":         (640, 80, 640, 340),
     },
     "timeline": {
         "title":          (64, 80, 1792, 100),
@@ -1105,6 +1111,40 @@ def _generate_section_divider(
             role="subheading",
             typography_token="typography.body",
         ))
+
+    # Optional accent image. Mirrors the cover generator's accent slot:
+    # the slide_plan block must be kind=image_ref, its content must be a
+    # manifest id, and the manifest must declare it. Absent the block,
+    # nothing is emitted, so a section_divider slide without an image
+    # renders exactly as before.
+    if "accent" in blocks_by_id:
+        block = blocks_by_id["accent"]
+        if block.get("kind") != "image_ref":
+            raise GenerationError(
+                f"slot 'accent' expects an image_ref block; "
+                f"got kind={block.get('kind')!r}"
+            )
+        image_ref = block.get("content")
+        if not isinstance(image_ref, str) or not image_ref:
+            raise GenerationError(
+                "slot 'accent' image_ref block has no string content"
+            )
+        if image_ref not in manifest_ids:
+            raise GenerationError(
+                f"slot 'accent' references image id {image_ref!r} that is "
+                f"not declared in image_manifest"
+            )
+        payload: dict = {"image_ref": image_ref}
+        alt = manifest_alt_by_id.get(image_ref)
+        if isinstance(alt, str) and alt:
+            payload["alt_text"] = alt
+        primitives.append({
+            "id": "accent_image",
+            "slot_id": "accent",
+            "kind": "image_slot",
+            "bounds": _bounds_for(slots_by_id, "section_divider", "accent"),
+            "image_slot": payload,
+        })
 
     return {
         "index": deck_slide["index"],

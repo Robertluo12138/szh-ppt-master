@@ -23,7 +23,14 @@
       "required": false,
       "primitive_kind": "text",
       "bounds": { "x": 64, "y": 720, "w": 1792, "h": 140 }
+    },
+    {
+      "id": "accent",
+      "type": "image_ref",
+      "required": false,
+      "primitive_kind": "image_slot",
+      "bounds": { "x": 640, "y": 80, "w": 640, "h": 340 }
     }
   ],
-  "todo": "Define typography scale (large title, muted background) and SVG mapping."
+  "todo": "Define typography scale (large title, muted background) and SVG mapping. The accent image slot is optional; section_divider slides without it render exactly as before."
 }
