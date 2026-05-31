@@ -3,38 +3,54 @@
 
 This is the smallest front door that lets an operator START from a local
 report file instead of having to hand-prepare a Markdown file. It accepts
-a local ``.md`` or ``.txt`` source, normalises it into Markdown with ATX
-(``# Title``) headings, and feeds the result into the EXISTING
-``source_to_image_requests.py`` bridge (its ``--mock-handoff`` lane) which
-parses one image request per heading and drives the operator
+a local ``.md``, ``.txt``, or ``.docx`` source, normalises it into
+Markdown with ATX (``# Title``) headings, and feeds the result into the
+EXISTING ``source_to_image_requests.py`` bridge (its ``--mock-handoff``
+lane) which parses one image request per heading and drives the operator
 image-to-editable-PPT lane to a validated review package.
 
 It does NOT invent document structure. ``source_to_image_requests.py``
 already accepts any UTF-8 file and derives requests from its ATX
 headings; this wrapper only adds a gated local-file front door in front
-of that lane (extension allow-list, DOCX/PDF TODO, repo-generated-artifact
-refusal, a convert-only ``--md-out`` mode). It stays inside the current
-first-stage scope (local/generated images -> review package): it is a
-mock/local bridge that feeds the EXISTING image lane, NOT report-to-deck
-automation and NOT report understanding.
+of that lane (extension allow-list, local DOCX heading-style extraction,
+PDF TODO, repo-generated-artifact refusal, a convert-only ``--md-out``
+mode). It stays inside the current first-stage scope (local/generated
+images -> review package): it is a mock/local bridge that feeds the
+EXISTING image lane, NOT report-to-deck automation and NOT report
+understanding.
 
-Markdown normalisation (``_to_markdown``):
+Markdown normalisation:
 
-  The source must ALREADY carry ATX (``# Title``) headings — in a ``.md``
-  or in a ``.txt`` that uses ``# `` markers. When it does, the text is
-  passed through to the bridge VERBATIM. When it does not, the run fails
-  CLOSED with guidance to add ``# `` headings. The wrapper never promotes
-  body lines to headings or guesses structure out of prose, so no body
-  text can ever become a deck title.
+  For ``.md`` / ``.txt`` (``_to_markdown``): the source must ALREADY carry
+  ATX (``# Title``) headings — a ``.md`` or a ``.txt`` that uses ``# ``
+  markers. When it does, the text is passed through to the bridge
+  VERBATIM. When it does not, the run fails CLOSED with guidance to add
+  ``# `` headings.
 
-  BOTH modes hold the normalised Markdown to the SAME downstream safety
-  contract: before ``--md-out`` writes anything (and before
-  ``--mock-handoff`` runs the lane), the Markdown is staged in a tempdir
-  and run through the bridge's own full plan gate. So convert-only
+  For ``.docx`` (``_docx_to_markdown``): the OOXML is read locally with
+  stdlib zip/XML parsing; Word heading STYLES (Heading 1 / Heading 2 /
+  ...) are the ONLY thing promoted to ATX ``# `` / ``## `` headings, and
+  every other paragraph is preserved as body text. A body paragraph whose
+  text merely starts with ``#`` or a ``` / ~~~ fence is backslash-escaped
+  so it can never be re-parsed downstream as a heading (nor toggle the
+  fence state that would skip a real styled heading). A ``.docx`` with no
+  usable heading styles fails CLOSED. Only ``word/document.xml`` + the
+  optional ``word/styles.xml`` are read, by name — nothing is extracted to
+  disk.
+
+  In neither path does the wrapper promote body lines to headings or
+  guess structure out of prose, so no body text can ever become a deck
+  title.
+
+  EVERY format and BOTH modes hold the normalised Markdown to the SAME
+  downstream safety contract: before ``--md-out`` writes anything (and
+  before ``--mock-handoff`` runs the lane), the Markdown is staged in a
+  tempdir and run through the bridge's own full plan gate. So convert-only
   ``--md-out`` can never write a file the ``--mock-handoff`` lane would
   refuse — the emitted-value scan on sanitised heading titles
   (``api*key`` -> ``apikey``, social-media / public-share wording, etc.)
-  applies identically in both modes.
+  applies identically in both modes, and DOCX-extracted body text is
+  scanned for credential / public-network wording exactly like ``.md``.
 
 What this is NOT:
 
@@ -43,10 +59,13 @@ What this is NOT:
     search, MCP, Qoder, public network, or telemetry is ever called.
   * NOT full report understanding. It derives nothing from the report
     body and invents no structure: it requires operator-supplied ``# ``
-    headings and NEVER promotes body prose into the plan or the deck.
-  * NOT a new parser/exporter. DOCX / PDF are NOT supported — the repo
-    has no safe local extractor for them, so they are refused with an
-    explicit TODO message rather than parsed with a fragile shim.
+    headings (or Word heading STYLES in a ``.docx``) and NEVER promotes
+    body prose into the plan or the deck.
+  * NOT a broad document converter. DOCX support is narrow: stdlib
+    zip/XML extraction of heading styles + paragraph text only, no
+    external dependency. PDF is NOT supported — the repo has no safe
+    local extractor for it, so it is refused with an explicit TODO
+    message rather than parsed with a fragile shim.
   * NOT a new safety contract. The whole source is scanned for
     credential / public-network / file-URI / absolute-path wording by
     REUSING ``source_to_image_requests._scan_source_safety``, and the
@@ -63,11 +82,13 @@ Fail-closed gates, BEFORE any conversion or downstream call:
     ``__pycache__/``) — a repo-resident generated artifact must not be
     fed back in as a source;
   * ``--report`` is not a regular file;
-  * unsupported extension (only ``.md`` / ``.txt`` accepted; ``.docx`` /
+  * unsupported extension (only ``.md`` / ``.txt`` / ``.docx`` accepted;
     ``.pdf`` refused as TODO; everything else refused generically);
   * non-identifier-safe basename (mirrors the downstream bridge so the
     derived Markdown filename is safe);
-  * empty / oversized / non-UTF-8 bytes;
+  * empty / oversized bytes; non-UTF-8 (``.md`` / ``.txt``); non-OOXML /
+    malformed zip, missing document part, or malformed XML (``.docx``);
+  * a ``.docx`` with no usable Word heading styles;
   * any credential / public-network / file-URI / absolute-path wording.
 
 CLI shape::
@@ -104,9 +125,12 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse  # noqa: E402
+import io  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import tempfile  # noqa: E402
+import xml.etree.ElementTree as ET  # noqa: E402
+import zipfile  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -128,11 +152,18 @@ from core_image_to_editable_ppt_demo import (  # noqa: E402
     _forbidden_symlink_ancestor,
 )
 
-# Accepted source extensions (case-insensitive).
-ACCEPTED_EXTS: tuple[str, ...] = (".md", ".txt")
+# Plain-text source extensions (case-insensitive): read + UTF-8 decoded
+# and passed through verbatim (they must already carry ATX '# ' headings).
+TEXT_EXTS: tuple[str, ...] = (".md", ".txt")
+# The local OOXML format we can extract safely with stdlib zip/XML parsing:
+# Word heading styles are promoted to ATX '# ' headings, normal paragraphs
+# preserved as body text (see _docx_to_markdown).
+DOCX_EXT: str = ".docx"
+# All extensions the front door accepts.
+ACCEPTED_EXTS: tuple[str, ...] = TEXT_EXTS + (DOCX_EXT,)
 # Formats we explicitly know about but cannot safely extract locally yet.
 # Refused with a TODO message rather than parsed with a fragile shim.
-TODO_EXTS: tuple[str, ...] = (".docx", ".pdf")
+TODO_EXTS: tuple[str, ...] = (".pdf",)
 
 # Generated-output directory names (mirrors .gitignore). A --report that
 # resolves under the repo tree AND inside one of these is a generated
@@ -281,6 +312,201 @@ def _to_markdown(text: str) -> tuple[str | None, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# DOCX -> Markdown extraction (local OOXML, stdlib zip/XML only).
+#
+# A .docx is a ZIP of OOXML parts. We read ONLY two fixed members by name
+# (word/document.xml + the optional word/styles.xml) — never extracting to
+# disk and never iterating arbitrary entries — so a path-traversal-style
+# zip entry name has nothing to write through. Word heading styles
+# (Heading 1 / Heading 2 / ...) are promoted to ATX '# ' / '## ' headings;
+# every other paragraph is preserved as body text. A .docx with no usable
+# heading styles fails CLOSED: the wrapper invents no structure and never
+# promotes body prose to a heading. The produced Markdown is then held to
+# the SAME full downstream safety gate as .md / .txt (see _load_and_convert).
+# ---------------------------------------------------------------------------
+
+# WordprocessingML main namespace. Element tags below are Clark-notation
+# ``{ns}local`` strings as produced by xml.etree.
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_DOCX_DOCUMENT_PART = "word/document.xml"
+_DOCX_STYLES_PART = "word/styles.xml"
+# A heading style name/id once whitespace-stripped + lowercased, e.g.
+# "heading 1" -> "heading1", "Heading2" -> "heading2". Capture the level.
+_HEADING_STYLE_RE = re.compile(r"^heading([1-9])$")
+
+
+def _heading_level_from_style_token(token: str | None) -> int | None:
+    """Map a style name OR styleId to a heading level 1..9, else None.
+    Matches both 'heading 1' (style display name) and 'Heading1' (styleId)
+    after whitespace strip + lowercase."""
+    if not token:
+        return None
+    m = _HEADING_STYLE_RE.match(re.sub(r"\s+", "", token.lower()))
+    return int(m.group(1)) if m else None
+
+
+def _docx_style_heading_levels(styles_xml: bytes | None) -> dict[str, int]:
+    """Map paragraph styleId -> heading level using word/styles.xml's
+    ``<w:style><w:name w:val="heading N"/>``. Best-effort: a missing or
+    malformed styles part yields an empty map and the styleId-token
+    fallback in _docx_to_markdown still recognises 'Heading1'-style ids."""
+    levels: dict[str, int] = {}
+    if not styles_xml:
+        return levels
+    try:
+        root = ET.fromstring(styles_xml)
+    except ET.ParseError:
+        return levels
+    for style in root.iter(f"{_W}style"):
+        # type defaults to paragraph when absent; only paragraph styles
+        # can be a heading style.
+        if style.get(f"{_W}type") not in (None, "paragraph"):
+            continue
+        style_id = style.get(f"{_W}styleId")
+        if not style_id:
+            continue
+        name_el = style.find(f"{_W}name")
+        if name_el is None:
+            continue
+        level = _heading_level_from_style_token(name_el.get(f"{_W}val"))
+        if level is not None:
+            levels[style_id] = level
+    return levels
+
+
+def _docx_paragraph_text(p: ET.Element) -> str:
+    """Concatenate the visible text of a ``<w:p>`` in document order. Tabs
+    and line breaks collapse to a single space; the result is stripped."""
+    parts: list[str] = []
+    for node in p.iter():
+        tag = node.tag
+        if tag == f"{_W}t":
+            parts.append(node.text or "")
+        elif tag in (f"{_W}tab", f"{_W}br", f"{_W}cr"):
+            parts.append(" ")
+    return re.sub(r"\s+", " ", "".join(parts)).strip()
+
+
+# A body paragraph whose collapsed text begins (after optional leading
+# whitespace) with '#' or a ``` / ~~~ code fence would be re-parsed by the
+# downstream heading parser as an ATX heading — or, for a fence, would
+# toggle its fence state and make it SKIP real styled headings. Both turn
+# body prose into deck structure. We detect and neutralise such lines.
+_BODY_LEADING_MD_RE = re.compile(r"^[ \t]*(#|```|~~~)")
+
+
+def _neutralise_body_line(text: str) -> str:
+    """Keep a body paragraph from being parsed as a heading / fence by the
+    downstream parser. The paragraph's whitespace is already collapsed to a
+    single line, so a single backslash escape at the start is enough: it
+    defeats both _ATX_RE and _FENCE_RE while leaving the visible text intact
+    for the credential / public-network safety scan (the leading marker is
+    never itself a denied token, and the rest of the line is unchanged)."""
+    if _BODY_LEADING_MD_RE.match(text):
+        return "\\" + text
+    return text
+
+
+def _docx_paragraph_level(p: ET.Element, style_levels: dict[str, int]) -> int | None:
+    """Return the heading level for a ``<w:p>`` from its ``<w:pStyle>``,
+    via the styles.xml name map first then the styleId-token fallback."""
+    ppr = p.find(f"{_W}pPr")
+    if ppr is None:
+        return None
+    pstyle = ppr.find(f"{_W}pStyle")
+    if pstyle is None:
+        return None
+    val = pstyle.get(f"{_W}val")
+    if val in style_levels:
+        return style_levels[val]
+    return _heading_level_from_style_token(val)
+
+
+def _docx_to_markdown(path: Path) -> tuple[str | None, list[str]]:
+    """Extract a .docx into Markdown, promoting Word heading styles to ATX
+    '# ' headings and preserving other paragraphs as body text. Fails
+    CLOSED on an unreadable/oversized file, a non-OOXML or malformed zip, a
+    missing document part, malformed XML, or no usable heading styles."""
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return None, [f"cannot read --report {path}: {type(exc).__name__}: {exc}"]
+    if not raw:
+        return None, [f"--report {path} is empty"]
+    if len(raw) > s2ir.MAX_SOURCE_BYTES:
+        return None, [
+            f"--report {path} is {len(raw)} bytes; exceeds cap "
+            f"{s2ir.MAX_SOURCE_BYTES}"
+        ]
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            try:
+                doc_info = zf.getinfo(_DOCX_DOCUMENT_PART)
+            except KeyError:
+                return None, [
+                    f"--report {path} is not a DOCX: missing "
+                    f"{_DOCX_DOCUMENT_PART} (not an OOXML Word document)"
+                ]
+            # Zip-bomb guard: refuse on the declared uncompressed size before
+            # decompressing, holding the document part to the same byte cap.
+            if doc_info.file_size > s2ir.MAX_SOURCE_BYTES:
+                return None, [
+                    f"--report {path} {_DOCX_DOCUMENT_PART} uncompressed size "
+                    f"{doc_info.file_size} exceeds cap {s2ir.MAX_SOURCE_BYTES}; "
+                    f"refused (zip-bomb guard)"
+                ]
+            document_xml = zf.read(_DOCX_DOCUMENT_PART)
+            styles_xml: bytes | None = None
+            try:
+                styles_info = zf.getinfo(_DOCX_STYLES_PART)
+                if styles_info.file_size <= s2ir.MAX_SOURCE_BYTES:
+                    styles_xml = zf.read(_DOCX_STYLES_PART)
+            except KeyError:
+                styles_xml = None
+    except (zipfile.BadZipFile, OSError) as exc:
+        return None, [
+            f"--report {path} is not a readable DOCX (OOXML zip): "
+            f"{type(exc).__name__}: {exc}"
+        ]
+
+    try:
+        root = ET.fromstring(document_xml)
+    except ET.ParseError as exc:
+        return None, [
+            f"--report {path} {_DOCX_DOCUMENT_PART} is not well-formed XML: {exc}"
+        ]
+
+    style_levels = _docx_style_heading_levels(styles_xml)
+    blocks: list[str] = []
+    heading_count = 0
+    for p in root.iter(f"{_W}p"):
+        text = _docx_paragraph_text(p)
+        if not text:
+            continue
+        level = _docx_paragraph_level(p, style_levels)
+        if level is not None:
+            # ATX headings only run 1..6; deeper Word levels clamp to '######'.
+            blocks.append(f"{'#' * min(level, 6)} {text}")
+            heading_count += 1
+        else:
+            # Style-based promotion is the ONLY way a heading is created;
+            # body prose that merely starts with '#'/a fence is neutralised
+            # so it can never become a slide heading downstream.
+            blocks.append(_neutralise_body_line(text))
+
+    if heading_count == 0:
+        return None, [
+            f"--report {path} has no usable Word heading styles (Heading 1 / "
+            f"Heading 2 / ...): nothing can be promoted to a Markdown '# ' "
+            f"heading. The bridge derives one image request per heading and "
+            f"invents no structure — apply Word heading styles in the .docx "
+            f"(or convert it to .md / .txt with '# ' headings) and retry."
+        ]
+    return "\n\n".join(blocks) + "\n", []
+
+
+# ---------------------------------------------------------------------------
 # md-out path gate (convert-only mode).
 # ---------------------------------------------------------------------------
 
@@ -331,15 +557,22 @@ def _gate_md_out(md_out_arg: str) -> tuple[Path | None, list[str]]:
 def _load_and_convert(report_arg: str) -> tuple[Path | None, str | None, list[str]]:
     """Run the full gate -> read -> normalise -> downstream-gate pipeline.
     Returns (report_path, markdown_text, failures)."""
-    path, _suffix, failures = _gate_report(report_arg)
+    path, suffix, failures = _gate_report(report_arg)
     if failures or path is None:
         return None, None, failures
-    text, failures = _read_text(path)
-    if failures or text is None:
-        return None, None, failures
-    markdown, failures = _to_markdown(text)
-    if failures or markdown is None:
-        return None, None, failures
+    if suffix == DOCX_EXT:
+        # DOCX is binary OOXML: extract + promote heading styles locally.
+        markdown, failures = _docx_to_markdown(path)
+        if failures or markdown is None:
+            return None, None, failures
+    else:
+        # .md / .txt: read UTF-8 + require operator-supplied ATX headings.
+        text, failures = _read_text(path)
+        if failures or text is None:
+            return None, None, failures
+        markdown, failures = _to_markdown(text)
+        if failures or markdown is None:
+            return None, None, failures
     # Hold the normalised Markdown to the EXACT downstream safety contract
     # the --mock-handoff lane applies, so --md-out can never emit a file the
     # bridge would later refuse. Staging it under a tempdir (never the repo)
@@ -468,6 +701,87 @@ A body paragraph about the market.
 """
 
 
+def _xml_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+
+
+def _make_docx(
+    paragraphs: list[tuple[str | None, str]],
+    *,
+    style_names: dict[str, str] | None = None,
+    include_styles: bool = True,
+    document_xml: str | None = None,
+) -> bytes:
+    """Synthesise a minimal valid .docx (OOXML zip) in memory for tests.
+
+    ``paragraphs`` is a list of ``(style_id_or_None, text)``; a style id
+    emits ``<w:pStyle w:val=...>``. ``style_names`` maps style id ->
+    ``<w:name w:val>`` written into word/styles.xml (drives styles-name
+    heading detection). ``document_xml`` overrides the body verbatim (for
+    malformed-XML probes). Only the parts the reader uses plus a minimal
+    OOXML skeleton are written."""
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    if document_xml is None:
+        body = []
+        for style_id, text in paragraphs:
+            ppr = (
+                f'<w:pPr><w:pStyle w:val="{_xml_escape(style_id)}"/></w:pPr>'
+                if style_id is not None
+                else ""
+            )
+            body.append(
+                f"<w:p>{ppr}<w:r><w:t>{_xml_escape(text)}</w:t></w:r></w:p>"
+            )
+        document_xml = (
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<w:document xmlns:w="{w}"><w:body>{"".join(body)}</w:body></w:document>'
+        )
+    style_names = style_names or {}
+    style_defs = "".join(
+        f'<w:style w:type="paragraph" w:styleId="{_xml_escape(sid)}">'
+        f'<w:name w:val="{_xml_escape(name)}"/></w:style>'
+        for sid, name in style_names.items()
+    )
+    styles_xml = (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:styles xmlns:w="{w}">{style_defs}</w:styles>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '</Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr(_DOCX_DOCUMENT_PART, document_xml)
+        if include_styles:
+            zf.writestr(_DOCX_STYLES_PART, styles_xml)
+    return buf.getvalue()
+
+
+# A .docx with Word heading styles: 'Heading1'/'Heading2' detected by the
+# styleId-token fallback, 'CustomHeadingTwo' detected via styles.xml name.
+_DOCX_HEADING_PARAGRAPHS: list[tuple[str | None, str]] = [
+    ("Heading1", "Quarterly Strategy Overview"),
+    (None, "Some narrative body text describing the strategy."),
+    ("CustomHeadingTwo", "Market Landscape"),
+    (None, "Body paragraph about the market."),
+    ("Heading2", "Closing Summary"),
+    (None, "Final body paragraph."),
+]
+_DOCX_HEADING_STYLE_NAMES = {"CustomHeadingTwo": "heading 2"}
+
+
 def _run_self_tests() -> int:
     print("=== ingest_local_source_file --self-test ===")
     examples_before = _snapshot_dir(REPO_ROOT / "examples")
@@ -530,8 +844,9 @@ def _run_self_tests() -> int:
             probes.append(_Probe(f"W3 no-heading txt refused ({label})", ok,
                                  "" if ok else f"rc={rc}; md_out={md_out.exists()}"))
 
-    # W4 unsupported / TODO extensions refused.
-    for ext, label in ((".docx", "docx-todo"), (".pdf", "pdf-todo"), (".rtf", "generic")):
+    # W4 unsupported / TODO extensions refused. (.docx is NOW accepted —
+    # see W11..W16; malformed/non-docx .docx bytes are covered there.)
+    for ext, label in ((".pdf", "pdf-todo"), (".rtf", "generic")):
         with tempfile.TemporaryDirectory(prefix=f"ilsf-W4-{label}-") as raw_td:
             td = Path(raw_td)
             report = td / f"report{ext}"
@@ -652,6 +967,157 @@ def _run_self_tests() -> int:
         ok = rc == 2 and not (td / "u").exists()
         probes.append(_Probe("W10 URI out-dir refused (delegated)", ok, "" if ok else f"rc={rc}"))
 
+    # W11 .docx with Word heading styles -> --md-out: heading styles
+    # promoted to ATX '# '/'## ', body paragraphs preserved, and NO body
+    # line promoted to a heading (styleId fallback + styles.xml name map).
+    with tempfile.TemporaryDirectory(prefix="ilsf-W11-") as raw_td:
+        td = Path(raw_td)
+        report = td / "report.docx"
+        report.write_bytes(_make_docx(
+            _DOCX_HEADING_PARAGRAPHS, style_names=_DOCX_HEADING_STYLE_NAMES,
+        ))
+        md_out = td / "derived.md"
+        rc = _run_convert_only(str(report), str(md_out))
+        ok = rc == 0 and md_out.is_file()
+        detail = "" if ok else f"rc={rc}; md_out={md_out.is_file()}"
+        if ok:
+            got = md_out.read_text(encoding="utf-8")
+            heads = s2ir._parse_headings(got)
+            levels = [(h.level, h.text) for h in heads]
+            if levels != [
+                (1, "Quarterly Strategy Overview"),
+                (2, "Market Landscape"),
+                (2, "Closing Summary"),
+            ]:
+                ok, detail = False, f"unexpected headings: {levels!r}"
+            elif "Some narrative body text describing the strategy." not in got:
+                ok, detail = False, "body paragraph not preserved"
+            elif "# Some narrative" in got:
+                ok, detail = False, "body prose became a heading"
+        probes.append(_Probe("W11 .docx heading styles -> ATX md-out", ok, detail))
+
+    # W12 .docx with NO usable heading styles -> refused (no md written).
+    with tempfile.TemporaryDirectory(prefix="ilsf-W12-") as raw_td:
+        td = Path(raw_td)
+        report = td / "report.docx"
+        report.write_bytes(_make_docx([
+            ("Normal", "A body paragraph describing the strategy."),
+            (None, "Another body paragraph with no heading style."),
+        ]))
+        md_out = td / "derived.md"
+        rc = _run_convert_only(str(report), str(md_out))
+        ok = rc == 1 and not md_out.exists()
+        probes.append(_Probe("W12 .docx no heading styles refused", ok, "" if ok else f"rc={rc}"))
+
+    # W13 malformed zip with a .docx extension -> refused (no md written).
+    with tempfile.TemporaryDirectory(prefix="ilsf-W13-") as raw_td:
+        td = Path(raw_td)
+        report = td / "report.docx"
+        report.write_bytes(b"not a zip at all\n")
+        md_out = td / "derived.md"
+        rc = _run_convert_only(str(report), str(md_out))
+        ok = rc == 1 and not md_out.exists()
+        probes.append(_Probe("W13 malformed-zip .docx refused", ok, "" if ok else f"rc={rc}"))
+
+    # W14 a valid zip that is NOT a Word doc (missing word/document.xml)
+    # -> refused. Also covers an .docx whose document.xml is malformed XML.
+    with tempfile.TemporaryDirectory(prefix="ilsf-W14-") as raw_td:
+        td = Path(raw_td)
+        non_doc = io.BytesIO()
+        with zipfile.ZipFile(non_doc, "w") as zf:
+            zf.writestr("hello.txt", "not a word document\n")
+        report = td / "report.docx"
+        report.write_bytes(non_doc.getvalue())
+        md_out = td / "derived.md"
+        rc = _run_convert_only(str(report), str(md_out))
+        ok_missing = rc == 1 and not md_out.exists()
+
+        report2 = td / "report2.docx"
+        report2.write_bytes(_make_docx([], document_xml="<w:body><not well formed"))
+        md_out2 = td / "derived2.md"
+        rc2 = _run_convert_only(str(report2), str(md_out2))
+        ok_malformed = rc2 == 1 and not md_out2.exists()
+        ok = ok_missing and ok_malformed
+        probes.append(_Probe("W14 non-docx zip / malformed XML refused", ok,
+                             "" if ok else f"rc_missing={rc}; rc_malformed={rc2}"))
+
+    # W15 .docx credential wording in a body paragraph -> refused by the
+    # SAME downstream safety gate as .md/.txt (proves extracted body text
+    # is scanned, not just headings).
+    with tempfile.TemporaryDirectory(prefix="ilsf-W15-") as raw_td:
+        td = Path(raw_td)
+        report = td / "report.docx"
+        report.write_bytes(_make_docx([
+            ("Heading1", "Overview"),
+            (None, "api_key = abc123 embedded in the body."),
+        ]))
+        md_out = td / "derived.md"
+        rc = _run_convert_only(str(report), str(md_out))
+        ok = rc == 1 and not md_out.exists()
+        probes.append(_Probe("W15 .docx unsafe body wording refused", ok, "" if ok else f"rc={rc}"))
+
+    # W16 full mock/local handoff from a heading-bearing .docx -> existing
+    # bridge -> validated review package with an editable deck.pptx.
+    with tempfile.TemporaryDirectory(prefix="ilsf-W16-") as raw_td:
+        td = Path(raw_td)
+        report = td / "report.docx"
+        report.write_bytes(_make_docx(
+            _DOCX_HEADING_PARAGRAPHS, style_names=_DOCX_HEADING_STYLE_NAMES,
+        ))
+        out_dir = td / "out"
+        rc = _run_mock_handoff(str(report), str(out_dir))
+        ok = rc == 0
+        detail = "" if ok else f"rc={rc}"
+        review = out_dir / "review_package"
+        if ok:
+            for rel in ("deck.pptx", "summary.json", "README.md"):
+                if not (review / rel).is_file():
+                    ok, detail = False, f"missing review_package/{rel}"
+                    break
+        if ok and not (out_dir / "image_request_plan.json").is_file():
+            ok, detail = False, "missing image_request_plan.json"
+        probes.append(_Probe("W16 .docx mock handoff -> review package", ok, detail))
+
+    # W17 DOCX body prose that LOOKS like Markdown structure (a line
+    # starting with '#', and a ``` code-fence line) must NEVER become a
+    # heading, and the stray fence must not suppress real styled headings:
+    # only the two heading-STYLED paragraphs may surface as headings.
+    with tempfile.TemporaryDirectory(prefix="ilsf-W17-") as raw_td:
+        td = Path(raw_td)
+        report = td / "report.docx"
+        report.write_bytes(_make_docx([
+            ("Heading1", "Real Heading One"),
+            (None, "# This looks like a heading but is body prose"),
+            (None, "``` fenced-looking body line"),
+            ("Heading2", "Real Heading Two"),
+            (None, "Closing body paragraph."),
+        ]))
+        md_out = td / "derived.md"
+        rc = _run_convert_only(str(report), str(md_out))
+        ok = rc == 0 and md_out.is_file()
+        detail = "" if ok else f"rc={rc}; md_out={md_out.is_file()}"
+        if ok:
+            got = md_out.read_text(encoding="utf-8")
+            heads = [h.text for h in s2ir._parse_headings(got)]
+            if heads != ["Real Heading One", "Real Heading Two"]:
+                ok, detail = False, f"body prose leaked into headings: {heads!r}"
+        probes.append(_Probe("W17 .docx body prose never becomes a heading", ok, detail))
+
+    # W17b a neutralised body line still gets safety-scanned: a '#'-leading
+    # body paragraph carrying credential wording is refused, proving the
+    # escape preserves the text for the downstream scan.
+    with tempfile.TemporaryDirectory(prefix="ilsf-W17b-") as raw_td:
+        td = Path(raw_td)
+        report = td / "report.docx"
+        report.write_bytes(_make_docx([
+            ("Heading1", "Overview"),
+            (None, "# api_key = abc123 hidden behind a hash"),
+        ]))
+        md_out = td / "derived.md"
+        rc = _run_convert_only(str(report), str(md_out))
+        ok = rc == 1 and not md_out.exists()
+        probes.append(_Probe("W17b neutralised body still safety-scanned", ok, "" if ok else f"rc={rc}"))
+
     # Repo immutability.
     repo_ok = True
     for label, before in (
@@ -694,11 +1160,14 @@ def main(argv: list[str]) -> int:
             "Local source-file -> Markdown ingestion bridge (MOCK / LOCAL "
             "only). A gated local-file front door for the existing "
             "source_to_image_requests.py lane. Accepts a local .md or .txt "
-            "report that ALREADY carries ATX '# ' headings, passes it "
-            "through verbatim, and feeds it into the --mock-handoff lane to "
-            "produce a validated review package. A source with no headings "
-            "is refused (the wrapper invents no structure and never promotes "
-            "body prose into a title). DOCX / PDF are a documented TODO (no "
+            "report that ALREADY carries ATX '# ' headings (passed through "
+            "verbatim), or a local .docx whose Word heading styles (Heading "
+            "1 / Heading 2 / ...) are extracted to ATX '# ' headings with "
+            "stdlib zip/XML parsing, and feeds the result into the "
+            "--mock-handoff lane to produce a validated review package. A "
+            ".md/.txt with no headings, or a .docx with no usable heading "
+            "styles, is refused (the wrapper invents no structure and never "
+            "promotes body prose into a title). PDF is a documented TODO (no "
             "safe local extractor). Local-only: no D-One, MCP, Qoder, public "
             "network, telemetry, model API, or image search. NOT real image "
             "generation; NOT full report understanding."
@@ -707,12 +1176,14 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--report",
         help=(
-            "Path to a local UTF-8 .md or .txt report that already carries "
-            "ATX '# ' headings (identifier-safe basename, not a symlink, not "
-            "URI-shaped, not a repo generated-output artifact). The whole "
-            "file is scanned for credential / public-network / file-URI / "
-            "absolute-path wording and refused on any hit. A source with no "
-            "headings, or a DOCX / PDF, is refused (DOCX / PDF are a TODO)."
+            "Path to a local .md / .txt report that already carries ATX '# ' "
+            "headings, or a local .docx with Word heading styles "
+            "(identifier-safe basename, not a symlink, not URI-shaped, not a "
+            "repo generated-output artifact). The derived Markdown is scanned "
+            "for credential / public-network / file-URI / absolute-path "
+            "wording and refused on any hit. A .md/.txt with no headings, a "
+            ".docx with no usable heading styles, or a .pdf is refused (.pdf "
+            "is a documented TODO)."
         ),
     )
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -743,10 +1214,12 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help=(
             "Run every scenario under a per-run TMPDIR (md/txt verbatim "
-            "passthrough, no-heading rejection, unsupported/TODO formats, "
-            "URI/symlink/repo-generated rejection, unsafe wording, md-out "
-            "enforcing the full downstream emitted-value gate, md-out under "
-            "repo, full mock handoff, delegated out-dir gate). No "
+            "passthrough, docx heading-style extraction, docx no-heading / "
+            "malformed-zip / non-docx rejection, no-heading rejection, "
+            "unsupported/TODO formats, URI/symlink/repo-generated rejection, "
+            "unsafe wording, md-out enforcing the full downstream "
+            "emitted-value gate, md-out under repo, full mock handoff "
+            "including a docx handoff, delegated out-dir gate). No "
             "caller-visible artifacts retained."
         ),
     )
