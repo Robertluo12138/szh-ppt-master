@@ -54,8 +54,23 @@ CLI shape::
     python3 scripts/source_to_image_requests.py \\
         --source REPORT.md --mock-handoff --out-dir OUT   # OUT outside repo
 
+    # Generation packet: source-free operator handoff for an image generator
+    python3 scripts/source_to_image_requests.py \\
+        --source REPORT.md --generation-packet --out-dir OUT   # OUT outside repo
+
     # Self-test (every scenario under TMPDIR; nothing leaks under repo)
     python3 scripts/source_to_image_requests.py --self-test
+
+The ``--generation-packet`` mode stops one step BEFORE --mock-handoff: it
+writes the plan, a human-readable ``image_generation_requests.md``, the
+SAME plan-derived operator-bundle sidecars (``manifest.json`` +
+``generated_provenance.json``), and an ``expected_images/README.md``
+naming every required filename — but synthesises NO pixels and runs NO
+operator lane. A human / internal image generator returns real images
+under the expected filenames; those then feed the existing operator
+``--bundle`` lane (finishing commands are in the packet README). A
+``.docx`` / ``.txt`` source reaches this mode via
+``ingest_local_source_file.py --md-out`` first.
 
 ``--out-dir`` is validated through
 ``core_image_to_editable_ppt_demo._validate_out_dir_arg`` so the same
@@ -867,6 +882,229 @@ def _render_handoff_readme(plan: dict, review_package: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Mode C: generation packet (operator image-generation handoff).
+#
+# Exports a clean, source-FREE handoff packet that tells a human / internal
+# image generator WHAT images to create and WHAT filenames + metadata to
+# return. Unlike --mock-handoff it synthesises NO placeholder pixels and
+# runs NO operator lane: it stops at the handoff artifacts. The packet's
+# manifest.json + generated_provenance.json are the SAME operator-bundle
+# sidecars --mock-handoff builds (reusing _build_manifest /
+# _build_generated_provenance verbatim), so once the operator drops the
+# returned images into a <bundle>/images/ folder the packet is consumed by
+# the EXISTING operator --bundle lane unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _render_generation_requests_md(plan: dict) -> str:
+    """Human-readable generation brief: one block per image request,
+    preserving filename / slide_title / alt_text / intended_use /
+    image_descriptor / placement_role. Carries NO raw source body text —
+    every string is sourced from the plan, which the source bridge already
+    holds source-free."""
+    blocks: list[str] = []
+    for req in plan["image_requests"]:
+        layout = "cover" if req["placement_role"] == "hero_page" else "section_divider"
+        blocks.extend([
+            f"### Request #{req['index']} — return `{req['filename']}`",
+            "",
+            f"- **return filename:** `{req['filename']}` "
+            f"(return PNG bytes under this EXACT filename — the operator "
+            f"bundle matches by exact basename)",
+            f"- **slide_title:** {req['slide_title']}",
+            f"- **placement_role:** {req['placement_role']} "
+            f"(operator layout: {layout})",
+            f"- **intended_use:** {req['intended_use']}",
+            f"- **alt_text:** {req['alt_text']}",
+            f"- **image_descriptor (what to draw):** {req['image_descriptor']}",
+            f"- **declared text_policy:** `{_TEXT_POLICY}` — return a TEXT-FREE "
+            f"image (no text, lettering, numbers, logos, or watermarks). If "
+            f"yours has any text, fix this entry's `text_policy` before "
+            f"building (see `expected_images/README.md`).",
+            "",
+        ])
+    return "\n".join([
+        "# Image generation requests",
+        "",
+        "A source-free handoff for a human / internal image generator. Each",
+        "request below names ONE image to create, the EXACT filename to",
+        "return it under, and the per-slide metadata to preserve. No raw",
+        "source body text is included — only synthetic per-slide descriptors.",
+        "",
+        f"Deck: {plan['deck']['title']}  ·  {len(plan['image_requests'])} "
+        f"image request(s).",
+        "",
+        "## How to return the images",
+        "",
+        "1. Create one image per request below using its `image_descriptor`.",
+        "   Every request asks for a TEXT-FREE abstract illustration — do not",
+        "   embed text, lettering, numbers, logos, or watermarks.",
+        "2. Save each file into `expected_images/` under its EXACT",
+        "   `return filename` (see `expected_images/README.md`).",
+        "3. Confirm provenance: the starter `generated_provenance.json`",
+        f"   declares `text_policy: \"{_TEXT_POLICY}\"` for every image, matching",
+        "   the text-free request. The packet was written BEFORE your images",
+        "   exist, so it cannot verify this — if a returned image DOES contain",
+        "   text, set that entry's `text_policy` to `decorative_glyphs` or",
+        "   `caption_safe` before building, or the deck carries a false claim.",
+        "4. Assemble an operator bundle and build the review package (the",
+        "   finish steps are in `expected_images/README.md`).",
+        "",
+        "## Requests",
+        "",
+        *blocks,
+        "## Boundary statement",
+        "",
+        _BOUNDARY,
+        "",
+        _REAL_IMAGE_STATUS,
+        "",
+    ])
+
+
+def _render_expected_images_readme(plan: dict, *, out_dir_name: str) -> str:
+    """README placed at expected_images/README.md: the filename contract
+    plus the exact finishing commands that turn the filled packet into a
+    validated review package via the EXISTING operator --bundle lane."""
+    rows = "\n".join(
+        f"- `{req['filename']}` — {req['slide_title']} "
+        f"(placement_role `{req['placement_role']}`)"
+        for req in plan["image_requests"]
+    )
+    return "\n".join([
+        "# expected_images — drop your generated images here",
+        "",
+        "Place exactly ONE image per row below into THIS directory, using the",
+        "EXACT filename shown — the operator lane matches each returned file",
+        "to its request by exact basename, and this packet's `manifest.json` /",
+        "`generated_provenance.json` pin these filenames.",
+        "",
+        "Return PNG bytes: every filename below ends in `.png`, and the",
+        "operator verifies the bytes match the extension, so the content must",
+        "be a real PNG. Do NOT rename the file or change its extension.",
+        "",
+        "## Required filenames",
+        "",
+        rows,
+        "",
+        "## Confirm provenance before building",
+        "",
+        "`generated_provenance.json` is a STARTER aligned with the operator",
+        "bundle contract. It declares `text_policy: " + f"\"{_TEXT_POLICY}\"" + "` for every",
+        "image because each request asks for a text-free abstract illustration.",
+        "This packet was written BEFORE your images exist, so it cannot verify",
+        "the claim — before building you MUST make each entry match the REAL",
+        "image you return:",
+        "",
+        "- `text_policy` — keep `no_text` only if the image truly has no text;",
+        "  otherwise set `decorative_glyphs` or `caption_safe`.",
+        "- `placement_role` / `subject_domain` / `intent_summary` — adjust if a",
+        "  returned image differs from what the request described.",
+        "",
+        "Leaving a wrong value here puts a FALSE provenance claim in the deck.",
+        "",
+        "## Finish: build a validated review package",
+        "",
+        "Once every file above is present, assemble an operator bundle from",
+        "this packet's sidecars and run the EXISTING operator lane. The",
+        "packet's `manifest.json` + `generated_provenance.json` are used",
+        "verbatim — only the returned images are copied into the bundle's",
+        "`images/` (the bundle must NOT contain this README).",
+        "",
+        "Set every path below to an ABSOLUTE path so cwd cannot change what",
+        "they resolve to. REPO is your checkout of this skill; PACKET is THIS",
+        "packet directory. BUNDLE and REVIEW must live OUTSIDE the repo tree —",
+        "the operator lane refuses an --out-dir that anchors under the repo,",
+        "so do NOT place them inside REPO. Every path is quoted, so values",
+        "containing spaces are safe:",
+        "",
+        "```",
+        'REPO="/absolute/path/to/this/skill/checkout"',
+        'PACKET="/absolute/path/to/this/packet/directory"',
+        'BUNDLE="/absolute/path/outside/repo/bundle"      # fresh, outside REPO',
+        'REVIEW="/absolute/path/outside/repo/review"      # fresh, outside REPO',
+        "",
+        'mkdir -p "$BUNDLE/images"',
+        'cp "$PACKET"/expected_images/img_*.png "$BUNDLE/images/"   # images only',
+        'cp "$PACKET/manifest.json" "$PACKET/generated_provenance.json" "$BUNDLE/"',
+        'python3 "$REPO/scripts/operator_local_images_to_editable_ppt.py" \\',
+        '    --bundle "$BUNDLE" --out-dir "$REVIEW"',
+        "```",
+        "",
+        f"(This packet was generated under a directory named `{out_dir_name}/`.)",
+        "",
+        "## Boundary statement",
+        "",
+        _BOUNDARY,
+        "",
+        _REAL_IMAGE_STATUS,
+        "",
+    ])
+
+
+def _run_generation_packet(source_arg: str, out_dir_arg: str) -> int:
+    out_dir, failures = _validate_out_dir_arg(out_dir_arg)
+    if failures or out_dir is None:
+        for line in failures:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 2
+
+    # Parse + validate the source BEFORE creating any output dir, so an
+    # unsafe / heading-less source never leaves artifacts behind.
+    plan, plan_failures = _plan_from_source(source_arg)
+    if plan_failures or plan is None:
+        for line in plan_failures:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 1
+
+    if not out_dir.exists():
+        try:
+            out_dir.mkdir(parents=False, exist_ok=False)
+        except OSError as exc:
+            print(f"FAIL: cannot create --out-dir {out_dir}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+
+    print("=== source_to_image_requests --generation-packet ===")
+    print(f"  out-dir: {out_dir}")
+    print()
+
+    (out_dir / "image_request_plan.json").write_text(
+        json.dumps(plan, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (out_dir / "image_generation_requests.md").write_text(
+        _render_generation_requests_md(plan), encoding="utf-8"
+    )
+    # Starter operator-bundle sidecars, built from the plan by the SAME
+    # helpers --mock-handoff uses, so the packet is consumed by the operator
+    # --bundle lane verbatim once images are dropped in.
+    (out_dir / "manifest.json").write_text(
+        json.dumps(_build_manifest(plan), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (out_dir / "generated_provenance.json").write_text(
+        json.dumps(_build_generated_provenance(plan), indent=2, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    expected_images = out_dir / "expected_images"
+    expected_images.mkdir(parents=False, exist_ok=False)
+    (expected_images / "README.md").write_text(
+        _render_expected_images_readme(plan, out_dir_name=out_dir.name),
+        encoding="utf-8",
+    )
+
+    n = len(plan["image_requests"])
+    print(f"  [PASS] wrote image_request_plan.json + image_generation_requests.md")
+    print(f"  [PASS] wrote starter manifest.json + generated_provenance.json")
+    print(f"  [PASS] wrote expected_images/README.md ({n} required filename(s))")
+    print()
+    print(f"OK: generation packet ready under {out_dir}. Hand it to the image "
+          f"generator, then follow expected_images/README.md to build the "
+          f"review package.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Self-test.
 # ---------------------------------------------------------------------------
 
@@ -1182,6 +1420,272 @@ def _run_self_tests() -> int:
         ok = rc == 2 and not (td / "u").exists()
         probes.append(_Probe("T6 URI out-dir refused", ok, "" if ok else f"rc={rc}"))
 
+    # T7 generation packet: source-free handoff packet, then the documented
+    # round-trip (fill expected filenames -> assemble bundle -> existing
+    # operator --bundle lane -> validated review package).
+    with tempfile.TemporaryDirectory(prefix="s2ir-T7-") as raw_td:
+        td = Path(raw_td)
+        src = td / "report.md"
+        src.write_text(_SAMPLE_MD, encoding="utf-8")
+        out_dir = td / "packet"
+        rc = main(["--source", str(src), "--generation-packet", "--out-dir", str(out_dir)])
+        ok = rc == 0
+        detail = "" if ok else f"rc={rc}"
+        expected_files = (
+            "image_request_plan.json", "image_generation_requests.md",
+            "manifest.json", "generated_provenance.json",
+            "expected_images/README.md",
+        )
+        if ok:
+            for rel in expected_files:
+                if not (out_dir / rel).is_file():
+                    ok, detail = False, f"missing packet file {rel}"
+                    break
+        plan_obj = None
+        if ok:
+            # No raw source body text leaks into ANY packet file.
+            for p in sorted(out_dir.rglob("*")):
+                if p.is_file() and "ZZMARKERBODYZZ" in p.read_text(encoding="utf-8"):
+                    ok, detail = False, f"raw source body leaked into {p.name}"
+                    break
+        if ok:
+            plan_obj = json.loads(
+                (out_dir / "image_request_plan.json").read_text(encoding="utf-8")
+            )
+            reqs_md = (out_dir / "image_generation_requests.md").read_text(encoding="utf-8")
+            # Every request preserves all six handoff fields in the brief.
+            for req in plan_obj["image_requests"]:
+                for field in ("filename", "slide_title", "alt_text",
+                              "intended_use", "image_descriptor", "placement_role"):
+                    if str(req[field]) not in reqs_md:
+                        ok, detail = False, f"{field} for {req['filename']} not in requests md"
+                        break
+                if not ok:
+                    break
+        probes.append(_Probe("T7 generation packet written", ok, detail))
+
+        # T7a round-trip: fill expected filenames with placeholder PNGs,
+        # assemble an operator bundle from the packet sidecars, and drive the
+        # EXISTING operator --bundle lane to a validated review package.
+        ok_a, detail_a = ok, ""
+        if ok_a and plan_obj is not None:
+            expected_images = out_dir / "expected_images"
+            for req in plan_obj["image_requests"]:
+                idx = req["index"]
+                rgb = ((idx * 37) % 256, (idx * 53) % 256, (idx * 71) % 256)
+                (expected_images / req["filename"]).write_bytes(_png_bytes(2 + idx, 2, rgb))
+            bundle = td / "bundle"
+            (bundle / "images").mkdir(parents=True, exist_ok=False)
+            # Follow the README's documented finish verbatim: the
+            # `img_*.png` glob must select exactly the returned images and
+            # NOT the README, so the bundle's images/ stays image-only.
+            globbed = sorted(expected_images.glob("img_*.png"))
+            for img in globbed:
+                (bundle / "images" / img.name).write_bytes(img.read_bytes())
+            for sidecar in ("manifest.json", "generated_provenance.json"):
+                (bundle / sidecar).write_bytes((out_dir / sidecar).read_bytes())
+            review = td / "review"
+            if len(globbed) != len(plan_obj["image_requests"]):
+                ok_a, detail_a = False, (
+                    f"img_*.png glob selected {len(globbed)} file(s), "
+                    f"expected {len(plan_obj['image_requests'])}"
+                )
+            if ok_a:
+                op = _run(
+                    "operator --bundle (packet round-trip)",
+                    [
+                        sys.executable, str(OPERATOR_HELPER),
+                        "--bundle", str(bundle), "--out-dir", str(review),
+                    ],
+                )
+                if op.rc != 0:
+                    ok_a, detail_a = False, f"operator --bundle rc={op.rc}"
+                else:
+                    val = _run(
+                        "validate_operator_review_package (packet round-trip)",
+                        [sys.executable, str(PACKAGE_VALIDATOR), "--out-dir", str(review)],
+                    )
+                    if val.rc != 0:
+                        ok_a, detail_a = False, f"validate rc={val.rc}"
+                    elif not (review / "deck.pptx").is_file():
+                        ok_a, detail_a = False, "round-trip produced no deck.pptx"
+        else:
+            ok_a, detail_a = False, "T7 prerequisite failed"
+        probes.append(_Probe("T7a packet round-trip -> review package", ok_a, detail_a))
+
+    # T7b generation-packet out-dir gate wired: URI --out-dir refused, no dir.
+    with tempfile.TemporaryDirectory(prefix="s2ir-T7b-") as raw_td:
+        td = Path(raw_td)
+        src = td / "report.md"
+        src.write_text(_SAMPLE_MD, encoding="utf-8")
+        uri_out = "file:///" + str(td / "u").lstrip("/")
+        rc = main(["--source", str(src), "--generation-packet", "--out-dir", uri_out])
+        ok = rc == 2 and not (td / "u").exists()
+        probes.append(_Probe("T7b packet URI out-dir refused", ok, "" if ok else f"rc={rc}"))
+
+    # T7c generation-packet fails closed on an unsafe source: no out-dir
+    # artifacts are created when the plan gate refuses the source.
+    with tempfile.TemporaryDirectory(prefix="s2ir-T7c-") as raw_td:
+        td = Path(raw_td)
+        src = td / "report.md"
+        src.write_text("# Title\n\napi_key = abc123\n", encoding="utf-8")
+        out_dir = td / "packet"
+        rc = main(["--source", str(src), "--generation-packet", "--out-dir", str(out_dir)])
+        ok = rc == 1 and not out_dir.exists()
+        probes.append(_Probe("T7c packet refuses unsafe source", ok, "" if ok else f"rc={rc}; dir={out_dir.exists()}"))
+
+    # T7d the README's documented finish commands are PATH-SAFE and runnable:
+    # extract the literal fenced shell block from expected_images/README.md,
+    # swap the example REPO/PACKET/BUNDLE/REVIEW assignments for real ABSOLUTE
+    # temp paths, and run it via /bin/sh from a cwd OUTSIDE the repo. PACKET /
+    # BUNDLE / REVIEW are placed under a SPACE-BEARING directory (the operator
+    # lane accepts spaces — it only refuses URI / symlink / repo-tree / non-
+    # empty paths), so this also proves the documented commands survive paths
+    # with spaces and the doc cannot drift back into the cwd-relative or
+    # unquoted-assignment traps the operator gate would otherwise expose.
+    with tempfile.TemporaryDirectory(prefix="s2ir-T7d-") as raw_td:
+        td = Path(raw_td)
+        work = td / "dir with spaces"
+        work.mkdir(parents=False, exist_ok=False)
+        src = td / "report.md"
+        src.write_text(_SAMPLE_MD, encoding="utf-8")
+        packet = work / "packet"
+        rc = main(["--source", str(src), "--generation-packet", "--out-dir", str(packet)])
+        ok = rc == 0
+        detail = "" if ok else f"packet rc={rc}"
+        bundle = work / "bundle"
+        review = work / "review"
+        if ok:
+            plan_obj = json.loads(
+                (packet / "image_request_plan.json").read_text(encoding="utf-8")
+            )
+            expected_images = packet / "expected_images"
+            for req in plan_obj["image_requests"]:
+                idx = req["index"]
+                rgb = ((idx * 37) % 256, (idx * 53) % 256, (idx * 71) % 256)
+                (expected_images / req["filename"]).write_bytes(_png_bytes(2 + idx, 2, rgb))
+            readme = (expected_images / "README.md").read_text(encoding="utf-8")
+            fenced = readme.split("```")
+            snippet = fenced[1] if len(fenced) >= 3 else ""
+            # Run the README's finish block VERBATIM. Only the placeholder
+            # VALUES are substituted — the README's own assignment LINES (and
+            # their quoting) are kept exactly. PACKET / BUNDLE / REVIEW resolve
+            # to SPACE-bearing dirs, so if any assignment line were unquoted
+            # the substituted value would split on the space and `set -e`
+            # would abort the run: this is what guards the assignment-quoting
+            # regression. Stripping the lines and injecting our own quoted
+            # assignments (the earlier approach) did NOT exercise the README's
+            # quoting and so could not catch a revert to unquoted assignments.
+            placeholders = {
+                "/absolute/path/to/this/skill/checkout": str(REPO_ROOT),
+                "/absolute/path/to/this/packet/directory": str(packet),
+                "/absolute/path/outside/repo/bundle": str(bundle),
+                "/absolute/path/outside/repo/review": str(review),
+            }
+            missing_ph = [ph for ph in placeholders if ph not in snippet]
+            # Belt-and-braces static check: every documented assignment is
+            # quoted (covers REPO too, whose real value here has no space).
+            unquoted = [
+                name for name in ("REPO", "PACKET", "BUNDLE", "REVIEW")
+                if not re.search(rf'(?m)^{name}="[^"]*"', snippet)
+            ]
+            block = snippet
+            for ph, real in placeholders.items():
+                block = block.replace(ph, real)
+            if missing_ph:
+                ok, detail = False, f"README placeholder(s) not found: {missing_ph}"
+            elif unquoted:
+                ok, detail = False, f"README assignment(s) not quoted: {unquoted}"
+            else:
+                proc = subprocess.run(
+                    ["sh", "-c", "set -e\n" + block], cwd=str(td),
+                    capture_output=True, text=True,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                )
+                if proc.returncode != 0:
+                    ok, detail = False, (
+                        f"documented commands rc={proc.returncode}: "
+                        f"{(proc.stderr or proc.stdout)[-300:]}"
+                    )
+                elif not (review / "deck.pptx").is_file():
+                    ok, detail = False, "documented commands produced no deck.pptx"
+        probes.append(_Probe("T7d README finish commands are path-safe", ok, detail))
+
+    # T7e the packet does not silently ship a FALSE no_text provenance claim:
+    # the starter sidecar declares text_policy "no_text" (the requested
+    # text-free intent), and BOTH operator-facing docs require a text-free
+    # image AND tell the operator to correct text_policy if a returned image
+    # contains text — so an unverified no_text claim cannot ride into the deck
+    # unnoticed. Unlike --mock-handoff (where the tool makes the blank pixels
+    # itself, so no_text is verified), the packet's images are produced later
+    # by a human, hence the explicit confirm-before-build contract.
+    with tempfile.TemporaryDirectory(prefix="s2ir-T7e-") as raw_td:
+        td = Path(raw_td)
+        src = td / "report.md"
+        src.write_text(_SAMPLE_MD, encoding="utf-8")
+        packet = td / "packet"
+        rc = main(["--source", str(src), "--generation-packet", "--out-dir", str(packet)])
+        ok = rc == 0
+        detail = "" if ok else f"packet rc={rc}"
+        if ok:
+            prov = json.loads(
+                (packet / "generated_provenance.json").read_text(encoding="utf-8")
+            )
+            if any(e.get("text_policy") != "no_text" for e in prov["entries"]):
+                ok, detail = False, "sidecar text_policy is not the documented no_text default"
+        if ok:
+            reqs_md = (packet / "image_generation_requests.md").read_text(encoding="utf-8").lower()
+            readme = (packet / "expected_images" / "README.md").read_text(encoding="utf-8").lower()
+            # Both docs must (a) demand a text-free image and (b) tell the
+            # operator to correct text_policy when the image has text.
+            checks = {
+                "requests: text-free demand": "text-free" in reqs_md,
+                "requests: correct text_policy": "text_policy" in reqs_md and "decorative_glyphs" in reqs_md,
+                "readme: confirm provenance": "confirm provenance" in readme,
+                "readme: false claim warning": "false provenance" in readme,
+                "readme: correct text_policy": "decorative_glyphs" in readme and "caption_safe" in readme,
+            }
+            missing = [k for k, v in checks.items() if not v]
+            if missing:
+                ok, detail = False, f"missing honesty wording: {missing}"
+        probes.append(_Probe("T7e packet flags unverified no_text provenance", ok, detail))
+
+    # T7f CLI help + error text stays in sync with the generation-packet mode
+    # (guards the help/error-drift class): the --out-dir help names BOTH
+    # out-dir modes, the --generation-packet help states the text-free /
+    # no_text confirmation contract, the --self-test help lists the path-safe
+    # + no_text probes, and the missing-source error names the mode.
+    # Inspect the parser's RAW help strings (not the line-wrapped rendered
+    # output, in which argparse may break --mock-handoff across a line).
+    import contextlib as _ctx
+    import io as _io
+    help_by_opt = {
+        opt: (act.help or "")
+        for act in _build_parser()._actions
+        for opt in act.option_strings
+    }
+    err_buf = _io.StringIO()
+    with _ctx.redirect_stderr(err_buf):
+        rc_missing = main(["--generation-packet"])
+    err_text = err_buf.getvalue()
+    out_dir_help = help_by_opt.get("--out-dir", "")
+    gp_help = help_by_opt.get("--generation-packet", "")
+    st_help = help_by_opt.get("--self-test", "")
+    checks = {
+        "out-dir help names both modes":
+            "--mock-handoff" in out_dir_help and "--generation-packet" in out_dir_help,
+        "gen-packet help states no_text contract":
+            "text_policy" in gp_help and "no_text" in gp_help,
+        "self-test help lists new probes":
+            "path-safe finish" in st_help and "no_text provenance honesty" in st_help,
+        "missing-source error names mode":
+            rc_missing == 2 and "--generation-packet" in err_text,
+    }
+    missing = [k for k, v in checks.items() if not v]
+    ok = not missing
+    detail = "" if ok else f"help/error drift: {missing}"
+    probes.append(_Probe("T7f CLI help/error in sync with mode", ok, detail))
+
     # Repo immutability.
     repo_ok = True
     for label, before in (
@@ -1218,7 +1722,7 @@ def _run_self_tests() -> int:
 # ---------------------------------------------------------------------------
 
 
-def main(argv: list[str]) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Source-document -> image-request bridge (MOCK / LOCAL only). "
@@ -1226,7 +1730,10 @@ def main(argv: list[str]) -> int:
             "(one image request per heading, synthetic-safe per-slide "
             "metadata + heading traceability) and can perform a mock/local "
             "handoff that writes byte-distinct placeholder PNGs and feeds "
-            "them into the existing operator image-to-editable-PPT lane. "
+            "them into the existing operator image-to-editable-PPT lane, or "
+            "export a source-free --generation-packet that tells a human / "
+            "internal image generator what images to create and what "
+            "filenames + metadata to return. "
             "Local-only: no D-One, MCP, Qoder, public network, telemetry, "
             "model API, or image search. NOT real image generation; NOT "
             "full report-to-PPT automation."
@@ -1266,33 +1773,70 @@ def main(argv: list[str]) -> int:
         ),
     )
     mode.add_argument(
+        "--generation-packet",
+        action="store_true",
+        help=(
+            "Generation packet: write a source-free operator handoff packet "
+            "under --out-dir (image_request_plan.json + a human-readable "
+            "image_generation_requests.md + starter manifest.json / "
+            "generated_provenance.json operator-bundle sidecars + "
+            "expected_images/README.md naming every required filename). It "
+            "synthesises NO pixels and runs NO operator lane: it stops at the "
+            "handoff so a human / internal image generator can return real "
+            "images under the expected filenames, which then feed the "
+            "existing operator --bundle lane. Because those images are "
+            "produced later, every request asks for a TEXT-FREE image and the "
+            "starter generated_provenance.json declares text_policy 'no_text' "
+            "as the REQUESTED intent — the packet docs require the operator to "
+            "correct each entry's text_policy per the returned image before "
+            "building. Requires --source and --out-dir."
+        ),
+    )
+    mode.add_argument(
         "--self-test",
         action="store_true",
         help=(
             "Run every scenario under a per-run TMPDIR (valid plan, unsafe "
-            "rejection, no-headings rejection, mock handoff, no-external "
-            "claims, out-dir gate). No caller-visible artifacts retained."
+            "rejection, no-headings rejection, mock handoff, generation "
+            "packet + round-trip + path-safe finish commands + no_text "
+            "provenance honesty, no-external claims, out-dir gate). No "
+            "caller-visible artifacts retained."
         ),
     )
     parser.add_argument(
         "--out-dir",
         help=(
-            "Output directory outside the repo tree for --mock-handoff. Must "
-            "not be URI-shaped, a symlink, or have a symlink ancestor; must "
-            "not anchor under the repo tree; must be missing or empty."
+            "Output directory outside the repo tree for --mock-handoff / "
+            "--generation-packet. Must not be URI-shaped, a symlink, or have "
+            "a symlink ancestor; must not anchor under the repo tree; must be "
+            "missing or empty."
         ),
     )
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = _build_parser().parse_args(argv)
 
     if args.self_test:
         return _run_self_tests()
 
     if not args.source:
-        print("FAIL: --source is required with --plan-out / --mock-handoff", file=sys.stderr)
+        print(
+            "FAIL: --source is required with --plan-out / --mock-handoff / "
+            "--generation-packet",
+            file=sys.stderr,
+        )
         return 2
 
     if args.plan_out:
         return _run_plan_only(args.source, args.plan_out)
+
+    if args.generation_packet:
+        if not args.out_dir:
+            print("FAIL: --generation-packet requires --out-dir", file=sys.stderr)
+            return 2
+        return _run_generation_packet(args.source, args.out_dir)
 
     # --mock-handoff
     if not args.out_dir:

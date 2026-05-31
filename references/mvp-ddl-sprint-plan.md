@@ -76,11 +76,12 @@ Acceptance:
 
 ### Goal 3: One MVP Command Surface
 
-Add a simple operator command such as:
+Add a single MVP entrypoint (planned — NOT yet implemented), e.g. a
+`run_mvp_image_to_ppt` wrapper that fronts the existing lower-level scripts:
 
 ```bash
-python3 scripts/run_mvp_image_to_ppt.py --source report.docx --out-dir /tmp/szh-mvp
-python3 scripts/run_mvp_image_to_ppt.py --resume /tmp/szh-mvp
+run_mvp_image_to_ppt --source report.docx --out-dir /tmp/szh-mvp
+run_mvp_image_to_ppt --resume /tmp/szh-mvp
 ```
 
 Acceptance:

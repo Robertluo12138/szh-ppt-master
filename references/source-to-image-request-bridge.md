@@ -36,6 +36,31 @@ source body, and never performs real image generation.
     image: source heading → `image_request_plan.json` request → placeholder
     filename → `placement_role` → `chosen_layout` → embedded
     `ppt/media/*` part, plus `operator_slide_title` / `operator_alt_text`.
+- In `--generation-packet` mode, a source-free **operator handoff packet**
+  written under a fresh `--out-dir` outside the repo. It stops one step
+  BEFORE `--mock-handoff`: it synthesises NO pixels and runs NO operator
+  lane, exporting only what a human / internal image generator needs:
+  - `image_request_plan.json` — the same schema-validated plan;
+  - `image_generation_requests.md` — a human-readable brief, one block per
+    request, preserving `filename` / `slide_title` / `alt_text` /
+    `intended_use` / `image_descriptor` / `placement_role` (no raw source
+    body text);
+  - starter `manifest.json` + `generated_provenance.json` — the SAME
+    plan-derived operator-bundle sidecars `--mock-handoff` builds, so they
+    feed the operator `--bundle` lane verbatim;
+  - `expected_images/README.md` — names every required filename and gives
+    the exact finishing commands (drop the returned images into a bundle's
+    `images/`, copy the two sidecars, run
+    `operator_local_images_to_editable_ppt.py --bundle`).
+  Because the packet is written BEFORE the images exist, the starter
+  `generated_provenance.json` declares `text_policy: "no_text"` as the
+  REQUESTED (text-free) intent, not a verified fact — unlike `--mock-handoff`,
+  where the tool makes the blank pixels itself so `no_text` is true. Both
+  packet docs therefore require a text-free image AND tell the operator to
+  correct each entry's `text_policy` (to `decorative_glyphs` / `caption_safe`)
+  if a returned image contains text, so an unverified `no_text` claim cannot
+  silently ride into the deck. A `.docx` / `.txt` source reaches this mode
+  via `ingest_local_source_file.py --md-out` first.
 
 ## Commands
 
@@ -54,6 +79,11 @@ python3 scripts/validate_artifacts.py \
 python3 scripts/source_to_image_requests.py \
   --source examples/source_to_image_requests/sample_report.md \
   --mock-handoff --out-dir /tmp/s2ir_out      # fresh dir, outside the repo
+
+# Generation packet: source-free operator handoff for an image generator
+python3 scripts/source_to_image_requests.py \
+  --source examples/source_to_image_requests/sample_report.md \
+  --generation-packet --out-dir /tmp/s2ir_packet   # fresh dir, outside the repo
 
 # Self-test (every scenario under TMPDIR)
 python3 scripts/source_to_image_requests.py --self-test
