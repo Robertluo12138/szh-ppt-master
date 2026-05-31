@@ -79,7 +79,7 @@ never mutated.
 | `summary.json`, `deck.pptx` | `$PILOT/out/review_package/` | 4 resume |
 
 Observed normalisation (step 1): `Hero Cover (v2).png -> hero_cover_v2_.png`,
-`Q3-Report FINAL.png -> q3_report_final.png`, `季度总结.png -> img_.png`.
+`Q3-Report FINAL.png -> q3_report_final.png`, `季度总结.png -> img.png`.
 
 ## Validation Results
 
@@ -111,12 +111,15 @@ prepared image.
   to a shared part" — there are three parts; the fan-out is purely in the
   provenance readback and disappears with a real folder of **distinct** images.
   Prefer distinct images for a real pilot.
-- **All-CJK / no-ASCII-stem filenames normalise toward `img_`.** `季度总结.png`
-  became `img_.png`. Per the documented IG7 safe-stem collision gate, a folder
-  with several no-ASCII-stem names would collapse toward the same `img_` stem and
-  be refused before any byte is copied, so operators with CJK-heavy folders should
-  give each file at least one ASCII character (or pre-rename) to keep stems
-  distinct.
+- **All-CJK / no-ASCII-stem filenames need no pre-rename (resolved).**
+  `季度总结.png` has no usable ASCII stem, so `--prepare-images-only` maps it to
+  the uniform base `img` (step 1 above). A folder with several such names no
+  longer collapses onto one `img_` stem and gets refused: each is given a
+  distinct name with a deterministic numeric suffix (`img`, `img_2`, `img_3`, …)
+  in sorted order, so a CJK-heavy folder prepares to distinct, `image_ref`-valid
+  names with no manual rename. (An earlier revision instead normalised every
+  no-ASCII-stem name toward `img_` and refused the resulting collision; this
+  normalisation removes that friction.)
 - **`review_package/` carries an internal `_pipeline_fixture/` dir.** The helper
   retains its materialised workspace inputs (`source.md`, `plan_spec.json`,
   `image_manifest_spec.json`, `assets/`, `specs/`) inside the operator-facing

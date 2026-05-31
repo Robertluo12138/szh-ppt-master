@@ -477,9 +477,11 @@ record per image: `original_filename`, `safe_filename`, `byte_count`, `sha256`,
 `media_type`, `extension`) and the normalised **`$PILOT/prepared/images/`**.
 The three messy names normalise to `image_ref`-valid stems —
 `Hero Cover (v2).png` -> `hero_cover_v2_.png`, `Q3-Report FINAL.png` ->
-`q3_report_final.png`, `季度总结.png` -> `img_.png` (a name with no usable
-ASCII stem falls back to the `img_` prefix). Inspect the mapping, then feed the
-prepared `images/` forward.
+`q3_report_final.png`, `季度总结.png` -> `img.png` (a name with no usable
+ASCII stem falls back to the base `img`; several such names in one folder get
+`img`, `img_2`, `img_3`, … with a deterministic suffix, so CJK-heavy folders
+need no pre-rename). Inspect the mapping, then feed the prepared `images/`
+forward.
 
 ```bash
 # 2. METADATA/TEMPLATES -> editable starter manifest.json +
@@ -581,7 +583,7 @@ python3 scripts/operator_images_to_review_package.py --resume \
 
 ### Have messy generated filenames? (`--prepare-images-only`)
 
-Real generated-image folders routinely carry filenames with spaces, uppercase letters, parentheses, dots, hyphens, or CJK characters. The operator lane uses each filename stem **verbatim** as the asset_id that becomes a slide's render_model `image_ref`, which `schemas/render_model.schema.json` constrains to `^[a-z][a-z0-9_]*$` — stricter than the IG6 `--images-dir` gate (it forbids a leading digit, dots, hyphens, and uppercase), so such names pass staging but build a broken deck. Rather than hand-rename every file, point `--prepare-images-only` at the folder: it copies each PNG / JPG / JPEG into `<out-dir>/images/` under a stable, safe filename (lowercased, every character outside `[a-z0-9_]` mapped to `_` and collapsed, prefixed `img_` when it would not start with a lowercase letter, truncated to the byte cap — so the stem matches the `image_ref` contract, which implies IG6) and writes an inspectable `filename_mapping.json` (one record per image: `original_filename`, `safe_filename`, `byte_count`, `sha256`, `media_type`, `extension`) plus a short `README.md`. It builds **nothing heavier** — no `bundle/`, `approved_plan.json`, `review_package/`, `deck.pptx`, `workspace/`, or `reports/` — and never mutates your source folder:
+Real generated-image folders routinely carry filenames with spaces, uppercase letters, parentheses, dots, hyphens, or CJK characters. The operator lane uses each filename stem **verbatim** as the asset_id that becomes a slide's render_model `image_ref`, which `schemas/render_model.schema.json` constrains to `^[a-z][a-z0-9_]*$` — stricter than the IG6 `--images-dir` gate (it forbids a leading digit, dots, hyphens, and uppercase), so such names pass staging but build a broken deck. Rather than hand-rename every file, point `--prepare-images-only` at the folder: it copies each PNG / JPG / JPEG into `<out-dir>/images/` under a stable, safe filename (lowercased, every character outside `[a-z0-9_]` mapped to `_` and collapsed; a name with no usable `[a-z0-9]` content — a CJK-only name — falls back to the base `img`, a name that would not otherwise start with a lowercase letter is prefixed `img_`, and the result is truncated to the byte cap — so the stem matches the `image_ref` contract, which implies IG6) and writes an inspectable `filename_mapping.json` (one record per image: `original_filename`, `safe_filename`, `byte_count`, `sha256`, `media_type`, `extension`) plus a short `README.md`. It builds **nothing heavier** — no `bundle/`, `approved_plan.json`, `review_package/`, `deck.pptx`, `workspace/`, or `reports/` — and never mutates your source folder:
 
 ```bash
 TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
@@ -590,7 +592,7 @@ python3 scripts/operator_images_to_review_package.py --prepare-images-only \
   --out-dir "$RUN_DIR/prepared"
 ```
 
-Every entry passes the same safety gate the bundle-staging path uses (symlink / subdirectory / non-image / hidden-dotfile / size + count caps), and a filename collision after normalisation is refused on the safe stem (matching IG7) **before any byte is copied**, so a refused run leaves no half-written `images/`. Feed the prepared `<out-dir>/images/` into a `--templates-only` / `--plan` / one-command run. `--prepare-images-only` is mutually exclusive with `--plan` / `--resume` / `--templates-only` / `--manifest` / `--generated-provenance` and is refused (rc 2, no `--out-dir` created) if combined with them.
+Every entry passes the same safety gate the bundle-staging path uses (symlink / subdirectory / non-image / hidden-dotfile / size + count caps), and two names that normalise to the same base stem are given distinct names with a deterministic numeric suffix (`img` / `img_2` …, `my_file` / `my_file_2`) — so a CJK-heavy folder prepares without hand-renaming — while only a stem that still violates the `image_ref` contract is refused **before any byte is copied**, so a refused run leaves no half-written `images/`. Feed the prepared `<out-dir>/images/` into a `--templates-only` / `--plan` / one-command run. `--prepare-images-only` is mutually exclusive with `--plan` / `--resume` / `--templates-only` / `--manifest` / `--generated-provenance` and is refused (rc 2, no `--out-dir` created) if combined with them.
 
 ### Just want editable starter metadata? (`--templates-only`)
 
@@ -621,19 +623,20 @@ python3 scripts/operator_images_to_review_package.py \
 Each supplied path is gated at the CLI for URI-shape / symlink / symlink-ancestor / missing / non-file (rc 2 **before** any image is staged). Its content is then validated by the helper's own `_validate_manifest_arg` (MAN1..MAN12) / `_validate_generated_provenance_sidecar` (GP1..GP13) gates against the **copied** image basenames — JSON parse, `schema_version == "1"`, the closed field set / closed enums, the safe-string deny lists (no URL / URI / path separator / credential / public-upload / confidential / fake-success wording), and the filename-set-equals-the-copied-images cross-check — and the file is copied race-safely into the bundle in place of the default template. Either flag may be supplied alone or together; an omitted flag keeps the default template for that file. Because the downstream plan-out / approved-plan / resume drift-lock build the plan from the bundle, the produced `approved_plan.json` and `review_package/summary.json` reflect the supplied metadata with no further wiring. The wrapper re-implements no contract logic — it reuses the helper's validators verbatim. A filename-set mismatch, unsafe wording, malformed JSON, or a drift between the supplied metadata at `--plan` time and `--resume` all fail closed with no review package.
 
 ```bash
-# Thirty-three self-test probes (one-command happy path + copy/TOCTOU gates
+# Thirty-five self-test probes (one-command happy path + copy/TOCTOU gates
 # + T15–T20 for the two-step flow + T21–T26 for operator-supplied
 # metadata: valid custom manifest/provenance accepted and reflected in
 # plan/summary, filename-set mismatch rejected, symlink/URI metadata path
 # rejected, unsafe wording rejected, plan/resume works with supplied
 # metadata, and the default no-metadata path is unchanged + T27–T28 for
 # the --templates-only shortcut: template-only output that passes the
-# helper validators, plus mutual-exclusion refusal + T29–T33 for the
+# helper validators, plus mutual-exclusion refusal + T29–T35 for the
 # --prepare-images-only step: messy filenames (incl. dots / hyphens / a
-# leading digit) normalised into image_ref-valid safe names, a
-# post-normalisation collision failing closed, unsafe entries failing
-# closed, mutual-exclusion refusal, and an end-to-end one-command build
-# on the prepared images proving the safe stems satisfy the downstream
+# leading digit / CJK-only names) normalised into image_ref-valid safe
+# names, a post-normalisation base-stem collision disambiguated with a
+# deterministic numeric suffix, unsafe entries failing closed,
+# mutual-exclusion refusal, and an end-to-end one-command build on the
+# prepared images proving the safe stems satisfy the downstream
 # image_ref contract ^[a-z][a-z0-9_]*$):
 TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
   python3 scripts/operator_images_to_review_package.py --self-test

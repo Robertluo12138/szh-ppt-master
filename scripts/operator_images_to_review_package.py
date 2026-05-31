@@ -151,8 +151,10 @@ names build a broken deck even though they pass the looser IG6
 every file first. Point ``--images-dir`` at such a folder and the wrapper
 copies each PNG / JPG / JPEG into ``<out-dir>/images/`` under a stable
 safe filename (lowercased, every character outside ``[a-z0-9_]`` mapped to
-``_`` and collapsed, prefixed ``img_`` when it would not start with a
-lowercase letter, truncated to the byte cap — so the stem matches the
+``_`` and collapsed; a name with no usable ``[a-z0-9]`` content — a
+CJK-only name — falls back to the base ``img``, a name that would not
+otherwise start with a lowercase letter is prefixed ``img_``, and the
+result is truncated to the byte cap — so the stem matches the
 ``image_ref`` contract, which implies IG6)
 and writes ``filename_mapping.json`` (one record per image carrying
 ``original_filename`` / ``safe_filename`` / ``byte_count`` / ``sha256`` /
@@ -161,9 +163,12 @@ NOTHING heavier — no ``bundle/``, ``approved_plan.json``,
 ``review_package/``, ``deck.pptx``, ``workspace`` / ``reports``. The same
 ``_preflight_image_entries`` gate the bundle-staging path uses still fires
 (symlink / subdirectory / non-image / hidden-dotfile / size + count caps),
-and a filename collision after normalisation is refused on the safe STEM
-(matching IG7) BEFORE any byte is copied, so a refused run leaves no
-half-written ``images/``. Feed the prepared ``images/`` into a
+and two names that normalise to the same base stem are given distinct names
+with a deterministic numeric suffix (``img`` / ``img_2`` …, ``my_file`` /
+``my_file_2``) so a CJK-heavy folder prepares without hand-renaming; only a
+stem that still violates the ``image_ref`` contract (a truly unsafe input)
+is refused BEFORE any byte is copied, so a refused run leaves no half-written
+``images/``. Feed the prepared ``images/`` into a
 ``--templates-only`` / ``--plan`` / one-command run. ``--prepare-images-only``
 is mutually exclusive with ``--plan`` / ``--resume`` / ``--templates-only``
 / ``--manifest`` / ``--generated-provenance`` / ``--self-test``.
@@ -1448,7 +1453,8 @@ def _run_resume_mode(*, out_dir: Path) -> int:
 
 def _safe_image_stem(stem: str) -> str:
     """Normalise an operator image filename STEM (basename minus extension)
-    into a stable, downstream-safe stem.
+    into a stable, downstream-safe BASE stem (the caller disambiguates
+    same-base collisions; see ``_disambiguated_stem``).
 
     The result is guaranteed BY CONSTRUCTION to satisfy the STRICT
     downstream image-reference contract ``_IMAGE_REF_PATTERN``
@@ -1464,22 +1470,60 @@ def _safe_image_stem(stem: str) -> str:
     hyphens, CJK glyphs, uppercase letters, and any other shape a real
     generated-image folder produces — is mapped to ``_`` (after lowercasing,
     so uppercase survives as its lowercase form) and runs of ``_`` are
-    collapsed; a stem that would not start with a lowercase letter (a
-    leading digit / ``_``, or one that normalised to empty) is prefixed
-    ``img_``; and the result is truncated to the byte cap.
+    collapsed. A stem that carried NO ``[a-z0-9]`` content at all — a
+    CJK-only or punctuation-only name, the exact friction this step exists
+    to absorb — has nothing left to make readable, so it falls back to the
+    uniform base ``img``; the caller then turns the resulting same-base
+    collisions into ``img`` / ``img_2`` / ``img_3`` … with a deterministic
+    numeric suffix rather than refusing the run, so an operator with a
+    CJK-heavy folder need not hand-rename anything. A stem that has content
+    but does not start with a lowercase letter (a leading digit / ``_``) is
+    prefixed ``img_``; the result is truncated to the byte cap.
 
     Pure + deterministic: the same input always yields the same output, so
-    two operator files collide on the safe stem iff they genuinely normalise
-    to the same name — the caller refuses such collisions rather than
-    silently overwriting."""
+    two operator files share a base stem iff they genuinely normalise to the
+    same name — the caller assigns the later ones a deterministic numeric
+    suffix instead of silently overwriting."""
     safe = re.sub(r"[^a-z0-9_]", "_", stem.lower())
     safe = re.sub(r"_+", "_", safe)
+    if not re.search(r"[a-z0-9]", safe):
+        # Degenerate: the stem carried no [a-z0-9] content at all (a
+        # CJK-only / punctuation-only name). Nothing remains to make
+        # readable, so fall back to a single uniform base; the caller
+        # disambiguates same-base collisions with a deterministic suffix.
+        return "img"
     if not re.match(r"[a-z]", safe):
-        # Leading char is a digit / '_' (or the stem normalised to empty);
-        # the image_ref contract requires a leading lowercase LETTER, so
-        # prefix a literal and re-collapse the doubled separator.
+        # Has content but starts with a digit / '_'; the image_ref contract
+        # requires a leading lowercase LETTER, so prefix a literal and
+        # re-collapse the doubled separator.
         safe = re.sub(r"_+", "_", "img_" + safe)
     return safe[:_ID_MAX_LEN]
+
+
+def _disambiguated_stem(base: str, used: set[str]) -> str:
+    """Return ``base`` if it is free, else the first ``base_<n>`` (n >= 2)
+    not already in ``used``, truncating ``base`` so the suffixed result
+    stays within ``_ID_MAX_LEN`` bytes.
+
+    Deterministic given the same ``used`` set and call order: the caller
+    walks the SORTED entry list and threads one ``used`` set through it, so
+    the same folder content always yields the same assignment regardless of
+    the order the filesystem listed the directory in. The output still
+    matches ``_IMAGE_REF_PATTERN`` because ``base`` already does (it starts
+    with a lowercase letter) and the only thing appended is ``_<digits>``.
+    This is the deterministic suffix strategy that lets a folder of names
+    which normalise to the same base — several CJK-only files all mapping to
+    ``img``, or ``My File.png`` + ``my_file.png`` both mapping to
+    ``my_file`` — prepare successfully instead of being refused."""
+    if base not in used:
+        return base
+    n = 2
+    while True:
+        suffix = f"_{n}"
+        cand = base[: _ID_MAX_LEN - len(suffix)] + suffix
+        if cand not in used:
+            return cand
+        n += 1
 
 
 def _render_prepare_readme(*, images_dir: Path, out_images: Path) -> str:
@@ -1549,12 +1593,17 @@ def _run_prepare_images_only(*, images_dir: Path, out_dir: Path) -> int:
     Every entry is first run through ``_preflight_image_entries`` (the SAME
     safety gates the bundle-staging path applies — symlink / subdirectory /
     non-image / hidden-dotfile / size + count caps), then each surviving
-    name is normalised with ``_safe_image_stem`` and a collision on the safe
-    STEM (matching the helper's IG7 "no two filenames share a stem" rule) is
-    refused BEFORE any byte is copied, so a refused run leaves no half-written
-    ``images/`` behind. Surviving files are copied under their safe names with
-    the same race-safe O_NOFOLLOW / S_ISREG / bounded-read gate the other
-    modes use. Returns 0 on success, 1 on any refusal or copy failure."""
+    name is normalised with ``_safe_image_stem`` and any two names that
+    normalise to the same base stem (matching the helper's IG7 "no two
+    filenames share a stem" rule) are given distinct names via a
+    deterministic numeric suffix (``_disambiguated_stem``) — so a CJK-heavy
+    or otherwise messy folder prepares successfully without hand-renaming —
+    while a stem that still violates the image_ref contract (a truly unsafe
+    input) is refused BEFORE any byte is copied, so a refused run leaves no
+    half-written ``images/`` behind. Surviving files are copied under their
+    safe names with the same race-safe O_NOFOLLOW / S_ISREG / bounded-read
+    gate the other modes use. Returns 0 on success, 1 on any refusal or copy
+    failure."""
     out_images = out_dir / "images"
     mapping_path = out_dir / "filename_mapping.json"
     readme_path = out_dir / "README.md"
@@ -1574,21 +1623,28 @@ def _run_prepare_images_only(*, images_dir: Path, out_dir: Path) -> int:
             print(f"  [FAIL] {line}")
         return 1
 
-    # Compute the safe filename for every entry and refuse a collision
-    # BEFORE creating images/, so a refused run leaves no half-written
-    # output. Collisions are detected on the safe STEM (not the full
-    # filename) to match the helper's IG7 rule — ``a.png`` and ``a.jpg``
-    # share the stem ``a`` and would collide downstream even though their
-    # full names differ.
+    # Compute the safe filename for every entry BEFORE creating images/, so
+    # a refused run leaves no half-written output. ``entries`` is already
+    # sorted (``_preflight_image_entries`` sorts it), and ``_disambiguated_
+    # stem`` threads one ``used`` set through that sorted walk, so two names
+    # that normalise to the same base stem — several CJK-only files all
+    # mapping to ``img``, or ``My File.png`` + ``my_file.png`` both mapping
+    # to ``my_file`` — are assigned distinct names (``img`` / ``img_2`` …,
+    # ``my_file`` / ``my_file_2``) deterministically instead of refusing the
+    # run. Uniqueness is enforced on the safe STEM (not the full filename) to
+    # match the helper's IG7 rule — ``a.png`` and ``a.jpg`` share the stem
+    # ``a`` and would collide downstream even though their full names differ.
     plan: list[tuple[Path, str]] = []   # (source entry, safe filename)
-    claimed: dict[str, str] = {}        # safe stem -> original name
+    used: set[str] = set()              # safe stems already taken this run
     for child in entries:
         ext = child.suffix.lstrip(".").lower()
-        safe_stem = _safe_image_stem(child.stem)
-        # Belt-and-braces: the normalisation is built to satisfy the strict
-        # image_ref contract, but tie the guarantee to that real downstream
-        # pattern so a future normalisation bug fails closed instead of
-        # emitting a stem that would only break when the deck is built.
+        safe_stem = _disambiguated_stem(_safe_image_stem(child.stem), used)
+        # Belt-and-braces: the normalisation + numeric-suffix disambiguation
+        # are built to satisfy the strict image_ref contract, but tie the
+        # guarantee to that real downstream pattern so a future bug fails
+        # closed instead of emitting a stem that would only break when the
+        # deck is built. A stem that fails this is a TRULY unsafe input, so
+        # the run is refused rather than disambiguated.
         if (not _IMAGE_REF_PATTERN.match(safe_stem)
                 or len(safe_stem) > _ID_MAX_LEN):
             failures.append(
@@ -1598,16 +1654,7 @@ def _run_prepare_images_only(*, images_dir: Path, out_dir: Path) -> int:
                 f"(<= {_ID_MAX_LEN} bytes); refused."
             )
             continue
-        if safe_stem in claimed:
-            failures.append(
-                f"--images-dir entries {claimed[safe_stem]!r} and "
-                f"{child.name!r} both normalise to the safe stem "
-                f"{safe_stem!r}; refused — two prepared files cannot share "
-                f"a stem (the downstream IG7 gate would reject them and "
-                f"they would collide in images/). Rename one and re-run."
-            )
-            continue
-        claimed[safe_stem] = child.name
+        used.add(safe_stem)
         plan.append((child, f"{safe_stem}.{ext}"))
     if failures:
         for line in failures:
@@ -2417,7 +2464,7 @@ def _selftest_write_custom_sidecar(
 # ---------------------------------------------------------------------------
 # Self-test entrypoint. T1–T14 are detailed below; later probes (T15
 # onward, including the --templates-only T27–T28 and --prepare-images-only
-# T29–T33 groups) are documented at each probe's own inline comment, and
+# T29–T35 groups) are documented at each probe's own inline comment, and
 # the complete, current probe list + count live in the --self-test
 # argument help. T1–T14:
 #   T1 — full happy path from operator --images-dir to validated review
@@ -4381,12 +4428,13 @@ def _run_self_tests() -> int:
         ))
 
     # ----------------------------------------------------------------
-    # Prepare-images convenience (--prepare-images-only). T29..T32 pin
+    # Prepare-images convenience (--prepare-images-only). T29..T35 pin
     # the messy-filename prepare step: it normalises real-world image
     # filenames into stable safe names usable by the existing
-    # --templates-only / --plan / --resume flow, refuses collisions and
-    # unsafe entries before any byte is copied, and refuses the modes /
-    # inputs it must not combine with.
+    # --templates-only / --plan / --resume flow, disambiguates base-stem
+    # collisions with a deterministic numeric suffix, refuses unsafe
+    # entries before any byte is copied, and refuses the modes / inputs it
+    # must not combine with.
     # ----------------------------------------------------------------
 
     # T29 — happy path: a folder of messy real-world filenames (spaces +
@@ -4530,34 +4578,80 @@ def _run_self_tests() -> int:
             ok=ok, detail=detail,
         ))
 
-    # T30 — a filename collision after normalisation fails closed. Two
-    # DISTINCT source names ("My File.png" and "my_file.png") normalise to
-    # the same safe stem 'my_file'; the run must refuse with rc 1 BEFORE
-    # creating images/ (no overwrite, no partial mapping). The two names
-    # differ by more than case, so the probe is valid on a
-    # case-insensitive filesystem too.
+    # T30 — two DISTINCT source names that normalise to the same base stem
+    # ("My File.png" and "my_file.png" both -> 'my_file') are DISAMBIGUATED
+    # with a deterministic numeric suffix instead of failing closed: in
+    # sorted order the earlier name keeps 'my_file' and the later takes
+    # 'my_file_2'. The two names differ by more than case, so the probe is
+    # valid on a case-insensitive filesystem too. A second run on the same
+    # content must yield the identical mapping (determinism), and the two
+    # safe names must be distinct on disk (no silent overwrite).
     with tempfile.TemporaryDirectory(prefix="o2rp-T30-") as raw_td:
         td = Path(raw_td)
         images_dir = td / "operator_images"
         images_dir.mkdir()
         (images_dir / "My File.png").write_bytes(_TINY_PNG_BYTES)
         (images_dir / "my_file.png").write_bytes(_TINY_PNG_BYTES)
+        # sorted(iterdir()) orders 'My File.png' (uppercase 'M' = 0x4D)
+        # before 'my_file.png' (lowercase 'm' = 0x6D), so the first keeps
+        # the bare stem and the second takes the _2 suffix.
+        want = {"My File.png": "my_file.png", "my_file.png": "my_file_2.png"}
         out_dir = td / "prepared"
         rc = main(["--prepare-images-only",
                    "--images-dir", str(images_dir),
                    "--out-dir", str(out_dir)])
-        ok = rc == 1
-        detail = "" if ok else f"collision did not fail closed (rc={rc})"
-        if ok and (out_dir / "images").exists():
-            ok, detail = False, "collision-refused run still created images/"
-        if ok and (out_dir / "filename_mapping.json").exists():
-            ok, detail = False, (
-                "collision-refused run still wrote filename_mapping.json"
-            )
+        ok = rc == 0
+        detail = "" if ok else f"collision disambiguation rc={rc} (expected 0)"
+        got: dict = {}
+        if ok:
+            try:
+                mapping = json.loads(
+                    (out_dir / "filename_mapping.json").read_text(
+                        encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                ok, detail = False, f"mapping unreadable: {exc!r}"
+            else:
+                got = {
+                    r.get("original_filename"): r.get("safe_filename")
+                    for r in mapping.get("images", []) if isinstance(r, dict)
+                }
+                if got != want:
+                    ok, detail = False, (
+                        f"collision mapping {got!r} != expected {want!r}"
+                    )
+        if ok and len(set(want.values())) != 2:
+            ok, detail = False, "the two safe names are not distinct"
+        if ok:
+            for safe in want.values():
+                if not (out_dir / "images" / safe).is_file():
+                    ok, detail = False, f"safe file images/{safe} missing"
+                    break
+        if ok:
+            # Determinism: a second run on the same content -> same names.
+            out_dir2 = td / "prepared2"
+            rc2 = main(["--prepare-images-only",
+                        "--images-dir", str(images_dir),
+                        "--out-dir", str(out_dir2)])
+            if rc2 != 0:
+                ok, detail = False, f"second run rc={rc2} (expected 0)"
+            else:
+                mapping2 = json.loads(
+                    (out_dir2 / "filename_mapping.json").read_text(
+                        encoding="utf-8")
+                )
+                got2 = {
+                    r.get("original_filename"): r.get("safe_filename")
+                    for r in mapping2.get("images", []) if isinstance(r, dict)
+                }
+                if got2 != got:
+                    ok, detail = False, f"non-deterministic: {got2!r} != {got!r}"
         results.append(_ProbeResult(
             name=(
-                "T30 --prepare-images-only refuses a post-normalisation "
-                "filename collision (rc 1, no images/ or mapping written)"
+                "T30 --prepare-images-only disambiguates a base-stem "
+                "collision (My File.png / my_file.png) into distinct names "
+                "with a deterministic numeric suffix (my_file / my_file_2), "
+                "not a refusal"
             ),
             ok=ok, detail=detail,
         ))
@@ -4648,13 +4742,14 @@ def _run_self_tests() -> int:
 
     # T33 — END-TO-END downstream proof: the prepared images/ (safe names
     # derived from messy originals carrying dots / hyphens / a leading
-    # digit — the exact shapes that pass the looser IG6 --images-dir gate
-    # but break the render_model image_ref contract) builds a FULL review
-    # package via the one-command workflow. The operator lane uses each stem
-    # verbatim as the asset_id that becomes the slide's image_ref, so a name
-    # normalised only to IG6 would fail render_model validation during the
-    # build; a green deck.pptx is the authoritative proof that the prepare
-    # step normalises to the real downstream contract, not just IG6.
+    # digit AND a CJK-only name with no usable ASCII stem — the exact shapes
+    # that pass the looser IG6 --images-dir gate but break the render_model
+    # image_ref contract) builds a FULL review package via the one-command
+    # workflow. The operator lane uses each stem verbatim as the asset_id
+    # that becomes the slide's image_ref, so a name normalised only to IG6
+    # would fail render_model validation during the build; a green deck.pptx
+    # is the authoritative proof that the prepare step normalises to the real
+    # downstream contract, not just IG6 — including the CJK-only 'img' stem.
     with tempfile.TemporaryDirectory(prefix="o2rp-T33-") as raw_td:
         td = Path(raw_td)
         images_dir = td / "messy images"
@@ -4662,6 +4757,7 @@ def _run_self_tests() -> int:
         (images_dir / "report-v2.png").write_bytes(_TINY_PNG_BYTES)
         (images_dir / "photo.final.png").write_bytes(_TINY_PNG_BYTES)
         (images_dir / "2024 Shots.JPG").write_bytes(_TINY_JPEG_BYTES)
+        (images_dir / "季度报告.png").write_bytes(_TINY_PNG_BYTES)
         prepared = td / "prepared"
         rc = main(["--prepare-images-only",
                    "--images-dir", str(images_dir),
@@ -4686,9 +4782,151 @@ def _run_self_tests() -> int:
         results.append(_ProbeResult(
             name=(
                 "T33 prepared images/ (safe names from messy originals with "
-                "dots / hyphens / leading digit) build a full review package "
-                "end-to-end (proves the image_ref contract ^[a-z][a-z0-9_]*$, "
-                "not just IG6)"
+                "dots / hyphens / leading digit / a CJK-only name) build a "
+                "full review package end-to-end (proves the image_ref "
+                "contract ^[a-z][a-z0-9_]*$, not just IG6)"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T34 — multiple CJK-only (no usable ASCII stem) filenames each prepare
+    # to a DISTINCT, image_ref-valid safe name instead of all collapsing onto
+    # one 'img' stem and being refused. Three distinct CJK-only names map to
+    # the uniform base 'img' and are disambiguated to img / img_2 / img_3 in
+    # sorted-original order; a second run yields the identical mapping
+    # (determinism); and every safe stem satisfies ^[a-z][a-z0-9_]*$.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T34-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "cjk images"
+        images_dir.mkdir()
+        cjk_names = ["财务.png", "报告.png", "预算.png"]
+        for n in cjk_names:
+            (images_dir / n).write_bytes(_TINY_PNG_BYTES)
+        # The wrapper walks sorted(iterdir()); the bare base 'img' goes to
+        # the first sorted original, then img_2, img_3.
+        want = dict(zip(sorted(cjk_names),
+                        ["img.png", "img_2.png", "img_3.png"]))
+        out_dir = td / "prepared"
+        rc = main(["--prepare-images-only",
+                   "--images-dir", str(images_dir),
+                   "--out-dir", str(out_dir)])
+        ok = rc == 0
+        detail = "" if ok else f"CJK-only prepare rc={rc} (expected 0)"
+        got: dict = {}
+        if ok:
+            try:
+                mapping = json.loads(
+                    (out_dir / "filename_mapping.json").read_text(
+                        encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                ok, detail = False, f"mapping unreadable: {exc!r}"
+            else:
+                got = {
+                    r.get("original_filename"): r.get("safe_filename")
+                    for r in mapping.get("images", []) if isinstance(r, dict)
+                }
+                if got != want:
+                    ok, detail = False, (
+                        f"CJK mapping {got!r} != expected {want!r}"
+                    )
+        if ok and len(set(want.values())) != len(want):
+            ok, detail = False, "CJK safe names are not distinct"
+        if ok:
+            for orig, safe in want.items():
+                stem = safe.rsplit(".", 1)[0]
+                if not _IMAGE_REF_PATTERN.match(stem):
+                    ok, detail = False, (
+                        f"CJK safe stem {stem!r} (from {orig!r}) violates "
+                        f"{_IMAGE_REF_PATTERN.pattern!r}"
+                    )
+                    break
+                if not (out_dir / "images" / safe).is_file():
+                    ok, detail = False, f"safe file images/{safe} missing"
+                    break
+        if ok:
+            # Determinism: a second run on the same content -> same names.
+            out_dir2 = td / "prepared2"
+            rc2 = main(["--prepare-images-only",
+                        "--images-dir", str(images_dir),
+                        "--out-dir", str(out_dir2)])
+            if rc2 != 0:
+                ok, detail = False, f"second run rc={rc2} (expected 0)"
+            else:
+                mapping2 = json.loads(
+                    (out_dir2 / "filename_mapping.json").read_text(
+                        encoding="utf-8")
+                )
+                got2 = {
+                    r.get("original_filename"): r.get("safe_filename")
+                    for r in mapping2.get("images", []) if isinstance(r, dict)
+                }
+                if got2 != got:
+                    ok, detail = False, f"non-deterministic: {got2!r} != {got!r}"
+        results.append(_ProbeResult(
+            name=(
+                "T34 --prepare-images-only maps multiple CJK-only filenames "
+                "to distinct image_ref-valid names (img / img_2 / img_3) "
+                "deterministically, no pre-rename or refusal"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T35 — mixed CJK + ASCII filenames keep their ASCII run in the safe
+    # stem (the CJK glyphs map to '_', the ASCII letters/digits survive), so
+    # the prepared name stays readable rather than collapsing to a bare
+    # 'img'. The three names do not collide, so no numeric suffix is applied.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T35-") as raw_td:
+        td = Path(raw_td)
+        images_dir = td / "mixed images"
+        images_dir.mkdir()
+        want = {
+            "数据chart.png": "img_chart.png",   # leading CJK -> img_ + chart
+            "report报告.png": "report_.png",    # trailing CJK -> trailing _
+            "q3财报2024.png": "q3_2024.png",     # CJK between ASCII runs
+        }
+        for n in want:
+            (images_dir / n).write_bytes(_TINY_PNG_BYTES)
+        out_dir = td / "prepared"
+        rc = main(["--prepare-images-only",
+                   "--images-dir", str(images_dir),
+                   "--out-dir", str(out_dir)])
+        ok = rc == 0
+        detail = "" if ok else f"mixed prepare rc={rc} (expected 0)"
+        if ok:
+            try:
+                mapping = json.loads(
+                    (out_dir / "filename_mapping.json").read_text(
+                        encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                ok, detail = False, f"mapping unreadable: {exc!r}"
+            else:
+                got = {
+                    r.get("original_filename"): r.get("safe_filename")
+                    for r in mapping.get("images", []) if isinstance(r, dict)
+                }
+                if got != want:
+                    ok, detail = False, (
+                        f"mixed mapping {got!r} != expected {want!r}"
+                    )
+        if ok:
+            for orig, safe in want.items():
+                stem = safe.rsplit(".", 1)[0]
+                if not _IMAGE_REF_PATTERN.match(stem):
+                    ok, detail = False, (
+                        f"mixed safe stem {stem!r} (from {orig!r}) violates "
+                        f"{_IMAGE_REF_PATTERN.pattern!r}"
+                    )
+                    break
+                if not (out_dir / "images" / safe).is_file():
+                    ok, detail = False, f"safe file images/{safe} missing"
+                    break
+        results.append(_ProbeResult(
+            name=(
+                "T35 --prepare-images-only preserves the ASCII run of mixed "
+                "CJK + ASCII filenames (数据chart -> img_chart, report报告 "
+                "-> report_, q3财报2024 -> q3_2024)"
             ),
             ok=ok, detail=detail,
         ))
@@ -4872,8 +5110,10 @@ def main(argv: list[str]) -> int:
             "names carry spaces / uppercase / parentheses / dots / hyphens "
             "/ CJK characters and copy them into <out-dir>/images/ under "
             "stable, downstream-safe filenames whose stems match the "
-            "render_model image_ref contract ^[a-z][a-z0-9_]*$ (lowercased, "
-            "unique) — the pattern the operator lane's asset_id (= filename "
+            "render_model image_ref contract ^[a-z][a-z0-9_]*$ (lowercased; "
+            "a name with no usable ASCII content — a CJK-only name — falls "
+            "back to the base img; unique) — the pattern the operator "
+            "lane's asset_id (= filename "
             "stem) must satisfy when the deck is built, stricter than the "
             "IG6 --images-dir gate. Then write an inspectable "
             "filename_mapping.json "
@@ -4881,10 +5121,14 @@ def main(argv: list[str]) -> int:
             "/ extension) and a short README.md. Builds NOTHING heavier: no "
             "bundle/, no approved_plan.json, no review_package/, no "
             "deck.pptx, no workspace / reports. The operator's source "
-            "folder is never mutated. A filename collision after "
-            "normalisation, a symlink / subdirectory / non-image / hidden "
-            "entry, or an oversized / over-count folder all fail closed "
-            "before any byte is copied. Feed the prepared images/ into a "
+            "folder is never mutated. Two names that normalise to the same "
+            "base stem are disambiguated with a deterministic numeric "
+            "suffix (img / img_2 …, my_file / my_file_2) rather than "
+            "refused, so a CJK-heavy folder need not be hand-renamed; a "
+            "symlink / subdirectory / non-image / hidden entry, an "
+            "oversized / over-count folder, or a stem that still violates "
+            "the image_ref contract all fail closed before any byte is "
+            "copied. Feed the prepared images/ into a "
             "--templates-only / --plan / one-command run. Requires "
             "--images-dir + a fresh --out-dir; mutually exclusive with "
             "--plan / --resume / --templates-only / --self-test / "
@@ -4895,7 +5139,7 @@ def main(argv: list[str]) -> int:
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios under TMPDIR "
-            "(no writes under REPO_ROOT). Thirty-three probes: T1 full "
+            "(no writes under REPO_ROOT). Thirty-five probes: T1 full "
             "happy path from synthetic --images-dir through to a "
             "validated review package + locked README markers; T2 "
             "drift (mutating generated_provenance.json after plan-"
@@ -4989,18 +5233,23 @@ def main(argv: list[str]) -> int:
             "filename_mapping.json (original -> safe + byte_count / sha256 / "
             "media_type / extension), produces only images/ + mapping + "
             "README, and the prepared images/ feeds --templates-only; T30 "
-            "--prepare-images-only refuses a post-normalisation filename "
-            "collision (two distinct names sharing a safe stem) with rc 1 "
-            "and no images/ or mapping written; T31 --prepare-images-only "
+            "--prepare-images-only disambiguates a post-normalisation "
+            "base-stem collision (two distinct names sharing a base stem, "
+            "e.g. My File.png / my_file.png) into distinct names with a "
+            "deterministic numeric suffix (my_file / my_file_2) rather than "
+            "refusing; T31 --prepare-images-only "
             "refuses unsafe entries (per-file symlink, non-image file) "
             "before any byte is copied; T32 --prepare-images-only refuses "
             "--plan / --templates-only / --manifest combinations at the "
             "gate (rc 2, no --out-dir created); T33 the prepared images/ "
             "(safe names from messy originals with dots / hyphens / a "
-            "leading digit) build a full review package end-to-end via the "
-            "one-command workflow, proving the safe stems satisfy the "
-            "render_model image_ref contract ^[a-z][a-z0-9_]*$ (not just "
-            "the looser IG6 gate). Mutually exclusive with "
+            "leading digit and a CJK-only name) build a full review package "
+            "end-to-end via the one-command workflow, proving the safe stems "
+            "satisfy the render_model image_ref contract ^[a-z][a-z0-9_]*$ "
+            "(not just the looser IG6 gate); T34 multiple CJK-only filenames "
+            "map to distinct image_ref-valid names (img / img_2 / img_3) "
+            "deterministically; T35 mixed CJK + ASCII filenames keep their "
+            "ASCII run in the safe stem. Mutually exclusive with "
             "--images-dir / --out-dir / --manifest / --generated-provenance "
             "/ --plan / --resume / --templates-only / --prepare-images-only."
         ),
