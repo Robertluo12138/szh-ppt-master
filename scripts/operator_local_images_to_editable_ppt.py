@@ -4660,7 +4660,10 @@ def _render_review_readme(summary: dict) -> str:
         ]
     # Per-image landing view — always present (both the sidecar and the
     # no-sidecar default path) so a reviewer sees where each input image
-    # landed: the filename the helper embedded, its asset id, the
+    # landed: the slide title when supplied via --manifest (carrying
+    # the operator's original pre-normalization filename when seeded via
+    # --filename-mapping), the normalized safe filename the helper
+    # embedded, its asset id, the
     # declared placement_role (or the default note when no sidecar was
     # supplied), the 1-based slide, the editable layout the deck_plan
     # assigned (cover / section_divider), and the embedded local
@@ -4674,7 +4677,12 @@ def _render_review_readme(summary: dict) -> str:
         "layout: `local_region` -> `section_divider` (accent beside a "
         "section title), every other role -> `cover`; the no-sidecar "
         "default lands every image on a `cover` slide. Each image "
-        "embeds as a local `ppt/media/*` part byte-for-byte.",
+        "embeds as a local `ppt/media/*` part byte-for-byte. When the "
+        "operator supplied per-image titles via --manifest, each row "
+        "also shows the slide title — which carries the original "
+        "filename when seeded via --filename-mapping, so a deck built "
+        "from CJK or otherwise-normalized filenames stays traceable — "
+        "next to the safe filename the deck embedded.",
         "",
     ]
     for entry in prov:
@@ -4683,10 +4691,16 @@ def _render_review_readme(summary: dict) -> str:
         role = entry.get("placement_role")
         role_str = role if role is not None else "default (no sidecar)"
         parts = entry.get("embedded_media_parts") or []
+        # operator_slide_title is present only when --manifest was
+        # supplied (see _provenance_for); omit the clause on a
+        # no-manifest run rather than printing `title None`.
+        title = entry.get("operator_slide_title")
+        title_clause = f"title `{title}`; " if title else ""
         landing_block.append(
             f"- slide {entry.get('intended_slide_index')} -> layout "
             f"`{entry.get('chosen_layout')}`; placement_role "
-            f"`{role_str}`; `{entry.get('operator_filename')}` "
+            f"`{role_str}`; {title_clause}"
+            f"`{entry.get('operator_filename')}` "
             f"(asset id `{entry.get('asset_id')}`) embedded "
             f"`{', '.join(parts)}` (`{entry.get('media_type')}`)"
         )
