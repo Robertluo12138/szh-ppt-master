@@ -27,6 +27,15 @@ Markdown normalisation (``_to_markdown``):
   body lines to headings or guesses structure out of prose, so no body
   text can ever become a deck title.
 
+  BOTH modes hold the normalised Markdown to the SAME downstream safety
+  contract: before ``--md-out`` writes anything (and before
+  ``--mock-handoff`` runs the lane), the Markdown is staged in a tempdir
+  and run through the bridge's own full plan gate. So convert-only
+  ``--md-out`` can never write a file the ``--mock-handoff`` lane would
+  refuse — the emitted-value scan on sanitised heading titles
+  (``api*key`` -> ``apikey``, social-media / public-share wording, etc.)
+  applies identically in both modes.
+
 What this is NOT:
 
   * NOT real image generation. The downstream ``--mock-handoff`` writes
@@ -320,7 +329,7 @@ def _gate_md_out(md_out_arg: str) -> tuple[Path | None, list[str]]:
 
 
 def _load_and_convert(report_arg: str) -> tuple[Path | None, str | None, list[str]]:
-    """Run the full gate -> read -> safety-scan -> convert pipeline.
+    """Run the full gate -> read -> normalise -> downstream-gate pipeline.
     Returns (report_path, markdown_text, failures)."""
     path, _suffix, failures = _gate_report(report_arg)
     if failures or path is None:
@@ -328,14 +337,25 @@ def _load_and_convert(report_arg: str) -> tuple[Path | None, str | None, list[st
     text, failures = _read_text(path)
     if failures or text is None:
         return None, None, failures
-    # Reuse the downstream bridge's source-safety scan up front so we fail
-    # closed on credential / public-network / file-URI / absolute-path
-    # wording before touching the conversion or the operator lane.
-    failures = s2ir._scan_source_safety(text)
-    if failures:
-        return None, None, failures
     markdown, failures = _to_markdown(text)
     if failures or markdown is None:
+        return None, None, failures
+    # Hold the normalised Markdown to the EXACT downstream safety contract
+    # the --mock-handoff lane applies, so --md-out can never emit a file the
+    # bridge would later refuse. Staging it under a tempdir (never the repo)
+    # and running the bridge's own full plan gate enforces the source-safety
+    # scan PLUS the emitted-value scan on sanitised heading titles (catching
+    # sanitisation-assembly bypasses like 'api*key' -> 'apikey' and the
+    # operator review-package gates — social-media / public-share / etc.),
+    # heading caps, schema validation, and the per-deck-string operator
+    # contract. Without this, convert-only --md-out would only run the raw
+    # source scan and could write a heading the handoff lane rejects.
+    stem = path.stem or "source"
+    with tempfile.TemporaryDirectory(prefix="ingest-gate-") as raw_td:
+        staged = Path(raw_td) / f"{stem}.md"
+        staged.write_text(markdown, encoding="utf-8")
+        _plan, failures = s2ir._plan_from_source(str(staged))
+    if failures:
         return None, None, failures
     return path, markdown, []
 
@@ -566,6 +586,32 @@ def _run_self_tests() -> int:
             ok = rc == 1 and not md_out.exists()
             probes.append(_Probe(f"W7 unsafe wording refused ({label})", ok, "" if ok else f"rc={rc}"))
 
+    # W7b convert-only --md-out enforces the FULL downstream emitted-value
+    # gate, not just the raw source scan. These headings pass
+    # _scan_source_safety but are refused by the bridge's emitted-value /
+    # operator contract — so a permissive --md-out would have written them.
+    # Each must be refused with NO file written, proving --md-out is no
+    # weaker than --mock-handoff.
+    for label, body in (
+        # Operator social-media gate (not in the raw deny-list).
+        ("social-media-heading", "# Twitter rollout plan\n\nbody\n"),
+        # Sanitisation-assembly bypass: raw 'api*key' carries no denied
+        # substring, but the sanitised title 'apikey' is refused.
+        ("sanitisation-bypass", "# api*key overview\n\nbody\n"),
+    ):
+        with tempfile.TemporaryDirectory(prefix=f"ilsf-W7b-{label}-") as raw_td:
+            td = Path(raw_td)
+            report = td / "report.md"
+            report.write_text(body, encoding="utf-8")
+            # Confirm the raw source scan alone would NOT have caught it,
+            # so this genuinely exercises the downstream gate.
+            raw_clean = not s2ir._scan_source_safety(body)
+            md_out = td / "derived.md"
+            rc = _run_convert_only(str(report), str(md_out))
+            ok = raw_clean and rc == 1 and not md_out.exists()
+            detail = "" if ok else f"raw_clean={raw_clean}; rc={rc}; md_out={md_out.exists()}"
+            probes.append(_Probe(f"W7b md-out enforces downstream gate ({label})", ok, detail))
+
     # W8 md-out under repo refused.
     with tempfile.TemporaryDirectory(prefix="ilsf-W8-") as raw_td:
         td = Path(raw_td)
@@ -675,7 +721,10 @@ def main(argv: list[str]) -> int:
         help=(
             "Convert only: write the derived Markdown to this path (must not "
             "exist, not a symlink, not URI-shaped, not under the repo tree; "
-            "parent must exist). Requires --report."
+            "parent must exist). The Markdown is held to the SAME full "
+            "downstream safety gate as --mock-handoff before it is written, "
+            "so it can never emit a file the handoff lane would refuse. "
+            "Requires --report."
         ),
     )
     mode.add_argument(
@@ -696,7 +745,8 @@ def main(argv: list[str]) -> int:
             "Run every scenario under a per-run TMPDIR (md/txt verbatim "
             "passthrough, no-heading rejection, unsupported/TODO formats, "
             "URI/symlink/repo-generated rejection, unsafe wording, md-out "
-            "under repo, full mock handoff, delegated out-dir gate). No "
+            "enforcing the full downstream emitted-value gate, md-out under "
+            "repo, full mock handoff, delegated out-dir gate). No "
             "caller-visible artifacts retained."
         ),
     )
