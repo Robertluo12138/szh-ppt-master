@@ -18,12 +18,24 @@ source body, and never performs real image generation.
   `alt_text`, `image_descriptor`, `placement_role`, `intended_use`) and
   structural traceability back to the heading (level + ordinal). Raw
   source body text is never copied into the plan.
-- In `--mock-handoff` mode, a byte-distinct locally-synthesised
-  **placeholder PNG** per request, fed into the existing operator lane
-  (`scripts/operator_local_images_to_editable_ppt.py`) to produce a
-  validated review package with an editable `deck.pptx` and per-image
-  provenance, re-checked by
+- In `--mock-handoff` mode, a plan-derived operator **bundle**
+  (`bundle/images/` byte-distinct placeholder PNGs + `bundle/manifest.json`
+  + `bundle/generated_provenance.json`), fed into the existing operator
+  lane (`scripts/operator_local_images_to_editable_ppt.py --bundle`) to
+  produce a validated review package with an editable `deck.pptx` whose
+  slide titles, alt text, and role-aware layouts reflect the image request
+  plan, plus per-image provenance, re-checked by
   `scripts/validate_operator_review_package.py`.
+  - The manifest carries each request's `slide_title` / `alt_text` /
+    `intended_use`; the sidecar carries `generator_source` /
+    `placement_role` / `text_policy` / `subject_domain` / `intent_summary`,
+    reusing the operator manifest + generated_provenance contracts
+    verbatim. `placement_role` drives the operator's role-aware layout
+    (`hero_page` → `cover`, `local_region` → `section_divider`), and the
+    produced `summary.json` `image_provenance` carries the full trace per
+    image: source heading → `image_request_plan.json` request → placeholder
+    filename → `placement_role` → `chosen_layout` → embedded
+    `ppt/media/*` part, plus `operator_slide_title` / `operator_alt_text`.
 
 ## Commands
 
@@ -78,11 +90,16 @@ python3 scripts/source_to_image_requests.py --self-test
   limits.
 - Placeholder PNGs are tiny locally-synthesised raster bytes. No real
   image generator runs.
-- The image folder handed to the operator lane is **images-only** (no
-  manifest), so the operator lane synthesises slide titles; the rich
-  per-image metadata + heading traceability live in the plan. Join the
-  plan (filename ↔ heading) with the review package's `summary.json`
-  (filename ↔ embedded media part + slide) for end-to-end provenance.
+- `--mock-handoff` hands the operator lane a **plan-derived bundle**, not
+  an images-only folder: `bundle/manifest.json` carries each request's
+  `slide_title` / `alt_text` / `intended_use`, and
+  `bundle/generated_provenance.json` carries `generator_source` /
+  `placement_role` / `text_policy` / `subject_domain` / `intent_summary`.
+  `placement_role` drives the operator's role-aware layout (`hero_page` →
+  `cover`, `local_region` → `section_divider`). Join the plan (filename ↔
+  heading) with the review package's `summary.json` `image_provenance`
+  (`operator_slide_title` / `operator_alt_text`, `placement_role`,
+  `chosen_layout`, `embedded_media_parts`) for end-to-end provenance.
 
 Local-only: no D-One, MCP, Qoder, public network, telemetry, model API,
 or image search. Real image generation remains UNVERIFIED / out of scope

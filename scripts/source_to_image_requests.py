@@ -8,10 +8,13 @@ per ATX heading, each carrying SYNTHETIC-SAFE per-slide metadata
 (``slide_title`` / ``alt_text`` / ``image_descriptor`` / ``placement_role``
 / ``intended_use``) plus structural traceability back to the heading
 (level + ordinal). It can then perform a MOCK / LOCAL handoff that
-writes a byte-distinct placeholder PNG per request and feeds that image
-folder into the EXISTING operator image-to-editable-PPT lane, producing
-a validated review package with an editable ``deck.pptx`` and per-image
-provenance.
+writes a byte-distinct placeholder PNG per request PLUS a plan-derived
+operator bundle (``manifest.json`` + ``generated_provenance.json``) and
+feeds that bundle into the EXISTING operator image-to-editable-PPT lane
+(``--bundle``), producing a validated review package with an editable
+``deck.pptx`` whose slide titles / alt text / role-aware layouts
+(``hero_page`` -> ``cover``, ``local_region`` -> ``section_divider``)
+reflect the image request plan, plus per-image provenance.
 
 What this is NOT:
 
@@ -554,6 +557,89 @@ def _write_placeholder_images(images_dir: Path, plan: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Operator-handoff sidecars derived from the plan. These reuse the
+# EXISTING operator manifest + generated_provenance contracts verbatim
+# (no new fields invented); the bridge only fills them from the plan so
+# the produced review package reflects the source-derived image request
+# plan.
+# ---------------------------------------------------------------------------
+
+# Closed-set / safe constants the operator sidecar GP9 enum gate accepts
+# (mirrors operator_local_images_to_editable_ppt's
+# _SIDECAR_ALLOWED_{GENERATOR_SOURCES,TEXT_POLICIES} and the
+# subject_domain vocabulary). The placeholder PNGs carry no text, so
+# text_policy is honestly "no_text"; subject_domain is "abstract_marker"
+# (the synthetic placeholders are abstract spot illustrations, not data
+# visuals / icons / backgrounds). "general" is NOT in the GP9 enum.
+_GENERATOR_SOURCE = "operator_declared_generated"
+_TEXT_POLICY = "no_text"
+_SUBJECT_DOMAIN = "abstract_marker"
+
+
+def _build_manifest(plan: dict) -> dict:
+    """Build an operator ``manifest.json`` from the plan, in plan
+    (heading) order. Carries each request's slide_title / alt_text /
+    intended_use, which the operator lane routes into the editable slide
+    title and the generated image_manifest's alt_text / intended_use."""
+    return {
+        "schema_version": "1",
+        "images": [
+            {
+                "filename": req["filename"],
+                "slide_title": req["slide_title"],
+                "alt_text": req["alt_text"],
+                "intended_use": req["intended_use"],
+            }
+            for req in plan["image_requests"]
+        ],
+    }
+
+
+def _build_generated_provenance(plan: dict) -> dict:
+    """Build an operator ``generated_provenance.json`` sidecar from the
+    plan. ``placement_role`` flows verbatim from the plan (hero_page /
+    local_region), so the operator lane's role-aware layout picks cover
+    for the hero request and section_divider for the rest. The other
+    fields are safe closed-set / placeholder values the GP1..GP13 gates
+    accept."""
+    return {
+        "schema_version": "1",
+        "entries": [
+            {
+                "filename": req["filename"],
+                "generator_source": _GENERATOR_SOURCE,
+                "intent_summary": req["intended_use"],
+                "placement_role": req["placement_role"],
+                "text_policy": _TEXT_POLICY,
+                "subject_domain": _SUBJECT_DOMAIN,
+            }
+            for req in plan["image_requests"]
+        ],
+    }
+
+
+def _write_bundle(bundle: Path, plan: dict) -> None:
+    """Materialize a complete operator handoff bundle from the plan::
+
+        <bundle>/images/<image_ref>.png      # byte-distinct placeholders
+        <bundle>/manifest.json               # slide_title / alt_text / use
+        <bundle>/generated_provenance.json   # placement_role / generator ...
+
+    The operator lane's ``--bundle`` shortcut auto-detects both sidecars
+    and runs their full MAN1..MAN12 / GP1..GP13 content gates."""
+    _write_placeholder_images(bundle / "images", plan)
+    (bundle / "manifest.json").write_text(
+        json.dumps(_build_manifest(plan), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (bundle / "generated_provenance.json").write_text(
+        json.dumps(_build_generated_provenance(plan), indent=2, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Subprocess runner.
 # ---------------------------------------------------------------------------
 
@@ -658,34 +744,36 @@ def _run_mock_handoff(source_arg: str, out_dir_arg: str) -> int:
             return 1
 
     plan_path = out_dir / "image_request_plan.json"
-    images_dir = out_dir / "images"
+    bundle = out_dir / "bundle"
     review_package = out_dir / "review_package"
 
     print("=== source_to_image_requests --mock-handoff ===")
     print(f"  out-dir:        {out_dir}")
     print(f"  plan:           {plan_path}")
-    print(f"  images:         {images_dir}")
+    print(f"  bundle:         {bundle}")
     print(f"  review-package: {review_package}")
     print()
 
     plan_path.write_text(
         json.dumps(plan, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
-    _write_placeholder_images(images_dir, plan)
+    _write_bundle(bundle, plan)
     n = len(plan["image_requests"])
-    print(f"  [PASS] wrote plan + {n} byte-distinct placeholder PNG(s)")
+    print(f"  [PASS] wrote plan + {n} byte-distinct placeholder PNG(s) + "
+          f"manifest.json + generated_provenance.json")
 
-    # Drive the EXISTING operator lane against the images-only folder.
-    # No manifest is supplied, so the operator lane synthesises slide
-    # titles; the rich per-image metadata + heading traceability live in
-    # image_request_plan.json (joined by filename). --images-dir (not
-    # --bundle) is used so the placeholder folder may live under the
-    # caller's --out-dir even when that sits inside the system temp dir.
+    # Drive the EXISTING operator lane via its --bundle shortcut so the
+    # plan-derived manifest.json + generated_provenance.json sidecars are
+    # auto-detected and run through the operator's own MAN/GP content
+    # gates. The manifest's slide_title / alt_text / intended_use land in
+    # the editable deck + summary provenance, and the sidecar's
+    # placement_role drives the operator's role-aware layout (hero_page ->
+    # cover, local_region -> section_divider). No new renderer is added.
     op = _run(
-        "operator_local_images_to_editable_ppt --images-dir",
+        "operator_local_images_to_editable_ppt --bundle",
         [
             sys.executable, str(OPERATOR_HELPER),
-            "--images-dir", str(images_dir),
+            "--bundle", str(bundle),
             "--out-dir", str(review_package),
         ],
     )
@@ -716,9 +804,11 @@ def _run_mock_handoff(source_arg: str, out_dir_arg: str) -> int:
 
 def _render_handoff_readme(plan: dict, review_package: Path) -> str:
     rows = "\n".join(
-        f"- `images/{r['filename']}` -> plan request #{r['index']} "
-        f"(heading L{r['source_heading_level']} #{r['source_heading_ordinal']}): "
-        f"{r['slide_title']}"
+        f"- heading L{r['source_heading_level']} #{r['source_heading_ordinal']} "
+        f"({r['slide_title']}) -> request #{r['index']} -> "
+        f"`bundle/images/{r['filename']}` -> placement_role "
+        f"`{r['placement_role']}` "
+        f"(-> chosen_layout `{'cover' if r['placement_role'] == 'hero_page' else 'section_divider'}`)"
         for r in plan["image_requests"]
     )
     return "\n".join([
@@ -726,9 +816,10 @@ def _render_handoff_readme(plan: dict, review_package: Path) -> str:
         "",
         "A MOCK / LOCAL run of the source-document -> image-request bridge.",
         "A Markdown source was parsed into an image request plan, byte-distinct",
-        "placeholder PNGs were synthesised locally (one per heading), and that",
-        "image folder was fed into the existing operator image-to-editable-PPT",
-        "lane to produce a validated review package.",
+        "placeholder PNGs were synthesised locally (one per heading), and a",
+        "plan-derived bundle (images + manifest.json + generated_provenance.json)",
+        "was fed into the existing operator image-to-editable-PPT lane to produce",
+        "a validated review package whose slides reflect the image request plan.",
         "",
         "## What to open first",
         "",
@@ -736,18 +827,28 @@ def _render_handoff_readme(plan: dict, review_package: Path) -> str:
         "   (slide_title / alt_text / image_descriptor / placement_role +",
         "   structural heading traceability). Validated against",
         "   `schemas/image_request_plan.schema.json`.",
-        f"2. `{review_package.name}/deck.pptx` - the editable PPTX built from the",
+        "2. `bundle/manifest.json` + `bundle/generated_provenance.json` - the",
+        "   operator sidecars derived from the plan (slide_title / alt_text /",
+        "   intended_use; generator_source / placement_role / text_policy /",
+        "   subject_domain / intent_summary).",
+        f"3. `{review_package.name}/deck.pptx` - the editable PPTX built from the",
         "   placeholder images (native PowerPoint objects).",
-        f"3. `{review_package.name}/summary.json` - `image_provenance` ties each",
-        "   placeholder filename to its embedded `ppt/media/*` part + slides.",
+        f"4. `{review_package.name}/summary.json` - `image_provenance` ties each",
+        "   placeholder filename to its operator_slide_title / alt_text, its",
+        "   placement_role + chosen_layout, and its embedded",
+        "   `ppt/media/*` part + slides.",
         "",
-        "## Per-image traceability (filename <-> source heading)",
+        "## End-to-end traceability",
+        "",
+        "source heading -> image_request_plan request -> placeholder filename ->",
+        "placement_role -> chosen_layout -> embedded ppt/media part:",
         "",
         rows,
         "",
-        "Join `image_request_plan.json` (filename <-> heading) with",
-        f"`{review_package.name}/summary.json` (filename <-> embedded media",
-        "part + slide) for end-to-end provenance from source heading to deck.",
+        "The placement_role -> chosen_layout step is the operator lane's own",
+        "role-aware layout (hero_page -> cover, local_region -> section_divider);",
+        f"confirm it in `{review_package.name}/summary.json` image_provenance",
+        "(`placement_role` + `chosen_layout` + `embedded_media_parts`).",
         "",
         "## Boundary statement",
         "",
@@ -981,9 +1082,14 @@ def _run_self_tests() -> int:
             ok, detail = False, "missing image_request_plan.json"
         if ok and not (out_dir / "README.md").is_file():
             ok, detail = False, "missing handoff README"
+        summary = None
+        plan_obj = None
         if ok:
             summary = json.loads((review / "summary.json").read_text(encoding="utf-8"))
             handoff_summary_text = json.dumps(summary)
+            plan_obj = json.loads(
+                (out_dir / "image_request_plan.json").read_text(encoding="utf-8")
+            )
             prov = summary.get("image_provenance")
             if not isinstance(prov, list) or len(prov) != 5:
                 ok, detail = False, f"image_provenance not 5 rows: {prov!r}"
@@ -994,6 +1100,60 @@ def _run_self_tests() -> int:
                         ok, detail = False, f"row {i} has no embedded_media_parts"
                         break
         probes.append(_Probe("T4 mock handoff -> review package", ok, detail))
+
+        # T4a plan metadata flows into operator provenance: the manifest's
+        # slide_title / alt_text (derived from the plan) appear verbatim on
+        # each summary image_provenance row, keyed by filename.
+        ok_a, detail_a = ok, ""
+        if ok_a and summary is not None and plan_obj is not None:
+            by_file = {r.get("operator_filename"): r
+                       for r in summary["image_provenance"]}
+            for req in plan_obj["image_requests"]:
+                row = by_file.get(req["filename"])
+                if row is None:
+                    ok_a, detail_a = False, f"no provenance row for {req['filename']}"
+                    break
+                if row.get("operator_slide_title") != req["slide_title"]:
+                    ok_a, detail_a = False, (
+                        f"{req['filename']} operator_slide_title="
+                        f"{row.get('operator_slide_title')!r} != plan "
+                        f"{req['slide_title']!r}"
+                    )
+                    break
+                if row.get("operator_alt_text") != req["alt_text"]:
+                    ok_a, detail_a = False, f"{req['filename']} operator_alt_text mismatch"
+                    break
+        else:
+            ok_a, detail_a = False, "T4 prerequisite failed"
+        probes.append(_Probe("T4a plan slide_title/alt_text in provenance", ok_a, detail_a))
+
+        # T4b role-aware layout: the FIRST request (hero_page) routes to a
+        # cover layout; every LATER request (local_region) routes to a
+        # section_divider layout — the operator lane's own placement-role
+        # mapping, driven by the plan-derived generated_provenance sidecar.
+        ok_b, detail_b = ok, ""
+        if ok_b and summary is not None and plan_obj is not None:
+            by_file = {r.get("operator_filename"): r
+                       for r in summary["image_provenance"]}
+            for req in plan_obj["image_requests"]:
+                row = by_file[req["filename"]]
+                role = row.get("placement_role")
+                layout = row.get("chosen_layout")
+                want_role = "hero_page" if req["index"] == 1 else "local_region"
+                want_layout = "cover" if req["index"] == 1 else "section_divider"
+                if role != want_role:
+                    ok_b, detail_b = False, (
+                        f"{req['filename']} placement_role={role!r} != {want_role!r}"
+                    )
+                    break
+                if layout != want_layout:
+                    ok_b, detail_b = False, (
+                        f"{req['filename']} chosen_layout={layout!r} != {want_layout!r}"
+                    )
+                    break
+        else:
+            ok_b, detail_b = False, "T4 prerequisite failed"
+        probes.append(_Probe("T4b role-aware layout (cover/section_divider)", ok_b, detail_b))
 
     # T5 no positive external-service claims on any produced surface.
     # Phrasings are POSITIVE success claims, not bare service names, so a
@@ -1096,10 +1256,13 @@ def main(argv: list[str]) -> int:
         "--mock-handoff",
         action="store_true",
         help=(
-            "Mock/local handoff: write the plan + byte-distinct placeholder "
-            "PNGs under --out-dir and drive the existing operator "
-            "image-to-editable-PPT lane to produce a validated review "
-            "package. Requires --source and --out-dir."
+            "Mock/local handoff: write the plan + a plan-derived operator "
+            "bundle (placeholder PNGs + manifest.json + "
+            "generated_provenance.json) under --out-dir and drive the "
+            "existing operator image-to-editable-PPT lane (--bundle) to "
+            "produce a validated review package whose slide titles / alt "
+            "text / role-aware layouts reflect the image request plan. "
+            "Requires --source and --out-dir."
         ),
     )
     mode.add_argument(

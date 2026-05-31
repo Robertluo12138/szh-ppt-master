@@ -138,13 +138,13 @@
           "placement_role": {
             "type": "string",
             "enum": ["hero_page", "local_region"],
-            "description": "Planned placement hint (first request hero_page, rest local_region). Advisory for the future real lane; the mock handoff uses the operator lane's default placement."
+            "description": "Placement role (first request hero_page, rest local_region). In --mock-handoff it is written verbatim into the operator generated_provenance.json sidecar and drives the operator lane's role-aware layout: hero_page -> cover, local_region -> section_divider."
           },
           "intended_use": {
             "type": "string",
             "minLength": 1,
             "maxLength": 120,
-            "description": "Spot-illustration / icon style note. Never 'full-slide background'. Capped at the operator contract's intended_use limit."
+            "description": "Spot-illustration / icon style note. Never 'full-slide background'. Capped at the operator contract's intended_use limit. In --mock-handoff it flows into the operator manifest.json (intended_use) and the generated_provenance.json sidecar (intent_summary)."
           },
           "alt_text": {
             "type": "string",
