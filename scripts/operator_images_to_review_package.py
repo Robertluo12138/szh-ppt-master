@@ -93,8 +93,10 @@ CLI shape::
 
     # Templates-only seeded from the prepared images' ORIGINAL filenames
     # (pass the prepare step's filename_mapping.json so the manifest's
-    # slide_title / alt_text keep the human-readable original names that
-    # were normalized away for safe local storage):
+    # slide_title / alt_text keep the human-readable original names, and the
+    # generated_provenance placement_role is seeded hero_page for a
+    # hero / cover / title / opening name — incl. CJK 封面 — else
+    # local_region; starter metadata reviewed before --plan):
     python3 scripts/operator_images_to_review_package.py --templates-only \
         --images-dir PREPARED_OUT_DIR/images \
         --filename-mapping PREPARED_OUT_DIR/filename_mapping.json \
@@ -153,25 +155,35 @@ exclusive with ``--plan`` / ``--resume`` / ``--manifest`` /
 The optional ``--filename-mapping`` flag (valid ONLY with
 ``--templates-only``) points at the ``filename_mapping.json`` a prior
 ``--prepare-images-only`` run wrote next to the prepared ``images/``. When
-supplied, the manifest's per-image ``slide_title`` / ``alt_text`` are
-seeded from each image's ORIGINAL filename — preserving the spaces /
-punctuation / CJK characters ``--prepare-images-only`` normalized away for
-safe local storage — instead of the normalized safe basename, so a deck
-prepared from messy real-world names keeps human-readable titles. The path
-is gated for URI / symlink / symlink-ancestor / missing / non-file (rc 2)
-at the CLI; the mapping is then bound to the prepared image BYTES — its
+supplied, two fields are seeded from each image's ORIGINAL filename
+(preserving the spaces / punctuation / CJK characters
+``--prepare-images-only`` normalized away for safe local storage) instead
+of the normalized safe basename: the manifest's per-image ``slide_title`` /
+``alt_text``, so a deck prepared from messy real-world names keeps
+human-readable titles; and the generated-provenance sidecar's per-entry
+``placement_role`` — a bounded hero / cover / title / opening marker
+(including the small CJK cover set, e.g. ``封面``) seeds ``hero_page``
+(which routes to a cover layout), every other name keeps the template
+default ``local_region`` (section_divider). The seeded ``placement_role``
+is STARTER metadata only — the operator reviews / edits
+``generated_provenance.json`` before ``--plan``. The path is gated for
+URI / symlink / symlink-ancestor / missing / non-file (rc 2) at the CLI;
+the mapping is then bound to the prepared image BYTES — its
 ``safe_filename`` set must equal the prepared images exactly AND each
 record's recorded ``sha256`` / ``byte_count`` must match the prepared
 bytes (else the run fails closed, so a stale mapping that reuses the same
-safe names for different images is refused rather than mislabelling the
-deck) — and the re-seeded manifest is re-validated through the helper's
-``_validate_manifest_arg`` gate so an over-long / unsafe seeded title fails
-closed rather than producing a manifest that only breaks at build time. Only the manifest is seeded — the
-generated-provenance sidecar carries no filename-derived title. With no
-``--filename-mapping`` the manifest is exactly the helper's default
-template (prior behavior). The flag is refused outside ``--templates-only``
-(build modes consume a reviewed manifest via ``--manifest``;
-``--prepare-images-only`` produces the mapping rather than consuming it).
+safe names for different images is refused rather than mis-seeding the
+deck) — and each re-seeded file is re-validated through its helper gate
+(``_validate_manifest_arg`` / ``_validate_generated_provenance_sidecar``)
+so an over-long / unsafe title or an out-of-enum role fails closed rather
+than producing metadata that only breaks at build time. Seeding stays
+inside the closed ``placement_role`` enum, so the sidecar's
+unsafe / credential / public-sharing / confidential wording gates are
+untouched. With no ``--filename-mapping`` both files are exactly the
+helper's default templates (prior behavior). The flag is refused outside
+``--templates-only`` (build modes consume a reviewed manifest via
+``--manifest``; ``--prepare-images-only`` produces the mapping rather than
+consuming it).
 
 ``--prepare-images-only`` is the messy-filename prepare shortcut: real
 generated-image folders routinely carry names with spaces, uppercase
@@ -191,8 +203,9 @@ result is truncated to the byte cap — so the stem matches the
 and writes ``filename_mapping.json`` (one record per image carrying
 ``original_filename`` / ``safe_filename`` / ``byte_count`` / ``sha256`` /
 ``media_type`` / ``extension``; the recorded ``original_filename`` is what
-``--templates-only --filename-mapping`` later seeds slide titles from) plus
-a short ``README.md``. It builds
+``--templates-only --filename-mapping`` later seeds slide titles AND the
+generated-provenance sidecar's ``placement_role`` from) plus a short
+``README.md``. It builds
 NOTHING heavier — no ``bundle/``, ``approved_plan.json``,
 ``review_package/``, ``deck.pptx``, ``workspace`` / ``reports``. The same
 ``_preflight_image_entries`` gate the bundle-staging path uses still fires
@@ -253,6 +266,7 @@ from core_image_to_editable_ppt_demo import (  # noqa: E402
 )
 from operator_local_images_to_editable_ppt import (  # noqa: E402
     MAX_IMAGES,
+    _DEFAULT_SIDECAR_PLACEMENT_ROLE,
     _EXPLICIT_BOUNDARIES,
     _ID_MAX_LEN,
     _TINY_JPEG_BYTES,
@@ -1606,9 +1620,15 @@ def _render_prepare_readme(*, images_dir: Path, out_images: Path) -> str:
         "",
         "Author starter metadata (or run the full review-package workflow) "
         "from the prepared `images/`. Pass `--filename-mapping "
-        "filename_mapping.json` so the manifest's `slide_title` / `alt_text` "
-        "keep the human-readable ORIGINAL filenames instead of the "
-        "normalized safe names:",
+        "filename_mapping.json` so the starter metadata is seeded from the "
+        "human-readable ORIGINAL filenames instead of the normalized safe "
+        "names: the manifest's `slide_title` / `alt_text` keep the original "
+        "name, and the generated_provenance sidecar's `placement_role` is "
+        "seeded `hero_page` (cover layout) for a bounded hero / cover / "
+        "title / opening marker — incl. the small CJK cover set, e.g. 封面 — "
+        "else the default `local_region` (section_divider). The seeded "
+        "`placement_role` is starter metadata you review / edit before "
+        "`--plan`:",
         "",
         "```",
         "python3 scripts/operator_images_to_review_package.py "
@@ -1775,8 +1795,9 @@ def _run_prepare_images_only(*, images_dir: Path, out_dir: Path) -> int:
           f"sha256 / media_type)")
     print(f"  - README.md")
     print(f"Feed the prepared images into the existing workflow, e.g. "
-          f"(--filename-mapping keeps the original filenames in the "
-          f"manifest titles):")
+          f"(--filename-mapping seeds the manifest titles from the original "
+          f"filenames AND the sidecar placement_role: hero_page for a "
+          f"hero / cover / title / opening name, else local_region):")
     print(f"  python3 scripts/operator_images_to_review_package.py "
           f"--templates-only \\")
     print(f"      --images-dir {shlex.quote(str(out_images))} \\")
@@ -1960,6 +1981,53 @@ def _load_filename_mapping(
     return mapping, []
 
 
+# Bounded ASCII markers that, when present as a WHOLE TOKEN in an
+# operator's ORIGINAL filename, seed the generated-provenance starter
+# sidecar's placement_role to "hero_page" (which routes to the cover
+# layout) instead of the default "local_region" (section_divider). The
+# stem is split on runs of non-letters before matching, so a marker only
+# fires when it stands alone between separators / digits / string ends —
+# "discovery" / "recover" / "makeover" do NOT trip "cover", and
+# "subtitle" / "untitled" do NOT trip "title".
+_HERO_FILENAME_MARKERS_ASCII: frozenset[str] = frozenset({
+    "hero", "cover", "title", "opening",
+})
+# Bounded CJK cover / front-page markers, matched as a SUBSTRING of the
+# stem (CJK text carries no word separators, so the ASCII token split
+# cannot apply). Kept to a small, unambiguous "front/cover page" set so
+# an ordinary chart / diagram name cannot accidentally match.
+_HERO_FILENAME_MARKERS_CJK: tuple[str, ...] = (
+    "封面",  # front cover
+    "首页",  # front / opening page
+    "扉页",  # title page
+)
+
+
+def _placement_role_for_original_filename(original: str) -> str:
+    """Return the STARTER ``placement_role`` seeded from an operator's
+    ORIGINAL filename: ``"hero_page"`` when the filename carries a bounded
+    hero / cover / title / opening marker (so the deck's first impression
+    lands on a cover layout), else the existing default
+    ``_DEFAULT_SIDECAR_PLACEMENT_ROLE`` (``"local_region"`` — a
+    section_divider accent).
+
+    This is STARTER metadata only — the operator reviews and may edit
+    ``generated_provenance.json`` before ``--plan``. Matching is
+    deterministic and does NOT rank: every file whose name carries a
+    marker seeds ``hero_page`` (a multi-cover folder simply produces
+    several hero starters for the operator to prune). ASCII markers match
+    token-bounded (the stem is split on runs of non-letters, so
+    ``discovery`` / ``recover`` / ``subtitle`` do not trip ``cover`` /
+    ``title``); the small CJK marker set matches as a substring."""
+    stem = Path(original).stem
+    tokens = {tok.lower() for tok in re.split(r"[^A-Za-z]+", stem) if tok}
+    if tokens & _HERO_FILENAME_MARKERS_ASCII:
+        return "hero_page"
+    if any(marker in stem for marker in _HERO_FILENAME_MARKERS_CJK):
+        return "hero_page"
+    return _DEFAULT_SIDECAR_PLACEMENT_ROLE
+
+
 def _seed_manifest_titles_from_mapping(
     *, manifest: Path, mapping_path: Path, prepared_images: Path,
 ) -> list[str]:
@@ -2042,6 +2110,94 @@ def _seed_manifest_titles_from_mapping(
     return []
 
 
+def _seed_sidecar_roles_from_mapping(
+    *, gen_prov: Path, mapping_path: Path, prepared_images: Path,
+) -> list[str]:
+    """Re-seed each generated-provenance entry's ``placement_role`` from
+    the operator's ORIGINAL filename (recovered from the prepare step's
+    ``filename_mapping.json``): a bounded hero / cover / title / opening
+    marker — including the small CJK cover set — seeds ``hero_page``
+    (cover layout), every other name keeps the template default
+    ``local_region`` (section_divider). Then re-validate the rewritten
+    sidecar with the helper's own ``_validate_generated_provenance_
+    sidecar``. Returns ``[]`` on success or a list of failure lines.
+
+    This mirrors ``_seed_manifest_titles_from_mapping`` exactly: the
+    mapping is bound to the ACTUAL bytes of ``prepared_images`` (each
+    image's sha256 / byte_count must match the mapping's recorded
+    digest), so a stale or unrelated mapping that reuses the same safe
+    filenames but describes different bytes is refused rather than
+    mis-seeding the deck. Only ``placement_role`` is touched — the
+    per-entry ``filename`` and every other sidecar field stay the
+    template default — and the seeded role is just STARTER metadata the
+    operator reviews / edits before ``--plan``. Re-validation through the
+    helper gate means a sidecar that somehow drifts out of the closed
+    placement_role enum fails closed here rather than at build time.
+
+    Note the seeded values stay inside the closed placement_role enum
+    (``hero_page`` / ``local_region``), so the safety gates that refuse
+    unsafe / credential / public-sharing / confidential wording in the
+    sidecar's free-text fields are untouched by this seeding."""
+    digests, digest_fails = _prepared_image_digests(prepared_images)
+    if digest_fails or digests is None:
+        return digest_fails or [
+            f"could not digest prepared images {prepared_images} for "
+            f"mapping binding."
+        ]
+    mapping, fails = _load_filename_mapping(mapping_path, digests)
+    if fails or mapping is None:
+        return fails or [
+            f"--filename-mapping {mapping_path} was refused."
+        ]
+    try:
+        body = json.loads(gen_prov.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [
+            f"could not read back generated_provenance {gen_prov} for "
+            f"placement_role seeding: {type(exc).__name__}: {exc}"
+        ]
+    entries = body.get("entries") if isinstance(body, dict) else None
+    if not isinstance(entries, list):
+        return [
+            f"generated_provenance {gen_prov} has no entries[] list to seed."
+        ]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return [
+                f"generated_provenance {gen_prov} has a non-object "
+                f"entries[] entry; refused."
+            ]
+        safe = entry.get("filename")
+        original = mapping.get(safe)
+        if original is None:
+            return [
+                f"generated_provenance {gen_prov} names safe filename "
+                f"{safe!r} that is absent from --filename-mapping; refused."
+            ]
+        entry["placement_role"] = _placement_role_for_original_filename(
+            original,
+        )
+    try:
+        gen_prov.write_text(
+            json.dumps(body, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return [
+            f"could not rewrite generated_provenance {gen_prov} with "
+            f"seeded placement_role: {type(exc).__name__}: {exc}"
+        ]
+    sc_entries, _resolved, gp_fails = _validate_generated_provenance_sidecar(
+        str(gen_prov), sorted(digests),
+    )
+    if gp_fails or sc_entries is None:
+        return gp_fails or [
+            f"seeded generated_provenance {gen_prov} failed the helper "
+            f"sidecar validator after placement_role seeding."
+        ]
+    return []
+
+
 def _run_templates_only(
     *, images_dir: Path, out_dir: Path, mapping_src: Path | None = None,
 ) -> int:
@@ -2060,18 +2216,25 @@ def _run_templates_only(
     re-implements no contract logic.
 
     When ``mapping_src`` is given (the optional ``--filename-mapping``
-    pointing at a ``--prepare-images-only`` ``filename_mapping.json``), the
-    manifest's per-image ``slide_title`` / ``alt_text`` are re-seeded from
-    each image's ORIGINAL filename instead of the normalized safe basename
-    the snapshot carries, so a deck prepared from messy real-world names
-    keeps human-readable titles. The mapping is bound to the snapshot BYTES
-    (each record's recorded sha256 / byte_count must match the prepared
-    image), so the seeding fails closed if the mapping does not correspond
-    to the prepared image set OR describes different bytes, and the
-    rewritten manifest is re-validated through the helper's own contract
-    gate (see ``_seed_manifest_titles_from_mapping``). With no
-    ``mapping_src`` the manifest is exactly the helper's default template
-    (prior behavior).
+    pointing at a ``--prepare-images-only`` ``filename_mapping.json``), two
+    fields are re-seeded from each image's ORIGINAL filename instead of the
+    normalized safe basename the snapshot carries: the manifest's per-image
+    ``slide_title`` / ``alt_text`` (so a deck prepared from messy real-world
+    names keeps human-readable titles), and the generated-provenance
+    sidecar's per-entry ``placement_role`` (a bounded hero / cover / title /
+    opening marker — including the small CJK cover set — seeds
+    ``hero_page``, which routes to a cover layout; every other name keeps
+    the template default ``local_region`` / section_divider). The mapping
+    is bound to the snapshot BYTES (each record's recorded sha256 /
+    byte_count must match the prepared image), so the seeding fails closed
+    if the mapping does not correspond to the prepared image set OR
+    describes different bytes, and each rewritten file is re-validated
+    through the helper's own contract gate (see
+    ``_seed_manifest_titles_from_mapping`` /
+    ``_seed_sidecar_roles_from_mapping``). The seeded ``placement_role`` is
+    STARTER metadata only — the operator reviews / edits
+    ``generated_provenance.json`` before ``--plan``. With no ``mapping_src``
+    both files are exactly the helper's default templates (prior behavior).
 
     Nothing else is produced — no ``bundle/``, ``approved_plan.json``,
     ``review_package/``, or ``deck.pptx`` — and a belt-and-braces leak
@@ -2155,16 +2318,19 @@ def _run_templates_only(
         print(f"  [PASS] generated-provenance template written to "
               f"{gen_prov}")
 
-        # Stage 3 (optional) — re-seed the manifest's slide_title /
-        # alt_text from each image's ORIGINAL filename when the operator
-        # passed --filename-mapping. Runs against the SAME snapshot the
-        # writers used: the mapping's safe_filename set must match the
-        # snapshot basenames AND each record's recorded sha256 / byte_count
-        # must match the snapshot bytes, so a stale / unrelated mapping is
-        # refused rather than mislabelling the deck. The rewritten manifest
-        # is re-validated through the helper gate so an unsafe / over-long
-        # seeded title fails closed. Only the manifest is touched — the
-        # generated-provenance sidecar carries no filename-derived title.
+        # Stage 3 (optional) — re-seed from each image's ORIGINAL filename
+        # when the operator passed --filename-mapping. Runs against the SAME
+        # snapshot the writers used: the mapping's safe_filename set must
+        # match the snapshot basenames AND each record's recorded sha256 /
+        # byte_count must match the snapshot bytes, so a stale / unrelated
+        # mapping is refused rather than mis-seeding the deck. Two fields are
+        # seeded, each re-validated through its helper gate so an unsafe /
+        # over-long / out-of-enum value fails closed here: the manifest's
+        # slide_title / alt_text, then the generated-provenance sidecar's
+        # placement_role (hero_page for a bounded hero / cover / title /
+        # opening marker, else the template default local_region). The
+        # seeded placement_role is STARTER metadata the operator reviews /
+        # edits before --plan.
         if mapping_src is not None:
             seed_failures = _seed_manifest_titles_from_mapping(
                 manifest=manifest, mapping_path=mapping_src,
@@ -2176,6 +2342,17 @@ def _run_templates_only(
                 return 1
             print(f"  [PASS] manifest slide_title / alt_text seeded from "
                   f"original filenames in {mapping_src}")
+            role_failures = _seed_sidecar_roles_from_mapping(
+                gen_prov=gen_prov, mapping_path=mapping_src,
+                prepared_images=snapshot_images,
+            )
+            if role_failures:
+                for line in role_failures:
+                    print(f"  [FAIL] {line}")
+                return 1
+            print(f"  [PASS] generated_provenance placement_role seeded "
+                  f"from original filenames in {mapping_src} "
+                  f"(starter metadata; operator-reviewable)")
 
     # Belt-and-braces: template-only mode must NOT have produced any of
     # the heavier build artifacts. Mirrors _run_plan_mode's leak guard so
@@ -2199,9 +2376,11 @@ def _run_templates_only(
     if mapping_src is not None:
         print(f"  - manifest.json  (slide_title / alt_text seeded from "
               f"original filenames)")
+        print(f"  - generated_provenance.json  (placement_role seeded from "
+              f"original filenames; operator-reviewable)")
     else:
         print(f"  - manifest.json")
-    print(f"  - generated_provenance.json")
+        print(f"  - generated_provenance.json")
     print(f"Hand-edit them, then build with --manifest / "
           f"--generated-provenance, e.g.:")
     print(f"  python3 scripts/operator_images_to_review_package.py \\")
@@ -5683,6 +5862,294 @@ def _run_self_tests() -> int:
             ok=ok, detail=detail,
         ))
 
+    # Filename-mapping placement_role seeding (--templates-only
+    # --filename-mapping). T41..T44 pin the second operator-facing seed:
+    # when a deck is prepared from messy real-world filenames, the
+    # generated_provenance starter sidecar's placement_role is seeded from
+    # each image's ORIGINAL filename — a bounded hero / cover / title /
+    # opening marker (incl. the small CJK cover set) seeds hero_page (cover
+    # layout); every other name keeps the template default local_region
+    # (section_divider). It is STARTER metadata the operator reviews before
+    # --plan; without a mapping the prior default-sidecar behavior is kept.
+    # ----------------------------------------------------------------
+
+    # T41 — the placement_role marker helper. Pure-function table so a
+    # regression in the bounded-ASCII-token / CJK-substring logic fails here,
+    # independent of the seeding / build machinery. Substring lookalikes
+    # (discovery / recover / makeover / subtitle / Untitled) must NOT trip a
+    # marker, and an ordinary CJK chart name must stay local_region.
+    cases = [
+        ("Hero Cover (v2).png", "hero_page"),
+        ("cover.png", "hero_page"),
+        ("00_cover.jpg", "hero_page"),
+        ("cover_v2.png", "hero_page"),
+        ("Opening Slide.png", "hero_page"),
+        ("Title Page.png", "hero_page"),
+        ("hero-banner.jpeg", "hero_page"),
+        ("封面.png", "hero_page"),
+        ("封面设计 final.png", "hero_page"),
+        ("首页.png", "hero_page"),
+        ("扉页.jpg", "hero_page"),
+        ("Quarterly Revenue Chart.png", "local_region"),
+        ("system_diagram_v2.jpg", "local_region"),
+        ("discovery.png", "local_region"),
+        ("recover_chart.png", "local_region"),
+        ("makeover.png", "local_region"),
+        ("subtitle_slide.png", "local_region"),
+        ("Untitled.png", "local_region"),
+        ("季度营收.png", "local_region"),
+    ]
+    ok, detail = True, ""
+    for original, want in cases:
+        got = _placement_role_for_original_filename(original)
+        if got != want:
+            ok, detail = False, (
+                f"{original!r} -> {got!r}, expected {want!r}"
+            )
+            break
+    results.append(_ProbeResult(
+        name=(
+            "T41 _placement_role_for_original_filename maps bounded hero / "
+            "cover / title / opening markers (and CJK 封面 / 首页 / 扉页) to "
+            "hero_page; normal names and substring lookalikes "
+            "(discovery / recover / subtitle / Untitled) stay local_region"
+        ),
+        ok=ok, detail=detail,
+    ))
+
+    # T42 — --templates-only --filename-mapping seeds the generated_
+    # provenance sidecar's placement_role from original filenames: a
+    # Hero Cover name -> hero_page, a normal chart name -> local_region, a
+    # CJK 封面 name -> hero_page. The fixture mixes both roles, and the
+    # seeded sidecar must still pass _validate_generated_provenance_sidecar
+    # (starter metadata stays schema-valid).
+    with tempfile.TemporaryDirectory(prefix="o2rp-T42-") as raw_td:
+        td = Path(raw_td)
+        src = td / "operator images"
+        src.mkdir()
+        originals = {
+            "Hero Cover (v2).png": _TINY_PNG_BYTES,
+            "Quarterly Chart.jpg": _TINY_JPEG_BYTES,
+            "封面.png": _TINY_PNG_BYTES,
+        }
+        for name, data in originals.items():
+            (src / name).write_bytes(data)
+        prepared = td / "prepared"
+        rc = main(["--prepare-images-only", "--images-dir", str(src),
+                   "--out-dir", str(prepared)])
+        ok = rc == 0
+        detail = "" if ok else f"--prepare-images-only rc={rc}"
+        out_dir = td / "templates_out"
+        if ok:
+            rc = main(["--templates-only",
+                       "--images-dir", str(prepared / "images"),
+                       "--filename-mapping",
+                       str(prepared / "filename_mapping.json"),
+                       "--out-dir", str(out_dir)])
+            if rc != 0:
+                ok, detail = False, (
+                    f"--templates-only --filename-mapping rc={rc}"
+                )
+        safe_to_orig: dict[str, str] = {}
+        if ok:
+            mapping = json.loads(
+                (prepared / "filename_mapping.json").read_text(
+                    encoding="utf-8")
+            )
+            safe_to_orig = {
+                r["safe_filename"]: r["original_filename"]
+                for r in mapping["images"]
+            }
+            sidecar = json.loads(
+                (out_dir / "generated_provenance.json").read_text(
+                    encoding="utf-8")
+            )
+            saw_hero = saw_local = False
+            for entry in sidecar["entries"]:
+                safe = entry["filename"]
+                original = safe_to_orig[safe]
+                want = _placement_role_for_original_filename(original)
+                if entry["placement_role"] != want:
+                    ok, detail = False, (
+                        f"{safe} (from {original!r}) placement_role="
+                        f"{entry['placement_role']!r} != seeded {want!r}"
+                    )
+                    break
+                if want == "hero_page":
+                    saw_hero = True
+                else:
+                    saw_local = True
+            if ok and not (saw_hero and saw_local):
+                ok, detail = False, (
+                    f"fixture did not exercise both roles "
+                    f"(hero={saw_hero}, local={saw_local})"
+                )
+        if ok:
+            # Acceptance: the seeded sidecar still passes the existing
+            # generated_provenance validation against the prepared images.
+            _e, _r, gp_fails = _validate_generated_provenance_sidecar(
+                str(out_dir / "generated_provenance.json"),
+                sorted(safe_to_orig),
+            )
+            if gp_fails:
+                ok, detail = False, (
+                    f"seeded sidecar failed validation: {gp_fails[0]}"
+                )
+        results.append(_ProbeResult(
+            name=(
+                "T42 --templates-only --filename-mapping seeds "
+                "generated_provenance placement_role from original filenames "
+                "(Hero Cover -> hero_page, normal -> local_region, "
+                "封面 -> hero_page) and the seeded sidecar still passes "
+                "_validate_generated_provenance_sidecar"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T43 — WITHOUT --filename-mapping the sidecar's placement_role stays the
+    # helper template default (local_region) for EVERY entry, even a
+    # hero-named image. Guards that the placement_role seeding is purely
+    # additive (no behavior change unless the operator opts in).
+    with tempfile.TemporaryDirectory(prefix="o2rp-T43-") as raw_td:
+        td = Path(raw_td)
+        src = td / "images"
+        src.mkdir()
+        # A hero-cover name that WOULD seed hero_page WITH a mapping —
+        # proving the no-mapping path leaves it at the default.
+        (src / "hero_cover.png").write_bytes(_TINY_PNG_BYTES)
+        (src / "chart.jpg").write_bytes(_TINY_JPEG_BYTES)
+        out_dir = td / "templates_out"
+        rc = main(["--templates-only",
+                   "--images-dir", str(src),
+                   "--out-dir", str(out_dir)])
+        ok = rc == 0
+        detail = "" if ok else f"--templates-only rc={rc}"
+        if ok:
+            sidecar = json.loads(
+                (out_dir / "generated_provenance.json").read_text(
+                    encoding="utf-8")
+            )
+            for entry in sidecar["entries"]:
+                if (entry["placement_role"]
+                        != _DEFAULT_SIDECAR_PLACEMENT_ROLE):
+                    ok, detail = False, (
+                        f"{entry['filename']} placement_role="
+                        f"{entry['placement_role']!r} != default "
+                        f"{_DEFAULT_SIDECAR_PLACEMENT_ROLE!r} "
+                        f"(no-mapping path must be unchanged)"
+                    )
+                    break
+        results.append(_ProbeResult(
+            name=(
+                "T43 --templates-only WITHOUT --filename-mapping keeps the "
+                "sidecar placement_role at the template default "
+                "(local_region) for every entry, even a hero-named image"
+            ),
+            ok=ok, detail=detail,
+        ))
+
+    # T44 — end-to-end: a seeded sidecar flows through --plan / --resume and
+    # the role-aware layout lands. The hero_page image produces a cover
+    # render_model; the local_region image produces a section_divider
+    # render_model. Proves the placement_role seeding reaches the produced
+    # deck, not just the starter sidecar.
+    with tempfile.TemporaryDirectory(prefix="o2rp-T44-") as raw_td:
+        td = Path(raw_td)
+        src = td / "operator images"
+        src.mkdir()
+        (src / "Cover Hero.png").write_bytes(_TINY_PNG_BYTES)
+        (src / "Revenue Chart.jpg").write_bytes(_TINY_JPEG_BYTES)
+        prepared = td / "prepared"
+        ok = main(["--prepare-images-only", "--images-dir", str(src),
+                   "--out-dir", str(prepared)]) == 0
+        detail = "" if ok else "prepare failed"
+        tpl = td / "templates_out"
+        if ok:
+            rc = main(["--templates-only",
+                       "--images-dir", str(prepared / "images"),
+                       "--filename-mapping",
+                       str(prepared / "filename_mapping.json"),
+                       "--out-dir", str(tpl)])
+            if rc != 0:
+                ok, detail = False, (
+                    f"--templates-only --filename-mapping rc={rc}"
+                )
+        out_dir = td / "build"
+        if ok:
+            rc = main(["--plan",
+                       "--images-dir", str(prepared / "images"),
+                       "--out-dir", str(out_dir),
+                       "--manifest", str(tpl / "manifest.json"),
+                       "--generated-provenance",
+                       str(tpl / "generated_provenance.json")])
+            if rc != 0:
+                ok, detail = False, f"--plan rc={rc}"
+        if ok:
+            rc = main(["--resume", "--out-dir", str(out_dir)])
+            if rc != 0:
+                ok, detail = False, f"--resume rc={rc}"
+        if ok:
+            plan = json.loads(
+                (out_dir / "approved_plan.json").read_text(encoding="utf-8")
+            )
+            render_dir = (
+                out_dir / "review_package" / "workspace" / "render_models"
+            )
+            mapping = json.loads(
+                (prepared / "filename_mapping.json").read_text(
+                    encoding="utf-8")
+            )
+            safe_to_orig = {
+                r["safe_filename"]: r["original_filename"]
+                for r in mapping["images"]
+            }
+            layout_by_role = {
+                "hero_page": "cover",
+                "local_region": "section_divider",
+            }
+            saw_cover = saw_divider = False
+            if not render_dir.is_dir():
+                ok, detail = False, (
+                    f"render_models dir missing at {render_dir}"
+                )
+            for row in (plan.get("images", []) if ok else []):
+                safe = row.get("filename")
+                idx = row.get("intended_slide_index")
+                role = row.get("placement_role")
+                original = safe_to_orig.get(safe)
+                want_role = _placement_role_for_original_filename(original)
+                if role != want_role:
+                    ok, detail = False, (
+                        f"plan row {safe} placement_role={role!r} != seeded "
+                        f"{want_role!r}"
+                    )
+                    break
+                want_layout = layout_by_role[role]
+                rm = render_dir / f"{idx:02d}_{want_layout}.json"
+                if not rm.is_file():
+                    ok, detail = False, (
+                        f"missing render_model {rm.name} for {safe} "
+                        f"(role={role})"
+                    )
+                    break
+                if want_layout == "cover":
+                    saw_cover = True
+                else:
+                    saw_divider = True
+            if ok and not (saw_cover and saw_divider):
+                ok, detail = False, (
+                    f"end-to-end did not produce both layouts "
+                    f"(cover={saw_cover}, section_divider={saw_divider})"
+                )
+        results.append(_ProbeResult(
+            name=(
+                "T44 a seeded sidecar flows through --plan / --resume: the "
+                "hero_page image produces a cover render_model and the "
+                "local_region image produces a section_divider render_model"
+            ),
+            ok=ok, detail=detail,
+        ))
+
     repo_rc = _check_repo_unchanged(
         examples_before=examples_before,
         scripts_before=scripts_before,
@@ -5850,9 +6317,13 @@ def main(argv: list[str]) -> int:
             "files, then feed them back via --manifest / "
             "--generated-provenance to a --plan or one-command run. "
             "Optionally pass --filename-mapping (a --prepare-images-only "
-            "filename_mapping.json) to seed the manifest's slide_title / "
-            "alt_text from each image's ORIGINAL filename instead of the "
-            "normalized safe basename. Requires --images-dir + a fresh "
+            "filename_mapping.json) to seed from each image's ORIGINAL "
+            "filename instead of the normalized safe basename: the "
+            "manifest's slide_title / alt_text, and the "
+            "generated_provenance sidecar's placement_role (hero_page for a "
+            "bounded hero / cover / title / opening marker incl. the CJK "
+            "cover set, else local_region; starter metadata reviewed before "
+            "--plan). Requires --images-dir + a fresh "
             "--out-dir; mutually exclusive with --plan / --resume / "
             "--self-test / --manifest / --generated-provenance "
             "(--filename-mapping is the only optional companion)."
@@ -5896,31 +6367,38 @@ def main(argv: list[str]) -> int:
         help=(
             "Optional, ONLY with --templates-only. Path to the "
             "filename_mapping.json a prior --prepare-images-only run wrote "
-            "next to the prepared images/. When supplied, the generated "
-            "manifest.json's per-image slide_title / alt_text are seeded "
-            "from each image's ORIGINAL filename (preserving the spaces / "
-            "punctuation / CJK characters that --prepare-images-only "
-            "normalized away for safe local storage) instead of the "
-            "normalized safe basename, so a deck prepared from messy "
-            "real-world filenames keeps human-readable titles. The path "
-            "must be a local, non-URI, non-symlink regular file with no "
-            "symlink ancestor; the mapping is bound to the prepared image "
-            "BYTES (its safe_filename set must equal the prepared images "
-            "exactly AND each record's recorded sha256 / byte_count must "
-            "match the prepared bytes, else the run fails closed — so a "
-            "stale mapping that reuses the same names for different images "
-            "is refused), and the re-seeded manifest is re-validated through "
-            "the helper's manifest contract gates so an over-long / unsafe "
-            "seeded title fails closed. Omit it to keep the prior behavior "
-            "(titles derived from the safe basename). Local file only — no "
-            "network / model API / image search."
+            "next to the prepared images/. When supplied, two fields are "
+            "seeded from each image's ORIGINAL filename (preserving the "
+            "spaces / punctuation / CJK characters that "
+            "--prepare-images-only normalized away for safe local storage) "
+            "instead of the normalized safe basename: the manifest.json's "
+            "per-image slide_title / alt_text, so a deck prepared from messy "
+            "real-world filenames keeps human-readable titles; and the "
+            "generated_provenance.json sidecar's per-entry placement_role — "
+            "a bounded hero / cover / title / opening marker (including the "
+            "small CJK cover set, e.g. 封面) seeds hero_page (cover layout), "
+            "every other name keeps the template default local_region "
+            "(section_divider). The seeded placement_role is STARTER "
+            "metadata only — review / edit generated_provenance.json before "
+            "--plan. The path must be a local, non-URI, non-symlink regular "
+            "file with no symlink ancestor; the mapping is bound to the "
+            "prepared image BYTES (its safe_filename set must equal the "
+            "prepared images exactly AND each record's recorded sha256 / "
+            "byte_count must match the prepared bytes, else the run fails "
+            "closed — so a stale mapping that reuses the same names for "
+            "different images is refused), and each re-seeded file is "
+            "re-validated through its helper contract gates so an over-long "
+            "/ unsafe title or an out-of-enum role fails closed. Omit it to "
+            "keep the prior behavior (titles + placement_role from the "
+            "helper default templates). Local file only — no network / "
+            "model API / image search."
         ),
     )
     parser.add_argument(
         "--self-test", action="store_true",
         help=(
             "Run the in-script tempfixture scenarios under TMPDIR "
-            "(no writes under REPO_ROOT). Forty probes: T1 full "
+            "(no writes under REPO_ROOT). Forty-four probes: T1 full "
             "happy path from synthetic --images-dir through to a "
             "validated review package + locked README markers; T2 "
             "drift (mutating generated_provenance.json after plan-"
@@ -6044,7 +6522,22 @@ def main(argv: list[str]) -> int:
             "mapped starter metadata flows end-to-end "
             "(--templates-only --filename-mapping -> --plan -> --resume) into "
             "a re-validated review package whose summary carries the "
-            "original-filename slide_title. Mutually exclusive with "
+            "original-filename slide_title; T41 the placement_role marker "
+            "helper maps bounded hero / cover / title / opening markers (and "
+            "the CJK cover set 封面 / 首页 / 扉页) to hero_page while leaving "
+            "normal chart / diagram names — and substring-only lookalikes "
+            "like discovery / recover / subtitle — at local_region; T42 "
+            "--templates-only --filename-mapping seeds the "
+            "generated_provenance sidecar's placement_role from original "
+            "filenames (hero_page for a Hero Cover name, local_region for a "
+            "normal chart name, hero_page for a CJK 封面 name) and the seeded "
+            "sidecar still passes _validate_generated_provenance_sidecar; "
+            "T43 WITHOUT --filename-mapping the sidecar's placement_role "
+            "stays the template default local_region for every entry (the "
+            "seeding is purely additive); T44 a seeded sidecar flowed "
+            "through --plan / --resume produces a cover-layout render_model "
+            "for the hero_page image and a section_divider render_model for "
+            "the local_region image. Mutually exclusive with "
             "--images-dir / --out-dir / --manifest / --generated-provenance "
             "/ --plan / --resume / --templates-only / --prepare-images-only / "
             "--filename-mapping."
