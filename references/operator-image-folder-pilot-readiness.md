@@ -13,6 +13,59 @@ pipeline behavior.
 issue was found. The remaining items in *Non-Blocking TODOs* are polish, not
 gates.
 
+## Final MVP Ship-Gate Re-Run (2026-05-31)
+
+A fresh end-to-end ship gate re-ran the full messy/CJK operator chain plus the
+packaging gates on a throwaway folder of five PNGs with spaces / uppercase /
+parentheses / CJK names (`封面 Cover Slide.png`, `Q3 Revenue (Final).PNG`,
+`市场分析 chart.png`, `Team Photo - 2026.png`, `产品路线图.png`), all outside
+the repo:
+
+```
+python3 scripts/operator_images_to_review_package.py --prepare-images-only \
+    --images-dir <raw> --out-dir <prep>
+python3 scripts/operator_images_to_review_package.py --templates-only \
+    --images-dir <prep>/images \
+    --filename-mapping <prep>/filename_mapping.json --out-dir <meta>
+python3 scripts/operator_images_to_review_package.py --plan \
+    --images-dir <prep>/images --manifest <meta>/manifest.json \
+    --generated-provenance <meta>/generated_provenance.json --out-dir <run>
+python3 scripts/operator_images_to_review_package.py --resume --out-dir <run>
+python3 scripts/validate_operator_review_package.py \
+    --out-dir <run>/review_package
+```
+
+Result: every step rc=0. `--prepare-images-only` normalised the CJK/messy names
+to `image_ref`-valid stems (CJK-only `产品路线图.png` -> `img.png`, the rest to
+readable stems) and disambiguated collisions. `--templates-only
+--filename-mapping` seeded human-readable titles from the original filenames and
+seeded `placement_role` from them — the `封面`(cover) image got `hero_page`,
+every other image `local_region`. The review-package README traces each image
+end to end: original-filename title -> safe filename -> `chosen_layout`
+(`hero_page`->`cover`, `local_region`->`section_divider`) -> `placement_role` ->
+embedded `ppt/media/imageN.png` part -> `summary.image_provenance[]` with
+`placement_verified=True` (blip-confirmed readback) on all five slides
+(`slide_count == embedded_media_count == 5`). The standalone validator
+re-confirmed the package rc=0.
+
+Packaging / hygiene gates, all rc=0:
+
+```
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 python3 scripts/core_editable_ppt_acceptance.py --self-test
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_skill_package.py
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 python3 scripts/package_skill.py --self-test
+git diff --check
+git diff --cached --check
+```
+
+`core_editable_ppt_acceptance` reported 26 delegated smokes passed and every
+committed top-level repo path byte-identical before/after; `verify_skill_package`
+and `package_skill --self-test` (16 scenarios) passed; both `git diff --check`
+runs were clean and the working tree stayed clean (no generated artifacts
+staged). No code change was needed. **Lane remains ready; repo is ready for
+Codex final review, commit, and push.** Live Qoder runtime packaging and real
+D-One generation stay UNVERIFIED and out of scope.
+
 ## What The Pilot Exercised
 
 A throwaway image folder outside the repo held synthetic PNG / JPEG bytes with
