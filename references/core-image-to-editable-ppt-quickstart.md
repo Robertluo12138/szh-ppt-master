@@ -442,6 +442,98 @@ The subsections below document each mode in full; the pilot above is the fastest
 way to exercise all four against a committed asset. Clean up when done:
 `rm -rf "$RUN_DIR" "$REV" "$META"`.
 
+### Full pilot: messy generated folder -> validated package
+
+The "Try it now" pilot above starts from an already-clean filename. Real
+generated-image folders rarely do, so this pilot starts from a **messy** folder
+and walks the complete reviewed chain end to end: `--prepare-images-only` ->
+`--templates-only` -> `--plan` -> `--resume` ->
+`validate_operator_review_package.py`. It is copy-paste with no path edits and
+writes only under a fresh `mktemp -d` dir outside the repo. Have your own folder
+of generated images? Skip step 0 and point `--images-dir` at it. The per-mode
+subsections below carry each mode's full gate/contract details.
+
+```bash
+# 0. A throwaway, caller-owned folder of "generated" images with realistic
+#    MESSY names -- spaces, uppercase, parentheses, hyphens, and CJK. Staged
+#    here from one committed synthetic PNG so the pilot is copy-paste; in real
+#    use this is your own folder of distinct images.
+PILOT=$(mktemp -d "${TMPDIR:-/tmp}/szh-genimg-pilot-XXXX")
+mkdir "$PILOT/messy"
+SRC=examples/synthetic_8_page_product_brief/assets/synthetic_marker.png
+cp "$SRC" "$PILOT/messy/Hero Cover (v2).png"
+cp "$SRC" "$PILOT/messy/Q3-Report FINAL.png"
+cp "$SRC" "$PILOT/messy/季度总结.png"
+
+# 1. PREPARE -> normalised images/ + filename_mapping.json. Builds nothing
+#    heavier and never mutates your source folder.
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_images_to_review_package.py --prepare-images-only \
+  --images-dir "$PILOT/messy" --out-dir "$PILOT/prepared"
+```
+
+`--prepare-images-only` writes **`$PILOT/prepared/filename_mapping.json`** (one
+record per image: `original_filename`, `safe_filename`, `byte_count`, `sha256`,
+`media_type`, `extension`) and the normalised **`$PILOT/prepared/images/`**.
+The three messy names normalise to `image_ref`-valid stems —
+`Hero Cover (v2).png` -> `hero_cover_v2_.png`, `Q3-Report FINAL.png` ->
+`q3_report_final.png`, `季度总结.png` -> `img_.png` (a name with no usable
+ASCII stem falls back to the `img_` prefix). Inspect the mapping, then feed the
+prepared `images/` forward.
+
+```bash
+# 2. METADATA/TEMPLATES -> editable starter manifest.json +
+#    generated_provenance.json for the prepared images (hand-edit before a real
+#    review; used as-is here).
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_images_to_review_package.py --templates-only \
+  --images-dir "$PILOT/prepared/images" --out-dir "$PILOT/templates"
+
+# 3. PLAN -> stage the bundle from the prepared images + reviewed metadata and
+#    write the reviewable plan, then STOP (no deck.pptx yet).
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_images_to_review_package.py --plan \
+  --images-dir "$PILOT/prepared/images" --out-dir "$PILOT/out" \
+  --manifest "$PILOT/templates/manifest.json" \
+  --generated-provenance "$PILOT/templates/generated_provenance.json"
+```
+
+`--plan` writes **`$PILOT/out/approved_plan.json`** (plus `$PILOT/out/bundle/`)
+and stops — a human inspects the plan here; no review package exists yet. To
+approve a *changed* plan, discard `$PILOT/out` and re-run `--plan`.
+
+```bash
+# 4. RESUME -> build the review package from the reviewed plan (same validators
+#    and evidence as one-command mode).
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/operator_images_to_review_package.py --resume \
+  --out-dir "$PILOT/out"
+
+# 5. VALIDATE -> read-only on-disk re-check of the produced package (rc 0).
+TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1 \
+python3 scripts/validate_operator_review_package.py \
+  --out-dir "$PILOT/out/review_package"
+```
+
+`--resume` writes **`$PILOT/out/review_package/`** containing **`deck.pptx`**
+(native editable deck, one slide per prepared image), **`summary.json`**
+(slide / embedded-media evidence, `approved_plan.matched=true`),
+`inventory.json`, `visual_quality.json`, `workspace/`, `reports/`, and a
+`README.md`; `validate_operator_review_package.py` re-checks it read-only.
+
+Where each named artifact lands:
+
+| Artifact | Path | Written by |
+| --- | --- | --- |
+| `filename_mapping.json` | `$PILOT/prepared/filename_mapping.json` | step 1 — `--prepare-images-only` |
+| `manifest.json` / `generated_provenance.json` | `$PILOT/templates/` | step 2 — `--templates-only` |
+| `approved_plan.json` | `$PILOT/out/approved_plan.json` | step 3 — `--plan` |
+| `summary.json`, `deck.pptx` | `$PILOT/out/review_package/` | step 4 — `--resume` |
+
+Clean up when done: `rm -rf "$PILOT"`. Local-only — no D-One, MCP, Qoder,
+public network, model API, image search, or telemetry, and nothing is written
+under the repo tree. Real D-One remains UNVERIFIED.
+
 ### Normal (one command)
 
 ```bash

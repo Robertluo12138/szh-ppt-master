@@ -56,7 +56,11 @@ up front with `scripts/operator_images_to_review_package.py
 --prepare-images-only`, which copies them into a fresh `images/` under stable
 `image_ref`-valid filenames (`^[a-z][a-z0-9_]*$`) plus an inspectable
 `filename_mapping.json`, then feed the prepared folder into the one-command /
-`--plan` / `--templates-only` flow.
+`--plan` / `--templates-only` flow. A copy-paste runbook for this complete
+messy-folder -> validated-package chain (prepare -> templates -> plan -> resume
+-> validate) is in
+[`core-image-to-editable-ppt-quickstart.md`](core-image-to-editable-ppt-quickstart.md)
+under *Full pilot: messy generated folder -> validated package*.
 
 ## Non-Blocking TODOs
 
