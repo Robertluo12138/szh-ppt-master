@@ -38,6 +38,14 @@ WHAT GETS CHECKED
         ``rc`` values / ``inventory.ok`` / ``inventory.findings_empty`` /
         ``visual_quality.error_count == 0`` / every
         ``image_provenance[*].placement_verified == True``.
+      - Every ``image_provenance[*].chosen_layout`` is a known
+        operator layout (``cover`` / ``section_divider``) AND agrees
+        with the produced ``workspace/deck_plan.json`` slide layout,
+        the matching ``workspace/render_models/<idx>_<layout>.json``
+        file, and the placement_role -> layout rule (``local_region``
+        -> ``section_divider``, else ``cover``) — a tampered summary
+        whose reported layout / role conflicts with the approved plan
+        or the render_models is refused.
       - Re-runs the existing ``validate_pptx_contract.py
         --expected-slide-count`` and ``inspect_pptx_inventory.py``
         validators against the on-disk ``deck.pptx`` and confirms the
@@ -108,6 +116,21 @@ _EXPECTED_SIDECAR_GENERATOR_SOURCES: frozenset[str] = frozenset({
 _EXPECTED_SIDECAR_PLACEMENT_ROLES: frozenset[str] = frozenset({
     "hero_page", "local_region",
 })
+# The two editable layouts the operator-image lane assigns (one per
+# image) and the placement_role -> layout rule the role-aware fixture
+# builder applies: ``local_region`` -> ``section_divider``, every other
+# role (and the no-sidecar default) -> ``cover``. Mirrored here so the
+# validator can refuse a summary whose reported ``chosen_layout``
+# disagrees with the declared ``placement_role`` OR with the produced
+# deck_plan / render_models in the package's workspace.
+_KNOWN_OPERATOR_LAYOUTS: frozenset[str] = frozenset({
+    "cover", "section_divider",
+})
+_ROLE_TO_LAYOUT: dict[str, str] = {
+    "local_region": "section_divider",
+    "hero_page": "cover",
+}
+_DEFAULT_LAYOUT = "cover"
 _EXPECTED_SIDECAR_TEXT_POLICIES: frozenset[str] = frozenset({
     "no_text", "decorative_glyphs", "caption_safe",
 })
@@ -515,6 +538,20 @@ def _check_summary(summary: Any, out_dir: Path) -> list[str]:
                     f"summary.image_provenance[{i}].placement_verified="
                     f"{placement!r}; expected True"
                 )
+            chosen_layout = entry.get("chosen_layout")
+            # ``isinstance`` short-circuits BEFORE the membership test so
+            # a tampered non-string (e.g. a list / dict) is refused
+            # rather than raising ``TypeError: unhashable type`` on the
+            # ``in`` against the frozenset — fail closed, never crash.
+            if (
+                not isinstance(chosen_layout, str)
+                or chosen_layout not in _KNOWN_OPERATOR_LAYOUTS
+            ):
+                failures.append(
+                    f"summary.image_provenance[{i}].chosen_layout="
+                    f"{chosen_layout!r}; expected one of "
+                    f"{sorted(_KNOWN_OPERATOR_LAYOUTS)!r}"
+                )
 
     # approved_plan: the helper's truth-checker enforces this field
     # before writing summary.json, so a tampered post-helper edit
@@ -637,8 +674,16 @@ def _check_summary(summary: Any, out_dir: Path) -> list[str]:
                 for i, entry in enumerate(prov):
                     if not isinstance(entry, dict):
                         continue
+                    # Each sidecar enum check short-circuits on a
+                    # non-string BEFORE the frozenset membership so a
+                    # tampered list / dict value is refused rather than
+                    # raising TypeError: unhashable type — fail closed,
+                    # never crash.
                     gs = entry.get("generator_source")
-                    if gs not in _EXPECTED_SIDECAR_GENERATOR_SOURCES:
+                    if (
+                        not isinstance(gs, str)
+                        or gs not in _EXPECTED_SIDECAR_GENERATOR_SOURCES
+                    ):
                         failures.append(
                             f"summary.image_provenance[{i}]."
                             f"generator_source={gs!r}; expected one "
@@ -653,21 +698,30 @@ def _check_summary(summary: Any, out_dir: Path) -> list[str]:
                             f"non-empty string"
                         )
                     pr = entry.get("placement_role")
-                    if pr not in _EXPECTED_SIDECAR_PLACEMENT_ROLES:
+                    if (
+                        not isinstance(pr, str)
+                        or pr not in _EXPECTED_SIDECAR_PLACEMENT_ROLES
+                    ):
                         failures.append(
                             f"summary.image_provenance[{i}]."
                             f"placement_role={pr!r}; expected one of "
                             f"{sorted(_EXPECTED_SIDECAR_PLACEMENT_ROLES)!r}"
                         )
                     tp = entry.get("text_policy")
-                    if tp not in _EXPECTED_SIDECAR_TEXT_POLICIES:
+                    if (
+                        not isinstance(tp, str)
+                        or tp not in _EXPECTED_SIDECAR_TEXT_POLICIES
+                    ):
                         failures.append(
                             f"summary.image_provenance[{i}]."
                             f"text_policy={tp!r}; expected one of "
                             f"{sorted(_EXPECTED_SIDECAR_TEXT_POLICIES)!r}"
                         )
                     sd = entry.get("subject_domain")
-                    if sd not in _EXPECTED_SIDECAR_SUBJECT_DOMAINS:
+                    if (
+                        not isinstance(sd, str)
+                        or sd not in _EXPECTED_SIDECAR_SUBJECT_DOMAINS
+                    ):
                         failures.append(
                             f"summary.image_provenance[{i}]."
                             f"subject_domain={sd!r}; expected one of "
@@ -794,6 +848,115 @@ def _check_visual_quality(report: Any, summary: dict) -> list[str]:
             f"summary.visual_quality.error_count={s_err!r} differs from "
             f"visual_quality.totals.errors={errors!r}"
         )
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Layout / placement_role cross-check against the produced plan.
+# ---------------------------------------------------------------------------
+
+
+def _check_layout_vs_plan(summary: dict, out_dir: Path) -> list[str]:
+    """Fail closed when a summary's reported per-image ``chosen_layout``
+    / ``placement_role`` conflicts with the editable layout the deck
+    actually used. Each ``image_provenance`` row is cross-checked
+    against three independent ground-truth signals inside the package's
+    ``workspace/``:
+
+      1. ``deck_plan.json`` — the approved / active plan: its
+         ``slides[index].layout`` must equal the row's ``chosen_layout``.
+      2. ``render_models/<idx:02d>_<chosen_layout>.json`` — the actual
+         render model the exporter consumed: a file with that layout
+         name must exist, so a tampered layout pointing at a model the
+         deck never built is refused.
+      3. the placement_role -> layout rule (``local_region`` ->
+         ``section_divider``, else ``cover``) — applied only when the
+         row declares a sidecar ``placement_role``; the no-sidecar
+         default carries none.
+
+    Read-only: opens the workspace artifacts the helper already wrote;
+    never mutates the package."""
+    failures: list[str] = []
+    prov = summary.get("image_provenance")
+    if not isinstance(prov, list):
+        return failures
+
+    workspace = out_dir / "workspace"
+    plan_layout_by_index: dict[int, Any] = {}
+    deck_plan, err = _load_json(workspace / "deck_plan.json")
+    if err is not None:
+        failures.append(
+            f"cannot read workspace/deck_plan.json for the "
+            f"chosen_layout cross-check: {err}"
+        )
+    elif isinstance(deck_plan, dict):
+        # A tampered deck_plan whose ``slides`` is not a list (e.g. an
+        # int) must not crash the ``for`` — coerce a non-list to empty
+        # and let the per-row deck_plan-agreement check fail closed.
+        slides = deck_plan.get("slides")
+        for slide in slides if isinstance(slides, list) else []:
+            if (
+                isinstance(slide, dict)
+                and isinstance(slide.get("index"), int)
+                and not isinstance(slide.get("index"), bool)
+            ):
+                plan_layout_by_index[slide["index"]] = slide.get("layout")
+    else:
+        failures.append(
+            "workspace/deck_plan.json did not decode as a JSON object; "
+            "cannot cross-check chosen_layout"
+        )
+
+    render_dir = workspace / "render_models"
+    for i, entry in enumerate(prov):
+        if not isinstance(entry, dict):
+            continue
+        # Every signal below tolerates arbitrary tampered JSON types
+        # without raising: a non-string layout / role would otherwise
+        # raise ``TypeError: unhashable type`` against the frozenset /
+        # dict lookups, and a non-int index would crash the deck_plan
+        # ``.get`` and the f-string format. Each guard fails closed
+        # (skips the cross-check) and leaves the presence / enum refusal
+        # to _check_summary, so the run still exits non-zero — never with
+        # a traceback.
+        layout = entry.get("chosen_layout")
+        if (
+            not isinstance(layout, str)
+            or layout not in _KNOWN_OPERATOR_LAYOUTS
+        ):
+            # Presence / enum is already gated in _check_summary; skip
+            # the cross-check rather than double-reporting the same row.
+            continue
+        idx = entry.get("intended_slide_index")
+        if isinstance(idx, int) and not isinstance(idx, bool):
+            # (1) deck_plan agreement.
+            plan_layout = plan_layout_by_index.get(idx)
+            if plan_layout != layout:
+                failures.append(
+                    f"summary.image_provenance[{i}].chosen_layout="
+                    f"{layout!r} conflicts with workspace/deck_plan.json "
+                    f"slide index={idx!r} layout={plan_layout!r}"
+                )
+            # (2) render_model on disk for the claimed layout.
+            rm = render_dir / f"{idx:02d}_{layout}.json"
+            if not rm.is_file() or rm.is_symlink():
+                failures.append(
+                    f"summary.image_provenance[{i}].chosen_layout="
+                    f"{layout!r} has no matching render_model at "
+                    f"workspace/render_models/{rm.name}"
+                )
+        # (3) placement_role -> layout rule (sidecar rows only). A
+        # non-string role is left to _check_summary's sidecar / absent-
+        # leak gates; here it just skips the rule check.
+        role = entry.get("placement_role")
+        if isinstance(role, str):
+            expected = _ROLE_TO_LAYOUT.get(role, _DEFAULT_LAYOUT)
+            if layout != expected:
+                failures.append(
+                    f"summary.image_provenance[{i}] placement_role="
+                    f"{role!r} expects chosen_layout={expected!r} but "
+                    f"the row reports chosen_layout={layout!r}"
+                )
     return failures
 
 
@@ -996,6 +1159,7 @@ def _validate_package(out_dir: Path) -> _ValidationResult:
 
     if isinstance(summary, dict):
         failures.extend(_check_summary(summary, out_dir))
+        failures.extend(_check_layout_vs_plan(summary, out_dir))
         if isinstance(inventory, dict):
             failures.extend(_check_inventory_vs_summary(inventory, summary))
         if vq_report is not None:
@@ -1717,6 +1881,250 @@ def _run_self_tests() -> int:
                     for f in result.failures
                 ),
                 f"failures={result.failures[:3]!r}",
+            ))
+
+    # T24 — role-aware layout surfacing. A review package built from a
+    # bundle whose sidecar marks one image hero_page and one
+    # local_region must SHOW, per image, the editable layout it landed
+    # on: hero_page -> cover, local_region -> section_divider. Surfaced
+    # in both summary.image_provenance[].chosen_layout AND the README's
+    # "Where each image landed" section. Acceptance for the image-role
+    # layout decision surfacing.
+    with tempfile.TemporaryDirectory(prefix="op-review-T24-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(
+            td, include_generated_provenance=True,
+        )
+        if not ok:
+            results.append(_ProbeResult(
+                "T24 layout-surface setup", False, detail,
+            ))
+        else:
+            result = _validate_package(out_dir)
+            summary = json.loads(
+                (out_dir / "summary.json").read_text(),
+            )
+            by_role = {
+                p.get("placement_role"): p.get("chosen_layout")
+                for p in summary.get("image_provenance") or []
+                if isinstance(p, dict)
+            }
+            landed_ok = (
+                by_role.get("hero_page") == "cover"
+                and by_role.get("local_region") == "section_divider"
+            )
+            readme = (out_dir / "README.md").read_text(encoding="utf-8")
+            readme_ok = (
+                "Where each image landed" in readme
+                and "layout `cover`" in readme
+                and "layout `section_divider`" in readme
+            )
+            results.append(_ProbeResult(
+                "T24 role-aware layout surfaced: hero_page -> cover, "
+                "local_region -> section_divider in summary + README",
+                result.ok and landed_ok and readme_ok,
+                f"by_role={by_role!r}; readme_ok={readme_ok}; "
+                + ("first failures: " + "; ".join(result.failures[:3])
+                   if not result.ok else ""),
+            ))
+
+    # T25 — chosen_layout conflicting with the produced deck_plan /
+    # render_models — refused. Flipping the hero_page row's
+    # chosen_layout to section_divider (without moving the real slide)
+    # must fail closed: the deck_plan slide and the render_model on disk
+    # still name the cover layout. Acceptance #3 (vs render_models /
+    # approved plan).
+    with tempfile.TemporaryDirectory(prefix="op-review-T25-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(
+            td, include_generated_provenance=True,
+        )
+        if not ok:
+            results.append(_ProbeResult(
+                "T25 layout-conflict setup", False, detail,
+            ))
+        else:
+            summary_path = out_dir / "summary.json"
+            data = json.loads(summary_path.read_text())
+            for p in data["image_provenance"]:
+                if p.get("placement_role") == "hero_page":
+                    p["chosen_layout"] = "section_divider"
+            summary_path.write_text(
+                json.dumps(data, indent=2, sort_keys=True) + "\n",
+            )
+            result = _validate_package(out_dir)
+            results.append(_ProbeResult(
+                "T25 chosen_layout conflicting with deck_plan / "
+                "render_models refused",
+                (not result.ok)
+                and any(
+                    "conflicts with workspace/deck_plan.json" in f
+                    or "no matching render_model" in f
+                    for f in result.failures
+                ),
+                f"failures={result.failures[:4]!r}",
+            ))
+
+    # T26 — placement_role conflicting with chosen_layout — refused.
+    # Flipping the local_region row's placement_role to hero_page leaves
+    # its real chosen_layout at section_divider, so the locked
+    # role -> layout rule (hero_page expects cover) no longer holds.
+    # Acceptance #3 (the role-conflict half).
+    with tempfile.TemporaryDirectory(prefix="op-review-T26-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(
+            td, include_generated_provenance=True,
+        )
+        if not ok:
+            results.append(_ProbeResult(
+                "T26 role-conflict setup", False, detail,
+            ))
+        else:
+            summary_path = out_dir / "summary.json"
+            data = json.loads(summary_path.read_text())
+            for p in data["image_provenance"]:
+                if p.get("placement_role") == "local_region":
+                    p["placement_role"] = "hero_page"
+            summary_path.write_text(
+                json.dumps(data, indent=2, sort_keys=True) + "\n",
+            )
+            result = _validate_package(out_dir)
+            results.append(_ProbeResult(
+                "T26 placement_role conflicting with chosen_layout "
+                "refused",
+                (not result.ok)
+                and any(
+                    "placement_role" in f and "expects chosen_layout" in f
+                    for f in result.failures
+                ),
+                f"failures={result.failures[:4]!r}",
+            ))
+
+    # T27 — no-sidecar default still surfaces chosen_layout=cover for
+    # every image AND validates rc=0. Guards that the layout surfacing
+    # is purely additive on the default path (acceptance #4: existing
+    # no-mapping / default behavior still passes).
+    with tempfile.TemporaryDirectory(prefix="op-review-T27-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(td)
+        if not ok:
+            results.append(_ProbeResult(
+                "T27 default-layout setup", False, detail,
+            ))
+        else:
+            result = _validate_package(out_dir)
+            summary = json.loads(
+                (out_dir / "summary.json").read_text(),
+            )
+            prov = summary.get("image_provenance") or []
+            all_cover = bool(prov) and all(
+                isinstance(p, dict)
+                and p.get("chosen_layout") == "cover"
+                and p.get("placement_role") is None
+                for p in prov
+            )
+            results.append(_ProbeResult(
+                "T27 no-sidecar default: every image surfaces "
+                "chosen_layout=cover (no placement_role) and validates "
+                "rc=0",
+                result.ok and all_cover,
+                f"all_cover={all_cover}; "
+                + ("first failures: " + "; ".join(result.failures[:3])
+                   if not result.ok else ""),
+            ))
+
+    # T28 — fail-closed on tampered non-string / non-hashable field
+    # types. A summary whose chosen_layout / intended_slide_index /
+    # placement_role is a list (or other unhashable) must be REFUSED
+    # with diagnostics, never crash the validator with an uncaught
+    # TypeError on a frozenset membership or dict lookup. Locks the
+    # layout cross-check's tamper handling against regression.
+    with tempfile.TemporaryDirectory(prefix="op-review-T28-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(td)
+        if not ok:
+            results.append(_ProbeResult(
+                "T28 type-tamper setup", False, detail,
+            ))
+        else:
+            summary_path = out_dir / "summary.json"
+            base = json.loads(summary_path.read_text())
+            probe_ok = True
+            note = ""
+            for field, bad in (
+                ("chosen_layout", ["cover"]),
+                ("intended_slide_index", [1, 2]),
+                ("placement_role", ["hero_page"]),
+            ):
+                data = json.loads(json.dumps(base))
+                data["image_provenance"][0][field] = bad
+                summary_path.write_text(
+                    json.dumps(data, indent=2, sort_keys=True) + "\n",
+                )
+                try:
+                    result = _validate_package(out_dir)
+                except Exception as exc:
+                    probe_ok = False
+                    note = f"{field}={bad!r} crashed validator: {exc!r}"
+                    break
+                if result.ok:
+                    probe_ok = False
+                    note = f"{field}={bad!r} was not refused"
+                    break
+            results.append(_ProbeResult(
+                "T28 tampered non-string chosen_layout / "
+                "intended_slide_index / placement_role fails closed "
+                "(refused, no validator crash)",
+                probe_ok,
+                note,
+            ))
+
+    # T29 — sidecar enum type tamper fails closed. With a sidecar
+    # present (summary.generated_provenance set), a row whose
+    # generator_source / placement_role / text_policy / subject_domain
+    # is a list (or other non-string) must be REFUSED, never crash the
+    # validator on the frozenset membership check.
+    with tempfile.TemporaryDirectory(prefix="op-review-T29-") as raw_td:
+        td = Path(raw_td)
+        ok, detail, out_dir = _materialize_review_package(
+            td, include_generated_provenance=True,
+        )
+        if not ok:
+            results.append(_ProbeResult(
+                "T29 sidecar type-tamper setup", False, detail,
+            ))
+        else:
+            summary_path = out_dir / "summary.json"
+            base = json.loads(summary_path.read_text())
+            probe_ok = True
+            note = ""
+            for field in (
+                "generator_source", "placement_role",
+                "text_policy", "subject_domain",
+            ):
+                data = json.loads(json.dumps(base))
+                data["image_provenance"][0][field] = ["tampered"]
+                summary_path.write_text(
+                    json.dumps(data, indent=2, sort_keys=True) + "\n",
+                )
+                try:
+                    result = _validate_package(out_dir)
+                except Exception as exc:
+                    probe_ok = False
+                    note = (
+                        f"{field}=['tampered'] crashed validator: {exc!r}"
+                    )
+                    break
+                if result.ok:
+                    probe_ok = False
+                    note = f"{field}=['tampered'] was not refused"
+                    break
+            results.append(_ProbeResult(
+                "T29 sidecar enum type tamper (generator_source / "
+                "placement_role / text_policy / subject_domain as a "
+                "list) fails closed (refused, no validator crash)",
+                probe_ok,
+                note,
             ))
 
     rc = 0

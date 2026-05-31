@@ -285,10 +285,15 @@ verbatim — the helper's load-bearing operator-facing output):
     "operator_filename", "asset_id", "sha256",
     "workspace_local_path", "workspace_destination_path",
     "media_type", "byte_count", "embedded_media_parts",
-    "intended_slide_index", "embedded_referencing_slides",
+    "intended_slide_index", "chosen_layout",
+    "embedded_referencing_slides",
     "placement_verified" }``, plus (only when ``--manifest`` was
     supplied) ``operator_slide_title``, ``operator_alt_text``,
-    ``operator_intended_use``. The ``embedded_media_parts`` field is
+    ``operator_intended_use``. ``chosen_layout`` is the editable
+    layout the deck_plan assigned to this image (``cover`` or
+    ``section_divider``), surfaced so a reviewer sees where each
+    image landed (local_region -> section_divider accent, else a
+    cover slide) without opening the deck. The ``embedded_media_parts`` field is
     the sorted list of ``ppt/media/*`` parts whose sha256 equals the
     operator file's sha256, so a reviewer can trace each operator
     filename straight to its embedded PPTX part.
@@ -2642,8 +2647,15 @@ def _validate_generated_provenance_sidecar(
         else:
             cleaned["filename"] = filename
 
+        # Each enum check short-circuits on a non-string BEFORE the
+        # frozenset membership so a tampered list / dict sidecar value
+        # is refused at GP9 with rc 2 rather than raising TypeError:
+        # unhashable type — fail closed, never crash.
         generator_source = entry.get("generator_source")
-        if generator_source not in _SIDECAR_ALLOWED_GENERATOR_SOURCES:
+        if (
+            not isinstance(generator_source, str)
+            or generator_source not in _SIDECAR_ALLOWED_GENERATOR_SOURCES
+        ):
             failures.append(
                 f"generated_provenance sidecar entries[{idx}]."
                 f"generator_source={generator_source!r}; expected one "
@@ -2655,7 +2667,10 @@ def _validate_generated_provenance_sidecar(
             cleaned["generator_source"] = generator_source
 
         placement_role = entry.get("placement_role")
-        if placement_role not in _SIDECAR_ALLOWED_PLACEMENT_ROLES:
+        if (
+            not isinstance(placement_role, str)
+            or placement_role not in _SIDECAR_ALLOWED_PLACEMENT_ROLES
+        ):
             failures.append(
                 f"generated_provenance sidecar entries[{idx}]."
                 f"placement_role={placement_role!r}; expected one of "
@@ -2666,7 +2681,10 @@ def _validate_generated_provenance_sidecar(
             cleaned["placement_role"] = placement_role
 
         text_policy = entry.get("text_policy")
-        if text_policy not in _SIDECAR_ALLOWED_TEXT_POLICIES:
+        if (
+            not isinstance(text_policy, str)
+            or text_policy not in _SIDECAR_ALLOWED_TEXT_POLICIES
+        ):
             failures.append(
                 f"generated_provenance sidecar entries[{idx}]."
                 f"text_policy={text_policy!r}; expected one of "
@@ -2677,7 +2695,10 @@ def _validate_generated_provenance_sidecar(
             cleaned["text_policy"] = text_policy
 
         subject_domain = entry.get("subject_domain")
-        if subject_domain not in _SIDECAR_ALLOWED_SUBJECT_DOMAINS:
+        if (
+            not isinstance(subject_domain, str)
+            or subject_domain not in _SIDECAR_ALLOWED_SUBJECT_DOMAINS
+        ):
             failures.append(
                 f"generated_provenance sidecar entries[{idx}]."
                 f"subject_domain={subject_domain!r}; expected one of "
@@ -3266,6 +3287,19 @@ _DEFAULT_SIDECAR_PLACEMENT_ROLE = "local_region"
 _DEFAULT_SIDECAR_TEXT_POLICY = "no_text"
 _DEFAULT_SIDECAR_SUBJECT_DOMAIN = "abstract_marker"
 
+# The two editable layouts the operator-image lane ever assigns, one per
+# image. The role-aware fixture builder picks between them from the
+# generated-provenance sidecar's placement_role: ``local_region`` ->
+# ``section_divider`` (image in that layout's accent slot beside a
+# section title); every other role AND the no-sidecar default -> the
+# ``cover`` slide. The summary surfaces the assigned layout per image as
+# ``image_provenance[].chosen_layout`` (read back from the produced
+# deck_plan — the ground truth — not re-derived) so a reviewer sees
+# where each input image landed without opening the deck.
+_OPERATOR_IMAGE_LAYOUTS: frozenset[str] = frozenset({
+    "cover", "section_divider",
+})
+
 
 def _default_slide_title(image: _DiscoveredImage) -> str:
     return _cover_title_for(image)
@@ -3597,10 +3631,40 @@ def _author_source_registry(
     return registry_path
 
 
+def _layout_by_index_from_deck_plan(workspace: Path) -> dict[int, str]:
+    """Read the produced ``<workspace>/deck_plan.json`` and return a
+    ``{1-based slide index: layout}`` map. The deck_plan is the ground
+    truth the pipeline already built and validated, so the summary
+    surfaces ``chosen_layout`` straight from it rather than re-deriving
+    the placement_role -> layout rule (the rule lives once, in the
+    role-aware fixture builder). Returns an empty map when the file is
+    absent or malformed; the summary truth-checker then refuses the run
+    because some row would carry no known ``chosen_layout``."""
+    deck_plan = workspace / "deck_plan.json"
+    try:
+        body = json.loads(deck_plan.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(body, dict):
+        return {}
+    out: dict[int, str] = {}
+    slides = body.get("slides")
+    for slide in slides if isinstance(slides, list) else []:
+        if (
+            isinstance(slide, dict)
+            and isinstance(slide.get("index"), int)
+            and not isinstance(slide.get("index"), bool)
+            and isinstance(slide.get("layout"), str)
+        ):
+            out[slide["index"]] = slide["layout"]
+    return out
+
+
 def _provenance_for(
     *,
     image: _DiscoveredImage,
     intended_slide_index: int,
+    chosen_layout: str | None,
     pptx_media_shas: dict[str, list[str]],
     part_to_referencing_slides: dict[str, list[int]],
     sidecar_entry: dict | None = None,
@@ -3627,6 +3691,15 @@ def _provenance_for(
     the truth-checker — ``placement_verified`` is the precomputed
     boolean a reviewer can read off the JSON without redoing the set
     membership test.
+
+    ``chosen_layout`` is the editable layout the deck_plan assigned to
+    this operator image (``cover`` or ``section_divider``), read back
+    from the produced deck_plan by the caller rather than re-derived
+    here, so a reviewer sees where the image landed (hero / cover page
+    vs section_divider accent) without opening the deck. It is the
+    ground-truth counterpart to the sidecar's declared
+    ``placement_role`` below; the review-package validator refuses a
+    summary whose two disagree.
 
     The ``operator_slide_title`` / ``operator_alt_text`` /
     ``operator_intended_use`` keys are present iff the operator
@@ -3657,6 +3730,7 @@ def _provenance_for(
         ),
         "embedded_media_parts": embedded_media_parts,
         "intended_slide_index": intended_slide_index,
+        "chosen_layout": chosen_layout,
         "embedded_referencing_slides": embedded_referencing_slides,
         "placement_verified": (
             intended_slide_index in ref_slides
@@ -3891,6 +3965,10 @@ def _build_summary(
     part_to_referencing_slides = (
         _part_to_blip_referencing_slides_from_inventory(inventory)
     )
+    # Ground-truth layout per 1-based slide index, read back from the
+    # produced deck_plan so each provenance row can surface the editable
+    # layout the image actually landed on without re-deriving the rule.
+    layout_by_index = _layout_by_index_from_deck_plan(workspace)
     sidecar_by_filename: dict[str, dict] = {}
     if sidecar_entries is not None:
         for entry in sidecar_entries:
@@ -3941,6 +4019,7 @@ def _build_summary(
             _provenance_for(
                 image=img,
                 intended_slide_index=idx,
+                chosen_layout=layout_by_index.get(idx),
                 pptx_media_shas=pptx_media_shas,
                 part_to_referencing_slides=part_to_referencing_slides,
                 sidecar_entry=sidecar_by_filename.get(
@@ -4201,6 +4280,19 @@ def _check_summary_truth(summary: dict) -> list[str]:
                     f"intended_slide_index in "
                     f"embedded_referencing_slides)"
                 )
+            chosen_layout = entry.get("chosen_layout")
+            if (
+                not isinstance(chosen_layout, str)
+                or chosen_layout not in _OPERATOR_IMAGE_LAYOUTS
+            ):
+                failures.append(
+                    f"summary.image_provenance[{i}] for "
+                    f"{entry.get('operator_filename')!r} has "
+                    f"chosen_layout={chosen_layout!r}; expected one of "
+                    f"{sorted(_OPERATOR_IMAGE_LAYOUTS)!r} (the editable "
+                    f"layout the deck_plan assigned to this operator "
+                    f"image: local_region -> section_divider, else cover)"
+                )
 
     # manifest_path is required to be present in the summary record
     # (either a non-empty string when --manifest was supplied, or None
@@ -4385,8 +4477,16 @@ def _check_summary_truth(summary: dict) -> list[str]:
                 for i, entry in enumerate(prov):
                     if not isinstance(entry, dict):
                         continue
+                    # Each enum check short-circuits on a non-string
+                    # BEFORE the frozenset membership so a tampered list
+                    # / dict value is refused rather than raising
+                    # TypeError: unhashable type — mirrors the
+                    # review-package validator's guarded gate.
                     gs = entry.get("generator_source")
-                    if gs not in _SIDECAR_ALLOWED_GENERATOR_SOURCES:
+                    if (
+                        not isinstance(gs, str)
+                        or gs not in _SIDECAR_ALLOWED_GENERATOR_SOURCES
+                    ):
                         failures.append(
                             f"summary.image_provenance[{i}]."
                             f"generator_source={gs!r}; expected one "
@@ -4402,7 +4502,10 @@ def _check_summary_truth(summary: dict) -> list[str]:
                             f"non-empty string (sidecar supplied)"
                         )
                     pr = entry.get("placement_role")
-                    if pr not in _SIDECAR_ALLOWED_PLACEMENT_ROLES:
+                    if (
+                        not isinstance(pr, str)
+                        or pr not in _SIDECAR_ALLOWED_PLACEMENT_ROLES
+                    ):
                         failures.append(
                             f"summary.image_provenance[{i}]."
                             f"placement_role={pr!r}; expected one of "
@@ -4410,7 +4513,10 @@ def _check_summary_truth(summary: dict) -> list[str]:
                             f"(sidecar supplied)"
                         )
                     tp = entry.get("text_policy")
-                    if tp not in _SIDECAR_ALLOWED_TEXT_POLICIES:
+                    if (
+                        not isinstance(tp, str)
+                        or tp not in _SIDECAR_ALLOWED_TEXT_POLICIES
+                    ):
                         failures.append(
                             f"summary.image_provenance[{i}]."
                             f"text_policy={tp!r}; expected one of "
@@ -4418,7 +4524,10 @@ def _check_summary_truth(summary: dict) -> list[str]:
                             f"(sidecar supplied)"
                         )
                     sd = entry.get("subject_domain")
-                    if sd not in _SIDECAR_ALLOWED_SUBJECT_DOMAINS:
+                    if (
+                        not isinstance(sd, str)
+                        or sd not in _SIDECAR_ALLOWED_SUBJECT_DOMAINS
+                    ):
                         failures.append(
                             f"summary.image_provenance[{i}]."
                             f"subject_domain={sd!r}; expected one of "
@@ -4549,6 +4658,39 @@ def _render_review_readme(summary: dict) -> str:
             "same `path`, `sha256`, and `matched: true` evidence).",
             "",
         ]
+    # Per-image landing view — always present (both the sidecar and the
+    # no-sidecar default path) so a reviewer sees where each input image
+    # landed: the filename the helper embedded, its asset id, the
+    # declared placement_role (or the default note when no sidecar was
+    # supplied), the 1-based slide, the editable layout the deck_plan
+    # assigned (cover / section_divider), and the embedded local
+    # `ppt/media/*` part(s). The role -> layout rule matches the
+    # deck.pptx bullet below.
+    landing_block: list[str] = [
+        "## Where each image landed",
+        "",
+        "One slide per operator image. When a generated-provenance "
+        "sidecar is supplied, `placement_role` picks the editable "
+        "layout: `local_region` -> `section_divider` (accent beside a "
+        "section title), every other role -> `cover`; the no-sidecar "
+        "default lands every image on a `cover` slide. Each image "
+        "embeds as a local `ppt/media/*` part byte-for-byte.",
+        "",
+    ]
+    for entry in prov:
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("placement_role")
+        role_str = role if role is not None else "default (no sidecar)"
+        parts = entry.get("embedded_media_parts") or []
+        landing_block.append(
+            f"- slide {entry.get('intended_slide_index')} -> layout "
+            f"`{entry.get('chosen_layout')}`; placement_role "
+            f"`{role_str}`; `{entry.get('operator_filename')}` "
+            f"(asset id `{entry.get('asset_id')}`) embedded "
+            f"`{', '.join(parts)}` (`{entry.get('media_type')}`)"
+        )
+    landing_block.append("")
     lines = [
         "# Operator local-images review package",
         "",
@@ -4560,6 +4702,7 @@ def _render_review_readme(summary: dict) -> str:
         "",
         manifest_line,
         "",
+        *landing_block,
         *generated_provenance_block,
         *approved_plan_block,
         "## Files in this review package",
@@ -11573,30 +11716,51 @@ def _run_self_tests() -> int:
             f"rc={rc}, out_dir_exists={out_dir.exists()}",
         ))
 
-    # GP-UNSAFE-ENUM sidecar entry carries an out-of-vocab
-    # placement_role. GP9 refuses with rc 2.
+    # GP-UNSAFE-ENUM sidecar entry carries an out-of-vocab OR wrong-type
+    # placement_role. GP9 refuses with rc 2 for both — crucially a
+    # non-string (list / dict) value must fail closed at the enum check,
+    # never raise TypeError: unhashable type and crash the helper.
     with tempfile.TemporaryDirectory(prefix="op-helper-GP-U-E-") as raw_td:
         td = Path(raw_td)
-        bundle = td / "bundle"
-        bundle.mkdir()
-        _write_synthetic_images(bundle / "images")
-        sidecar = bundle / "generated_provenance.json"
-        body = _make_sidecar_body(("alpha_marker.png", "beta_marker.jpg"))
-        body["entries"][0]["placement_role"] = "billboard"
-        sidecar.write_text(
-            json.dumps(body) + "\n", encoding="utf-8",
-        )
-        out_dir = td / "out"
-        rc = main([
-            "--bundle", str(bundle), "--out-dir", str(out_dir),
-        ])
-        ok = rc == 2 and not out_dir.exists()
+        probe_ok = True
+        note = ""
+        for i, (label, bad) in enumerate((
+            ("out-of-vocab string", "billboard"),
+            ("non-string list", ["hero_page"]),
+        )):
+            bundle = td / f"bundle{i}"
+            bundle.mkdir()
+            _write_synthetic_images(bundle / "images")
+            sidecar = bundle / "generated_provenance.json"
+            body = _make_sidecar_body(
+                ("alpha_marker.png", "beta_marker.jpg"),
+            )
+            body["entries"][0]["placement_role"] = bad
+            sidecar.write_text(
+                json.dumps(body) + "\n", encoding="utf-8",
+            )
+            out_dir = td / f"out{i}"
+            try:
+                rc = main([
+                    "--bundle", str(bundle), "--out-dir", str(out_dir),
+                ])
+            except Exception as exc:
+                probe_ok = False
+                note = f"{label} crashed main(): {exc!r}"
+                break
+            if not (rc == 2 and not out_dir.exists()):
+                probe_ok = False
+                note = (
+                    f"{label}: rc={rc}, "
+                    f"out_dir_exists={out_dir.exists()}"
+                )
+                break
         results.append(_ProbeResult(
-            "GP-UNSAFE-ENUM sidecar entry with an out-of-vocab "
-            "placement_role is refused (GP9) with rc 2 and no "
-            "--out-dir artifact materialised",
-            ok,
-            f"rc={rc}, out_dir_exists={out_dir.exists()}",
+            "GP-UNSAFE-ENUM sidecar entry with an out-of-vocab OR "
+            "non-string placement_role is refused (GP9) with rc 2, no "
+            "--out-dir artifact, and no helper crash",
+            probe_ok,
+            note,
         ))
 
     # GP-UNSAFE-CD sidecar carries an unsafe custom_descriptor (mixed
