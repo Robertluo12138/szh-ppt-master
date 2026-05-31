@@ -72,6 +72,24 @@ Edit the two files, then pass them back via `--manifest` / `--generated-provenan
 
 **Boundary:** local-only — no D-One, no MCP / Qoder, no model API, no image search, no public network, no telemetry. See [`references/core-image-to-editable-ppt-quickstart.md`](references/core-image-to-editable-ppt-quickstart.md) for the full flag surface (`--bundle`, `--manifest`, `--plan-out`, `--approved-plan`, the provenance sidecar) and [`references/operator-image-folder-pilot-readiness.md`](references/operator-image-folder-pilot-readiness.md) for the two-step human-review checkpoint and pilot status.
 
+## Markdown source → image request plan (front-end bridge)
+
+A narrow, local-only **front-end bridge** that moves one step earlier than the operator image lane: a Markdown source document → an **image request plan** → (mock/local) placeholder images → the existing operator image-to-editable-PPT lane. It is a *bridge, not full report-to-PPT automation*: it derives one image request per ATX heading, never extracts business content from the source body, and never performs real image generation.
+
+```bash
+# Plan only: Markdown -> image_request_plan.json
+python3 scripts/source_to_image_requests.py \
+  --source examples/source_to_image_requests/sample_report.md \
+  --plan-out /tmp/image_request_plan.json
+
+# Mock/local handoff: plan + byte-distinct placeholder PNGs -> validated review package
+python3 scripts/source_to_image_requests.py \
+  --source examples/source_to_image_requests/sample_report.md \
+  --mock-handoff --out-dir /tmp/s2ir_out      # fresh dir, outside the repo
+```
+
+`scripts/source_to_image_requests.py` writes a schema-validated `image_request_plan.json` (one entry per heading: `slide_title` / `alt_text` / `image_descriptor` / `placement_role` / `intended_use` + structural heading traceability) against `schemas/image_request_plan.schema.json`. The whole source is scanned and **refused on any credential / public-network / file-URI / absolute-path wording and on credential value shapes** (AWS-style keys, PEM blocks, bearer / key-value secrets — via the shared `verify_skill_package.CREDENTIAL_PATTERNS` detector); the downstream filename + heading titles are re-scanned after sanitisation through a gate that is the **union of this bridge's deny-list, the credential-shape detector, and the operator lane's own `_safe_manifest_string` contract**, so the bridge's safety gate is **provably no weaker than the operator review-package contract** (it inherits the operator's OpenAI-key / upload-share-hosting / social-media / public-share-regex / confidential-customer / positive-real-service-claim gates) and a crafted heading cannot assemble a denied token or credential shape via character stripping. In `--mock-handoff` mode it synthesises one byte-distinct placeholder PNG per request and feeds the images-only folder into `scripts/operator_local_images_to_editable_ppt.py`, producing a review package with an editable `deck.pptx` and per-image provenance (join the plan's filename↔heading with `summary.json`'s filename↔media-part↔slide). Real image generation remains UNVERIFIED / out of scope. See [`references/source-to-image-request-bridge.md`](references/source-to-image-request-bridge.md).
+
 ## Adaptive deck shape
 
 There is **no universal deck structure** and no fixed slide count. The planner decides shape from the user request and source material:

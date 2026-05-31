@@ -1,0 +1,90 @@
+{
+  "schema_version": "1",
+  "plan_id": "image_request_plan",
+  "boundary": "Local-only mock bridge. Does NOT call D-One, MCP, Qoder, a public network, telemetry, a model API, an image search, or any external service. NOT full report-to-PPT automation.",
+  "real_image_generation_status": "NOT_PERFORMED: no real image generator produced these requests' pixels. The --mock-handoff placeholders are tiny locally-synthesised raster bytes; real D-One / model-API image generation remains UNVERIFIED and out of scope for this bridge.",
+  "source": {
+    "filename": "sample_report.md",
+    "byte_count": 786,
+    "sha256": "ba7622ad3cbc0a68dc4b3b28924bcad6d358a6abb94dae202c2ca8b3ee71f46f",
+    "heading_count": 6
+  },
+  "deck": {
+    "title": "Quarterly Strategy Overview",
+    "slide_count": 6
+  },
+  "image_requests": [
+    {
+      "index": 1,
+      "image_ref": "img_01",
+      "filename": "img_01.png",
+      "slide_title": "Quarterly Strategy Overview",
+      "placement_role": "hero_page",
+      "intended_use": "hero spot illustration",
+      "alt_text": "Synthetic placeholder illustration for slide 1: Quarterly Strategy Overview",
+      "image_descriptor": "Abstract editorial spot illustration evoking the theme of 'Quarterly Strategy Overview'. Flat vector style, neutral palette. Synthetic placeholder; no real source content embedded.",
+      "source_heading_level": 1,
+      "source_heading_ordinal": 1
+    },
+    {
+      "index": 2,
+      "image_ref": "img_02",
+      "filename": "img_02.png",
+      "slide_title": "Market Landscape",
+      "placement_role": "local_region",
+      "intended_use": "spot illustration",
+      "alt_text": "Synthetic placeholder illustration for slide 2: Market Landscape",
+      "image_descriptor": "Abstract editorial spot illustration evoking the theme of 'Market Landscape'. Flat vector style, neutral palette. Synthetic placeholder; no real source content embedded.",
+      "source_heading_level": 2,
+      "source_heading_ordinal": 2
+    },
+    {
+      "index": 3,
+      "image_ref": "img_03",
+      "filename": "img_03.png",
+      "slide_title": "Product Direction",
+      "placement_role": "local_region",
+      "intended_use": "spot illustration",
+      "alt_text": "Synthetic placeholder illustration for slide 3: Product Direction",
+      "image_descriptor": "Abstract editorial spot illustration evoking the theme of 'Product Direction'. Flat vector style, neutral palette. Synthetic placeholder; no real source content embedded.",
+      "source_heading_level": 2,
+      "source_heading_ordinal": 3
+    },
+    {
+      "index": 4,
+      "image_ref": "img_04",
+      "filename": "img_04.png",
+      "slide_title": "Near-term Priorities",
+      "placement_role": "local_region",
+      "intended_use": "spot illustration",
+      "alt_text": "Synthetic placeholder illustration for slide 4: Near-term Priorities",
+      "image_descriptor": "Abstract editorial spot illustration evoking the theme of 'Near-term Priorities'. Flat vector style, neutral palette. Synthetic placeholder; no real source content embedded.",
+      "source_heading_level": 3,
+      "source_heading_ordinal": 4
+    },
+    {
+      "index": 5,
+      "image_ref": "img_05",
+      "filename": "img_05.png",
+      "slide_title": "Risks and Mitigations",
+      "placement_role": "local_region",
+      "intended_use": "spot illustration",
+      "alt_text": "Synthetic placeholder illustration for slide 5: Risks and Mitigations",
+      "image_descriptor": "Abstract editorial spot illustration evoking the theme of 'Risks and Mitigations'. Flat vector style, neutral palette. Synthetic placeholder; no real source content embedded.",
+      "source_heading_level": 2,
+      "source_heading_ordinal": 5
+    },
+    {
+      "index": 6,
+      "image_ref": "img_06",
+      "filename": "img_06.png",
+      "slide_title": "Closing Summary",
+      "placement_role": "local_region",
+      "intended_use": "spot illustration",
+      "alt_text": "Synthetic placeholder illustration for slide 6: Closing Summary",
+      "image_descriptor": "Abstract editorial spot illustration evoking the theme of 'Closing Summary'. Flat vector style, neutral palette. Synthetic placeholder; no real source content embedded.",
+      "source_heading_level": 2,
+      "source_heading_ordinal": 6
+    }
+  ]
+}

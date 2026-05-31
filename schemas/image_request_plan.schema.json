@@ -1,0 +1,178 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "image_request_plan.schema.json",
+  "title": "Image Request Plan",
+  "description": "Committed-safe contract for the source-document -> image-request bridge (scripts/source_to_image_requests.py). A Markdown source file is parsed into one image request per heading; each request carries SYNTHETIC-SAFE per-slide metadata (slide_title / alt_text / image_descriptor / placement_role / intended_use) plus structural traceability back to the heading (level + ordinal). The plan NEVER embeds raw source body text and NEVER triggers real image generation: it is a MOCK / LOCAL request plan only. real_image_generation_status is pinned to a self-describing NOT_PERFORMED sentence and the producing script refuses any source carrying credential / public-network / file-URI / absolute-path wording. This schema uses only the JSON Schema keyword subset that scripts/validate_artifacts.py implements.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "boundary",
+    "real_image_generation_status",
+    "source",
+    "deck",
+    "image_requests"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1"],
+      "description": "Plan-file schema version. Locked to '1'; bumped only with a paired emitter + schema change."
+    },
+    "plan_id": {
+      "type": "string",
+      "enum": ["image_request_plan"],
+      "description": "Self-describing record identifier so a reader scanning mixed JSON evidence recognises this plan."
+    },
+    "boundary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "description": "Fixed framing that this is a local-only mock bridge: no D-One, model API, public network, image search, or telemetry."
+    },
+    "real_image_generation_status": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "description": "Self-describing sentence pinned to NOT_PERFORMED: no real image generator produced these requests' pixels."
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "byte_count", "sha256", "heading_count"],
+      "properties": {
+        "filename": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.\\-]*$",
+          "description": "Basename of the parsed Markdown source. Identifier-safe; no path separators, URI scheme, or '..'."
+        },
+        "byte_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 67108864,
+          "description": "Byte length of the source file."
+        },
+        "sha256": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lowercase 64-char hex sha256 of the source bytes; lets a reviewer bind the plan to exact source bytes."
+        },
+        "heading_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Number of ATX Markdown headings discovered; equals len(image_requests)."
+        }
+      }
+    },
+    "deck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "slide_count"],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Deck title derived from the first top-level heading (or the source stem). Capped at the operator contract's slide_title limit."
+        },
+        "slide_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Planned slide count; equals len(image_requests) for this one-image-per-heading bridge."
+        }
+      }
+    },
+    "image_requests": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "index",
+          "image_ref",
+          "filename",
+          "slide_title",
+          "placement_role",
+          "intended_use",
+          "alt_text",
+          "image_descriptor",
+          "source_heading_level",
+          "source_heading_ordinal"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "description": "1-based request index, contiguous in heading order."
+          },
+          "image_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "description": "Render-model image_ref-safe token; also the placeholder filename stem in --mock-handoff."
+          },
+          "filename": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9_]*\\.png$",
+            "description": "Placeholder image filename the mock handoff writes (image_ref + '.png')."
+          },
+          "slide_title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "Human-readable title derived (sanitised) from the heading text. Capped at the operator contract's slide_title limit."
+          },
+          "placement_role": {
+            "type": "string",
+            "enum": ["hero_page", "local_region"],
+            "description": "Planned placement hint (first request hero_page, rest local_region). Advisory for the future real lane; the mock handoff uses the operator lane's default placement."
+          },
+          "intended_use": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "Spot-illustration / icon style note. Never 'full-slide background'. Capped at the operator contract's intended_use limit."
+          },
+          "alt_text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300,
+            "description": "Synthetic accessibility text; never raw source body. Capped at the operator contract's alt_text limit."
+          },
+          "image_descriptor": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300,
+            "description": "Synthetic, abstract descriptor for a would-be image generator. Derived only from the sanitised heading, never raw source body. Capped at the operator contract's alt_text limit (no operator manifest analog exists)."
+          },
+          "source_heading_level": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 6,
+            "description": "ATX heading depth (number of leading '#')."
+          },
+          "source_heading_ordinal": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "description": "1-based ordinal of the heading among all discovered headings; structural traceability without raw text."
+          }
+        }
+      },
+      "description": "One image request per discovered heading, in document order."
+    }
+  }
+}
