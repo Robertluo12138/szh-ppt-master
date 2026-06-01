@@ -49,6 +49,12 @@ First run (``--source S --out-dir O``):
     image_request_plan.json + a human-readable image_generation_requests.md
     + starter manifest.json / generated_provenance.json + an
     expected_images/README.md naming every required filename.
+  * with ``--emit-strategy-plan`` the wrapper additionally projects a
+    STARTER ``strategy_plan.json`` into the packet (one strategy record per
+    slide -- core_message / page_type / visual_structure / image_need --
+    biased toward editable structures, only the cover suggesting a generated
+    image) via ``init_strategy_plan.py``, BEFORE any image generation. Opt-in;
+    the default packet is byte-identical to prior runs.
   * the wrapper then prints the EXACT next step: drop the returned images
     under ``<O>/generation_packet/expected_images`` and re-run with
     ``--resume <O>``.
@@ -99,6 +105,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 # adds no second validator, and inherits every refusal they already apply.
 import ingest_local_source_file as ingest  # noqa: E402
 import source_to_image_requests as s2ir  # noqa: E402
+import init_strategy_plan as isp  # noqa: E402
 from core_image_to_editable_ppt_demo import (  # noqa: E402
     _forbidden_symlink_ancestor,
     _validate_out_dir_arg,
@@ -272,8 +279,15 @@ def _discard_staged_source(out_dir: Path, did_stage: bool, suffix: str) -> None:
         )
 
 
-def _run_first(source_arg: str, out_dir_arg: str) -> int:
-    """First run: local source -> generation packet under <out-dir>."""
+def _run_first(
+    source_arg: str, out_dir_arg: str, emit_strategy_plan: bool = False
+) -> int:
+    """First run: local source -> generation packet under <out-dir>.
+
+    When ``emit_strategy_plan`` is set, also project a STARTER
+    ``strategy_plan.json`` into the packet (before any image generation) via
+    the ``init_strategy_plan`` helper. Opt-in; default leaves the packet
+    byte-identical to prior runs."""
     # Same out-dir gate the lower-level helpers apply: URI / symlink /
     # symlink-ancestor / repo-tree / non-empty refusals, parent must exist.
     out_dir, failures = _validate_out_dir_arg(out_dir_arg)
@@ -350,10 +364,29 @@ def _run_first(source_arg: str, out_dir_arg: str) -> int:
         _discard_staged_source(out_dir, did_stage, suffix)
         return rc
 
+    # Optional: project a STARTER strategy plan from the just-built packet,
+    # BEFORE any image generation. Opt-in; the default path is unchanged.
+    # The starter biases the deck toward editable structures -- most slides
+    # need no generated image. The packet itself is already complete, so a
+    # projection failure does NOT roll back the packet (the staged source has
+    # passed every content gate); it is surfaced and returned non-zero.
+    if emit_strategy_plan:
+        rc_sp = isp.main(["--packet-dir", str(packet_dir)])
+        if rc_sp != 0:
+            print(
+                "FAIL: generation packet built, but --emit-strategy-plan "
+                "projection failed (see above); the packet itself is intact.",
+                file=sys.stderr,
+            )
+            return rc_sp
+
     expected_images = packet_dir / "expected_images"
     print()
     print("=== run_mvp_image_to_ppt: generation packet ready ===")
     print(f"  packet:  {packet_dir}")
+    if emit_strategy_plan:
+        print(f"  strategy_plan:  {packet_dir / 'strategy_plan.json'} "
+              f"(starter -- refine before the deck build)")
     print()
     print("Next steps:")
     print(f"  1. Give {packet_dir / 'image_generation_requests.md'} to your "
@@ -807,6 +840,42 @@ def _run_self_tests() -> int:
         except Exception as exc:  # pragma: no cover - defensive
             record("safe_name_not_staged", False, f"raised {exc!r}")
 
+        # T16 --emit-strategy-plan writes a starter strategy_plan.json into
+        #     the packet on the FIRST run (before image generation), and the
+        #     extra packet file does not disturb the resume round-trip to an
+        #     editable deck. init_strategy_plan validates + re-validates the
+        #     plan it writes, so a returned rc==0 file is already schema- and
+        #     semantics-valid; this probe proves the WIRING + coexistence.
+        try:
+            out = td / "strategy_run"
+            md = td / "report16.md"
+            md.write_text(sample, encoding="utf-8")
+            with _captured():
+                rc = _run_first(str(md), str(out), emit_strategy_plan=True)
+            packet = out / _PACKET_SUBDIR
+            strat = packet / "strategy_plan.json"
+            ok = (
+                rc == 0
+                and strat.is_file()
+                and (packet / "image_request_plan.json").is_file()
+            )
+            record("emit_strategy_plan_first_run", ok,
+                   "" if ok else f"rc={rc}; strategy_plan.json missing")
+            if ok:
+                _fill_expected_images(packet)
+                with _captured() as buf:
+                    rc2 = _run_resume(str(out))
+                deck = out / _REVIEW_SUBDIR / "review_package" / "deck.pptx"
+                ok2 = rc2 == 0 and deck.is_file()
+                record("emit_strategy_plan_then_resume_deck", ok2,
+                       "" if ok2 else f"rc={rc2}; deck missing\n{buf.getvalue()[-800:]}")
+            else:
+                record("emit_strategy_plan_then_resume_deck", False,
+                       "skipped: first run failed")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("emit_strategy_plan_first_run", False, f"raised {exc!r}")
+            record("emit_strategy_plan_then_resume_deck", False, "skipped: exception above")
+
     passed = sum(1 for _, ok, _ in results if ok)
     for name, ok, detail in results:
         tag = "PASS" if ok else "FAIL"
@@ -846,7 +915,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "every lower-level safety gate still runs on the staged bytes, and "
             "the staged copy is removed if the run is refused. "
             "Produces the generation packet under <out-dir>/generation_packet "
-            "and prints where to drop the returned images. Requires --out-dir. "
+            "and prints where to drop the returned images. Pass "
+            "--emit-strategy-plan to also project a starter strategy_plan.json "
+            "into the packet before image generation. Requires --out-dir. "
             "PDF is a documented TODO."
         ),
     )
@@ -875,8 +946,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "refusal, argument-shape gates, Chinese-named md/txt/docx sources "
             "auto-staged through the first run, an acceptable name left "
             "un-staged, staging preserving the symlink + content safety "
-            "gates, and a refused run rolling back its staged copy). No "
-            "caller-visible artifacts retained."
+            "gates, a refused run rolling back its staged copy, and "
+            "--emit-strategy-plan writing a starter strategy plan that "
+            "survives a resume round-trip). No caller-visible artifacts "
+            "retained."
         ),
     )
     parser.add_argument(
@@ -886,6 +959,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "outside the repo tree, not URI-shaped, not a symlink / under a "
             "symlink, and missing or empty; its parent must exist. Holds "
             "generation_packet/ (and review/ after --resume)."
+        ),
+    )
+    parser.add_argument(
+        "--emit-strategy-plan",
+        action="store_true",
+        help=(
+            "First run only (with --source): after the generation packet is "
+            "built and BEFORE any image generation, also project a STARTER "
+            "strategy_plan.json into <out-dir>/generation_packet via "
+            "init_strategy_plan.py. One strategy record per slide "
+            "(core_message / page_type / visual_structure / image_need), "
+            "biased toward editable structures -- only the cover suggests a "
+            "generated image. Opt-in; default leaves the packet "
+            "byte-identical to prior runs. No effect on --resume."
         ),
     )
     parser.add_argument(
@@ -932,7 +1019,7 @@ def main(argv: list[str]) -> int:
     if not args.out_dir:
         print("FAIL: --source requires --out-dir", file=sys.stderr)
         return 2
-    return _run_first(args.source, args.out_dir)
+    return _run_first(args.source, args.out_dir, args.emit_strategy_plan)
 
 
 if __name__ == "__main__":

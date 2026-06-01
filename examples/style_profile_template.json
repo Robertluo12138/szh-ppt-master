@@ -1,0 +1,34 @@
+{
+  "schema_version": "1",
+  "profile_id": "synthetic_business_neutral",
+  "display_name": "Synthetic Business Neutral",
+  "runtime_status": "non_runtime_contract",
+  "palette": {
+    "primary":    "#1F3A5F",
+    "secondary":  "#3E6390",
+    "accent":     "#C8893A",
+    "background": "#FFFFFF",
+    "text":       "#1A1A1A"
+  },
+  "background_mode": "subtle_tint",
+  "typography_scale": {
+    "heading": { "font_family": "Calibri, Helvetica Neue, Arial, sans-serif", "size_pt": 30 },
+    "body":    { "font_family": "Calibri, Helvetica Neue, Arial, sans-serif", "size_pt": 15 },
+    "scale_ratio": 1.25
+  },
+  "page_motifs": ["corner_accent", "footer_band", "section_number", "card_grid"],
+  "layout_archetypes": [
+    "cover_hero",
+    "executive_summary_cards",
+    "kpi_cluster",
+    "comparison_panel",
+    "metric_table",
+    "closing_summary"
+  ],
+  "image_usage_policy": {
+    "mode": "auxiliary",
+    "max_image_slides_ratio": 0.25,
+    "editable_structures_first": true
+  },
+  "notes": "Synthetic placeholder style profile for contract testing only. Images are auxiliary; prefer editable shapes, tables, and KPI structures."
+}

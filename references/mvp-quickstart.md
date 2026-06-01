@@ -114,6 +114,30 @@ lower-level `source_to_image_requests.py --resume-packet` and
 `operator_local_images_to_editable_ppt.py --bundle` commands take the
 same `--style company` flag.
 
+## Optional — emit a strategy plan (next quality layer)
+
+The MVP plans one image per heading and little else. The next quality layer
+moves toward a **per-slide strategy plan + brand style profile + editable
+visual structures**, with generated images treated as auxiliary. To project
+a **starter** strategy plan into the packet on the first run, before any
+image generation, add `--emit-strategy-plan`:
+
+```bash
+python3 scripts/run_mvp_image_to_ppt.py \
+  --source examples/mvp_demo_source.md --out-dir /tmp/szh-mvp --emit-strategy-plan
+```
+
+This writes `generation_packet/strategy_plan.json` (one record per slide:
+`core_message` / `page_type` / `visual_structure` / `image_need`), biased so
+only the cover suggests a generated image — every other slide defaults to an
+editable structure. The flag is opt-in; without it the packet is
+byte-identical to prior runs, and it has no effect on `--resume`. You can
+also run the planner standalone with
+`scripts/init_strategy_plan.py --packet-dir <out-dir>/generation_packet` and
+validate either contract with `scripts/validate_strategy_layer.py`. See
+[`strategy-and-style-layer.md`](strategy-and-style-layer.md) for the full
+quality direction and the `style_profile` contract.
+
 ## Optional — fully-local smoke with no image generator
 
 To see the whole flow produce a deck on one machine with no external

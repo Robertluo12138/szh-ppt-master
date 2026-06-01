@@ -1,0 +1,56 @@
+{
+  "schema_version": "1",
+  "plan_id": "strategy_plan",
+  "boundary": "Local-only deck strategy plan: one record per slide, derived from slide headings only with no document prose embedded. No image generator, D-One, model API, public network, or telemetry is invoked. Generated images are auxiliary - most slides use editable shapes, tables, and KPI structures.",
+  "deck_title": "Synthetic Quarterly Strategy Overview",
+  "slide_count": 5,
+  "slides": [
+    {
+      "slide_index": 1,
+      "slide_title": "Quarterly Strategy Overview",
+      "core_message": "Set the strategic frame for the quarter in one line.",
+      "page_type": "cover",
+      "visual_structure": "cover_hero",
+      "image_need": "recommended"
+    },
+    {
+      "slide_index": 2,
+      "slide_title": "Market Landscape",
+      "core_message": "The competitive field is consolidating around three moves.",
+      "page_type": "content",
+      "visual_structure": "comparison_panel",
+      "key_metrics": [
+        { "label": "Tracked segments", "value": "4" }
+      ],
+      "image_need": "none"
+    },
+    {
+      "slide_index": 3,
+      "slide_title": "Performance Snapshot",
+      "core_message": "Headline operating metrics moved the right direction.",
+      "page_type": "data",
+      "visual_structure": "kpi_cluster",
+      "key_metrics": [
+        { "label": "Revenue growth", "value": "+12%" },
+        { "label": "Active accounts", "value": "1,280" }
+      ],
+      "image_need": "none"
+    },
+    {
+      "slide_index": 4,
+      "slide_title": "Product Direction",
+      "core_message": "Two near-term bets carry most of the upside.",
+      "page_type": "content",
+      "visual_structure": "product_strategy",
+      "image_need": "optional"
+    },
+    {
+      "slide_index": 5,
+      "slide_title": "Closing Summary",
+      "core_message": "Recap the asks and the next checkpoints.",
+      "page_type": "closing",
+      "visual_structure": "closing_summary",
+      "image_need": "none"
+    }
+  ]
+}

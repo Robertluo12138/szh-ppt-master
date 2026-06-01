@@ -1,0 +1,124 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "strategy_plan.schema.json",
+  "title": "Deck Strategy Plan (one strategy record per slide)",
+  "description": "Local-only deck strategy plan: one strategy record per slide, sitting between the deck outline and per-slide artwork. Each record names the slide's core_message, page_type, the editable visual_structure archetype it should use, optional key_metrics, and an image_need that is biased toward editable structures. The plan is the main quality path for turning a business source into a strong deck — generated images are AUXILIARY. It embeds no raw source body text and triggers no image generation, D-One, model API, public network, or telemetry. The image_need enum has no 'required' value, so a generated image is never mandatory at the contract layer. Producers that derive a STARTER plan from headings (scripts/init_strategy_plan.py) keep most slides at image_need 'none'. Schema-level checks are complemented by the semantic cross-checks in scripts/validate_strategy_layer.py (slide_count == len(slides); slide_index unique AND contiguous 1..N). This schema uses only the JSON Schema keyword subset that scripts/validate_artifacts.py implements. See references/strategy-and-style-layer.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "boundary",
+    "deck_title",
+    "slide_count",
+    "slides"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1"],
+      "description": "Plan-file schema version. Locked to '1'; bumped only with a paired emitter + schema change."
+    },
+    "plan_id": {
+      "type": "string",
+      "enum": ["strategy_plan"],
+      "description": "Self-describing record identifier so a reader scanning mixed JSON evidence recognises this plan."
+    },
+    "boundary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "description": "Fixed framing that this is a local-only strategy plan with no raw source body text, no image generation, and no D-One / model API / public network / telemetry, and that generated images are auxiliary to editable structures."
+    },
+    "deck_title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "description": "Deck title. Capped at the operator contract's slide_title limit."
+    },
+    "slide_count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 200,
+      "description": "Planned slide count; must equal len(slides). The equality is enforced by scripts/validate_strategy_layer.py (the schema subset cannot express it)."
+    },
+    "slides": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 200,
+      "description": "One strategy record per slide, in slide order. slide_index values must be unique AND contiguous 1..N (checked by scripts/validate_strategy_layer.py).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "slide_index",
+          "slide_title",
+          "core_message",
+          "page_type",
+          "visual_structure",
+          "image_need"
+        ],
+        "properties": {
+          "slide_index": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "description": "1-based slide index, unique and contiguous in slide order."
+          },
+          "slide_title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "Human-readable slide title. Capped at the operator contract's slide_title limit."
+          },
+          "core_message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300,
+            "description": "The single point this slide must land — the takeaway a reader should leave with. Author-supplied or a heading-derived starter seed; never raw source body text."
+          },
+          "page_type": {
+            "type": "string",
+            "enum": ["cover", "section", "content", "data", "summary", "closing"],
+            "description": "Closed enum for the page's narrative role."
+          },
+          "key_metrics": {
+            "type": "array",
+            "maxItems": 6,
+            "description": "Optional headline metrics this slide should foreground as editable KPI / table content. Omitted (or empty) when no metric is being foregrounded; a heading-derived starter leaves this out.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["label", "value"],
+              "properties": {
+                "label": { "type": "string", "minLength": 1, "maxLength": 60 },
+                "value": { "type": "string", "minLength": 1, "maxLength": 40 }
+              }
+            }
+          },
+          "visual_structure": {
+            "type": "string",
+            "enum": [
+              "cover_hero",
+              "executive_summary_cards",
+              "kpi_cluster",
+              "comparison_panel",
+              "metric_table",
+              "audience_segment",
+              "competitor_flow",
+              "product_strategy",
+              "roadmap",
+              "closing_summary"
+            ],
+            "description": "The editable visual structure this slide should be built from. Shares the exact vocabulary used by style_profile.layout_archetypes. Every value is realisable from the controlled render primitives (text / shapes / lines / tables / KPI blocks) without a generated image."
+          },
+          "image_need": {
+            "type": "string",
+            "enum": ["none", "optional", "recommended"],
+            "description": "How much a generated image would help THIS slide. There is intentionally NO 'required' value: a generated image is never mandatory. Most business slides should be 'none' and rely on the editable visual_structure; reserve 'recommended' for the rare slide (e.g. a cover hero) where an image genuinely earns its place."
+          }
+        }
+      }
+    }
+  }
+}
