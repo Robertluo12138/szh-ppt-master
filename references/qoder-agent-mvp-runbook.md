@@ -55,7 +55,9 @@ references/qoder-agent-mvp-runbook.md, running every command from the repo
 root, for the business folder I point you at:
 
 1. Find exactly one local .docx / .md / .markdown / .txt source in the folder.
-   If you find zero or more than one, STOP and ask me which file to use.
+   If you find zero or more than one, STOP and ask me which file to use. A
+   Chinese / spaced / punctuated filename is fine — pass it as-is; do NOT
+   rename or copy it.
 2. Pick an empty output dir OUT outside the repo (e.g. /tmp/deck-out), then:
      python3 scripts/run_mvp_image_to_ppt.py --source <SOURCE> --out-dir OUT
 3. Do NOT generate real images and do NOT call any network, model API, or
@@ -85,6 +87,9 @@ the business folder.
   pick one.
 - A `.pdf` is a documented TODO — refuse it with that note rather than trying
   to parse it.
+- A Chinese / spaced / punctuated filename (`霸王茶姬 3月复盘.txt`) is fine —
+  **do not rename or copy it**. The first run auto-stages a safe internal
+  copy (see step 3); pass the original path to `--source` as-is.
 - Do not fetch a remote document or pull anything off the network; the source
   must already be a local file.
 
@@ -105,6 +110,17 @@ This writes the packet under `OUT/generation_packet/` and prints the exact
 next steps (where to drop returned images and the `--resume OUT` command).
 `.md` / `.markdown` feed the bridge directly; `.docx` / `.txt` are normalised
 to `OUT/normalized_source.md` first.
+
+You do **not** need to rename or copy a business file with a Chinese name,
+spaces, or punctuation (`霸王茶姬 3月复盘.txt`, `霸王茶姬.md`, …). When the
+basename is not identifier-safe for the lower-level helpers, the wrapper
+automatically stages a byte-for-byte copy at
+`OUT/source_input/source_input.<ext>` and uses that in its place (the
+original file is never renamed or modified), printing a `NOTE:` line so you
+can see it happened. Every safety / content gate still runs on the staged
+bytes, so this only adapts the filename — it does not relax any check. If the
+run is refused (e.g. credential / public-network content), the staged copy is
+removed automatically, so refused source bytes never linger.
 
 ### 4. Read the packet
 

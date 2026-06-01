@@ -32,6 +32,18 @@ First run (``--source S --out-dir O``):
     ``ingest_local_source_file.py --md-out`` (written to
     ``<O>/normalized_source.md``). Any other extension is refused (``.pdf``
     is a documented upstream TODO).
+  * if the source basename is NOT identifier-safe for the lower-level
+    helpers (Chinese characters, spaces, punctuation, parentheses -- common
+    on a company business folder), a byte-for-byte copy is first staged to
+    ``<O>/source_input/source_input.<ext>`` and fed to the helpers in its
+    place, so the operator never has to rename or copy a business file by
+    hand. The original file is never renamed or modified. Staging re-applies
+    the helpers' own URI / symlink / symlink-ancestor / repo-generated /
+    regular-file refusals before copying, and the helpers still re-run every
+    content / byte / heading gate on the staged bytes -- it adapts the
+    filename without loosening any safety check. If the run is then refused
+    (e.g. credential / public-network content), the staged copy is removed,
+    so refused raw source bytes never linger on disk.
   * the Markdown source feeds ``source_to_image_requests.py
     --generation-packet --out-dir <O>/generation_packet``, which writes the
     image_request_plan.json + a human-readable image_generation_requests.md
@@ -72,6 +84,7 @@ sys.dont_write_bytecode = True
 import argparse  # noqa: E402
 import contextlib  # noqa: E402
 import io  # noqa: E402
+import os  # noqa: E402
 import tempfile  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -86,7 +99,10 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 # adds no second validator, and inherits every refusal they already apply.
 import ingest_local_source_file as ingest  # noqa: E402
 import source_to_image_requests as s2ir  # noqa: E402
-from core_image_to_editable_ppt_demo import _validate_out_dir_arg  # noqa: E402
+from core_image_to_editable_ppt_demo import (  # noqa: E402
+    _forbidden_symlink_ancestor,
+    _validate_out_dir_arg,
+)
 
 # Fixed layout under the wrapper's --out-dir. The generation packet and the
 # resume build live in distinct sibling subdirectories so the resume step
@@ -95,10 +111,165 @@ _PACKET_SUBDIR = "generation_packet"
 _REVIEW_SUBDIR = "review"
 _NORMALIZED_MD = "normalized_source.md"
 
+# When the source basename is not identifier-safe for the lower-level
+# helpers (Chinese characters, spaces, punctuation, parentheses -- common on
+# a company business folder), the first run stages a byte-for-byte copy
+# under this deterministic safe name inside the validated --out-dir and
+# feeds THAT to the helpers, so the operator never has to rename or copy a
+# business file by hand.
+_STAGED_SUBDIR = "source_input"
+_STAGED_STEM = "source_input"
+
 # Source extensions routed straight to the Markdown bridge vs. normalised
 # to Markdown via ingest_local_source_file.py first.
 _MARKDOWN_SUFFIXES = frozenset({".md", ".markdown"})
 _INGEST_SUFFIXES = frozenset({".docx", ".txt"})
+
+
+def _stage_source_if_needed(
+    source_arg: str, out_dir: Path, suffix: str
+) -> tuple[str | None, str | None, list[str]]:
+    """Adapt a business filename the lower-level helpers would refuse.
+
+    Returns ``(effective_source, operator_note, failures)``.
+
+    If the source basename is ALREADY accepted by the lower-level helpers
+    (identifier-safe per their shared ``^[A-Za-z0-9_][A-Za-z0-9_.\\-]*$``
+    pattern), the source is returned unchanged with no note and no staging,
+    so a run with an acceptable name is byte-identical to calling the
+    helpers directly.
+
+    Otherwise (a Chinese / spaced / punctuated business filename), a
+    VERBATIM byte copy is written to
+    ``<out-dir>/source_input/source_input.<suffix>`` and that path is
+    returned, so the helpers see an identifier-safe basename. The copy is
+    created exclusively (never overwrites, never follows a symlink at the
+    destination) and is preceded by the SAME original-path refusals the
+    helpers apply (URI / symlink / symlink-ancestor / repo-generated /
+    non-regular-file) -- these operate on the source PATH, which the copy
+    dereferences by reading its bytes, so re-applying them here keeps
+    staging from smuggling in a source the helpers would have refused. The
+    helpers then re-run every CONTENT gate (extension, byte caps, UTF-8,
+    credential / public-network / heading scans) on the staged bytes
+    unchanged, so the wrapper adapts the filename without loosening any
+    lower-level safety check. A mid-write failure removes the partial copy
+    here; a DOWNSTREAM helper refusal is rolled back by the caller (see
+    ``_discard_staged_source``) so refused raw source bytes never linger on
+    disk -- just as the helpers leave nothing behind when they refuse.
+    """
+    # Reuse the lower-level helpers' OWN identifier-safe pattern so the
+    # wrapper's "would they accept this basename?" test cannot drift from
+    # theirs. ingest_local_source_file and source_to_image_requests carry
+    # the identical regex; reusing the compiled copy keeps the three in
+    # lock-step (a future divergence could only stage unnecessarily or
+    # surface the helper's own refusal -- never bypass a gate).
+    original_name = Path(source_arg).name
+    if ingest._SAFE_NAME_RE.match(original_name):
+        return source_arg, None, []
+
+    # Basename is NOT safe -> we must stage. First re-apply the original-path
+    # gates that a byte-copy would otherwise bypass.
+    if "://" in source_arg:
+        return None, None, [
+            f"--source {source_arg!r} is URI-shaped; refused (local-only)"
+        ]
+    src = Path(source_arg)
+    if src.is_symlink():
+        return None, None, [
+            f"--source {src} is a symlink; refused so a symlink cannot "
+            f"redirect which bytes are staged"
+        ]
+    bad_ancestor = _forbidden_symlink_ancestor(src)
+    if bad_ancestor is not None:
+        ancestor, tgt = bad_ancestor
+        return None, None, [
+            f"--source {src} has a symlink ancestor {ancestor} (-> {tgt}); "
+            f"refused so a symlink in the typed path cannot redirect the read"
+        ]
+    try:
+        resolved = src.resolve(strict=False)
+    except OSError as exc:
+        return None, None, [
+            f"--source {src} could not be resolved: {type(exc).__name__}: {exc}"
+        ]
+    if ingest._is_repo_generated_path(resolved):
+        return None, None, [
+            f"--source {resolved} resolves inside a repo generated-output "
+            f"directory; refused -- a generated artifact must not be fed back "
+            f"in as a source"
+        ]
+    if not src.is_file():
+        return None, None, [f"--source {src} is not a regular file"]
+
+    try:
+        raw = src.read_bytes()
+    except OSError as exc:
+        return None, None, [
+            f"cannot read --source {src}: {type(exc).__name__}: {exc}"
+        ]
+
+    staged_dir = out_dir / _STAGED_SUBDIR
+    staged = staged_dir / f"{_STAGED_STEM}{suffix}"
+    try:
+        staged_dir.mkdir(parents=False, exist_ok=False)
+    except OSError as exc:
+        return None, None, [
+            f"cannot create staging dir {staged_dir}: "
+            f"{type(exc).__name__}: {exc}"
+        ]
+    # Exclusive create (O_EXCL): never overwrite an existing file, and never
+    # follow a symlink planted at the destination path. On any write error,
+    # remove the partial copy + the dir we just made so a failed stage never
+    # leaves raw source bytes behind.
+    try:
+        fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+    except OSError as exc:
+        try:
+            if staged.is_file() and not staged.is_symlink():
+                staged.unlink()
+            staged_dir.rmdir()
+        except OSError:
+            pass
+        return None, None, [
+            f"cannot stage --source to {staged}: {type(exc).__name__}: {exc}"
+        ]
+
+    note = (
+        f"NOTE: source basename {original_name!r} is not identifier-safe for "
+        f"the lower-level helpers; staged a byte-for-byte copy to {staged} "
+        f"and used that as the source (your original file was not renamed or "
+        f"modified)."
+    )
+    return str(staged), note, []
+
+
+def _discard_staged_source(out_dir: Path, did_stage: bool, suffix: str) -> None:
+    """Remove the staged source copy (and the dir created for it) when a
+    first run FAILS after staging, so refused raw source bytes -- exactly the
+    credential / public-network material the lower-level content gates exist
+    to reject -- never linger on disk. The helpers leave nothing behind when
+    they refuse a source; this keeps the wrapper's staging just as
+    fail-closed. No-op when nothing was staged (an acceptable basename). Only
+    the file the wrapper itself wrote is unlinked, and the dir is removed
+    solely via ``rmdir`` (which refuses a non-empty dir), so an unexpected
+    foreign file is preserved + surfaced rather than deleted."""
+    if not did_stage:
+        return
+    staged_dir = out_dir / _STAGED_SUBDIR
+    staged_file = staged_dir / f"{_STAGED_STEM}{suffix}"
+    try:
+        if staged_file.is_file() and not staged_file.is_symlink():
+            staged_file.unlink()
+        staged_dir.rmdir()  # removes the dir only if it is now empty
+    except OSError as exc:
+        print(
+            f"WARNING: could not remove staged source under {staged_dir} after "
+            f"a failed run ({type(exc).__name__}: {exc}); remove it manually so "
+            f"refused source bytes do not linger",
+            file=sys.stderr,
+        )
 
 
 def _run_first(source_arg: str, out_dir_arg: str) -> int:
@@ -138,14 +309,37 @@ def _run_first(source_arg: str, out_dir_arg: str) -> int:
             )
             return 1
 
+    # Adapt a business filename the lower-level helpers would refuse: a
+    # Chinese / spaced / punctuated basename is staged to a deterministic
+    # safe copy inside the already-validated out-dir; an acceptable name is
+    # passed through unchanged. The helpers re-run every content gate on the
+    # staged bytes, so this only adapts the filename (see
+    # _stage_source_if_needed).
+    effective_source, note, stage_failures = _stage_source_if_needed(
+        source_arg, out_dir, suffix
+    )
+    if stage_failures or effective_source is None:
+        for line in stage_failures:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 1
+    did_stage = effective_source != source_arg
+    if note:
+        print(note)
+
+    # If a downstream helper REFUSES the source (e.g. credential / public-
+    # network content), roll back the staged copy so refused raw source
+    # bytes never persist on disk -- the helpers themselves leave nothing
+    # behind on refusal, and a staged copy is exactly the sensitive material
+    # the content gate just rejected.
     if needs_ingest:
         md_path = out_dir / _NORMALIZED_MD
-        rc = ingest.main(["--report", source_arg, "--md-out", str(md_path)])
+        rc = ingest.main(["--report", effective_source, "--md-out", str(md_path)])
         if rc != 0:
+            _discard_staged_source(out_dir, did_stage, suffix)
             return rc
         markdown_source = str(md_path)
     else:
-        markdown_source = source_arg
+        markdown_source = effective_source
 
     packet_dir = out_dir / _PACKET_SUBDIR
     rc = s2ir.main(
@@ -153,6 +347,7 @@ def _run_first(source_arg: str, out_dir_arg: str) -> int:
          "--out-dir", str(packet_dir)]
     )
     if rc != 0:
+        _discard_staged_source(out_dir, did_stage, suffix)
         return rc
 
     expected_images = packet_dir / "expected_images"
@@ -446,6 +641,172 @@ def _run_self_tests() -> int:
         except Exception as exc:  # pragma: no cover - defensive
             record("empty_resume_refused_no_traceback", False, f"raised {exc!r}")
 
+        # T10 a Chinese + space .md basename (refused by the lower-level
+        #     helpers) is auto-staged to source_input/source_input.md as a
+        #     byte-exact copy, the first run still produces a packet and
+        #     prints a staging NOTE, and the staged source flows all the way
+        #     through a resume round-trip to an editable deck.
+        try:
+            out = td / "cn_md_run"
+            md = td / "霸王茶姬 3月复盘.md"
+            md.write_text(sample, encoding="utf-8")
+            with _captured() as buf:
+                rc = _run_first(str(md), str(out))
+            text = buf.getvalue()
+            packet = out / _PACKET_SUBDIR
+            staged = out / _STAGED_SUBDIR / f"{_STAGED_STEM}.md"
+            ok = (
+                rc == 0
+                and staged.is_file()
+                and staged.read_bytes() == sample.encode("utf-8")
+                and (packet / "image_request_plan.json").is_file()
+                and "NOTE:" in text
+                and str(staged) in text
+            )
+            record("cn_md_staged_first_run_packet", ok,
+                   "" if ok else f"rc={rc}; staged/packet/note missing")
+            if ok:
+                _fill_expected_images(packet)
+                with _captured() as buf:
+                    rc2 = _run_resume(str(out))
+                deck = out / _REVIEW_SUBDIR / "review_package" / "deck.pptx"
+                ok2 = rc2 == 0 and deck.is_file()
+                record("cn_md_staged_resume_roundtrip_deck", ok2,
+                       "" if ok2 else f"rc={rc2}; deck missing\n{buf.getvalue()[-800:]}")
+            else:
+                record("cn_md_staged_resume_roundtrip_deck", False,
+                       "skipped: first run failed")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("cn_md_staged_first_run_packet", False, f"raised {exc!r}")
+            record("cn_md_staged_resume_roundtrip_deck", False, "skipped: exception above")
+
+        # T11 a Chinese + space .txt basename is auto-staged, then routed
+        #     through ingest (normalized_source.md) to a packet.
+        try:
+            out = td / "cn_txt_run"
+            txt = td / "霸王茶姬 3月复盘.txt"
+            txt.write_text(sample, encoding="utf-8")
+            with _captured():
+                rc = _run_first(str(txt), str(out))
+            staged = out / _STAGED_SUBDIR / f"{_STAGED_STEM}.txt"
+            ok = (
+                rc == 0
+                and staged.is_file()
+                and (out / _NORMALIZED_MD).is_file()
+                and (out / _PACKET_SUBDIR / "image_request_plan.json").is_file()
+            )
+            record("cn_txt_staged_first_run_via_ingest", ok,
+                   "" if ok else f"rc={rc}; staged/normalized/packet missing")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("cn_txt_staged_first_run_via_ingest", False, f"raised {exc!r}")
+
+        # T12 a Chinese .docx basename is auto-staged, then routed through
+        #     ingest heading-style extraction to a packet.
+        try:
+            out = td / "cn_docx_run"
+            docx = td / "霸王茶姬.docx"
+            docx.write_bytes(ingest._make_docx(
+                ingest._DOCX_HEADING_PARAGRAPHS,
+                style_names=ingest._DOCX_HEADING_STYLE_NAMES,
+            ))
+            with _captured():
+                rc = _run_first(str(docx), str(out))
+            staged = out / _STAGED_SUBDIR / f"{_STAGED_STEM}.docx"
+            ok = (
+                rc == 0
+                and staged.is_file()
+                and (out / _NORMALIZED_MD).is_file()
+                and (out / _PACKET_SUBDIR / "image_request_plan.json").is_file()
+            )
+            record("cn_docx_staged_first_run_via_ingest", ok,
+                   "" if ok else f"rc={rc}; staged/normalized/packet missing")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("cn_docx_staged_first_run_via_ingest", False, f"raised {exc!r}")
+
+        # T13 staging does NOT bypass the lower-level CONTENT gate: a
+        #     Chinese-named .md whose BODY carries credential wording is
+        #     still refused after staging (no packet produced), AND the
+        #     staged copy of those refused raw bytes is rolled back -- it
+        #     must not linger on disk.
+        try:
+            out = td / "cn_unsafe_run"
+            md = td / "霸王茶姬 机密.md"
+            md.write_text("# Overview\n\napi_key = abc123\n", encoding="utf-8")
+            with _captured():
+                rc = _run_first(str(md), str(out))
+            ok = (
+                rc != 0
+                and not (out / _PACKET_SUBDIR / "image_request_plan.json").is_file()
+                and not (out / _STAGED_SUBDIR).exists()
+            )
+            record("cn_unsafe_content_refused_and_rolled_back", ok,
+                   "" if ok else f"rc={rc}; packet/staged-copy left behind")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("cn_unsafe_content_refused_and_rolled_back", False, f"raised {exc!r}")
+
+        # T13b the ingest-path refusal ALSO rolls back the staged copy: a
+        #      Chinese-named .txt with credential wording is refused by
+        #      ingest, leaving neither a staged raw copy nor normalized md.
+        try:
+            out = td / "cn_unsafe_txt_run"
+            txt = td / "霸王茶姬 机密.txt"
+            txt.write_text("# Overview\n\napi_key = abc123\n", encoding="utf-8")
+            with _captured():
+                rc = _run_first(str(txt), str(out))
+            ok = (
+                rc != 0
+                and not (out / _STAGED_SUBDIR).exists()
+                and not (out / _NORMALIZED_MD).exists()
+            )
+            record("cn_unsafe_txt_staged_rolled_back", ok,
+                   "" if ok else f"rc={rc}; staged/normalized left behind")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("cn_unsafe_txt_staged_rolled_back", False, f"raised {exc!r}")
+
+        # T14 staging preserves the lower-level symlink refusal: a
+        #     Chinese-named symlink source is refused and never dereferenced
+        #     into the staging dir (the copy must not follow it).
+        try:
+            out = td / "cn_symlink_run"
+            real = td / "real_cn_source.md"
+            real.write_text(sample, encoding="utf-8")
+            link = td / "霸王茶姬 链接.md"
+            made = True
+            try:
+                link.symlink_to(real)
+            except OSError:
+                made = False
+            if made:
+                with _captured():
+                    rc = _run_first(str(link), str(out))
+                staged = out / _STAGED_SUBDIR / f"{_STAGED_STEM}.md"
+                ok = rc != 0 and not staged.exists()
+                detail = "" if ok else f"rc={rc}; symlink unexpectedly staged"
+            else:  # pragma: no cover - platform without symlink support
+                ok, detail = True, "skipped: symlinks unsupported here"
+            record("cn_symlink_source_refused", ok, detail)
+        except Exception as exc:  # pragma: no cover - defensive
+            record("cn_symlink_source_refused", False, f"raised {exc!r}")
+
+        # T15 an acceptable (identifier-safe) basename is NOT staged: no
+        #     source_input/ dir is created, proving staging is inert for
+        #     already-acceptable names and the existing path is unchanged.
+        try:
+            out = td / "safe_name_run"
+            md = td / "report_safe.md"
+            md.write_text(sample, encoding="utf-8")
+            with _captured():
+                rc = _run_first(str(md), str(out))
+            ok = (
+                rc == 0
+                and not (out / _STAGED_SUBDIR).exists()
+                and (out / _PACKET_SUBDIR / "image_request_plan.json").is_file()
+            )
+            record("safe_name_not_staged", ok,
+                   "" if ok else f"rc={rc}; unexpected staging for safe name")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("safe_name_not_staged", False, f"raised {exc!r}")
+
     passed = sum(1 for _, ok, _ in results if ok)
     for name, ok, detail in results:
         tag = "PASS" if ok else "FAIL"
@@ -477,10 +838,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "First run: path to a local .md / .markdown source (used "
             "directly) or a .docx / .txt source (normalised to Markdown via "
-            "ingest_local_source_file.py --md-out first). Produces the "
-            "generation packet under <out-dir>/generation_packet and prints "
-            "where to drop the returned images. Requires --out-dir. PDF is a "
-            "documented TODO."
+            "ingest_local_source_file.py --md-out first). A non-identifier-safe "
+            "basename (Chinese characters, spaces, punctuation -- common on a "
+            "company folder) is auto-staged to a byte-for-byte copy at "
+            "<out-dir>/source_input/source_input.<ext> and used in place of "
+            "the original, so you need NOT rename or copy the file yourself; "
+            "every lower-level safety gate still runs on the staged bytes, and "
+            "the staged copy is removed if the run is refused. "
+            "Produces the generation packet under <out-dir>/generation_packet "
+            "and prints where to drop the returned images. Requires --out-dir. "
+            "PDF is a documented TODO."
         ),
     )
     mode.add_argument(
@@ -505,8 +872,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "deck, a --style company resume round-trip, "
             "docx/txt routed through ingest, missing / mismatched "
             "image refusals, unsupported-extension refusal, unsafe-out-dir "
-            "refusal, argument-shape gates). No caller-visible artifacts "
-            "retained."
+            "refusal, argument-shape gates, Chinese-named md/txt/docx sources "
+            "auto-staged through the first run, an acceptable name left "
+            "un-staged, staging preserving the symlink + content safety "
+            "gates, and a refused run rolling back its staged copy). No "
+            "caller-visible artifacts retained."
         ),
     )
     parser.add_argument(

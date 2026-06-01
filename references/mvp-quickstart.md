@@ -21,7 +21,10 @@ step in between. No prior chat history or repo knowledge required.
 
 - `python3` (standard library only — no `pip install`).
 - A local source file: `.md` / `.markdown` (used directly) or `.docx` /
-  `.txt` (normalised to Markdown first). `.pdf` is a documented TODO.
+  `.txt` (normalised to Markdown first). `.pdf` is a documented TODO. A
+  Chinese / spaced / punctuated filename (`霸王茶姬 3月复盘.txt`) works as-is —
+  the first run auto-stages a safe internal copy under
+  `<out-dir>/source_input/`, so you need not rename or copy it.
 - A working directory **outside this repo** for outputs (e.g. under
   `/tmp`). The wrapper refuses an output dir that is URI-shaped, a
   symlink, inside the repo tree, or already non-empty; its parent must
