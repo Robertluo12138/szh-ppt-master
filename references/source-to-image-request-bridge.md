@@ -61,6 +61,27 @@ source body, and never performs real image generation.
   if a returned image contains text, so an unverified `no_text` claim cannot
   silently ride into the deck. A `.docx` / `.txt` source reaches this mode
   via `ingest_local_source_file.py --md-out` first.
+- In `--resume-packet` mode, the source-free **finish** for a completed
+  generation packet. Given the packet directory (`--packet-dir`) and a
+  folder of returned local images (`--images-dir`), it builds a validated
+  `<out-dir>/review_package` via the existing operator `--bundle` lane:
+  - it confirms the packet carries `image_request_plan.json` +
+    `manifest.json` + `generated_provenance.json`, derives the expected
+    filename set from the schema-validated plan, and checks the returned
+    images match it **EXACTLY** — one regular file per request, valid
+    PNG/JPG/JPEG magic bytes, no symlinks, no missing, no extras (the
+    packet's own `expected_images/README.md` sidecar is tolerated and
+    skipped). Every missing / extra / mismatch / non-image / unsafe-path
+    case fails closed with an actionable message **before** any bundle is
+    assembled or any output directory is created;
+  - it then assembles a **temporary** operator bundle under `TMPDIR`
+    (the returned images plus the packet's `manifest.json` /
+    `generated_provenance.json`, verbatim — auto-cleaned, never under the
+    repo) and runs `operator_local_images_to_editable_ppt.py --bundle`,
+    whose own MAN/GP content gates validate the sidecars, then re-checks
+    the result read-only with `validate_operator_review_package.py`.
+  It synthesises NO pixels and adds NO renderer; it is the documented
+  packet-finish commands wrapped behind one guarded entry point.
 
 ## Commands
 
@@ -84,6 +105,12 @@ python3 scripts/source_to_image_requests.py \
 python3 scripts/source_to_image_requests.py \
   --source examples/source_to_image_requests/sample_report.md \
   --generation-packet --out-dir /tmp/s2ir_packet   # fresh dir, outside the repo
+
+# Resume: completed packet + returned local images -> validated review package
+python3 scripts/source_to_image_requests.py --resume-packet \
+  --packet-dir /tmp/s2ir_packet \
+  --images-dir /tmp/s2ir_packet/expected_images \
+  --out-dir /tmp/s2ir_review            # fresh dir, outside the repo
 
 # Self-test (every scenario under TMPDIR)
 python3 scripts/source_to_image_requests.py --self-test

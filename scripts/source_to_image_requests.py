@@ -58,6 +58,10 @@ CLI shape::
     python3 scripts/source_to_image_requests.py \\
         --source REPORT.md --generation-packet --out-dir OUT   # OUT outside repo
 
+    # Resume: completed packet + returned local images -> review package
+    python3 scripts/source_to_image_requests.py --resume-packet \\
+        --packet-dir PACKET --images-dir RETURNED --out-dir OUT  # OUT outside repo
+
     # Self-test (every scenario under TMPDIR; nothing leaks under repo)
     python3 scripts/source_to_image_requests.py --self-test
 
@@ -71,6 +75,18 @@ under the expected filenames; those then feed the existing operator
 ``--bundle`` lane (finishing commands are in the packet README). A
 ``.docx`` / ``.txt`` source reaches this mode via
 ``ingest_local_source_file.py --md-out`` first.
+
+The ``--resume-packet`` mode is the source-free finish for that packet:
+given the completed ``--packet-dir`` and a ``--images-dir`` of returned
+local images, it checks the images match the plan's expected filenames
+EXACTLY (one per request, valid PNG/JPG/JPEG bytes, no symlinks / extras /
+missing — the packet's own ``expected_images/README.md`` is tolerated),
+assembles a TEMPORARY operator bundle (returned images + the packet's
+manifest.json / generated_provenance.json, verbatim) under TMPDIR, and
+drives the SAME operator ``--bundle`` lane to a validated
+``<out-dir>/review_package``. It synthesises NO pixels and adds NO
+renderer; it is the documented packet-finish commands wrapped behind one
+guarded entry point.
 
 ``--out-dir`` is validated through
 ``core_image_to_editable_ppt_demo._validate_out_dir_arg`` so the same
@@ -112,8 +128,13 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 # the contract the sibling helpers enforce, and the subset schema
 # validator so the plan is validated against the committed schema.
 from core_image_to_editable_ppt_demo import (  # noqa: E402
+    _forbidden_symlink_ancestor,
     _validate_out_dir_arg,
 )
+# Reuse the canonical supported-extension set + magic-byte gate so the
+# resume path's returned-image byte check is identical to the operator /
+# materialize_image_assets contract (no second, drifting signature table).
+from materialize_image_assets import SUPPORTED_EXTENSIONS  # noqa: E402
 from validate_artifacts import _validate as _schema_validate  # noqa: E402
 # Reuse the repo's canonical credential-VALUE shape detector (AWS keys,
 # PEM private-key blocks, bearer tokens, key=value secrets) so this
@@ -128,6 +149,7 @@ from operator_local_images_to_editable_ppt import (  # noqa: E402
     _MAX_ALT_TEXT_LEN,
     _MAX_INTENDED_USE_LEN,
     _MAX_SLIDE_TITLE_LEN,
+    _matches_image_signature,
     _safe_manifest_string,
 )
 
@@ -1105,6 +1127,275 @@ def _run_generation_packet(source_arg: str, out_dir_arg: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Mode D: resume / finish (generation packet + returned images -> review).
+#
+# The source-free counterpart of --generation-packet. It takes a completed
+# packet directory (image_request_plan.json + manifest.json +
+# generated_provenance.json) and a folder of returned local images, checks
+# the returned images match the plan's expected filenames EXACTLY (one per
+# request, no extras, valid image bytes, no symlinks / unsafe paths),
+# assembles a TEMPORARY operator bundle (returned images + the packet's own
+# sidecars, verbatim) under TMPDIR, and drives the EXISTING operator
+# --bundle lane to a validated review_package. It synthesises NO pixels and
+# adds NO renderer — only the operator lane builds the deck.
+# ---------------------------------------------------------------------------
+
+# Required files a completed generation packet must carry. image_request_plan
+# is consumed here (to derive the expected filename set); manifest.json +
+# generated_provenance.json are forwarded VERBATIM into the operator bundle,
+# where the operator's own MAN1..MAN12 / GP1..GP13 content gates validate
+# them.
+_REQUIRED_PACKET_FILES: tuple[str, ...] = (
+    "image_request_plan.json",
+    "manifest.json",
+    "generated_provenance.json",
+)
+
+# Basenames the packet itself writes into expected_images/ alongside the
+# returned images. Tolerated (and skipped) in --images-dir so the operator
+# can point --images-dir straight at the packet's expected_images/ folder;
+# any OTHER unexpected file is still refused.
+_PACKET_IMAGE_DIR_SIDECARS: frozenset[str] = frozenset({"README.md"})
+
+
+def _validate_input_dir(arg: str, label: str) -> tuple[Path | None, list[str]]:
+    """Shape-check an input directory argument (--packet-dir / --images-dir).
+    Read-only. Refuses a URI-shaped argument, a symlink at the path or any
+    ancestor, a missing path, and a non-directory — the same unsafe-path
+    refusals the sibling --out-dir gate enforces. Returns
+    ``(resolved_path_or_None, failures)``."""
+    if "://" in arg:
+        return None, [f"{label} {arg!r} is URI-shaped; refused (local-only)"]
+    path = Path(arg)
+    if path.is_symlink():
+        return None, [f"{label} {path} is a symlink; refused"]
+    forbidden = _forbidden_symlink_ancestor(path)
+    if forbidden is not None:
+        ancestor, tgt = forbidden
+        return None, [
+            f"{label} {path} has a symlink ancestor {ancestor} (-> {tgt}); "
+            f"refused so a symlink cannot redirect what bytes are ingested"
+        ]
+    if not path.exists():
+        return None, [f"{label} {path} does not exist"]
+    if not path.is_dir():
+        return None, [f"{label} {path} is not a directory"]
+    return path, []
+
+
+def _missing_or_unsafe_packet_files(packet_dir: Path) -> list[str]:
+    """Return failures for any required packet file that is absent or is a
+    symlink (a symlink could redirect what bytes the operator ingests)."""
+    failures: list[str] = []
+    for name in _REQUIRED_PACKET_FILES:
+        p = packet_dir / name
+        if p.is_symlink():
+            failures.append(
+                f"packet file {name!r} in --packet-dir {packet_dir} is a "
+                f"symlink; refused"
+            )
+        elif not p.is_file():
+            failures.append(
+                f"packet file {name!r} is missing from --packet-dir "
+                f"{packet_dir}; a completed generation packet must carry "
+                f"{', '.join(_REQUIRED_PACKET_FILES)}"
+            )
+    return failures
+
+
+def _load_expected_filenames(packet_dir: Path) -> tuple[list[str] | None, list[str]]:
+    """Read + schema-validate the packet's image_request_plan.json and
+    return the ordered list of expected image filenames (one per request).
+    Refuses a malformed plan or duplicate filenames."""
+    plan_path = packet_dir / "image_request_plan.json"
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, [f"cannot read {plan_path}: {type(exc).__name__}: {exc}"]
+    errors = _validate_plan(plan)
+    if errors:
+        return None, [
+            f"packet image_request_plan.json failed schema validation: {e}"
+            for e in errors
+        ]
+    filenames = [req["filename"] for req in plan["image_requests"]]
+    dupes = sorted({f for f in filenames if filenames.count(f) > 1})
+    if dupes:
+        return None, [
+            f"packet image_request_plan.json declares duplicate image "
+            f"filename(s) {dupes}; the resume contract is 1:1"
+        ]
+    return filenames, []
+
+
+def _validate_returned_images(
+    images_dir: Path, expected_filenames: list[str],
+) -> tuple[dict[str, Path] | None, list[str]]:
+    """Check the returned-images folder against the expected filename set.
+
+    Returns ``(filename -> path map, failures)``. Every expected filename
+    must be present EXACTLY once as a regular file whose first bytes match
+    the magic-byte signature for its extension; symlinks are refused;
+    unexpected files are refused (the packet's own README.md sidecar is the
+    sole tolerated extra). Missing / extra / symlink / non-image diagnostics
+    are all surfaced BEFORE any bundle is assembled."""
+    failures: list[str] = []
+    expected = set(expected_filenames)
+    entries: dict[str, Path] = {}
+    symlinked: set[str] = set()
+    for child in sorted(images_dir.iterdir()):
+        name = child.name
+        if child.is_symlink():
+            failures.append(
+                f"returned image {name!r} in --images-dir is a symlink; "
+                f"refused (unsafe path)"
+            )
+            symlinked.add(name)
+            continue
+        if name in _PACKET_IMAGE_DIR_SIDECARS and child.is_file():
+            continue  # the packet's own expected_images/README.md; skip it
+        entries[name] = child
+    present = set(entries)
+    for missing in sorted(expected - present - symlinked):
+        failures.append(
+            f"expected image {missing!r} is missing from --images-dir; the "
+            f"generation packet requires it"
+        )
+    for extra in sorted(present - expected):
+        failures.append(
+            f"unexpected file {extra!r} in --images-dir; the generation "
+            f"packet did not request it (refusing extras so the deck stays "
+            f"1:1 with the plan)"
+        )
+    images: dict[str, Path] = {}
+    for name in sorted(expected & present):
+        path = entries[name]
+        if not path.is_file():
+            failures.append(f"returned image {name!r} is not a regular file; refused")
+            continue
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        try:
+            with path.open("rb") as fh:
+                head = fh.read(8)
+        except OSError as exc:
+            failures.append(
+                f"cannot read returned image {name!r}: {type(exc).__name__}: {exc}"
+            )
+            continue
+        if ext not in SUPPORTED_EXTENSIONS or not _matches_image_signature(ext, head):
+            failures.append(
+                f"returned image {name!r} failed the magic-byte gate; refused "
+                f"(non-image bytes or bytes that do not match the "
+                f"'.{ext}' extension)"
+            )
+            continue
+        images[name] = path
+    if failures:
+        return None, failures
+    return images, []
+
+
+def _run_resume_packet(
+    packet_dir_arg: str, images_dir_arg: str, out_dir_arg: str,
+) -> int:
+    # Arg-shape gates first (rc=2): out-dir, packet-dir, images-dir.
+    out_dir, failures = _validate_out_dir_arg(out_dir_arg)
+    if failures or out_dir is None:
+        for line in failures:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 2
+    packet_dir, pf = _validate_input_dir(packet_dir_arg, "--packet-dir")
+    if pf or packet_dir is None:
+        for line in pf:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 2
+    images_dir, imf = _validate_input_dir(images_dir_arg, "--images-dir")
+    if imf or images_dir is None:
+        for line in imf:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 2
+
+    # Content gates (rc=1): required packet files, plan-derived expected
+    # filenames, returned-image set. All BEFORE any output dir is created,
+    # so a bad return leaves no artifacts behind.
+    pkt_failures = _missing_or_unsafe_packet_files(packet_dir)
+    if pkt_failures:
+        for line in pkt_failures:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 1
+    expected, ef = _load_expected_filenames(packet_dir)
+    if ef or expected is None:
+        for line in ef:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 1
+    images, img_failures = _validate_returned_images(images_dir, expected)
+    if img_failures or images is None:
+        for line in img_failures:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 1
+
+    print("=== source_to_image_requests --resume-packet ===")
+    print(f"  packet-dir: {packet_dir}")
+    print(f"  images-dir: {images_dir}")
+    print(f"  out-dir:    {out_dir}")
+    print(f"  matched {len(images)} returned image(s) to the packet plan 1:1")
+    print()
+
+    if not out_dir.exists():
+        try:
+            out_dir.mkdir(parents=False, exist_ok=False)
+        except OSError as exc:
+            print(f"FAIL: cannot create --out-dir {out_dir}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+    review_package = out_dir / "review_package"
+
+    # Assemble a TEMPORARY operator bundle under TMPDIR (auto-cleaned, never
+    # under the repo): the validated returned images plus the packet's own
+    # manifest.json + generated_provenance.json sidecars, verbatim. The
+    # operator --bundle lane auto-detects both sidecars and runs their full
+    # MAN1..MAN12 / GP1..GP13 content gates.
+    with tempfile.TemporaryDirectory(prefix="s2ir-resume-") as raw_td:
+        bundle = Path(raw_td) / "bundle"
+        (bundle / "images").mkdir(parents=True, exist_ok=False)
+        for name in sorted(images):
+            (bundle / "images" / name).write_bytes(images[name].read_bytes())
+        for sidecar in ("manifest.json", "generated_provenance.json"):
+            (bundle / sidecar).write_bytes((packet_dir / sidecar).read_bytes())
+
+        op = _run(
+            "operator_local_images_to_editable_ppt --bundle",
+            [
+                sys.executable, str(OPERATOR_HELPER),
+                "--bundle", str(bundle),
+                "--out-dir", str(review_package),
+            ],
+        )
+        if op.rc != 0:
+            print(f"  [FAIL] operator helper rc={op.rc}")
+            _print_tail(op)
+            return 1
+    print("  [PASS] operator helper rc=0 (editable deck.pptx produced)")
+
+    val = _run(
+        "validate_operator_review_package --out-dir",
+        [sys.executable, str(PACKAGE_VALIDATOR), "--out-dir", str(review_package)],
+    )
+    if val.rc != 0:
+        print(f"  [FAIL] validate_operator_review_package rc={val.rc}")
+        _print_tail(val)
+        return 1
+    print("  [PASS] validate_operator_review_package rc=0 (read-only re-check)")
+
+    print()
+    print(f"OK: resume complete. Validated review package at {review_package}.")
+    print(f"  deck.pptx:    {review_package / 'deck.pptx'}")
+    print(f"  summary.json: {review_package / 'summary.json'}")
+    print(f"  consumed:     {len(images)} returned image(s) from {images_dir} "
+          f"+ manifest.json + generated_provenance.json from {packet_dir}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Self-test.
 # ---------------------------------------------------------------------------
 
@@ -1686,6 +1977,168 @@ def _run_self_tests() -> int:
     detail = "" if ok else f"help/error drift: {missing}"
     probes.append(_Probe("T7f CLI help/error in sync with mode", ok, detail))
 
+    # T8 resume-packet: build a generation packet, fill the expected images,
+    # then drive the source-free resume mode to a validated review package,
+    # plus the missing / extra / mismatch / non-image / symlink / unsafe-path
+    # refusals (each must fail closed BEFORE any operator build or out-dir).
+    with tempfile.TemporaryDirectory(prefix="s2ir-T8-") as raw_td:
+        td = Path(raw_td)
+        src = td / "report.md"
+        src.write_text(_SAMPLE_MD, encoding="utf-8")
+        packet = td / "packet"
+        rc = main(["--source", str(src), "--generation-packet", "--out-dir", str(packet)])
+        plan_obj = json.loads(
+            (packet / "image_request_plan.json").read_text(encoding="utf-8")
+        )
+        expected_names = [req["filename"] for req in plan_obj["image_requests"]]
+        img_bytes: dict[str, bytes] = {}
+        for req in plan_obj["image_requests"]:
+            idx = req["index"]
+            rgb = ((idx * 37) % 256, (idx * 53) % 256, (idx * 71) % 256)
+            payload = _png_bytes(2 + idx, 2, rgb)
+            img_bytes[req["filename"]] = payload
+            (packet / "expected_images" / req["filename"]).write_bytes(payload)
+
+        def _fresh_images(name: str) -> Path:
+            d = td / name
+            d.mkdir(parents=False, exist_ok=False)
+            for fn, b in img_bytes.items():
+                (d / fn).write_bytes(b)
+            return d
+
+        # T8 happy path — point --images-dir straight at the packet's
+        # expected_images/ folder (which still holds its README.md sidecar),
+        # proving the sidecar tolerance and the 1:1 build in one step.
+        review_root = td / "review_ok"
+        rc = main([
+            "--resume-packet", "--packet-dir", str(packet),
+            "--images-dir", str(packet / "expected_images"),
+            "--out-dir", str(review_root),
+        ])
+        review = review_root / "review_package"
+        ok = rc == 0 and (review / "deck.pptx").is_file() and (review / "summary.json").is_file()
+        detail = "" if ok else f"rc={rc}; deck={(review / 'deck.pptx').is_file()}"
+        if ok:
+            val = _run(
+                "validate_operator_review_package (resume happy path)",
+                [sys.executable, str(PACKAGE_VALIDATOR), "--out-dir", str(review)],
+            )
+            if val.rc != 0:
+                ok, detail = False, f"review package failed validation rc={val.rc}"
+        probes.append(_Probe("T8 resume packet -> validated review package", ok, detail))
+
+        # T8a missing expected image fails closed before any out-dir.
+        miss = _fresh_images("imgs_missing")
+        (miss / expected_names[1]).unlink()
+        out = td / "rev_missing"
+        rc = main([
+            "--resume-packet", "--packet-dir", str(packet),
+            "--images-dir", str(miss), "--out-dir", str(out),
+        ])
+        ok = rc == 1 and not out.exists()
+        probes.append(_Probe("T8a missing image refused pre-build", ok, "" if ok else f"rc={rc}; out={out.exists()}"))
+
+        # T8b extra returned image fails closed before bundle assembly.
+        extra = _fresh_images("imgs_extra")
+        (extra / "unexpected_extra.png").write_bytes(_png_bytes(2, 2, (9, 9, 9)))
+        out = td / "rev_extra"
+        rc = main([
+            "--resume-packet", "--packet-dir", str(packet),
+            "--images-dir", str(extra), "--out-dir", str(out),
+        ])
+        ok = rc == 1 and not out.exists()
+        probes.append(_Probe("T8b extra image refused pre-build", ok, "" if ok else f"rc={rc}; out={out.exists()}"))
+
+        # T8c filename mismatch: one expected file renamed to a non-expected
+        # name surfaces as BOTH a missing and an extra; fails closed.
+        mismatch = _fresh_images("imgs_mismatch")
+        (mismatch / expected_names[0]).rename(mismatch / "renamed_wrong.png")
+        out = td / "rev_mismatch"
+        rc = main([
+            "--resume-packet", "--packet-dir", str(packet),
+            "--images-dir", str(mismatch), "--out-dir", str(out),
+        ])
+        ok = rc == 1 and not out.exists()
+        probes.append(_Probe("T8c filename mismatch refused pre-build", ok, "" if ok else f"rc={rc}; out={out.exists()}"))
+
+        # T8d non-image bytes under an expected filename fail the magic-byte
+        # gate.
+        badbytes = _fresh_images("imgs_badbytes")
+        (badbytes / expected_names[0]).write_bytes(b"this is not a PNG at all")
+        out = td / "rev_badbytes"
+        rc = main([
+            "--resume-packet", "--packet-dir", str(packet),
+            "--images-dir", str(badbytes), "--out-dir", str(out),
+        ])
+        ok = rc == 1 and not out.exists()
+        probes.append(_Probe("T8d non-image bytes refused pre-build", ok, "" if ok else f"rc={rc}; out={out.exists()}"))
+
+        # T8e a symlink under an expected filename is refused outright.
+        sym = _fresh_images("imgs_symlink")
+        (sym / expected_names[0]).unlink()
+        try:
+            (sym / expected_names[0]).symlink_to(sym / expected_names[1])
+            symlink_made = True
+        except OSError:
+            symlink_made = False  # platform without symlink support
+        out = td / "rev_symlink"
+        rc = main([
+            "--resume-packet", "--packet-dir", str(packet),
+            "--images-dir", str(sym), "--out-dir", str(out),
+        ])
+        ok = (not symlink_made) or (rc == 1 and not out.exists())
+        probes.append(_Probe("T8e symlink image refused pre-build", ok, "" if ok else f"rc={rc}; out={out.exists()}"))
+
+        # T8f a missing required packet file (manifest.json) is refused.
+        partial = td / "packet_no_manifest"
+        partial.mkdir(parents=False, exist_ok=False)
+        for fn in ("image_request_plan.json", "generated_provenance.json"):
+            (partial / fn).write_bytes((packet / fn).read_bytes())
+        out = td / "rev_nomanifest"
+        rc = main([
+            "--resume-packet", "--packet-dir", str(partial),
+            "--images-dir", str(packet / "expected_images"), "--out-dir", str(out),
+        ])
+        ok = rc == 1 and not out.exists()
+        probes.append(_Probe("T8f missing packet file refused", ok, "" if ok else f"rc={rc}; out={out.exists()}"))
+
+        # T8g a URI-shaped --images-dir is an arg-shape refusal (rc=2), no dir.
+        out = td / "rev_uri"
+        rc = main([
+            "--resume-packet", "--packet-dir", str(packet),
+            "--images-dir", "file:///nope", "--out-dir", str(out),
+        ])
+        ok = rc == 2 and not out.exists()
+        probes.append(_Probe("T8g URI images-dir refused", ok, "" if ok else f"rc={rc}; out={out.exists()}"))
+
+        # T8h a non-empty --out-dir is refused by the shared out-dir gate.
+        nonempty = td / "rev_nonempty"
+        nonempty.mkdir(parents=False, exist_ok=False)
+        (nonempty / "stale.txt").write_text("stale\n", encoding="utf-8")
+        rc = main([
+            "--resume-packet", "--packet-dir", str(packet),
+            "--images-dir", str(packet / "expected_images"), "--out-dir", str(nonempty),
+        ])
+        ok = rc == 2 and not (nonempty / "review_package").exists()
+        probes.append(_Probe("T8h non-empty out-dir refused", ok, "" if ok else f"rc={rc}"))
+
+        # T8i --resume-packet enforces its "NOT --source" contract: providing
+        # --source alongside it is refused (rc=2), not silently ignored —
+        # including a present-but-EMPTY --source "" (argparse keeps "" as a
+        # provided value distinct from an omitted flag, so a truthiness check
+        # would wrongly let it through).
+        ok, detail = True, ""
+        for tag, src_val in (("nonempty", str(src)), ("empty", "")):
+            out = td / f"rev_withsource_{tag}"
+            rc = main([
+                "--resume-packet", "--source", src_val, "--packet-dir", str(packet),
+                "--images-dir", str(packet / "expected_images"), "--out-dir", str(out),
+            ])
+            if not (rc == 2 and not out.exists()):
+                ok, detail = False, f"{tag}: rc={rc}; out={out.exists()}"
+                break
+        probes.append(_Probe("T8i resume refuses --source (incl. empty)", ok, detail))
+
     # Repo immutability.
     repo_ok = True
     for label, before in (
@@ -1793,23 +2246,60 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     mode.add_argument(
+        "--resume-packet",
+        action="store_true",
+        help=(
+            "Resume / finish a generation packet: consume a completed packet "
+            "(--packet-dir with image_request_plan.json + manifest.json + "
+            "generated_provenance.json) plus a folder of returned local "
+            "images (--images-dir) and build a validated review package "
+            "under --out-dir via the existing operator --bundle lane. The "
+            "returned images must match the plan's expected filenames "
+            "EXACTLY (one per request, valid PNG/JPG/JPEG bytes, no symlinks "
+            "/ extras / missing); the packet's expected_images/README.md "
+            "sidecar is tolerated and skipped. Source-free: reads no source "
+            "document and synthesises no pixels. Requires --packet-dir, "
+            "--images-dir, and --out-dir (NOT --source)."
+        ),
+    )
+    mode.add_argument(
         "--self-test",
         action="store_true",
         help=(
             "Run every scenario under a per-run TMPDIR (valid plan, unsafe "
             "rejection, no-headings rejection, mock handoff, generation "
             "packet + round-trip + path-safe finish commands + no_text "
-            "provenance honesty, no-external claims, out-dir gate). No "
-            "caller-visible artifacts retained."
+            "provenance honesty, resume-packet round-trip + missing / extra / "
+            "mismatch / symlink / non-image / unsafe-path refusals, "
+            "no-external claims, out-dir gate). No caller-visible artifacts "
+            "retained."
+        ),
+    )
+    parser.add_argument(
+        "--packet-dir",
+        help=(
+            "Completed generation-packet directory for --resume-packet "
+            "(carries image_request_plan.json + manifest.json + "
+            "generated_provenance.json). Must not be URI-shaped, a symlink, "
+            "or have a symlink ancestor."
+        ),
+    )
+    parser.add_argument(
+        "--images-dir",
+        help=(
+            "Folder of returned local images for --resume-packet (typically "
+            "the packet's expected_images/ folder). Must not be URI-shaped, a "
+            "symlink, or have a symlink ancestor; must hold exactly the plan's "
+            "expected filenames (the packet's own README.md is tolerated)."
         ),
     )
     parser.add_argument(
         "--out-dir",
         help=(
             "Output directory outside the repo tree for --mock-handoff / "
-            "--generation-packet. Must not be URI-shaped, a symlink, or have "
-            "a symlink ancestor; must not anchor under the repo tree; must be "
-            "missing or empty."
+            "--generation-packet / --resume-packet. Must not be URI-shaped, a "
+            "symlink, or have a symlink ancestor; must not anchor under the "
+            "repo tree; must be missing or empty."
         ),
     )
     return parser
@@ -1820,6 +2310,35 @@ def main(argv: list[str]) -> int:
 
     if args.self_test:
         return _run_self_tests()
+
+    # --resume-packet is source-free: it consumes a completed packet +
+    # returned images, so it is dispatched before the --source requirement.
+    if args.resume_packet:
+        # `is not None` (not truthiness): a present-but-empty --source ""
+        # is still a provided flag and must be refused, since the contract
+        # is that --source does not appear with --resume-packet at all.
+        if args.source is not None:
+            print(
+                "FAIL: --resume-packet does not take --source; it consumes a "
+                "completed generation packet (--packet-dir) plus returned "
+                "images (--images-dir), not a source document",
+                file=sys.stderr,
+            )
+            return 2
+        missing = [
+            flag for flag, value in (
+                ("--packet-dir", args.packet_dir),
+                ("--images-dir", args.images_dir),
+                ("--out-dir", args.out_dir),
+            ) if not value
+        ]
+        if missing:
+            print(
+                f"FAIL: --resume-packet requires {', '.join(missing)}",
+                file=sys.stderr,
+            )
+            return 2
+        return _run_resume_packet(args.packet_dir, args.images_dir, args.out_dir)
 
     if not args.source:
         print(
