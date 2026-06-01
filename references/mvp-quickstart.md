@@ -129,6 +129,30 @@ Then run Step 2. The deck appears at
 are flat solid-colour squares — useful only to prove the pipeline; swap
 in real returned images for a real deck.
 
+## One-command dry-run gate (company-machine proof)
+
+To run the *whole* quickstart above as a single fail-closed check — first
+run → placeholder images → resume run → review-package validation — use the
+dry-run gate. It drives the documented commands as subprocesses (exactly
+what you would type by hand), writes the placeholder PNGs for you, and
+additionally fails if the produced `deck.pptx` is missing, if
+`validate_operator_review_package.py` refuses the result, or if the run
+leaves **any** new artifact in the repo (a `git status --porcelain` delta
+taken across the run):
+
+```bash
+# Auto-removed temp output; asserts every step, retains nothing:
+python3 scripts/mvp_company_machine_dry_run.py --self-test
+
+# Or keep the produced deck for inspection (DIR must be outside the repo):
+python3 scripts/mvp_company_machine_dry_run.py --out-dir /tmp/szh-mvp-dryrun
+```
+
+Both modes print the final `deck.pptx` and `summary.json` paths. The gate is
+stdlib-only and local-only (no D-One, MCP, Qoder, public network, telemetry,
+model API, or image search); it adds no renderer or validator and synthesises
+only placeholder pixels.
+
 ## Behind the wrapper
 
 `run_mvp_image_to_ppt.py` is a thin orchestrator. It adds no renderer and
