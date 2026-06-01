@@ -71,8 +71,9 @@ python3 scripts/run_mvp_image_to_ppt.py --resume /tmp/szh-mvp-demo
 ```
 
 The resume run checks the returned images against the plan **1:1** (exact
-filenames, valid PNG/JPG/JPEG bytes, no symlinks / extras / missing —
-failing closed with an actionable message otherwise), builds the editable
+filenames, valid PNG bytes since every requested filename ends in `.png`, no
+symlinks / extras / missing — failing closed with an actionable message
+otherwise), builds the editable
 deck, and re-validates the result read-only. The final deck lands at:
 
 ```

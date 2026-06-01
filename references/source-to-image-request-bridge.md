@@ -68,8 +68,9 @@ source body, and never performs real image generation.
   - it confirms the packet carries `image_request_plan.json` +
     `manifest.json` + `generated_provenance.json`, derives the expected
     filename set from the schema-validated plan, and checks the returned
-    images match it **EXACTLY** — one regular file per request, valid
-    PNG/JPG/JPEG magic bytes, no symlinks, no missing, no extras (the
+    images match it **EXACTLY** — one regular file per request, valid PNG
+    magic bytes (every requested filename ends in `.png`), no symlinks, no
+    missing, no extras (the
     packet's own `expected_images/README.md` sidecar is tolerated and
     skipped). Every missing / extra / mismatch / non-image / unsafe-path
     case fails closed with an actionable message **before** any bundle is

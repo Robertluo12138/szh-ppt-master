@@ -46,8 +46,9 @@ Resume run (``--resume O``, source-free):
   * runs ``source_to_image_requests.py --resume-packet --packet-dir
     <O>/generation_packet --images-dir <O>/generation_packet/expected_images
     --out-dir <O>/review``, which checks the returned images match the
-    plan's expected filenames EXACTLY (valid PNG/JPG/JPEG, no symlinks /
-    extras / missing), drives the existing operator ``--bundle`` lane, and
+    plan's expected filenames EXACTLY (valid PNG bytes — every requested
+    filename ends in ``.png`` — no symlinks / extras / missing), drives the
+    existing operator ``--bundle`` lane, and
     re-validates the result read-only.
   * the validated, editable deck lands at
     ``<O>/review/review_package/deck.pptx`` (the resume helper always nests

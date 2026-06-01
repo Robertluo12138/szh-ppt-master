@@ -79,8 +79,9 @@ under the expected filenames; those then feed the existing operator
 The ``--resume-packet`` mode is the source-free finish for that packet:
 given the completed ``--packet-dir`` and a ``--images-dir`` of returned
 local images, it checks the images match the plan's expected filenames
-EXACTLY (one per request, valid PNG/JPG/JPEG bytes, no symlinks / extras /
-missing — the packet's own ``expected_images/README.md`` is tolerated),
+EXACTLY (one per request, valid PNG bytes — the plan emits ``.png``
+filenames — no symlinks / extras / missing; the packet's own
+``expected_images/README.md`` is tolerated),
 assembles a TEMPORARY operator bundle (returned images + the packet's
 manifest.json / generated_provenance.json, verbatim) under TMPDIR, and
 drives the SAME operator ``--bundle`` lane to a validated
@@ -938,7 +939,9 @@ def _render_generation_requests_md(plan: dict) -> str:
             f"(operator layout: {layout})",
             f"- **intended_use:** {req['intended_use']}",
             f"- **alt_text:** {req['alt_text']}",
-            f"- **image_descriptor (what to draw):** {req['image_descriptor']}",
+            f"- **image_descriptor (creative brief for a HUMAN creator — "
+            f"contains the slide heading; do NOT feed verbatim to an automated "
+            f"image generator):** {req['image_descriptor']}",
             f"- **declared text_policy:** `{_TEXT_POLICY}` — return a TEXT-FREE "
             f"image (no text, lettering, numbers, logos, or watermarks). If "
             f"yours has any text, fix this entry's `text_policy` before "
@@ -958,9 +961,16 @@ def _render_generation_requests_md(plan: dict) -> str:
         "",
         "## How to return the images",
         "",
-        "1. Create one image per request below using its `image_descriptor`.",
-        "   Every request asks for a TEXT-FREE abstract illustration — do not",
-        "   embed text, lettering, numbers, logos, or watermarks.",
+        "1. Create one image per request below BY HAND, or via an approved",
+        "   internal image generator operated under its own controls, using the",
+        "   request's `image_descriptor` / `slide_title` as your brief. Do NOT",
+        "   pipe this packet into an automated image generator: this packet runs",
+        "   NO prompt-audit gate, and prompts to a generator must be deny-list-",
+        "   validated and logged through the project's audited generation path —",
+        "   never send `slide_title` / `alt_text` / `image_descriptor` (they",
+        "   embed the source heading) or any source text to a generator. Every",
+        "   request asks for a TEXT-FREE abstract illustration — do not embed",
+        "   text, lettering, numbers, logos, or watermarks.",
         "2. Save each file into `expected_images/` under its EXACT",
         "   `return filename` (see `expected_images/README.md`).",
         "3. Confirm provenance: the starter `generated_provenance.json`",
@@ -2255,8 +2265,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "images (--images-dir) and build a validated review package "
             "under --out-dir via the existing operator --bundle lane. The "
             "returned images must match the plan's expected filenames "
-            "EXACTLY (one per request, valid PNG/JPG/JPEG bytes, no symlinks "
-            "/ extras / missing); the packet's expected_images/README.md "
+            "EXACTLY (one per request, valid PNG bytes since every requested "
+            "filename is .png, no symlinks / extras / missing); the packet's "
+            "expected_images/README.md "
             "sidecar is tolerated and skipped. Source-free: reads no source "
             "document and synthesises no pixels. Requires --packet-dir, "
             "--images-dir, and --out-dir (NOT --source)."

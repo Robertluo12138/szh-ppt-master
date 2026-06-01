@@ -176,10 +176,16 @@ to exercise the runtime pipeline through Qoder, the smoke MUST be synthetic:
   `scripts/image_asset_acceptance_smoke.py`). These scripts default to
   `tempfile.TemporaryDirectory()` outside the repo and outside Qoder's state
   directory; do not redirect output into Qoder-managed paths.
-- The runtime contract has not changed for this handoff: D-One stays local
-  and mock-only; no MCP call; no public network; no model API; no image
-  search; no full-slide screenshot; no raw source text sent to any image
-  prompt. If Qoder offers to wire any of those in, **stop**.
+- The runtime contract for **this import-verification smoke** is mock-only:
+  D-One stays local and mock-only; no MCP call; no public network; no model
+  API; no image search; no full-slide screenshot; no raw source text sent to
+  any image prompt. If Qoder offers to wire any of those into the
+  *verification smoke*, **stop** — you are confirming the archive loads, not
+  producing a deck. The separate *operational* MVP run is governed by
+  [`qoder-agent-mvp-runbook.md`](qoder-agent-mvp-runbook.md), where the
+  packet / resume path issues no generator prompts and agent-driven generation
+  is confined to the repo's audited (deny-list-validated, logged) pipeline;
+  none of that applies to this import-verification smoke.
 
 Document any deviation from the synthetic-only path as a handoff failure.
 
@@ -224,7 +230,12 @@ appears at any point:
   any update check, any "send anonymous usage data" prompt.
 - Qoder attempts to call D-One, any image-generation model, any MCP server,
   any external service, any model API, any image search, or any voice / video
-  generator.
+  generator **during this import handoff**. None of these should fire while
+  you are merely verifying that the archive imports. (Automated image
+  generation belongs to the operational MVP run, where it is confined to the
+  repo's audited, deny-list-validated, logged pipeline per
+  [`qoder-agent-mvp-runbook.md`](qoder-agent-mvp-runbook.md); this import
+  handoff itself never invokes any generator.)
 - Any prompt or workflow asks for real company data, real customer names,
   real account ids, internal screenshots, raw report text, or sensitive
   prompt content.
@@ -278,7 +289,10 @@ a `FAIL` / `BLOCKED` / `UNVERIFIED` outcome.
   contract, not an integration.
 - Real D-One image generation, MCP calls, public network, telemetry, model
   APIs, image search, or any external service. These remain refused by the
-  shipped scripts.
+  shipped scripts. The operational MVP run's audited image-generation pipeline
+  (every prompt deny-list-validated and logged) is documented in
+  [`qoder-agent-mvp-runbook.md`](qoder-agent-mvp-runbook.md), not here, and does
+  not change what the shipped scripts do.
 - Changes to PPTX export behavior, the render-model contract, the per-stage
   helpers, or the validator surface.
 - Real or confidential data of any kind.
