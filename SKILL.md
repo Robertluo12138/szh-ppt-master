@@ -1,10 +1,10 @@
 ---
-name: editable-ppt
-description: Internal clean-room skill that turns prompts, reports, or Markdown into editable PowerPoint decks through a planned pipeline. Invoke when the user asks to scaffold, plan, validate, or extend deck-generation artifacts in this repo.
+name: szh-ppt-master
+description: Internal clean-room szh-ppt-master skill that turns prompts, reports, or Markdown into editable PowerPoint decks through a planned pipeline. Invoke when the user asks to scaffold, plan, validate, or extend deck-generation artifacts in this repo.
 status: scaffold
 ---
 
-# editable-ppt
+# szh-ppt-master
 
 ## Status
 

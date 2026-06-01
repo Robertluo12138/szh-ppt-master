@@ -142,7 +142,7 @@ After a confirmed install command exits 0, run the post-import surface
 without leaving the local machine:
 
 1. **Registration**: list installed skills (e.g. `qoder skill list` or the
-   confirmed equivalent). Confirm the skill name `editable-ppt` (from
+   confirmed equivalent). Confirm the skill name `szh-ppt-master` (from
    `SKILL.md` frontmatter) appears and that its declared description matches
    the SKILL.md `description` field. Capture stdout verbatim.
 2. **Inspection**: show the skill's metadata / description / commands through

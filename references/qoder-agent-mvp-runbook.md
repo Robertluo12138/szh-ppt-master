@@ -1,7 +1,7 @@
 # Qoder-agent MVP runbook: local source → internal images → editable PPT
 
 Internal-only, clean-room. This is the runbook a **Qoder agent** follows to
-drive the MVP flow once the `editable-ppt` skill is loaded on a company
+drive the MVP flow once the `szh-ppt-master` skill is loaded on a company
 machine and an operator opens a business folder. It is written to be run
 **without chat history**: everything the agent needs is here plus the
 documented commands it cites.
@@ -44,13 +44,13 @@ API, or network call.
 
 ## Qoder operator prompt (paste this after installing the skill)
 
-Once the `editable-ppt` skill is installed and you have pointed Qoder at a
+Once the `szh-ppt-master` skill is installed and you have pointed Qoder at a
 business folder, paste the block below into Qoder. It routes the operational
 run to `--style company` and keeps the manual / internal image handoff
 boundary intact. The detailed steps follow in **Workflow**.
 
 ```text
-You have the `editable-ppt` skill installed. Follow
+You have the `szh-ppt-master` skill installed. Follow
 references/qoder-agent-mvp-runbook.md, running every command from the repo
 root, for the business folder I point you at:
 
@@ -73,7 +73,7 @@ root, for the business folder I point you at:
 
 ## Workflow
 
-Preconditions: the `editable-ppt` skill is loaded; `python3` is available
+Preconditions: the `szh-ppt-master` skill is loaded; `python3` is available
 (standard library only — no `pip install`); the operator has pointed the
 agent at a business folder. Run every command from the repo root.
 
