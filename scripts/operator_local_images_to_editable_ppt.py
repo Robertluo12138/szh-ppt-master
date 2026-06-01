@@ -393,6 +393,14 @@ from pathlib import Path  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 TEMPLATES_DIR = REPO_ROOT / "templates" / "layouts"
+# Clean-room company-style design tokens (palette / typography / grid).
+# Selected with ``--style company``; projected onto the deck via the
+# existing run_explicit_pipeline ``--design-system-spec`` seam instead of
+# the default ``--theme-from-template``. The default ``--style default``
+# leaves the run byte-identical to the template-theme behaviour.
+COMPANY_STYLE_DESIGN_SYSTEM = (
+    REPO_ROOT / "examples" / "company_style_design_system.json"
+)
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 
@@ -3518,7 +3526,18 @@ def _pipeline_args(
     workspace: Path,
     output: Path,
     report_dir: Path,
+    design_system_spec: Path | None = None,
 ) -> list[str]:
+    # Default (design_system_spec is None): project the chosen template's
+    # theme via --theme-from-template — byte-identical to prior behaviour.
+    # When --style company resolves a clean-room design_system spec, swap
+    # in run_explicit_pipeline's mutually-exclusive --design-system-spec
+    # input instead; --template-root still supplies the layouts.
+    design_system_args = (
+        ["--design-system-spec", str(design_system_spec)]
+        if design_system_spec is not None
+        else ["--theme-from-template"]
+    )
     return [
         sys.executable, str(RUN_EXPLICIT_PIPELINE),
         "--workspace", str(workspace),
@@ -3531,7 +3550,7 @@ def _pipeline_args(
         "--slide-specs-dir", str(fixture["specs_dir"]),
         "--image-manifest-spec", str(fixture["image_manifest_spec"]),
         "--template-root", str(TEMPLATES_DIR),
-        "--theme-from-template",
+        *design_system_args,
         "--assets-dir", str(fixture["assets_dir"]),
         "--output", str(output),
         "--report-dir", str(report_dir),
@@ -4775,6 +4794,7 @@ def _run_happy_path(
     approved_plan_evidence: dict | None = None,
     sidecar_entries: list[dict] | None = None,
     sidecar_path: Path | None = None,
+    design_system_spec: Path | None = None,
 ) -> tuple[int, dict | None, Path | None]:
     """Build the fixture under ``out_dir``, drive the pipeline, run the
     validators, and write the summary. Returns ``(rc, summary,
@@ -4839,6 +4859,7 @@ def _run_happy_path(
         _pipeline_args(
             fixture=fixture, workspace=workspace,
             output=output, report_dir=report_dir,
+            design_system_spec=design_system_spec,
         ),
     )
     if not pipeline.ok:
@@ -5043,6 +5064,7 @@ def _run_operator_mode(
     manifest_path_str: str | None = None,
     approved_plan_path_str: str | None = None,
     generated_provenance_path_str: str | None = None,
+    design_system_spec: Path | None = None,
 ) -> int:
     """Validate every operator argument, create ``--out-dir`` if
     needed, and drive the happy path. Returns 0 on success, 1 on any
@@ -5257,6 +5279,7 @@ def _run_operator_mode(
         approved_plan_evidence=approved_plan_evidence,
         sidecar_entries=sidecar_entries,
         sidecar_path=sidecar_path,
+        design_system_spec=design_system_spec,
     )
     if rc != 0 or summary is None or summary_path is None:
         print(
@@ -12299,6 +12322,21 @@ def main(argv: list[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--style", choices=("default", "company"), default="default",
+        help=(
+            "Design-token style for the produced deck. 'default' (the "
+            "default) projects the template theme via "
+            "--theme-from-template -- byte-identical to prior runs. "
+            "'company' applies the clean-room company-style design tokens "
+            "(examples/company_style_design_system.json: warm palette + "
+            "clean sans typography) via run_explicit_pipeline's "
+            "--design-system-spec seam; only the design_system differs, "
+            "layouts / images / every gate are unchanged. Applies to a "
+            "deck-building run (default mode or --bundle); ignored by "
+            "--plan-out / --write-*-template / --self-test."
+        ),
+    )
+    parser.add_argument(
         "--manifest", type=str, default=None,
         help=(
             "Optional caller-supplied local JSON file naming per-image "
@@ -12655,6 +12693,21 @@ def main(argv: list[str]) -> int:
         )
         return 2
 
+    # Resolve the optional company style here so it only affects a
+    # deck-building run; a missing tokens file fails closed (rc 2) before
+    # any out-dir is created. 'default' keeps design_system_spec None ->
+    # the pipeline behaves byte-identically to prior runs.
+    design_system_spec: Path | None = None
+    if args.style == "company":
+        if not COMPANY_STYLE_DESIGN_SYSTEM.is_file():
+            print(
+                f"FAIL: --style company needs the clean-room design tokens "
+                f"at {COMPANY_STYLE_DESIGN_SYSTEM}, but that file is missing.",
+                file=sys.stderr,
+            )
+            return 2
+        design_system_spec = COMPANY_STYLE_DESIGN_SYSTEM
+
     return _run_operator_mode(
         images_dir_str=args.images_dir,
         out_dir_str=args.out_dir,
@@ -12663,6 +12716,7 @@ def main(argv: list[str]) -> int:
         generated_provenance_path_str=getattr(
             args, "_generated_provenance_path", None,
         ),
+        design_system_spec=design_system_spec,
     )
 
 

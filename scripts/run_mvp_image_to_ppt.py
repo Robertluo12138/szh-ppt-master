@@ -171,7 +171,7 @@ def _run_first(source_arg: str, out_dir_arg: str) -> int:
     return 0
 
 
-def _run_resume(out_dir_arg: str) -> int:
+def _run_resume(out_dir_arg: str, style: str = "default") -> int:
     """Resume run: filled packet + returned images -> review package."""
     if not out_dir_arg:
         print(
@@ -200,12 +200,17 @@ def _run_resume(out_dir_arg: str) -> int:
 
     images_dir = packet_dir / "expected_images"
     review_root = out_dir / _REVIEW_SUBDIR
-    rc = s2ir.main(
-        ["--resume-packet",
-         "--packet-dir", str(packet_dir),
-         "--images-dir", str(images_dir),
-         "--out-dir", str(review_root)]
-    )
+    resume_cmd = [
+        "--resume-packet",
+        "--packet-dir", str(packet_dir),
+        "--images-dir", str(images_dir),
+        "--out-dir", str(review_root),
+    ]
+    if style == "company":
+        # Opt-in clean-room company style; default leaves the command
+        # (and the produced deck) byte-identical to prior runs.
+        resume_cmd += ["--style", "company"]
+    rc = s2ir.main(resume_cmd)
     if rc != 0:
         return rc
 
@@ -291,6 +296,31 @@ def _run_self_tests() -> int:
         except Exception as exc:  # pragma: no cover - defensive
             record("md_first_run_packet+instruction", False, f"raised {exc!r}")
             record("md_resume_roundtrip_deck", False, "skipped: exception above")
+
+        # T1b resume with --style company applies the clean-room company
+        #     design tokens end-to-end. rc==0 from the resume path already
+        #     implies validate_operator_review_package passed (it runs inside
+        #     --resume-packet), so a built deck proves selection + validation.
+        try:
+            out = td / "company_run"
+            md = td / "report_company.md"
+            md.write_text(sample, encoding="utf-8")
+            with _captured():
+                rc = _run_first(str(md), str(out))
+            packet = out / _PACKET_SUBDIR
+            if rc == 0:
+                _fill_expected_images(packet)
+                with _captured() as buf:
+                    rc2 = _run_resume(str(out), style="company")
+                deck = out / _REVIEW_SUBDIR / "review_package" / "deck.pptx"
+                ok2 = rc2 == 0 and deck.is_file()
+                record("resume_company_style_roundtrip_deck", ok2,
+                       "" if ok2 else f"rc={rc2}; deck missing\n{buf.getvalue()[-800:]}")
+            else:
+                record("resume_company_style_roundtrip_deck", False,
+                       "skipped: first run failed")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("resume_company_style_roundtrip_deck", False, f"raised {exc!r}")
 
         # T2 .txt first run routes through ingest --md-out (normalized_source.md
         #    written) and still produces a packet.
@@ -472,7 +502,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Run every scenario under a per-run TMPDIR (md first run + exact "
             "resume instruction + full resume round-trip to an editable "
-            "deck, docx/txt routed through ingest, missing / mismatched "
+            "deck, a --style company resume round-trip, "
+            "docx/txt routed through ingest, missing / mismatched "
             "image refusals, unsupported-extension refusal, unsafe-out-dir "
             "refusal, argument-shape gates). No caller-visible artifacts "
             "retained."
@@ -485,6 +516,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "outside the repo tree, not URI-shaped, not a symlink / under a "
             "symlink, and missing or empty; its parent must exist. Holds "
             "generation_packet/ (and review/ after --resume)."
+        ),
+    )
+    parser.add_argument(
+        "--style", choices=("default", "company"), default="default",
+        help=(
+            "Deck design-token style applied on the --resume step. "
+            "'default' (the default) projects the template theme -- "
+            "byte-identical to prior runs. 'company' applies the "
+            "clean-room company-style design tokens (warm palette + clean "
+            "sans typography) to the editable deck; only the design_system "
+            "differs, every safety / validation gate is unchanged. No "
+            "effect on the first --source run (which builds only the "
+            "image-generation packet)."
         ),
     )
     return parser
@@ -512,7 +556,7 @@ def main(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 2
-        return _run_resume(args.resume)
+        return _run_resume(args.resume, args.style)
 
     # --source
     if not args.out_dir:

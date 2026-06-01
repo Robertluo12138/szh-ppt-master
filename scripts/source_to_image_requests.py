@@ -1307,6 +1307,7 @@ def _validate_returned_images(
 
 def _run_resume_packet(
     packet_dir_arg: str, images_dir_arg: str, out_dir_arg: str,
+    style: str = "default",
 ) -> int:
     # Arg-shape gates first (rc=2): out-dir, packet-dir, images-dir.
     out_dir, failures = _validate_out_dir_arg(out_dir_arg)
@@ -1348,6 +1349,8 @@ def _run_resume_packet(
     print(f"  packet-dir: {packet_dir}")
     print(f"  images-dir: {images_dir}")
     print(f"  out-dir:    {out_dir}")
+    if style == "company":
+        print("  style:      company (clean-room company-style design tokens)")
     print(f"  matched {len(images)} returned image(s) to the packet plan 1:1")
     print()
 
@@ -1372,13 +1375,18 @@ def _run_resume_packet(
         for sidecar in ("manifest.json", "generated_provenance.json"):
             (bundle / sidecar).write_bytes((packet_dir / sidecar).read_bytes())
 
+        op_cmd = [
+            sys.executable, str(OPERATOR_HELPER),
+            "--bundle", str(bundle),
+            "--out-dir", str(review_package),
+        ]
+        if style == "company":
+            # Forward the clean-room company style to the operator's own
+            # --style flag; the default leaves the bundle command unchanged.
+            op_cmd += ["--style", "company"]
         op = _run(
             "operator_local_images_to_editable_ppt --bundle",
-            [
-                sys.executable, str(OPERATOR_HELPER),
-                "--bundle", str(bundle),
-                "--out-dir", str(review_package),
-            ],
+            op_cmd,
         )
         if op.rc != 0:
             print(f"  [FAIL] operator helper rc={op.rc}")
@@ -2037,6 +2045,28 @@ def _run_self_tests() -> int:
                 ok, detail = False, f"review package failed validation rc={val.rc}"
         probes.append(_Probe("T8 resume packet -> validated review package", ok, detail))
 
+        # T8z resume-packet --style company applies the clean-room
+        # company-style design tokens and STILL produces a validated
+        # review package: the 1:1 returned-image contract is unchanged;
+        # only the deck's design_system differs.
+        review_company = td / "review_company"
+        rc = main([
+            "--resume-packet", "--packet-dir", str(packet),
+            "--images-dir", str(packet / "expected_images"),
+            "--out-dir", str(review_company), "--style", "company",
+        ])
+        review_c = review_company / "review_package"
+        ok = rc == 0 and (review_c / "deck.pptx").is_file()
+        detail = "" if ok else f"rc={rc}; deck={(review_c / 'deck.pptx').is_file()}"
+        if ok:
+            val = _run(
+                "validate_operator_review_package (resume --style company)",
+                [sys.executable, str(PACKAGE_VALIDATOR), "--out-dir", str(review_c)],
+            )
+            if val.rc != 0:
+                ok, detail = False, f"company-style review package failed validation rc={val.rc}"
+        probes.append(_Probe("T8z resume --style company -> validated review package", ok, detail))
+
         # T8a missing expected image fails closed before any out-dir.
         miss = _fresh_images("imgs_missing")
         (miss / expected_names[1]).unlink()
@@ -2280,7 +2310,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Run every scenario under a per-run TMPDIR (valid plan, unsafe "
             "rejection, no-headings rejection, mock handoff, generation "
             "packet + round-trip + path-safe finish commands + no_text "
-            "provenance honesty, resume-packet round-trip + missing / extra / "
+            "provenance honesty, resume-packet round-trip + company-style "
+            "resume + missing / extra / "
             "mismatch / symlink / non-image / unsafe-path refusals, "
             "no-external claims, out-dir gate). No caller-visible artifacts "
             "retained."
@@ -2311,6 +2342,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "--generation-packet / --resume-packet. Must not be URI-shaped, a "
             "symlink, or have a symlink ancestor; must not anchor under the "
             "repo tree; must be missing or empty."
+        ),
+    )
+    parser.add_argument(
+        "--style", choices=("default", "company"), default="default",
+        help=(
+            "Deck design-token style for --resume-packet. 'default' (the "
+            "default) projects the template theme -- byte-identical to "
+            "prior runs. 'company' applies the clean-room company-style "
+            "design tokens (warm palette + clean sans typography) by "
+            "forwarding --style company to the operator --bundle lane; "
+            "only the design_system differs, the 1:1 returned-image "
+            "contract and every gate are unchanged. Ignored by "
+            "--mock-handoff / --generation-packet / --plan-out."
         ),
     )
     return parser
@@ -2349,7 +2393,9 @@ def main(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 2
-        return _run_resume_packet(args.packet_dir, args.images_dir, args.out_dir)
+        return _run_resume_packet(
+            args.packet_dir, args.images_dir, args.out_dir, args.style,
+        )
 
     if not args.source:
         print(

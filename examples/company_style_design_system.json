@@ -1,0 +1,18 @@
+{
+  "palette": {
+    "primary":    "#FF6200",
+    "secondary":  "#FF8F47",
+    "accent":     "#FFA020",
+    "background": "#FFFFFF",
+    "text":       "#222222"
+  },
+  "typography": {
+    "heading": { "font_family": "Roboto, Helvetica Neue, Arial, sans-serif", "size_pt": 32 },
+    "body":    { "font_family": "Roboto, Helvetica Neue, Arial, sans-serif", "size_pt": 16 }
+  },
+  "grid": {
+    "width_px": 1920,
+    "height_px": 1080,
+    "margin_px": 64
+  }
+}

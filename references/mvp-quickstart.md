@@ -85,6 +85,32 @@ alongside `summary.json`, `inventory.json`, `visual_quality.json`,
 time with `python3 scripts/validate_operator_review_package.py --out-dir
 /tmp/szh-mvp-demo/review/review_package`.
 
+## Optional — company style preset
+
+By default the deck uses the bundled template theme. To make the output
+feel closer to the company-preferred aesthetic — a warmer palette and a
+clean sans-serif type scale — add `--style company` to the resume run:
+
+```bash
+python3 scripts/run_mvp_image_to_ppt.py --resume /tmp/szh-mvp-demo --style company
+```
+
+This changes only the deck's `design_system` (palette + typography). The
+layouts, the 1:1 returned-image contract, and every safety / validation
+gate are unchanged, and the produced `deck.pptx` still validates.
+`--style default` (the default) is byte-identical to a run with no flag,
+so existing decks are unaffected.
+
+The style is a small, clean-room set of abstract design tokens — colour
+tokens, typography guidance, and the slide grid — kept in
+`examples/company_style_design_system.json` and applied through the
+existing `run_explicit_pipeline.py --design-system-spec` seam. It carries
+**no** proprietary images, logos, screenshots, full slides, or verbatim
+brand-guide text — only non-sensitive design observations. The
+lower-level `source_to_image_requests.py --resume-packet` and
+`operator_local_images_to_editable_ppt.py --bundle` commands take the
+same `--style company` flag.
+
 ## Optional — fully-local smoke with no image generator
 
 To see the whole flow produce a deck on one machine with no external
