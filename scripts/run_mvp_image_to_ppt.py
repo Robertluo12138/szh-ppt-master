@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""One-command MVP wrapper: local source -> generation packet -> (returned
+images) -> validated review package (MOCK / LOCAL only).
+
+This is a THIN orchestration wrapper over two existing lower-level helpers.
+It adds NO new renderer, NO new validation, and synthesises NO pixels: it
+sequences the helpers and reuses their safety gates verbatim. The operator
+runs it twice, with a human/internal image-generation step in between.
+
+CLI shape::
+
+    # First run: local .docx / .md / .markdown / .txt source -> packet
+    python3 scripts/run_mvp_image_to_ppt.py \\
+        --source /path/report.docx --out-dir /tmp/szh-mvp   # OUT outside repo
+
+    # ... hand the packet to an image generator, drop the returned images
+    # under <out-dir>/generation_packet/expected_images ...
+
+    # Resume run: filled packet + returned local images -> review package
+    python3 scripts/run_mvp_image_to_ppt.py --resume /tmp/szh-mvp
+
+    # Self-test (every scenario under TMPDIR; nothing leaks under the repo)
+    python3 scripts/run_mvp_image_to_ppt.py --self-test
+
+First run (``--source S --out-dir O``):
+
+  * ``O`` is validated by the SAME ``_validate_out_dir_arg`` gate the
+    lower-level helpers apply (URI-shaped / symlink / symlink-ancestor /
+    repo-tree / non-empty refusals; parent must exist) and then created.
+  * ``.md`` / ``.markdown`` is used directly as the Markdown source.
+    ``.docx`` / ``.txt`` is first normalised to Markdown via
+    ``ingest_local_source_file.py --md-out`` (written to
+    ``<O>/normalized_source.md``). Any other extension is refused (``.pdf``
+    is a documented upstream TODO).
+  * the Markdown source feeds ``source_to_image_requests.py
+    --generation-packet --out-dir <O>/generation_packet``, which writes the
+    image_request_plan.json + a human-readable image_generation_requests.md
+    + starter manifest.json / generated_provenance.json + an
+    expected_images/README.md naming every required filename.
+  * the wrapper then prints the EXACT next step: drop the returned images
+    under ``<O>/generation_packet/expected_images`` and re-run with
+    ``--resume <O>``.
+
+Resume run (``--resume O``, source-free):
+
+  * runs ``source_to_image_requests.py --resume-packet --packet-dir
+    <O>/generation_packet --images-dir <O>/generation_packet/expected_images
+    --out-dir <O>/review``, which checks the returned images match the
+    plan's expected filenames EXACTLY (valid PNG/JPG/JPEG, no symlinks /
+    extras / missing), drives the existing operator ``--bundle`` lane, and
+    re-validates the result read-only.
+  * the validated, editable deck lands at
+    ``<O>/review/review_package/deck.pptx`` (the resume helper always nests
+    a ``review_package/`` under its ``--out-dir``; the wrapper passes
+    ``<O>/review`` so the packet under ``<O>/generation_packet`` is left
+    untouched).
+
+Stdlib-only. Local-only -- does NOT call D-One, MCP, Qoder, a public
+network, telemetry, a model API, an image search, or any external service.
+NOT real image generation; NOT full report-to-PPT automation.
+"""
+
+from __future__ import annotations
+
+import sys
+
+# Refuse `.pyc` writes from any imported module. Mirrors the gate every
+# sibling helper applies; must be flipped BEFORE any first-party import.
+sys.dont_write_bytecode = True
+
+import argparse  # noqa: E402
+import contextlib  # noqa: E402
+import io  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+# Reuse the lower-level helpers' OWN entry points + path gates so this
+# wrapper cannot diverge from the contract they enforce. It calls their
+# `main(argv)` in-process (the same reuse interface their self-tests use),
+# adds no second validator, and inherits every refusal they already apply.
+import ingest_local_source_file as ingest  # noqa: E402
+import source_to_image_requests as s2ir  # noqa: E402
+from core_image_to_editable_ppt_demo import _validate_out_dir_arg  # noqa: E402
+
+# Fixed layout under the wrapper's --out-dir. The generation packet and the
+# resume build live in distinct sibling subdirectories so the resume step
+# never has to write into the (non-empty) packet directory.
+_PACKET_SUBDIR = "generation_packet"
+_REVIEW_SUBDIR = "review"
+_NORMALIZED_MD = "normalized_source.md"
+
+# Source extensions routed straight to the Markdown bridge vs. normalised
+# to Markdown via ingest_local_source_file.py first.
+_MARKDOWN_SUFFIXES = frozenset({".md", ".markdown"})
+_INGEST_SUFFIXES = frozenset({".docx", ".txt"})
+
+
+def _run_first(source_arg: str, out_dir_arg: str) -> int:
+    """First run: local source -> generation packet under <out-dir>."""
+    # Same out-dir gate the lower-level helpers apply: URI / symlink /
+    # symlink-ancestor / repo-tree / non-empty refusals, parent must exist.
+    out_dir, failures = _validate_out_dir_arg(out_dir_arg)
+    if failures or out_dir is None:
+        for line in failures:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 2
+
+    suffix = Path(source_arg).suffix.lower()
+    if suffix in _MARKDOWN_SUFFIXES:
+        needs_ingest = False
+    elif suffix in _INGEST_SUFFIXES:
+        needs_ingest = True
+    else:
+        print(
+            f"FAIL: --source {source_arg} has unsupported extension "
+            f"{suffix or '(none)'!r}; supported: .md / .markdown (used "
+            f"directly) or .docx / .txt (normalised via "
+            f"ingest_local_source_file.py). PDF is a documented TODO.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # The gate above proved the parent exists and out-dir is missing-or-empty.
+    if not out_dir.exists():
+        try:
+            out_dir.mkdir(parents=False, exist_ok=False)
+        except OSError as exc:
+            print(
+                f"FAIL: cannot create --out-dir {out_dir}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+    if needs_ingest:
+        md_path = out_dir / _NORMALIZED_MD
+        rc = ingest.main(["--report", source_arg, "--md-out", str(md_path)])
+        if rc != 0:
+            return rc
+        markdown_source = str(md_path)
+    else:
+        markdown_source = source_arg
+
+    packet_dir = out_dir / _PACKET_SUBDIR
+    rc = s2ir.main(
+        ["--source", markdown_source, "--generation-packet",
+         "--out-dir", str(packet_dir)]
+    )
+    if rc != 0:
+        return rc
+
+    expected_images = packet_dir / "expected_images"
+    print()
+    print("=== run_mvp_image_to_ppt: generation packet ready ===")
+    print(f"  packet:  {packet_dir}")
+    print()
+    print("Next steps:")
+    print(f"  1. Give {packet_dir / 'image_generation_requests.md'} to your "
+          f"local / internal image generator.")
+    print( "  2. Save each returned image under its EXACT requested filename "
+          "into:")
+    print(f"       {expected_images}")
+    print( "  3. Finish the editable deck with:")
+    print(f"       python3 scripts/run_mvp_image_to_ppt.py --resume {out_dir}")
+    return 0
+
+
+def _run_resume(out_dir_arg: str) -> int:
+    """Resume run: filled packet + returned images -> review package."""
+    if not out_dir_arg:
+        print(
+            "FAIL: --resume requires a non-empty output directory (the path "
+            "passed to the first run's --out-dir)",
+            file=sys.stderr,
+        )
+        return 2
+    # Reuse the helper's read-only input-dir gate (URI / symlink /
+    # symlink-ancestor / missing / non-directory refusals) for the wrapper
+    # out-dir the operator points back at.
+    out_dir, failures = s2ir._validate_input_dir(out_dir_arg, "--resume")
+    if failures or out_dir is None:
+        for line in failures:
+            print(f"FAIL: {line}", file=sys.stderr)
+        return 2
+
+    packet_dir = out_dir / _PACKET_SUBDIR
+    if not packet_dir.is_dir():
+        print(
+            f"FAIL: no {_PACKET_SUBDIR}/ under --resume {out_dir}; run the "
+            f"first step (--source ... --out-dir {out_dir}) before --resume.",
+            file=sys.stderr,
+        )
+        return 2
+
+    images_dir = packet_dir / "expected_images"
+    review_root = out_dir / _REVIEW_SUBDIR
+    rc = s2ir.main(
+        ["--resume-packet",
+         "--packet-dir", str(packet_dir),
+         "--images-dir", str(images_dir),
+         "--out-dir", str(review_root)]
+    )
+    if rc != 0:
+        return rc
+
+    print()
+    print("=== run_mvp_image_to_ppt: review package ready ===")
+    print(f"  deck.pptx: {review_root / 'review_package' / 'deck.pptx'}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Self-test. Every scenario runs under a per-run TMPDIR (outside the repo);
+# no caller-visible artifacts are retained. It proves the WRAPPER's command
+# surface only -- the lower-level helpers carry their own exhaustive gates.
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _captured():
+    """Swallow the sequenced helpers' stdout/stderr so probe output stays
+    readable; the buffer is surfaced only when a probe fails."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        yield buf
+
+
+def _fill_expected_images(packet_dir: Path) -> None:
+    """Write one byte-distinct valid PNG per expected filename, reusing the
+    bridge's OWN expected-filename reader + PNG synthesiser so the test data
+    matches the resume contract exactly."""
+    expected, failures = s2ir._load_expected_filenames(packet_dir)
+    if failures or expected is None:
+        raise AssertionError(f"could not load expected filenames: {failures}")
+    images_dir = packet_dir / "expected_images"
+    for idx, name in enumerate(expected):
+        rgb = ((idx * 37) % 256, (idx * 53) % 256, (idx * 71) % 256)
+        (images_dir / name).write_bytes(s2ir._png_bytes(2 + idx, 2, rgb))
+
+
+def _run_self_tests() -> int:
+    print("=== run_mvp_image_to_ppt --self-test ===")
+    results: list[tuple[str, bool, str]] = []
+
+    def record(name: str, ok: bool, detail: str = "") -> None:
+        results.append((name, ok, detail))
+
+    with tempfile.TemporaryDirectory(prefix="run-mvp-selftest-") as raw_td:
+        td = Path(raw_td)
+        # Reuse the bridge's own safe sample (ATX headings, passes the
+        # credential / network / path safety scan) as every source body.
+        sample = s2ir._SAMPLE_MD
+
+        # T1 .md first run -> packet, exact resume instruction, then a full
+        #    resume round-trip to a validated editable deck.
+        try:
+            out = td / "md_run"
+            md = td / "report.md"
+            md.write_text(sample, encoding="utf-8")
+            with _captured() as buf:
+                rc = _run_first(str(md), str(out))
+            packet = out / _PACKET_SUBDIR
+            expected_images = packet / "expected_images"
+            text = buf.getvalue()
+            ok = (
+                rc == 0
+                and (packet / "image_request_plan.json").is_file()
+                and (packet / "image_generation_requests.md").is_file()
+                and expected_images.is_dir()
+                and str(expected_images) in text
+                and f"--resume {out}" in text
+            )
+            record("md_first_run_packet+instruction", ok,
+                   "" if ok else f"rc={rc}; resume/expected hint missing")
+            if ok:
+                _fill_expected_images(packet)
+                with _captured() as buf:
+                    rc2 = _run_resume(str(out))
+                deck = out / _REVIEW_SUBDIR / "review_package" / "deck.pptx"
+                ok2 = rc2 == 0 and deck.is_file()
+                record("md_resume_roundtrip_deck", ok2,
+                       "" if ok2 else f"rc={rc2}; deck missing\n{buf.getvalue()[-800:]}")
+            else:
+                record("md_resume_roundtrip_deck", False, "skipped: first run failed")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("md_first_run_packet+instruction", False, f"raised {exc!r}")
+            record("md_resume_roundtrip_deck", False, "skipped: exception above")
+
+        # T2 .txt first run routes through ingest --md-out (normalized_source.md
+        #    written) and still produces a packet.
+        try:
+            out = td / "txt_run"
+            txt = td / "report.txt"
+            txt.write_text(sample, encoding="utf-8")
+            with _captured():
+                rc = _run_first(str(txt), str(out))
+            ok = (
+                rc == 0
+                and (out / _NORMALIZED_MD).is_file()
+                and (out / _PACKET_SUBDIR / "image_request_plan.json").is_file()
+            )
+            record("txt_first_run_via_ingest", ok,
+                   "" if ok else f"rc={rc}; normalized_source.md / packet missing")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("txt_first_run_via_ingest", False, f"raised {exc!r}")
+
+        # T3 .docx first run routes through ingest (heading-style extraction)
+        #    and still produces a packet.
+        try:
+            out = td / "docx_run"
+            docx = td / "report.docx"
+            docx.write_bytes(ingest._make_docx(
+                ingest._DOCX_HEADING_PARAGRAPHS,
+                style_names=ingest._DOCX_HEADING_STYLE_NAMES,
+            ))
+            with _captured():
+                rc = _run_first(str(docx), str(out))
+            ok = (
+                rc == 0
+                and (out / _NORMALIZED_MD).is_file()
+                and (out / _PACKET_SUBDIR / "image_request_plan.json").is_file()
+            )
+            record("docx_first_run_via_ingest", ok,
+                   "" if ok else f"rc={rc}; normalized_source.md / packet missing")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("docx_first_run_via_ingest", False, f"raised {exc!r}")
+
+        # T4 resume with NO returned images fails closed (rc != 0).
+        try:
+            out = td / "missing_run"
+            md = td / "report4.md"
+            md.write_text(sample, encoding="utf-8")
+            with _captured():
+                _run_first(str(md), str(out))
+                rc = _run_resume(str(out))
+            record("resume_missing_images_fails", rc != 0,
+                   "" if rc != 0 else "expected non-zero rc")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("resume_missing_images_fails", False, f"raised {exc!r}")
+
+        # T5 resume with a wrongly-named image fails closed (rc != 0).
+        try:
+            out = td / "mismatch_run"
+            md = td / "report5.md"
+            md.write_text(sample, encoding="utf-8")
+            with _captured():
+                _run_first(str(md), str(out))
+            (out / _PACKET_SUBDIR / "expected_images" / "not_a_requested_name.png"
+             ).write_bytes(s2ir._png_bytes(3, 2, (1, 2, 3)))
+            with _captured():
+                rc = _run_resume(str(out))
+            record("resume_filename_mismatch_fails", rc != 0,
+                   "" if rc != 0 else "expected non-zero rc")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("resume_filename_mismatch_fails", False, f"raised {exc!r}")
+
+        # T6 unsupported source extension is refused (rc == 2).
+        try:
+            out = td / "pdf_run"
+            pdf = td / "report.pdf"
+            pdf.write_text(sample, encoding="utf-8")
+            with _captured():
+                rc = _run_first(str(pdf), str(out))
+            record("unsupported_extension_refused", rc == 2 and not out.exists(),
+                   "" if rc == 2 else f"rc={rc}")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("unsupported_extension_refused", False, f"raised {exc!r}")
+
+        # T7 unsafe out-dir is refused by the reused gate: URI-shaped, and a
+        #    path under the repo tree.
+        try:
+            md = td / "report7.md"
+            md.write_text(sample, encoding="utf-8")
+            with _captured():
+                rc_uri = _run_first(str(md), "file:///tmp/x")
+                rc_repo = _run_first(str(md), str(REPO_ROOT / "tmp_mvp_out"))
+            ok = rc_uri == 2 and rc_repo == 2
+            record("unsafe_out_dir_refused", ok,
+                   "" if ok else f"uri={rc_uri} repo={rc_repo}")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("unsafe_out_dir_refused", False, f"raised {exc!r}")
+
+        # T8 argument-shape gates: --resume must not take --out-dir; --source
+        #    requires --out-dir; --resume before a first run is refused.
+        try:
+            md = td / "report8.md"
+            md.write_text(sample, encoding="utf-8")
+            empty = td / "empty_resume"
+            empty.mkdir()
+            with _captured():
+                rc_both = main(["--resume", str(empty), "--out-dir", str(td / "y")])
+                rc_no_out = main(["--source", str(md)])
+                rc_no_packet = main(["--resume", str(empty)])
+            ok = rc_both == 2 and rc_no_out == 2 and rc_no_packet == 2
+            record("arg_shape_gates", ok,
+                   "" if ok else f"both={rc_both} no_out={rc_no_out} no_packet={rc_no_packet}")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("arg_shape_gates", False, f"raised {exc!r}")
+
+        # T9 a present-but-empty --resume "" is refused (rc 2), never
+        #    mis-dispatched to the --source path where Path(None) would
+        #    traceback. Covers `--resume ""` alone and with --out-dir.
+        try:
+            with _captured():
+                rc_empty = main(["--resume", ""])
+                rc_empty_out = main(["--resume", "", "--out-dir", str(td / "z")])
+            ok = rc_empty == 2 and rc_empty_out == 2
+            record("empty_resume_refused_no_traceback", ok,
+                   "" if ok else f"empty={rc_empty} empty_out={rc_empty_out}")
+        except Exception as exc:  # pragma: no cover - defensive
+            record("empty_resume_refused_no_traceback", False, f"raised {exc!r}")
+
+    passed = sum(1 for _, ok, _ in results if ok)
+    for name, ok, detail in results:
+        tag = "PASS" if ok else "FAIL"
+        suffix = f" -- {detail}" if detail and not ok else ""
+        print(f"  [{tag}] {name}{suffix}")
+    print(f"\n{passed}/{len(results)} probe(s) passed.")
+    return 0 if passed == len(results) else 1
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "One-command MVP wrapper (MOCK / LOCAL only): sequences the "
+            "existing ingest + source-to-image-request helpers so an "
+            "operator runs ONE command to turn a local .docx / .md / "
+            ".markdown / .txt source into an image-generation packet, then "
+            "ONE command to turn the filled packet plus returned local "
+            "images into a validated, editable review_package/deck.pptx. "
+            "Thin orchestration: it adds no renderer, no second validator, "
+            "and synthesises no pixels -- it reuses the helpers' own safety "
+            "gates verbatim. Local-only: no D-One, MCP, Qoder, public "
+            "network, telemetry, model API, or image search. NOT real image "
+            "generation; NOT full report-to-PPT automation."
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--source",
+        help=(
+            "First run: path to a local .md / .markdown source (used "
+            "directly) or a .docx / .txt source (normalised to Markdown via "
+            "ingest_local_source_file.py --md-out first). Produces the "
+            "generation packet under <out-dir>/generation_packet and prints "
+            "where to drop the returned images. Requires --out-dir. PDF is a "
+            "documented TODO."
+        ),
+    )
+    mode.add_argument(
+        "--resume",
+        metavar="OUT_DIR",
+        help=(
+            "Resume run (source-free): the first run's --out-dir. Consumes "
+            "the completed packet under <OUT_DIR>/generation_packet plus the "
+            "returned images under <OUT_DIR>/generation_packet/expected_images "
+            "and builds a validated review package via "
+            "source_to_image_requests.py --resume-packet. The editable deck "
+            "lands at <OUT_DIR>/review/review_package/deck.pptx. Do NOT pass "
+            "--out-dir with --resume."
+        ),
+    )
+    mode.add_argument(
+        "--self-test",
+        action="store_true",
+        help=(
+            "Run every scenario under a per-run TMPDIR (md first run + exact "
+            "resume instruction + full resume round-trip to an editable "
+            "deck, docx/txt routed through ingest, missing / mismatched "
+            "image refusals, unsupported-extension refusal, unsafe-out-dir "
+            "refusal, argument-shape gates). No caller-visible artifacts "
+            "retained."
+        ),
+    )
+    parser.add_argument(
+        "--out-dir",
+        help=(
+            "Output directory for the first run (with --source). Must be "
+            "outside the repo tree, not URI-shaped, not a symlink / under a "
+            "symlink, and missing or empty; its parent must exist. Holds "
+            "generation_packet/ (and review/ after --resume)."
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = _build_parser().parse_args(argv)
+
+    if args.self_test:
+        return _run_self_tests()
+
+    # The required mutually-exclusive group guarantees exactly one of
+    # --source / --resume / --self-test is present. Dispatch --resume on
+    # `is not None` (NOT truthiness): a present-but-empty value (--resume "")
+    # must still route to the resume path and be refused there, not fall
+    # through to --source and traceback on Path(None) when --source was
+    # never supplied.
+    if args.resume is not None:
+        # --resume is source-free and carries the out-dir as its value; a
+        # separate --out-dir would be contradictory.
+        if args.out_dir:
+            print(
+                "FAIL: --resume takes the first run's output directory as its "
+                "value; do not also pass --out-dir",
+                file=sys.stderr,
+            )
+            return 2
+        return _run_resume(args.resume)
+
+    # --source
+    if not args.out_dir:
+        print("FAIL: --source requires --out-dir", file=sys.stderr)
+        return 2
+    return _run_first(args.source, args.out_dir)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

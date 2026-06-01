@@ -76,18 +76,22 @@ Acceptance:
 
 ### Goal 3: One MVP Command Surface
 
-Add a single MVP entrypoint (planned — NOT yet implemented), e.g. a
-`run_mvp_image_to_ppt` wrapper that fronts the existing lower-level scripts:
+Status: implemented as `scripts/run_mvp_image_to_ppt.py` — a thin wrapper that
+fronts the existing lower-level scripts (`ingest_local_source_file.py --md-out`
+for `.docx` / `.txt`, then `source_to_image_requests.py --generation-packet` /
+`--resume-packet`), adding no renderer / validator / pixels and reusing their
+path-safety gates:
 
 ```bash
-run_mvp_image_to_ppt --source report.docx --out-dir /tmp/szh-mvp
-run_mvp_image_to_ppt --resume /tmp/szh-mvp
+python3 scripts/run_mvp_image_to_ppt.py --source report.docx --out-dir /tmp/szh-mvp
+python3 scripts/run_mvp_image_to_ppt.py --resume /tmp/szh-mvp
 ```
 
-Acceptance:
-- First command creates the generation packet and tells the operator where to place images.
-- Second command validates returned images and creates the review package.
+Acceptance (met):
+- First command creates the generation packet (under `<out-dir>/generation_packet`) and tells the operator where to place images.
+- Second command validates returned images and creates the review package (`<out-dir>/review/review_package/deck.pptx`).
 - Existing lower-level scripts still work.
+- `python3 scripts/run_mvp_image_to_ppt.py --self-test` covers the command surface.
 
 ### Goal 4: Visible Quickstart + Tiny Demo Input
 

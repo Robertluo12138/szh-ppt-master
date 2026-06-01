@@ -72,6 +72,25 @@ Edit the two files, then pass them back via `--manifest` / `--generated-provenan
 
 **Boundary:** local-only — no D-One, no MCP / Qoder, no model API, no image search, no public network, no telemetry. See [`references/core-image-to-editable-ppt-quickstart.md`](references/core-image-to-editable-ppt-quickstart.md) for the full flag surface (`--bundle`, `--manifest`, `--plan-out`, `--approved-plan`, the provenance sidecar) and [`references/operator-image-folder-pilot-readiness.md`](references/operator-image-folder-pilot-readiness.md) for the two-step human-review checkpoint and pilot status.
 
+## One-command MVP: local source → images → editable PPT
+
+The fastest operator path from a local source document to an editable deck. `scripts/run_mvp_image_to_ppt.py` is a **thin wrapper** that sequences the two lower-level helpers below — it adds no renderer, no second validator, and synthesises no pixels, reusing their safety gates verbatim. Run it twice, with a local / internal image-generation step in between:
+
+```bash
+# 1. First run: local .docx / .md / .markdown / .txt source -> generation packet
+python3 scripts/run_mvp_image_to_ppt.py \
+  --source /path/report.docx --out-dir /tmp/szh-mvp   # fresh dir, outside the repo
+
+# ... hand <out-dir>/generation_packet/image_generation_requests.md to a local /
+# internal image generator, then save each returned image under its EXACT
+# requested filename into <out-dir>/generation_packet/expected_images ...
+
+# 2. Resume run (source-free): filled packet + returned images -> review package
+python3 scripts/run_mvp_image_to_ppt.py --resume /tmp/szh-mvp
+```
+
+The first run routes `.md` / `.markdown` straight to the image-request bridge and normalises `.docx` / `.txt` to `<out-dir>/normalized_source.md` via `ingest_local_source_file.py --md-out` first (PDF is a documented TODO), then writes the generation packet under `<out-dir>/generation_packet` and prints the exact next step (where to drop the returned images and the `--resume <out-dir>` command). The resume run drives `source_to_image_requests.py --resume-packet` and lands the validated, editable deck at `<out-dir>/review/review_package/deck.pptx`; it fails closed with an actionable message if a returned image is missing, misnamed, non-image, or unsafe. `--out-dir` must be outside the repo tree, not URI-shaped / a symlink, and missing or empty (the same `_validate_out_dir_arg` gate the helpers apply); its parent must exist. Self-test: `python3 scripts/run_mvp_image_to_ppt.py --self-test`. Local-only: no D-One, MCP, Qoder, public network, telemetry, model API, or image search. NOT real image generation; NOT full report-to-PPT automation.
+
 ## Markdown source → image request plan (front-end bridge)
 
 A narrow, local-only **front-end bridge** that moves one step earlier than the operator image lane: a Markdown source document → an **image request plan** → (mock/local) placeholder images → the existing operator image-to-editable-PPT lane. It is a *bridge, not full report-to-PPT automation*: it derives one image request per ATX heading, never extracts business content from the source body, and never performs real image generation.
