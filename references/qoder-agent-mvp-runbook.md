@@ -42,6 +42,33 @@ API, or network call.
   model API, public image search, or telemetry. Manual / internal image return
   is always a valid path.
 
+## Qoder operator prompt (paste this after installing the skill)
+
+Once the `editable-ppt` skill is installed and you have pointed Qoder at a
+business folder, paste the block below into Qoder. It routes the operational
+run to `--style company` and keeps the manual / internal image handoff
+boundary intact. The detailed steps follow in **Workflow**.
+
+```text
+You have the `editable-ppt` skill installed. Follow
+references/qoder-agent-mvp-runbook.md, running every command from the repo
+root, for the business folder I point you at:
+
+1. Find exactly one local .docx / .md / .markdown / .txt source in the folder.
+   If you find zero or more than one, STOP and ask me which file to use.
+2. Pick an empty output dir OUT outside the repo (e.g. /tmp/deck-out), then:
+     python3 scripts/run_mvp_image_to_ppt.py --source <SOURCE> --out-dir OUT
+3. Do NOT generate real images and do NOT call any network, model API, or
+   image service. STOP and report OUT/generation_packet/ so a human or our
+   approved internal generator fills expected_images/ with the exact PNG
+   filenames the packet lists.
+4. ONLY after expected_images/ is filled, build the deck with the company
+   style:
+     python3 scripts/run_mvp_image_to_ppt.py --resume OUT --style company
+5. Report the deck at OUT/review/review_package/deck.pptx and whether
+   validation passed.
+```
+
 ## Workflow
 
 Preconditions: the `editable-ppt` skill is loaded; `python3` is available
@@ -50,11 +77,12 @@ agent at a business folder. Run every command from the repo root.
 
 ### 1. Find the source
 
-Look for exactly one local `.docx` / `.md` / `.markdown` / `.txt` file in the
-business folder.
+Look for **exactly one** local `.docx` / `.md` / `.markdown` / `.txt` file in
+the business folder.
 
-- Zero candidates, or more than one and the intended file is ambiguous →
-  **ask the operator** which file to use (or to add one) before proceeding.
+- **Zero** candidates, or **more than one** → **ask the operator** which file
+  to use (or to add one) before proceeding. Do not guess and do not silently
+  pick one.
 - A `.pdf` is a documented TODO — refuse it with that note rather than trying
   to parse it.
 - Do not fetch a remote document or pull anything off the network; the source
@@ -138,8 +166,17 @@ contract.)
 ### 6. Resume run — packet + returned images → editable deck
 
 ```bash
-python3 scripts/run_mvp_image_to_ppt.py --resume OUT
+python3 scripts/run_mvp_image_to_ppt.py --resume OUT --style company
 ```
+
+On a company machine, run the resume step with **`--style company`** — the
+operational MVP default. It applies the clean-room company-style design tokens
+(warm palette + clean sans typography) to the deck's `design_system` only; the
+layouts, the 1:1 returned-image contract, and every safety / validation gate
+are unchanged, and the deck still validates. (Omit the flag, or pass
+`--style default`, for a byte-identical run against the bundled template theme.)
+The flag has **no** effect on the first `--source` run, which only builds the
+image-generation packet.
 
 Pass `OUT` as the value of `--resume`; do **not** also pass `--out-dir`. The
 resume run checks the returned images against the plan **1:1** (exact
@@ -173,7 +210,7 @@ credential content in any image prompt. No full-slide screenshots. No broad
 
 ## When to stop or ask
 
-- Missing or ambiguous source → ask the operator (step 1).
+- Zero or more than one candidate source file → ask the operator (step 1).
 - No human / internal generator available to fill the packet → stop at the
   packet and report the path (step 5); manual / internal image return is still
   valid.
